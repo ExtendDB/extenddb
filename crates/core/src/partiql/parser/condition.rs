@@ -5,11 +5,12 @@
 
 use super::limits::{MAX_OPERATORS, Nest};
 use super::{
-    AND_OR_ARGUMENTS, BARE_OPERAND, Brackets, GROUPED_OPERAND, NO_COMPARISON, NOT_A_CONDITION,
-    NOT_ARGUMENT, PResult, ParseError, Parser,
+    AND_OR_ARGUMENTS, BARE_OPERAND, GROUPED_OPERAND, NOT_A_CONDITION, NOT_ARGUMENT, PResult,
+    ParseError, Parser,
 };
 use crate::partiql::ast::{CompareOp, Operand, Path, TypeName, WhereExpr};
 use crate::partiql::lexer::{Token, TokenKind};
+use crate::partiql::operand_types::call_type;
 use crate::partiql::values::{self, CONDITION_FUNCTIONS};
 
 impl Parser {
@@ -158,37 +159,15 @@ impl Parser {
         }
     }
 
-    /// A predicate that is not in parentheses: a condition function, or an
-    /// operand and what follows it.
-    ///
-    /// A condition function is an unquoted name in any case. With another
-    /// number of operands than it takes (see [`Parser::check_operand_count`])
-    /// the predicate stands for the call and never runs.
+    /// A predicate that is not in parentheses: an operand and what follows
+    /// it. A call is an operand, its name quoted or not (measured
+    /// 2026-11-24: `size(m) BETWEEN 1 AND 2` and `"Size"(m) BETWEEN 1 AND 2`
+    /// run, and `size(m) + 1 = 2` and `contains(m LIKE 'x', 'a')` are
+    /// refused for the operator, as their quoted forms are). A condition
+    /// function with another number of operands than it takes (see
+    /// [`Parser::check_operand_count`]) stands for its call and never runs.
     #[inline(never)]
     fn term_predicate(&mut self) -> PResult<WhereExpr> {
-        if let Some(name) = self.condition_function_ahead() {
-            let within = self.within_operator_limit();
-            self.count_operator();
-            self.bump();
-            let args = self.call_args()?;
-            let counted = self.check_operand_count(&name, &args, within);
-            let predicate = if name == "size" {
-                // A size call is the left side of a comparison.
-                self.finish_comparison(Operand::Function(name, args))?
-            } else if !counted || args.len() == 1 {
-                WhereExpr::Function(name, args)
-            } else {
-                let mut it = args.into_iter();
-                let a = it.next().unwrap();
-                let b = it.next().unwrap();
-                match name.as_str() {
-                    "begins_with" => WhereExpr::BeginsWith(a, b),
-                    "contains" => WhereExpr::Contains(a, b),
-                    _ => WhereExpr::AttributeType(a, b),
-                }
-            };
-            return self.after_predicate(predicate);
-        }
         let left_start = self.pos;
         let exec = self.is_keyword("EXEC");
         let refused_operators = self.operator_refusals;
@@ -239,7 +218,7 @@ impl Parser {
             let in_list = self.in_list(left)?;
             return self.after_predicate(in_list);
         }
-        if !self.at_comparison() {
+        let Some(op) = self.comparison_op() else {
             // The operand is all the group around it holds: the group is
             // the operand, and the predicate goes on after the group (see
             // [`Parser::predicate`]).
@@ -256,9 +235,10 @@ impl Parser {
             // 2026-11-02: `... AND EXISTS(ss)` is "Unrecognized function"),
             // and so is an operand holding an operator a condition does not
             // take (measured 2026-11-02: `a + 1` is refused for the `+`).
-            // Each stands for a predicate that never runs.
+            // Each stands for a predicate that never runs. A call of a
+            // condition function is its predicate (see [`call_predicate`]).
             if let Operand::Function(name, args) = left {
-                return Ok(WhereExpr::Function(name, args));
+                return Ok(call_predicate(name, args));
             }
             let missing = matches!(
                 &self.tokens[left_start].kind,
@@ -286,8 +266,19 @@ impl Parser {
             // small (see [`limits`]).
             self.refuse_bare_operand(left_start);
             return Ok(WhereExpr::Function(BARE_OPERAND.to_owned(), vec![left]));
+        };
+        // A call whose result is BOOL compared with a boolean is the
+        // condition compared (see [`Parser::compared_with_boolean`]; measured
+        // 2026-11-24: `begins_with(m, 'a') = true` reaches the table).
+        let next = self.tokens.get(self.pos + 1);
+        if matches!(op, CompareOp::Eq | CompareOp::Ne)
+            && (is_word(next, "true") || is_word(next, "false"))
+            && matches!(&left, Operand::Function(name, _) if call_type(name) == Some("BOOL"))
+            && let Operand::Function(name, args) = left
+        {
+            return self.after_predicate(call_predicate(name, args));
         }
-        let comparison = self.finish_comparison(left)?;
+        let comparison = self.finish_comparison(left, op)?;
         self.after_predicate(comparison)
     }
 
@@ -321,34 +312,16 @@ impl Parser {
         }
     }
 
-    /// Whether the current token is a comparison operator.
-    fn at_comparison(&self) -> bool {
-        matches!(
-            self.peek().kind,
-            TokenKind::Eq
-                | TokenKind::Ne
-                | TokenKind::Lt
-                | TokenKind::Le
-                | TokenKind::Gt
-                | TokenKind::Ge
-        )
-    }
-
-    /// The condition function at the current token with `(` after it, by the
-    /// name the code compares it by (see [`values::call_ahead`]), or `None`.
-    /// A quoted name is read as any other call is (see [`Parser::call`]),
-    /// with what may follow an operand (measured 2026-11-24: `"Size"(m)
-    /// BETWEEN 1 AND 2` runs, and `"Size"(m) + 1 = 2` and `"Contains"(m LIKE
-    /// 'x', 'a')` are refused for the operator). In brackets a size call may
-    /// stand alone as a value, so it is read as an operand (measured
-    /// 2026-11-06: `m[k[size(x)]]` is refused at the `k`).
-    fn condition_function_ahead(&self) -> Option<String> {
-        if !matches!(self.peek().kind, TokenKind::Ident(_)) {
-            return None;
-        }
-        values::call_ahead(&self.tokens, self.pos).filter(|name| {
-            CONDITION_FUNCTIONS.contains(&name.as_str())
-                && !(name == "size" && self.brackets == Brackets::Inner)
+    /// The comparison operator at the current token, if it is one.
+    fn comparison_op(&self) -> Option<CompareOp> {
+        Some(match self.peek().kind {
+            TokenKind::Eq => CompareOp::Eq,
+            TokenKind::Ne => CompareOp::Ne,
+            TokenKind::Lt => CompareOp::Lt,
+            TokenKind::Le => CompareOp::Le,
+            TokenKind::Gt => CompareOp::Gt,
+            TokenKind::Ge => CompareOp::Ge,
+            _ => return None,
         })
     }
 
@@ -405,16 +378,9 @@ impl Parser {
         }
     }
 
-    fn finish_comparison(&mut self, left: Operand) -> PResult<WhereExpr> {
-        let op = match &self.peek().kind {
-            TokenKind::Eq => CompareOp::Eq,
-            TokenKind::Ne => CompareOp::Ne,
-            TokenKind::Lt => CompareOp::Lt,
-            TokenKind::Le => CompareOp::Le,
-            TokenKind::Gt => CompareOp::Gt,
-            TokenKind::Ge => CompareOp::Ge,
-            _ => return Err(ParseError::well_formed(NO_COMPARISON)),
-        };
+    /// The rest of a comparison of `left` by `op`, with the current token on
+    /// the operator.
+    fn finish_comparison(&mut self, left: Operand, op: CompareOp) -> PResult<WhereExpr> {
         self.count_operator();
         self.bump();
         self.require_rhs()?;
@@ -510,4 +476,20 @@ fn is_word(token: Option<&Token>, word: &str) -> bool {
         token.map(|t| &t.kind),
         Some(TokenKind::Ident(s)) if s.eq_ignore_ascii_case(word)
     )
+}
+
+/// The predicate a call stands for as a condition: `begins_with`,
+/// `contains` and `attribute_type` with the two operands they take are
+/// those predicates, and any other call stands for itself.
+fn call_predicate(name: String, args: Vec<Operand>) -> WhereExpr {
+    let predicate = match name.as_str() {
+        "begins_with" => WhereExpr::BeginsWith,
+        "contains" => WhereExpr::Contains,
+        "attribute_type" => WhereExpr::AttributeType,
+        _ => return WhereExpr::Function(name, args),
+    };
+    match <[Operand; 2]>::try_from(args) {
+        Ok([a, b]) => predicate(a, b),
+        Err(args) => WhereExpr::Function(name, args),
+    }
 }

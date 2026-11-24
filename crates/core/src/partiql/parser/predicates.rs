@@ -101,11 +101,11 @@ impl Parser {
     /// An argument of a call read as an operand of a condition: an operand,
     /// or an operand and a LIKE, which is refused there like anywhere in the
     /// condition (measured 2026-11-02: `foo(a LIKE 'x')` names the operator
-    /// `like`). The argument is one part of the walk, so the LIKE comes
-    /// after what the arguments before it met. The operand stands for the
-    /// LIKE and never runs. NOT LIKE there, and LIKE in the arguments of a
-    /// condition function that starts a predicate, are not measured, and keep
-    /// the syntax error of a call left open.
+    /// `like`; measured 2026-11-24 in a condition function, quoted or not:
+    /// `contains(m LIKE 'x', 'a')`). The argument is one part of the walk, so
+    /// the LIKE comes after what the arguments before it met. The operand
+    /// stands for the LIKE and never runs. NOT LIKE there is not measured,
+    /// and keeps the syntax error of a call left open.
     pub(super) fn argument_with_like(&mut self) -> PResult<Operand> {
         let before = self.walk_part();
         let argument = self.operand().and_then(|argument| {

@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! The operand-type check on ordering comparisons.
+//! The operand-type check on ordering comparisons and on calls.
 //!
 //! An ordering operator (`<`, `<=`, `>`, `>=`, `BETWEEN`) refuses a value
 //! operand whose type has no ordering: anything but `S`, `N` and `B`. The
@@ -9,14 +9,32 @@
 //! table is resolved, and the message is the bare sentence with no expression
 //! prefix (measured 2026-11-02). A document path is not checked: its type is
 //! only known per item.
+//!
+//! A call's result has a type (see [`call_type`]): AND, OR and NOT refuse an
+//! `N` call as an operand, and BETWEEN and the ordering operators a `BOOL`
+//! one, in the same message; a condition that is an `N` call alone gets the
+//! refusal of an operand that is the whole condition; IN and `=` take a call
+//! of either type. Measured 2026-11-24: AND refuses `size(m)` and
+//! `"Size"(m)`, OR and NOT refuse `size(m)` on either side, BETWEEN refuses
+//! `begins_with`, `"Begins_With"`, `attribute_exists` and `attribute_type`,
+//! `<`, `<=`, `>` and `>=` refuse `begins_with`, `contains` and
+//! `attribute_exists` on either side, `WHERE size(m)` is refused in a
+//! SELECT, a DELETE and an UPDATE, quoted and in parentheses, and
+//! `contains(m, 'a') IN [1]`, `contains(m, 'a') = 1`, `begins_with(m, 'a') =
+//! 1`, `begins_with(m, 'a') <> 1`, `begins_with(m, 'a') = true` and `size(m)
+//! < 1` run. The type of a call's own operands is not checked.
 
 use crate::types::AttributeValue;
 
 use super::ast::{CompareOp, Operand, Statement, WhereExpr};
+use super::parser::NOT_A_CONDITION;
+use super::values::CONDITION_FUNCTIONS;
 
-/// Check every ordering comparison in the statement's `WHERE` clause. A `?`
-/// operand is checked against its bound parameter; a missing parameter is left
-/// to the binding step, which reports the count mismatch.
+/// Check every ordering comparison in the statement's `WHERE` clause, and
+/// every call an operator of the condition takes or the condition is (see
+/// the module documentation). A `?` operand is checked against its bound
+/// parameter; a missing parameter is left to the binding step, which reports
+/// the count mismatch.
 ///
 /// # Errors
 ///
@@ -30,6 +48,9 @@ pub fn check_ordering_operands(stmt: &Statement, params: &[AttributeValue]) -> R
         Statement::Insert(_) => None,
     };
     match where_clause {
+        Some(WhereExpr::Function(name, _)) if call_type(name) == Some("N") => {
+            Err(NOT_A_CONDITION.to_owned())
+        }
         Some(expr) => check_where(expr, params),
         None => Ok(()),
     }
@@ -49,13 +70,16 @@ fn check_where(expr: &WhereExpr, params: &[AttributeValue]) -> Result<(), String
             check_operand(low, "BETWEEN", params)?;
             check_operand(high, "BETWEEN", params)
         }
-        WhereExpr::And(left, right) | WhereExpr::Or(left, right) => {
-            check_where(left, params)?;
-            check_where(right, params)
+        WhereExpr::And(left, right) => {
+            check_condition(left, "AND", params)?;
+            check_condition(right, "AND", params)
         }
-        WhereExpr::Not(inner) | WhereExpr::ComparedWithBoolean(inner, _) => {
-            check_where(inner, params)
+        WhereExpr::Or(left, right) => {
+            check_condition(left, "OR", params)?;
+            check_condition(right, "OR", params)
         }
+        WhereExpr::Not(inner) => check_condition(inner, "NOT", params),
+        WhereExpr::ComparedWithBoolean(inner, _) => check_where(inner, params),
         WhereExpr::In(..)
         | WhereExpr::BeginsWith(..)
         | WhereExpr::Contains(..)
@@ -63,6 +87,32 @@ fn check_where(expr: &WhereExpr, params: &[AttributeValue]) -> Result<(), String
         | WhereExpr::Function(..)
         | WhereExpr::IsMissing(..)
         | WhereExpr::IsType(..) => Ok(()),
+    }
+}
+
+/// Check `expr` as an operand of the condition operator `symbol`, AND, OR or
+/// NOT, which refuses a call whose result is `N`.
+fn check_condition(
+    expr: &WhereExpr,
+    symbol: &str,
+    params: &[AttributeValue],
+) -> Result<(), String> {
+    if let WhereExpr::Function(name, _) = expr
+        && call_type(name) == Some("N")
+    {
+        return Err(refusal(symbol, "N"));
+    }
+    check_where(expr, params)
+}
+
+/// The type of the result of a call, `name` as the code compares it (see
+/// `values::call_name`): `N` for `size`, `BOOL` for the other condition
+/// functions, `None` for any other call.
+pub(crate) fn call_type(name: &str) -> Option<&'static str> {
+    match name {
+        "size" => Some("N"),
+        name if CONDITION_FUNCTIONS.contains(&name) => Some("BOOL"),
+        _ => None,
     }
 }
 
@@ -85,6 +135,9 @@ fn check_operand(operand: &Operand, symbol: &str, params: &[AttributeValue]) -> 
             Some(value) => value,
             None => return Ok(()),
         },
+        Operand::Function(name, _) if call_type(name) == Some("BOOL") => {
+            return Err(refusal(symbol, "BOOL"));
+        }
         Operand::Path(_) | Operand::Arith(..) | Operand::Function(..) => return Ok(()),
     };
     let type_code = match value {
@@ -97,10 +150,15 @@ fn check_operand(operand: &Operand, symbol: &str, params: &[AttributeValue]) -> 
         AttributeValue::NS(_) => "NS",
         AttributeValue::BS(_) => "BS",
     };
-    Err(format!(
+    Err(refusal(symbol, type_code))
+}
+
+/// The refusal of an operand of type `type_code` by the operator `symbol`.
+fn refusal(symbol: &str, type_code: &str) -> String {
+    format!(
         "Incorrect operand type for operator or function; operator or function: {symbol}, \
          operand type: {type_code}"
-    ))
+    )
 }
 
 #[cfg(test)]

@@ -551,8 +551,12 @@ mod tests {
         check_statement(&parse(sql).unwrap(), params, sql)
     }
 
-    const OPERAND_TYPE: &str = "Incorrect operand type for operator or function; operator or function: <, operand type: \
-         BOOL";
+    fn operand_type(op: &str, ty: &str) -> String {
+        format!(
+            "Incorrect operand type for operator or function; operator or function: {op}, \
+             operand type: {ty}"
+        )
+    }
 
     #[test]
     fn statement_checks_run_the_table_name_rule_first() {
@@ -654,7 +658,11 @@ mod tests {
                 &params[..],
             ),
         ] {
-            assert_eq!(checked(sql, params), Err(OPERAND_TYPE.to_owned()), "{sql}");
+            assert_eq!(
+                checked(sql, params),
+                Err(operand_type("<", "BOOL")),
+                "{sql}"
+            );
         }
     }
 
@@ -758,6 +766,8 @@ mod tests {
             "The left hand side argument to IS must be a Variable Reference, Literal, or Path"
                 .to_owned()
         };
+        let not_boolean =
+            || "WHERE clause must contain an expression that resolves to a boolean".to_owned();
         let in101 = format!(
             "a IN [{}]",
             (1..=101)
@@ -905,6 +915,7 @@ mod tests {
             ("P6", es, select("contains(m, attribute_exists(1))"), path("attribute_exists")),
             ("P7", es, select("a = \"Attribute_Not_Exists\"(1)"), path("attribute_not_exists")),
             ("X8", es, select("a = \"Attribute_Exists\"(1)"), path("attribute_exists")),
+            ("Z50", es, select("attribute_exists(1) = attribute_exists(2)"), path("attribute_exists")),
             // The operand count and the path check of a condition function
             // or of IS MISSING, the IN list limit and the operator count come
             // in written order, each check of a call or of IS MISSING ahead
@@ -949,20 +960,79 @@ mod tests {
             ("N3", es, select(&format!("{}NOT contains(m)", "a = 1 AND ".repeat(149))), count("contains", 1)),
             ("R28", es, select(&format!("{ops150} AND attribute_exists(1)")), operator_limit()),
             ("R16", es, select("attribute_exists(1) IS NULL"), is_left_side()),
-            // A quoted condition function reads as any other call, with what
-            // may follow an operand, and a quoted presence function as a
-            // predicate gets the path check. In the brackets of an ORDER BY
-            // term or a SET target a condition function gets the brackets'
+            // A condition function, quoted or not, reads as any other call,
+            // with what may follow an operand, and a quoted presence function
+            // as a predicate gets the path check. In the brackets of an ORDER
+            // BY term or a SET target a condition function gets the brackets'
             // answer (measured 2026-11-24).
             ("A1", es, select("\"Size\"(m) BETWEEN 1 AND 2"), table_lookup()),
+            ("A2", es, select("size(m) BETWEEN 1 AND 2"), table_lookup()),
             ("A3", es, select("\"Size\"(m) IN [1, 2]"), table_lookup()),
+            ("A4", es, select("size(m) IN [1, 2]"), table_lookup()),
             ("A8", es, select("(\"Size\"(m)) = 1"), table_lookup()),
+            ("A9", es, select("(size(m)) = 1"), table_lookup()),
+            ("S6", es, select("size(m) < size(m)"), table_lookup()),
             ("A6", es, select("\"Size\"(m) + 1 = 2"), operator("+")),
+            ("A7", es, select("size(m) + 1 = 2"), operator("+")),
             ("A16", es, select("\"Contains\"(m, 'a') + 1 = 2"), operator("+")),
+            ("S11", es, select("contains(m, 'a') + 1 = 2"), operator("+")),
             ("A13", es, select("\"Size\"(m LIKE 'x') = 1"), operator("like")),
             ("A14", es, select("\"Contains\"(m LIKE 'x', 'a')"), operator("like")),
+            ("A15", es, select("contains(m LIKE 'x', 'a')"), operator("like")),
+            ("S12", es, select("begins_with(m LIKE 'x', 'a')"), operator("like")),
             ("A10", es, select("\"Size\"(m) IS NULL"), is_left_side()),
+            ("A11", es, select("size(m) IS NULL"), is_left_side()),
+            ("S10", es, select("size(m) IS MISSING"), is_left_side()),
             ("A22", es, select("\"Size\"(m, 1)"), count("size", 2)),
+            ("A23", es, select("size(m, 1)"), count("size", 2)),
+            // A call's result has a type: N for `size` and BOOL for the other
+            // condition functions. AND, OR and NOT refuse an N operand,
+            // BETWEEN and the ordering operators a BOOL one, and an N call
+            // alone is not a condition; IN and `=` take a BOOL (measured
+            // 2026-11-24).
+            ("H37a", es, select("\"Size\"(m)"), operand_type("AND", "N")),
+            ("H37b", es, select("size(m)"), operand_type("AND", "N")),
+            ("S8", es, select("(size(m))"), operand_type("AND", "N")),
+            ("S4", es, select("size(m) OR a = 1"), operand_type("AND", "N")),
+            ("U3", es, format!("SELECT * FROM {TABLE} WHERE pk = 'q' OR size(m)"), operand_type("OR", "N")),
+            ("S3", es, select("NOT size(m)"), operand_type("NOT", "N")),
+            ("U4", es, format!("SELECT * FROM {TABLE} WHERE size(m)"), not_boolean()),
+            ("A17", es, select("\"Begins_With\"(m, 'a') BETWEEN 1 AND 2"), operand_type("BETWEEN", "BOOL")),
+            ("S1", es, select("begins_with(m, 'a') BETWEEN 1 AND 2"), operand_type("BETWEEN", "BOOL")),
+            ("S5", es, select("attribute_exists(m) BETWEEN 1 AND 2"), operand_type("BETWEEN", "BOOL")),
+            ("S9", es, select("attribute_type(m, 'S') BETWEEN 1 AND 2"), operand_type("BETWEEN", "BOOL")),
+            ("U2", es, select("begins_with(m, 'a') < 1"), operand_type("<", "BOOL")),
+            ("TV1", es, select("begins_with(m, 'a') <= 1"), operand_type("<=", "BOOL")),
+            ("TV2", es, select("1 > contains(m, 'a')"), operand_type(">", "BOOL")),
+            ("TV3", es, select("attribute_exists(m) >= 1"), operand_type(">=", "BOOL")),
+            ("TV4", es, select("begins_with(m, 'a') < size(m)"), operand_type("<", "BOOL")),
+            ("TV5", es, format!("SELECT * FROM {TABLE} WHERE size(m) OR pk = 'q'"), operand_type("OR", "N")),
+            ("TV6", es, format!("SELECT * FROM {TABLE} WHERE \"Size\"(m)"), not_boolean()),
+            ("TV7", es, format!("SELECT * FROM {TABLE} WHERE (size(m))"), not_boolean()),
+            ("TV8", es, format!("DELETE FROM {TABLE} WHERE size(m)"), not_boolean()),
+            ("TV9", es, format!("UPDATE {TABLE} SET a = 1 WHERE size(m)"), not_boolean()),
+            ("TV10", es, select("begins_with(m, 'a') <> 1"), table_lookup()),
+            ("TV11", es, select("size(m) < 1"), table_lookup()),
+            ("TL1", es, select("begins_with(m, 'a') = (true)"), table_lookup()),
+            ("TL2", es, format!("SELECT * FROM {TABLE} WHERE pk = 'q' OR NOT size(m)"), operand_type("NOT", "N")),
+            ("TL3", es, select("NOT (size(m))"), operand_type("NOT", "N")),
+            ("TL4", es, select("(size(m) OR a = 1)"), operand_type("OR", "N")),
+            ("TL5", es, select("attribute_exists(m) = 1"), table_lookup()),
+            // Where the type refusal comes: after a number, an unsupported
+            // operator, an AND argument that is not a condition and an empty
+            // bag, and ahead of the overlapping paths of an UPDATE; two type
+            // refusals in written order (measured 2026-11-24).
+            ("TO3", es, select("size(m) AND a = 1e126"), overflow()),
+            ("TO4", es, select("size(m) AND a + 1 = 2"), operator("+")),
+            ("TO6", es, select("size(m) AND a"), "The arguments to AND/OR must be Expressions".to_owned()),
+            ("TO8", es, select("size(m) AND a < true"), operand_type("AND", "N")),
+            ("TO9", es, select("a < true AND size(m)"), operand_type("<", "BOOL")),
+            ("TO10", es, select("size(m) OR begins_with(m, 'a') BETWEEN 1 AND 2"), operand_type("AND", "N")),
+            ("TO11", es, format!("SELECT * FROM {TABLE} WHERE size(<<>>)"), "Empty bags are not supported".to_owned()),
+            ("TO13", es, format!("UPDATE {TABLE} SET a = 1, a = 2 WHERE pk = 'q' AND size(m)"), operand_type("AND", "N")),
+            ("TO14", es, select("size(m) AND a BETWEEN true AND 2"), operand_type("AND", "N")),
+            ("S2", es, select("contains(m, 'a') IN [1]"), table_lookup()),
+            ("S7", es, select("begins_with(m, 'a') = true"), table_lookup()),
             ("A19", es, select("\"Attribute_Exists\"(1)"), path("attribute_exists")),
             ("O15", es, select("\"Attribute_Not_Exists\"(1)"), path("attribute_not_exists")),
             ("O8", es, select("\"Attribute_Exists\"(1) AND contains(m)"), path("attribute_exists")),
