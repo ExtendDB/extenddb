@@ -25,13 +25,16 @@ use crate::serialize_output;
 /// `UpdateTimeToLive` has no equivalent refusal, so the gate is on this path
 /// only.
 fn check_describe_status(status: TableStatus) -> Result<(), DynamoDbError> {
-    let key = match status {
-        TableStatus::Creating => extenddb_core::error::ErrorMessageKey::DescribeTtlWhileCreating,
-        TableStatus::Deleting => extenddb_core::error::ErrorMessageKey::DescribeTtlWhileDeleting,
+    let state = match status {
+        TableStatus::Creating => "CREATING",
+        TableStatus::Deleting => "DELETING",
         TableStatus::Active | TableStatus::Updating => return Ok(()),
     };
     Err(DynamoDbError::ValidationException(
-        extenddb_core::error::error_message(key, &[]),
+        extenddb_core::error::error_message(
+            extenddb_core::error::ErrorMessageKey::DescribeTtlInState,
+            &[state],
+        ),
     ))
 }
 
