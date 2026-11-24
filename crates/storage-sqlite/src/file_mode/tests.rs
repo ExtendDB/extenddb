@@ -244,12 +244,18 @@ async fn prepare_creates_the_target_of_a_dangling_symlink() {
     pool.close().await;
 }
 
-/// Mode calls that record each existing file they are asked to change and
-/// fail the change, as `chmod` does on a read-only mount. Nothing outside the
+/// The `fchmod` of a file `create_owner_only` has just created, failing with
+/// `EROFS`.
+fn read_only_created(_: &std::fs::File) -> std::io::Result<()> {
+    Err(std::io::Error::from_raw_os_error(libc::EROFS))
+}
+
+/// Mode calls whose changes fail: `existing` is the caller's, and the
+/// `fchmod` of a file just created fails with `EROFS`. Nothing outside the
 /// test's directory is touched, whoever runs the test.
 fn read_only_calls<'a>(existing: &'a dyn Fn(&Path) -> std::io::Result<()>) -> super::ModeCalls<'a> {
     super::ModeCalls {
-        created: &crate::serve_lock::set_owner_only,
+        created: &read_only_created,
         existing,
     }
 }
@@ -335,6 +341,8 @@ fn only_regular_files_are_changed_and_nothing_waits() {
 
 /// A regular file wider than 0600 whose mode cannot be changed (here the
 /// change fails with EROFS) is an error naming the file, and stays as it was.
+/// A database file `prepare` creates whose mode cannot be set is an error
+/// naming that file.
 #[test]
 fn a_file_that_cannot_be_narrowed_is_an_error() {
     let tmp = temp_dir();
@@ -344,16 +352,26 @@ fn a_file_that_cannot_be_narrowed_is_an_error() {
     set_mode(&db, 0o644);
     let fail = |_: &Path| Err(std::io::Error::from_raw_os_error(libc::EROFS));
     let calls = read_only_calls(&fail);
-    let location = db.to_string_lossy().into_owned();
-    let err =
-        super::prepare_with(&location, &calls).expect_err("a mode that cannot be set is accepted");
-    assert!(
-        err.starts_with("cannot set the mode of SQLite file ")
-            && err.contains(&*db.to_string_lossy())
-            && err.contains("Read-only file system"),
-        "{err}"
+    let err = super::prepare_with(&db.to_string_lossy(), &calls)
+        .expect_err("a mode that cannot be set is accepted");
+    assert_eq!(
+        err,
+        format!(
+            "cannot set the mode of SQLite file {}: Read-only file system (os error 30)",
+            db.display()
+        )
     );
     assert_eq!(mode(&db), 0o644);
+    let missing = dir.join("missing.sqlite");
+    let err = super::prepare_with(&missing.to_string_lossy(), &calls)
+        .expect_err("a created file whose mode cannot be set is accepted");
+    assert_eq!(
+        err,
+        format!(
+            "cannot set the mode of SQLite database {}: Read-only file system (os error 30)",
+            missing.display()
+        )
+    );
 }
 
 /// Files already 0600, or narrower, are not changed at all, so a read-only
@@ -440,7 +458,9 @@ async fn narrowing_keeps_the_locks_of_an_open_connection() {
 /// `prepare` creates the database file with mode 0600, rather than a wider
 /// mode it narrows afterwards: the mode is read as the file is created, before
 /// `prepare` changes it, and compared with a file the test creates with mode
-/// 0600 under the same umask.
+/// 0600 under the same umask. The test then sets the new file to 0400, the
+/// mode a umask of 0o200 leaves, and the descriptor call must still leave it
+/// at 0600.
 #[test]
 fn prepare_creates_the_database_file_with_mode_0600() {
     use std::os::unix::fs::OpenOptionsExt;
@@ -457,6 +477,7 @@ fn prepare_creates_the_database_file_with_mode_0600() {
     let record = |file: &std::fs::File| {
         let created = file.metadata()?.permissions().mode() & 0o7777;
         *created_with.lock().expect("lock") = Some(created);
+        file.set_permissions(std::fs::Permissions::from_mode(0o400))?;
         crate::serve_lock::set_owner_only(file)
     };
     let calls = super::ModeCalls {
