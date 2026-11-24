@@ -127,14 +127,12 @@ impl std::fmt::Debug for KeySource {
 }
 
 /// Two KEK sources are equal only when their bytes match, compared in
-/// constant time (`CRYPTO_memcmp` through `aws-lc-rs`).
+/// constant time (through [`extenddb_core::crypto::constant_time_eq`]).
 impl PartialEq for KeySource {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::CatalogKey, Self::CatalogKey) | (Self::None, Self::None) => true,
-            (Self::Kek(a), Self::Kek(b)) => {
-                aws_lc_rs::constant_time::verify_slices_are_equal(&a[..], &b[..]).is_ok()
-            }
+            (Self::Kek(a), Self::Kek(b)) => extenddb_core::crypto::constant_time_eq(&a[..], &b[..]),
             _ => false,
         }
     }
