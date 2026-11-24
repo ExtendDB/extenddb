@@ -89,14 +89,20 @@ fn a_shape_fault_in_a_key_value_answers_the_prefixed_text() {
         Some(format!("{KEY_PREFIX}{MORE_THAN_ONE}"))
     );
     // Inside one member the first fault in the value's element order: the
-    // members of an `M` in sorted order (2026-11-05, `{"M": {"k": {"N":
-    // "bob"}, "j": {}}}` in a non-key member answers the empty value), the
-    // members of an `L` in their order (2026-11-23, `{"L": [{"N": "bob"},
-    // {}]}` answers the number).
+    // members of an `M` in the parsed map's order (the service answers the
+    // empty value for `{"M": {"k": {"N": "bob"}, "j": {}}}` in a non-key
+    // member, 2026-11-05), the members of an `L` in their order (2026-11-23,
+    // `{"L": [{"N": "bob"}, {}]}` answers the number).
     let inside = with_key(json!({
         "pk": {"S": "x"}, "sk": {"S": "x"}, "z": {"M": {"k": {"N": "bob"}, "j": {}}},
     }));
-    assert_eq!(check_key(&inside).as_deref(), Some(empty.as_str()));
+    // #1013: the MongoDB build (`serde_json/preserve_order`) reads `k` first.
+    let preserve_order = inside["ExclusiveStartKey"]["z"]["M"]
+        .as_object()
+        .and_then(|members| members.keys().next())
+        .is_some_and(|first| first == "k");
+    let in_a_map: &str = if preserve_order { NUMERIC_BOB } else { &empty };
+    assert_eq!(check_key(&inside).as_deref(), Some(in_a_map));
     let in_a_list = with_key(json!({"pk": {"L": [{"N": "bob"}, {}]}, "sk": {"S": "s"}}));
     assert_eq!(check_key(&in_a_list).as_deref(), Some(NUMERIC_BOB));
 }

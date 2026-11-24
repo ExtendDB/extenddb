@@ -519,14 +519,14 @@ impl SetFault<'_> {
 /// and every value an `L` or `M` holds, and with `sets` the set faults in the
 /// same walk (an `NS` after its numbers; see [`set_fault`]), then more than
 /// one type descriptor. `L` items are visited in document order and `M`
-/// members in sorted name order on every build. The parsed map keeps the
-/// request's order on the MongoDB build, where bson turns on the
-/// `preserve_order` feature of `serde_json`, so the sort keeps the answer the
-/// same on every backend. The service visits the members of an `M` in an
-/// order of its own (measured 2026-11-05 and 2026-11-23: `{"M": {"k": {"N":
-/// "bob"}, "j": {}}}` in a key member answers the empty value, and `{"M":
-/// {"z": {"N": "bob"}, "b": {"N": "fred"}}}` answers `bob`, which sorted
-/// order would not; #1013). A value of another JSON type, and an `N` or
+/// members in the map's iteration order: sorted by key without the
+/// `preserve_order` feature of `serde_json`, in document order with it, as in
+/// the MongoDB build (bson turns the feature on). The service visits the
+/// members of an `M` in an order of its own (#1013). Measured 2026-11-05 and
+/// 2026-11-23: `{"M": {"k": {"N": "bob"}, "j": {}}}` in an
+/// `ExclusiveStartKey` member answers the empty value, as sorted order does,
+/// and `{"M": {"z": {"N": "bob"}, "b": {"N": "fred"}}}` answers `bob`, as
+/// document order does. A value of another JSON type, and an `N` or
 /// `NS` payload of the wrong JSON type, are shape faults the deserializer
 /// reports. A type descriptor with a null payload counts as absent, as the
 /// service reads it (measured 2026-11-19: `{"S": null}` answers the empty
@@ -565,8 +565,8 @@ pub(crate) fn first_fault<'a>(
             ("L", Value::Array(items)) => {
                 items.iter().find_map(|item| first_fault(item, None, sets))
             }
-            ("M", Value::Object(members)) => sorted_entries(members)
-                .into_iter()
+            ("M", Value::Object(members)) => members
+                .iter()
                 .find_map(|(name, inner)| first_fault(inner, Some(name), sets)),
             _ => None,
         });
