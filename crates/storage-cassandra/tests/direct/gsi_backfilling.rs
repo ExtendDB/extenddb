@@ -21,7 +21,7 @@ mod tests {
     use extenddb_storage::error::StorageError;
     use extenddb_storage::{DataEngine, TableEngine};
     use extenddb_storage_cassandra::CassandraEngine;
-    use extenddb_storage_cassandra::cassandra_util::{execute, query_optional};
+    use extenddb_storage_cassandra::cassandra_util::{execute, query_optional, system_read};
     use extenddb_storage_cassandra::workers::recover_stale_gsi_backfills_of_table;
     use uuid::Uuid;
 
@@ -154,7 +154,7 @@ mod tests {
 
     /// The id and the write time of the schema row of `gidx`'s data table.
     async fn data_table(engine: &CassandraEngine, account_ks: &str, table: &str) -> (Uuid, i64) {
-        let row = query_optional::<StorageError>(
+        let row = system_read::<StorageError>(
             &engine.session_arc(),
             "SELECT id, WRITETIME(comment) AS v FROM system_schema.tables \
              WHERE keyspace_name = ? AND table_name = ?",
@@ -163,6 +163,8 @@ mod tests {
         )
         .await
         .expect("read the schema row")
+        .into_iter()
+        .next()
         .expect("the data table exists");
         (
             row.get_by_name("id").ok().flatten().expect("table id"),
