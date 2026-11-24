@@ -51,6 +51,7 @@ mod search_vectors;
 mod start_key;
 pub mod stream_capture;
 mod streams;
+mod streams_iterator_params;
 mod tagging;
 mod transact_get_items;
 mod transact_write_helpers;
@@ -303,13 +304,9 @@ pub(crate) fn validate_enum_fields(
     if errors.is_empty() {
         return Ok(());
     }
-    let count = errors.len();
-    let msg = format!(
-        "{count} validation error{} detected: {}",
-        if count == 1 { "" } else { "s" },
-        errors.join("; ")
-    );
-    Err(DynamoDbError::ValidationException(msg))
+    Err(DynamoDbError::ValidationException(
+        extenddb_core::error::validation_errors_detected(&errors),
+    ))
 }
 
 /// Validate the `ReturnValues` field for `PutItem` / `DeleteItem`, which accept
