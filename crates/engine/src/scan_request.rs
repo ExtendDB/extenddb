@@ -38,7 +38,8 @@
 //! reported together in one message, in that order, each value echoed as the
 //! service reads it (a fraction truncated toward zero, a value outside int32
 //! saturated: `Value '-2147483648' at 'limit' ...`), then the mix, the names
-//! and the values; see `older_form_checks`.
+//! and the values, an empty or duplicate set among them; see
+//! `older_form_checks`.
 //!
 //! On the service the undefined placeholder, unused value and filter syntax
 //! checks also come ahead of the `Select` enum and the table lookup (measured
@@ -52,15 +53,14 @@
 //! `SerializationException`; see `shape_fault_first`.
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::types::{AttributeValue, ScanInput};
-use serde::Deserialize;
+use extenddb_core::types::ScanInput;
 use serde_json::{Map, Value};
 
 use crate::int32_member::{SCAN_RANGES, newer_form, ranges};
 use crate::query_key_values::{
-    RETURN_CONSUMED_CAPACITY, SCAN_CONDITIONS, SELECT, has_unreadable, non_empty,
-    older_form_checks, present, readable_for_shape_check, shape_fault_first, sorted_entries,
-    validate_expression_attribute_value_numbers, validate_names,
+    RETURN_CONSUMED_CAPACITY, SCAN_CONDITIONS, SCAN_VALUE_EXPRESSIONS, SELECT, deserializer_fault,
+    has_unreadable, non_empty, older_form_checks, present, readable_for_shape_check,
+    shape_fault_first, sorted_entries, validate_expression_attribute_value_numbers, validate_names,
 };
 
 /// The `Scan` checks that run on the raw request body, in the order the
@@ -97,7 +97,13 @@ fn scan_request_checks(body: &Value) -> Result<(), DynamoDbError> {
         .get("ExpressionAttributeValues")
         .and_then(Value::as_object);
     if ranges.older_form || has_unreadable(body, SCAN_CONDITIONS) {
-        return older_form_checks(body, values, &ranges.faults, validate_parameter_mix);
+        return older_form_checks(
+            body,
+            values,
+            &ranges.faults,
+            validate_parameter_mix,
+            SCAN_VALUE_EXPRESSIONS,
+        );
     }
     if !ranges.faults.is_empty() {
         return Err(newer_form(&ranges.faults));
@@ -150,22 +156,22 @@ fn validate_parameter_mix(body: &Value) -> Result<(), DynamoDbError> {
 
 /// The faults the `AttributeValue` deserializer reports as a
 /// `ValidationException`, such as an empty set and a set with a duplicate
-/// member, with the deserializer's text. The values are visited in
-/// placeholder order. The service reports these after the
-/// `ExpressionAttributeNames` checks and ahead of the `Select` enum (measured
-/// 2026-11-19 and 2026-11-23: a duplicate or an empty `NS`, a duplicate `SS`
-/// or `BS`, and a duplicate `NS` in an `L` beside `Select: "NOPE"` answer the
-/// set text). Beside a number fault in another value, the service named
-/// either value between two identical requests (measured 2026-11-19), and
-/// this check comes after the numbers. A value of the wrong JSON type is left
-/// to the shape fault check.
+/// member, with the deserializer's text (see `deserializer_fault`). The
+/// values are visited in placeholder order. The service reports these after
+/// the `ExpressionAttributeNames` checks and ahead of the `Select` enum
+/// (measured 2026-11-19 and 2026-11-23: a duplicate or an empty `NS`, a
+/// duplicate `SS` or `BS`, and a duplicate `NS` in an `L` beside `Select:
+/// "NOPE"` answer the set text). Beside a number fault in another value, the
+/// service named either value between two identical requests (measured
+/// 2026-11-19), and this check comes after the numbers. A value of the wrong
+/// JSON type is left to the shape fault check. On the older validation path
+/// the sets are checked with the values, with that path's texts (see
+/// `older_form_checks`).
 fn validate_sets(values: &Map<String, Value>) -> Result<(), DynamoDbError> {
-    match sorted_entries(values).into_iter().find_map(|(_, value)| {
-        match AttributeValue::deserialize(value).map_err(crate::deserialize_error) {
-            Err(fault @ DynamoDbError::ValidationException(_)) => Some(fault),
-            _ => None,
-        }
-    }) {
+    match sorted_entries(values)
+        .into_iter()
+        .find_map(|(_, value)| deserializer_fault(value))
+    {
         Some(fault) => Err(fault),
         None => Ok(()),
     }

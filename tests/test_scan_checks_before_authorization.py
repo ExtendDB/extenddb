@@ -51,6 +51,17 @@ ROWS = [
     ("null beside Select", {**NULL_BESIDE_SELECT, "ExpressionAttributeValues": {":v": None}}, SELECT_BAD),
     ("exponent above int32",
      {"FilterExpression": "a = :n", "ExpressionAttributeValues": {":n": {"N": "1e9999999999"}}}, OVERFLOW),
+    # A float Limit puts the request on the service's older validation path,
+    # where an empty or duplicate set is refused with that path's wrapped
+    # text. Measured 2026-11-24 from a principal allowed only DescribeTable
+    # (the duplicate NS, in the review of #850) and at 05:41 UTC on a table
+    # that does not exist (both texts).
+    ("duplicate NS on the older path",
+     {"Limit": 1.5, "FilterExpression": "a = :a", "ExpressionAttributeValues": {":a": {"NS": ["1", "1"]}}},
+     INVALID_VALUE + "Input collection contains duplicates for key :a"),
+    ("empty NS on the older path",
+     {"Limit": 1.5, "FilterExpression": "a = :a", "ExpressionAttributeValues": {":a": {"NS": []}}},
+     INVALID_VALUE + "One or more parameter values were invalid: An number set  may not be empty for key :a"),
 ]
 
 

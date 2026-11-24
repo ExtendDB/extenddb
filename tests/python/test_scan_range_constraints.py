@@ -240,6 +240,23 @@ OLDER_FORM_BEFORE_THE_MIX = [
      "The parameter cannot be converted to a numeric value: bob for key :n"),
 ]
 
+# Measured 2026-11-24 at 05:41 UTC: on the older path an empty set and a set
+# with a duplicate member are refused with that path's wrapped text, a number
+# set's duplicate as "Input collection contains duplicates", the others with
+# the deserializer's text, an invalid names key ahead of them.
+INVALID_VALUE = "ExpressionAttributeValues contains invalid value: "
+DUPLICATE_NS = INVALID_VALUE + "Input collection contains duplicates for key :a"
+OLDER_FORM_SETS = [
+    ("duplicate-NS", '{"NS": ["1", "1"]}', DUPLICATE_NS),
+    ("empty-NS", '{"NS": []}',
+     INVALID_VALUE + "One or more parameter values were invalid: An number set  may not be empty "
+     "for key :a"),
+    ("duplicate-SS", '{"SS": ["x", "x"]}',
+     INVALID_VALUE + "One or more parameter values were invalid: Input collection [x, x] contains "
+     "duplicates. for key :a"),
+    ("duplicate-NS-in-L", '{"L": [{"NS": ["1", "1"]}]}', DUPLICATE_NS),
+]
+
 # Measured 2026-11-12 (demohan) and 2026-11-23 at 14:51 UTC (M07, M08): a null
 # is a value the service cannot read as one type, as an entry, an L member of
 # one or a payload in an ExclusiveStartKey value; {"NULL": true}, {"L": []} and
@@ -559,6 +576,21 @@ class TestBesideAnExpressionAttributeValuesEntry:
         status, payload = _raw(dynamodb_client, "Query", body("2.99999999999999999999"))
         assert status == 200, payload
         assert payload["Count"] == 1
+
+    @pytest.mark.parametrize("entry, expected", [r[1:] for r in OLDER_FORM_SETS],
+                             ids=[r[0] for r in OLDER_FORM_SETS])
+    def test_scan_set_on_the_older_path(self, dynamodb_client, table, entry, expected):
+        fields = ('"Limit": 1.5, "FilterExpression": "a = :a", "ExpressionAttributeValues": '
+                  '{":a": ' + entry + '}')
+        assert _validation_message(*_scan(dynamodb_client, table, fields)) == expected
+
+    def test_query_duplicate_ns_on_the_older_path(self, dynamodb_client, table):
+        body = json.dumps({
+            "TableName": table, "KeyConditionExpression": "pk = :p", "Limit": 1.5,
+            "FilterExpression": "a = :a",
+            "ExpressionAttributeValues": {":p": {"S": "p0"}, ":a": {"NS": ["1", "1"]}},
+        })
+        assert _validation_message(*_raw(dynamodb_client, "Query", body)) == DUPLICATE_NS
 
     @pytest.mark.parametrize("entry", [e for _, e in UNREADABLE_MEMBERS],
                              ids=[i for i, _ in UNREADABLE_MEMBERS])

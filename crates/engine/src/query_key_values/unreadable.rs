@@ -19,7 +19,7 @@ use extenddb_core::error::{DynamoDbError, validation_errors};
 use serde_json::{Map, Value};
 
 use super::{
-    RETURN_CONSUMED_CAPACITY, SELECT, TYPE_DESCRIPTORS, first_fault, sorted_entries,
+    RETURN_CONSUMED_CAPACITY, SELECT, TYPE_DESCRIPTORS, first_fault, present, sorted_entries,
     validate_name_keys, validate_names,
 };
 use crate::int32_member::{LIMIT, RangeFault, RangeField, SEGMENT, TOTAL_SEGMENTS};
@@ -31,6 +31,14 @@ pub(crate) const SCAN_CONDITIONS: &[&str] = &["ScanFilter"];
 /// The condition maps of `Query` whose `AttributeValueList` entries the
 /// service reads.
 pub(crate) const QUERY_CONDITIONS: &[&str] = &["KeyConditions", "QueryFilter"];
+
+/// The expression members of `Scan` that can read an
+/// `ExpressionAttributeValues` entry; see [`older_form_checks`] item 4.
+pub(crate) const SCAN_VALUE_EXPRESSIONS: &[&str] = &["FilterExpression"];
+
+/// The expression members of `Query` that can read an
+/// `ExpressionAttributeValues` entry; see [`older_form_checks`] item 4.
+pub(crate) const QUERY_VALUE_EXPRESSIONS: &[&str] = &["KeyConditionExpression", "FilterExpression"];
 
 /// Whether the service cannot read `value` as exactly one AttributeValue type:
 /// a null, no type descriptor it knows, more than one, one it does not know
@@ -233,7 +241,23 @@ fn null_value() -> Value {
 ///    empty one has no colon after the message. No `M` with more than one
 ///    member was measured. A float `Limit` that satisfies its constraint
 ///    beside `{"N": "bob"}` answers this wrapped text too, on `Scan` and
-///    `Query` (measured 2026-11-23 18:45 UTC);
+///    `Query` (measured 2026-11-23 18:45 UTC). An empty set and a set with a
+///    duplicate member are faults of the value too, with this path's texts
+///    (measured 2026-11-24 05:41 UTC beside `Limit: 1.5`; see `set_fault`):
+///    `{"NS": ["1", "1"]}` as an entry or inside an `L` answers `Input
+///    collection contains duplicates`, wrapped, on `Scan` and `Query`, and an
+///    invalid names key is reported ahead of it, an empty name after it. When
+///    no member of `value_expressions` is present, the service answers the
+///    expressions-only text ahead of these faults (`ExpressionAttributeValues
+///    can only be specified when using expressions: FilterExpression is
+///    null`, for a duplicate `NS` with no expression or with a
+///    `ProjectionExpression` alone, and for `{"N": "bob"}`), which the
+///    handler gives after these checks; so the sets are checked only when one
+///    is present, and a number is checked as before. The numbers of every
+///    value come ahead of the sets, as on the newer path: beside a set fault
+///    in one value and a number fault in another, the service named `:n`
+///    whether it held the set or the number (`:a` held the other), where this
+///    order names the number (#1013);
 /// 5. an empty name in `ExpressionAttributeNames` (measured 2026-11-19 in
 ///    either member order). `{"#a": ""}` beside `{"X": "1"}`, `{}`, `{"N":
 ///    "1", "S": "x"}`, a null or `{"S": null}` answers that value's text.
@@ -270,6 +294,7 @@ pub(crate) fn older_form_checks(
     values: Option<&Map<String, Value>>,
     ranges: &[RangeFault],
     validate_parameter_mix: fn(&Value) -> Result<(), DynamoDbError>,
+    value_expressions: &[&str],
 ) -> Result<(), DynamoDbError> {
     let range = |field: &RangeField| {
         ranges
@@ -313,15 +338,22 @@ pub(crate) fn older_form_checks(
 
     if let Some(values) = values {
         // The values the service cannot read first; the sort is stable, so
-        // each group keeps the placeholder order.
+        // each group keeps the placeholder order. The numbers of every value
+        // come ahead of the sets, as on the newer path, and the sets are
+        // checked only when an expression that can read a value is present
+        // (item 4).
         let mut entries = sorted_entries(values);
         entries.sort_by_key(|(_, value)| !unreadable(value));
-        for (key, value) in entries {
-            if let Some(fault) = first_fault(value, None) {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "ExpressionAttributeValues contains invalid value: {} for key {key}",
-                    fault.reason()
-                )));
+        let sets = value_expressions.iter().any(|field| present(body, field));
+        let passes: &[bool] = if sets { &[false, true] } else { &[false] };
+        for &with_sets in passes {
+            for (key, value) in &entries {
+                if let Some(fault) = first_fault(value, None, with_sets) {
+                    return Err(DynamoDbError::ValidationException(format!(
+                        "ExpressionAttributeValues contains invalid value: {} for key {key}",
+                        fault.reason()
+                    )));
+                }
             }
         }
     }
