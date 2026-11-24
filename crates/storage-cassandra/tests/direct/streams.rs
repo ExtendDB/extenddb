@@ -13,7 +13,7 @@ use extenddb_storage_cassandra::CassandraEngine;
 
 use crate::helpers::{TestTable, setup_engine};
 
-fn capture(view_type: StreamViewType) -> StreamCapture {
+pub(crate) fn capture(view_type: StreamViewType) -> StreamCapture {
     StreamCapture {
         view_type,
         user_identity: None,
