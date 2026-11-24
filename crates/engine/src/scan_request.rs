@@ -60,7 +60,9 @@
 //!    `ConditionalOperator` with no `ScanFilter`, then a `ScanFilter`
 //!    condition's value count (2026-11-05);
 //! 9. the `Select` enum (2026-11-05: after the no-expression check and the
-//!    nesting check, ahead of the filter syntax; see [`SelectBody`]);
+//!    nesting check; see [`SelectBody`]). The service makes the filter
+//!    syntax, an undefined value and the unused values of step 10 ahead of
+//!    it (2026-11-19, #1391);
 //! 10. the expression and request checks: the `FilterExpression` syntax, the
 //!     `ProjectionExpression` syntax, an undefined value, the operand types,
 //!     the three `Select` rules, the unused values, `COUNT` with

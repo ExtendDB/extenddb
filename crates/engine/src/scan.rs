@@ -627,7 +627,9 @@ pub(crate) fn checked_body(
         }
         CheckOrder::Readable => {
             // The Select enum, after the no-expression check and the nesting
-            // check and ahead of the filter syntax (measured 2026-11-05).
+            // check (measured 2026-11-05). The service makes the filter
+            // syntax, an undefined value and the unused values ahead of it
+            // (measured 2026-11-19, #1391).
             select.validate()?;
         }
     }
