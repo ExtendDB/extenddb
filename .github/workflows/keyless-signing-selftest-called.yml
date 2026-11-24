@@ -1,0 +1,150 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# The called half of the keyless signing selftest. keyless-signing-selftest
+# calls this file through workflow_call, as release-publish.yml will call the
+# release workflows, and the job here signs a throwaway image with the real
+# .github/actions/sign-image action. It proves four things about a
+# signature made in a called workflow, which the published `cosign verify`
+# commands and promote-registry rely on:
+#
+#   * the certificate names THIS file at the caller's ref
+#     (keyless-signing-selftest-called.yml@<ref>), not the calling file;
+#     sign-image verifies exactly that identity when signer-workflow is set;
+#   * the caller's identity does not verify the signature;
+#   * the certificate's trigger is the event that started the calling run;
+#   * the certificate records the repository the run belonged to, and a
+#     verify that names another repository fails.
+#
+# Any public repository can call a workflow stored in a public repository,
+# and a run started that way signs under this file's name. The job therefore
+# refuses to run outside ExtendDB/extenddb before it does anything else.
+#
+# Like the caller, it uses only GHCR through the run's GITHUB_TOKEN.
+
+name: keyless signing selftest (called)
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  sign-in-called-workflow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write   # GHCR scratch repo
+      id-token: write   # keyless signing (Sigstore/Fulcio) via OIDC
+    env:
+      REPO: ghcr.io/extenddb/keyless-selftest
+      TAG: called-run-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Refuse to run in another repository
+        run: |
+          [[ "$GITHUB_REPOSITORY" == "ExtendDB/extenddb" ]] \
+            || { echo "::error::this workflow runs only in ExtendDB/extenddb, not ${GITHUB_REPOSITORY}"; exit 1; }
+
+      - name: Check out (the composite actions live in-repo)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Log in to GHCR (docker + skopeo)
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u x-access-token --password-stdin
+          echo "$GHCR_TOKEN" | skopeo login ghcr.io -u x-access-token --password-stdin
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Build and push a throwaway image, capture its digest
+        id: build
+        run: |
+          set -euo pipefail
+          printf 'FROM alpine:3.20\nRUN echo keyless-selftest-called > /selftest.txt\n' > Dockerfile.selftest
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false --sbom=false \
+            -f Dockerfile.selftest \
+            -t "${REPO}:${TAG}" \
+            --push \
+            --metadata-file meta.json \
+            .
+          DIGEST=$(jq -r '."containerimage.digest"' meta.json)
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::bad digest: $DIGEST"; exit 1; }
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      # sign-image verifies the new signature against
+      # https://github.com/<repo>/.github/workflows/<signer-workflow>.yml@<ref>
+      # with an exact --certificate-identity, so this step passing is the
+      # first proof.
+      - name: Sign with the real composite action, naming this file
+        id: sign
+        uses: ./.github/actions/sign-image
+        with:
+          image-repo: ${{ env.REPO }}
+          digest: ${{ steps.build.outputs.digest }}
+          release-tag: v0.0.0-selftest
+          signer-workflow: keyless-signing-selftest-called
+
+      - name: The caller's identity must not verify; the trigger and repository are the caller's
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          ISSUER="https://token.actions.githubusercontent.com"
+          CALLED="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/keyless-signing-selftest-called.yml@${GITHUB_REF}"
+          # GITHUB_WORKFLOW_REF names the calling workflow in a called one.
+          CALLER="https://github.com/${GITHUB_WORKFLOW_REF}"
+          [[ "$CALLER" != "$CALLED" ]] \
+            || { echo "::error::GITHUB_WORKFLOW_REF names this file; the job did not run as a called workflow"; exit 1; }
+          # A refusal must be cosign's identity or repository mismatch. Any other
+          # failure (registry, Rekor, TUF, a bad flag) fails the step, so a
+          # transient error cannot pass for a refusal.
+          if OUT=$(cosign verify --certificate-identity "$CALLER" --certificate-oidc-issuer "$ISSUER" \
+               "${REPO}@${DIGEST}" 2>&1 >/dev/null); then
+            echo "::error::the signature verifies as the calling workflow ${CALLER}; a called workflow's certificate should name the called file"
+            exit 1
+          fi
+          grep -qF 'none of the expected identities matched what was in the certificate' <<< "$OUT" \
+            || { echo "::error::cosign failed, and not because of the identity: ${OUT}"; exit 1; }
+          cosign verify --certificate-identity "$CALLED" --certificate-oidc-issuer "$ISSUER" \
+            --certificate-github-workflow-trigger "$GITHUB_EVENT_NAME" \
+            --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
+            "${REPO}@${DIGEST}" >/dev/null
+          # A verify that names another repository must fail.
+          WRONG_REPO="${GITHUB_REPOSITORY}-selftest-wrong"
+          if OUT=$(cosign verify --certificate-identity "$CALLED" --certificate-oidc-issuer "$ISSUER" \
+               --certificate-github-workflow-repository "$WRONG_REPO" \
+               "${REPO}@${DIGEST}" 2>&1 >/dev/null); then
+            echo "::error::the signature verifies with --certificate-github-workflow-repository ${WRONG_REPO}; the repository check does not reject another repository"
+            exit 1
+          fi
+          grep -qF 'expected GitHub Workflow Repository not found in certificate' <<< "$OUT" \
+            || { echo "::error::cosign failed, and not because of the repository: ${OUT}"; exit 1; }
+          {
+            echo "### Keyless signature from a called workflow"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| certificate identity | \`${CALLED}\` |"
+            echo "| calling workflow (does not verify) | \`${CALLER}\` |"
+            echo "| trigger | \`${GITHUB_EVENT_NAME}\` |"
+            echo "| repository | \`${GITHUB_REPOSITORY}\` (\`${WRONG_REPO}\` does not verify) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean up the GHCR scratch tags (best effort)
+        if: always()
+        env:
+          SIG_TAG: ${{ steps.sign.outputs.sig-tag }}
+        run: |
+          set +e
+          for ref in "${REPO}:${TAG}" "${REPO}:${SIG_TAG}"; do
+            [[ "$ref" == *: ]] && continue
+            skopeo delete "docker://${ref}" 2>/dev/null
+          done
+          true

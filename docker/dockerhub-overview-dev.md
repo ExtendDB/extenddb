@@ -50,6 +50,7 @@ From 0.1.15, signatures are keyless, bound to the workflow that signed the image
 cosign verify \
   --certificate-identity-regexp '^https://github\.com/ExtendDB/extenddb/\.github/workflows/(release-dev-image|sign-image)\.yml@refs/heads/main$' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+  --certificate-github-workflow-repository 'ExtendDB/extenddb' \
   docker.io/extenddb/extenddb-dev:X.Y.Z
 ```
 

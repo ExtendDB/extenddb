@@ -158,6 +158,12 @@ runs:
         # image, and the reverse. A key-signed artifact from before the keyless
         # cutover does not verify here; promoting one through this path is not
         # supported.
+        # The identity alone does not prove the run belonged to this
+        # repository. Any public repository can call a public reusable
+        # workflow, and the certificate's SAN names the called file, in the
+        # repository that stores it, at its ref. The certificate records the
+        # repository the run belonged to in a separate extension, which
+        # --certificate-github-workflow-repository checks.
         # Fail closed on a malformed caller value before it reaches the regex.
         [[ "$SIGNER_WORKFLOWS" =~ ^[a-z0-9-]+(\|[a-z0-9-]+)*$ ]] \
           || { echo "::error::signer-workflows must be pipe-separated workflow basenames"; exit 1; }
@@ -166,6 +172,7 @@ runs:
           --certificate-identity-regexp "$IDENTITY_RE" \
           --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
           --certificate-github-workflow-trigger workflow_dispatch \
+          --certificate-github-workflow-repository 'ExtendDB/extenddb' \
           "${DST}@${DIGEST}" >/dev/null
 
         # --- 2. version tag: immutable, idempotent on the identical digest ---

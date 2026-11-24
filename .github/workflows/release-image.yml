@@ -602,6 +602,7 @@ jobs:
           image-repo: ${{ needs.gate.outputs.image_repo }}
           digest: ${{ steps.push.outputs.digest }}
           release-tag: v${{ needs.gate.outputs.version }}
+          signer-workflow: release-image
 
       - name: Summarise for the release checklist
         if: always()

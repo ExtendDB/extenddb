@@ -17,6 +17,14 @@
 # The CALLER is responsible for: reviewer-gated environment, id-token: write
 # permission (for the OIDC identity), and registry login. This action signs
 # and verifies; it needs no AWS credentials and no signing key.
+#
+# The certificate names the workflow file that holds the signing job. In a
+# workflow that another workflow calls (workflow_call), that is the called
+# file, while GITHUB_WORKFLOW_REF names the caller. A caller that can run
+# as a called workflow therefore passes its own file name as
+# signer-workflow, and the post-sign verify expects that file at the run's
+# ref. Without it, the verify expects GITHUB_WORKFLOW_REF, which is right
+# only for a run the workflow started itself.
 
 name: sign-image
 description: Sign a verified image digest keyless via GitHub OIDC (tag-based .sig, Rekor on)
@@ -39,6 +47,9 @@ inputs:
     default: 4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71
   extra-annotation:
     description: 'Optional additional key=value annotation to sign into the payload'
+    default: ''
+  signer-workflow:
+    description: 'Base name of the workflow file that holds the signing job, e.g. release-image. Required when that workflow runs through workflow_call; when empty, the verify expects GITHUB_WORKFLOW_REF'
     default: ''
 
 outputs:
@@ -115,13 +126,30 @@ runs:
       env:
         IMAGE_REPO: ${{ inputs.image-repo }}
         DIGEST: ${{ inputs.digest }}
+        SIGNER_WORKFLOW: ${{ inputs.signer-workflow }}
       run: |
         set -euo pipefail
         # Keyless verify: the signature must trace to THIS workflow's Fulcio
         # identity and the GitHub Actions OIDC issuer, and (keyless) to its
-        # Rekor entry. GITHUB_WORKFLOW_REF is owner/repo/.github/workflows/
-        # file.yml@ref, so the full certificate SAN is https://github.com/<it>.
+        # Rekor entry. The certificate SAN is
+        # https://github.com/<owner>/<repo>/.github/workflows/<file>.yml@<ref>,
+        # from the OIDC token's job_workflow_ref: the file that holds this
+        # job, at the run's ref. For a run the workflow started itself that
+        # is GITHUB_WORKFLOW_REF; under workflow_call it is the called file,
+        # which the caller names in signer-workflow. The SAN names the
+        # repository that stores the workflow file, which can differ from the
+        # repository the run belongs to, so the verify also checks the run's
+        # repository, as the published verify commands and promote-registry
+        # do.
+        if [[ -n "$SIGNER_WORKFLOW" ]]; then
+          [[ "$SIGNER_WORKFLOW" =~ ^[a-z0-9-]+$ ]] \
+            || { echo "::error::signer-workflow must be a workflow file base name"; exit 1; }
+          IDENTITY="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/${SIGNER_WORKFLOW}.yml@${GITHUB_REF}"
+        else
+          IDENTITY="https://github.com/${GITHUB_WORKFLOW_REF}"
+        fi
         cosign verify \
-          --certificate-identity "https://github.com/${GITHUB_WORKFLOW_REF}" \
+          --certificate-identity "$IDENTITY" \
           --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+          --certificate-github-workflow-repository "${GITHUB_REPOSITORY}" \
           "${IMAGE_REPO}@${DIGEST}" >/dev/null
