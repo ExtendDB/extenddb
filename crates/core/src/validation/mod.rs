@@ -1759,10 +1759,9 @@ pub fn validate_index_key_not_empty(
                          The AttributeValue for a key attribute cannot contain an empty {kind} value. IndexName: {}, IndexKey: {}",
                         idx.index_name, ks.attribute_name
                     ),
-                    SecondaryIndexEmptyContext::UpdateExpression => format!(
-                        "One or more parameter values are not valid. The update expression attempted to update a secondary index key to a value that is not supported. \
-                         The AttributeValue for a key attribute cannot contain an empty {kind} value."
-                    ),
+                    SecondaryIndexEmptyContext::UpdateExpression => {
+                        update_expression_empty_key_message(kind)
+                    }
                 };
                 return Err(DynamoDbError::ValidationException(msg));
             }
@@ -1965,12 +1964,20 @@ pub fn validate_index_key_empty_literals(
             Some(AttributeValue::B(b)) if b.is_empty() => "binary",
             _ => continue,
         };
-        return Err(DynamoDbError::ValidationException(format!(
-            "One or more parameter values are not valid. The update expression attempted to update a secondary index key to a value that is not supported. \
-             The AttributeValue for a key attribute cannot contain an empty {kind} value."
-        )));
+        return Err(DynamoDbError::ValidationException(
+            update_expression_empty_key_message(kind),
+        ));
     }
     Ok(())
+}
+
+/// The update-expression form of the empty index-key message, naming the
+/// empty value's kind (`"string"` or `"binary"`).
+fn update_expression_empty_key_message(kind: &str) -> String {
+    format!(
+        "One or more parameter values are not valid. The update expression attempted to update a secondary index key to a value that is not supported. \
+         The AttributeValue for a key attribute cannot contain an empty {kind} value."
+    )
 }
 
 /// Readable flags for the `is_query` parameter of [`validate_select_projection`].
@@ -5008,6 +5015,8 @@ mod index_key_literal_tests {
 
     const TYPE_L: &str = "One or more parameter values were invalid: Type mismatch for Index Key sidx Expected: S Actual: L IndexName: gsi_s";
     const TYPE_N: &str = "One or more parameter values were invalid: Type mismatch for Index Key sidx Expected: S Actual: N IndexName: gsi_s";
+    const EMPTY_S: &str = "One or more parameter values are not valid. The update expression attempted to update a secondary index key to a value that is not supported. The AttributeValue for a key attribute cannot contain an empty string value.";
+    const EMPTY_B: &str = "One or more parameter values are not valid. The update expression attempted to update a secondary index key to a value that is not supported. The AttributeValue for a key attribute cannot contain an empty binary value.";
 
     #[test]
     fn list_append_is_a_list_whatever_its_operands_read() {
@@ -5049,25 +5058,15 @@ mod index_key_literal_tests {
         let empty_s = ("e", AttributeValue::S(String::new()));
         let empty_b = ("eb", AttributeValue::B(Vec::new()));
         let string = empty_check("SET sidx = :e", std::slice::from_ref(&empty_s)).unwrap_err();
-        assert!(
-            string.ends_with("cannot contain an empty string value."),
-            "{string}"
-        );
+        assert_eq!(string, EMPTY_S);
         let binary =
             empty_check("SET sidx = n, bidx = :eb", std::slice::from_ref(&empty_b)).unwrap_err();
-        assert!(
-            binary.ends_with("cannot contain an empty binary value."),
-            "{binary}"
-        );
+        assert_eq!(binary, EMPTY_B);
         // Two empty literals of different kinds in one statement: the service
         // answered the binary one in one run and the string one in another
         // (measured 2026-11-01), so either answer passes.
         let either = empty_check("SET bidx = :eb, sidx = :e", &[empty_s, empty_b]).unwrap_err();
-        assert!(
-            either.ends_with("cannot contain an empty binary value.")
-                || either.ends_with("cannot contain an empty string value."),
-            "{either}"
-        );
+        assert!(either == EMPTY_B || either == EMPTY_S, "{either}");
     }
 
     #[test]
