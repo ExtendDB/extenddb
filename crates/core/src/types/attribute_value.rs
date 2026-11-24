@@ -84,12 +84,14 @@ impl<'de> Visitor<'de> for AttributeValueVisitor {
         while let Some(member) = map.next_entry::<String, serde_json::Value>()? {
             members.push(member);
         }
-        from_members(members).map_err(de::Error::custom)
+        // Read as an item attribute, whose item is a map around it.
+        from_members(members, 1).map_err(de::Error::custom)
     }
 }
 
 /// The type descriptors `DynamoDB` defines.
-const TYPE_DESCRIPTORS: [&str; 10] = ["S", "N", "B", "SS", "NS", "BS", "BOOL", "NULL", "L", "M"];
+pub(crate) const TYPE_DESCRIPTORS: [&str; 10] =
+    ["S", "N", "B", "SS", "NS", "BS", "BOOL", "NULL", "L", "M"];
 
 /// Whether the member `name: payload` of a value object is a type descriptor
 /// the value is read by: one of [`TYPE_DESCRIPTORS`] whose payload is not
@@ -133,49 +135,80 @@ where
 /// The value the members of one object describe, at any level: the one
 /// member [`type_descriptor`] leaves, read by [`from_descriptor`]. A value
 /// with two or more descriptors is refused for the first of their payloads
-/// that the service checks ahead of the count, else for the count.
+/// that the service checks ahead of the count, else for the count. `depth`
+/// counts the maps and lists around the value. An item attribute, a key and
+/// an `AttributeUpdates` value have their item around them, and a condition
+/// operand (an `ExpressionAttributeValues` value, an `Expected` value or an
+/// `AttributeValueList` member) nothing, so it may hold one map or list
+/// more, as a PartiQL parameter may (measured 2026-11-24).
 fn from_members(
     members: impl IntoIterator<Item = (String, serde_json::Value)>,
+    depth: usize,
 ) -> Result<AttributeValue, String> {
     let members: Vec<(String, serde_json::Value)> = members.into_iter().collect();
     let counted = type_descriptor(members.iter().map(|(name, payload)| (name, payload)));
     if matches!(counted, Err(MULTI_ATTRIBUTE_VALUE)) {
-        // The service checks a string set, then an `N`, then a number set
-        // payload before it counts the descriptors, whatever order the
-        // members come in (measured 2026-11-23 on UpdateItem, Query and
-        // PutItem; the set shapes in both member orders). The other payloads
-        // are not read; the count refuses the value.
-        for tag in ["SS", "N", "NS"] {
-            for (_, payload) in members.iter().filter(|(name, _)| name == tag) {
-                crate::partiql::params::payload_refusal(tag, payload)?;
-            }
-        }
+        // The service refuses a `B` or `BS` payload that is not base64 first,
+        // at any depth, as a single `B`. It then checks the payloads as it
+        // checks a PartiQL parameter `depth` maps and lists deep, and counts
+        // the descriptors last (measured 2026-11-23 and 2026-11-24 on
+        // PutItem, UpdateItem and ExecuteStatement).
+        let value = serde_json::Value::Object(members.into_iter().collect());
+        check_base64(&value)?;
+        crate::partiql::params::check_value(&value, depth)?;
+        return Err(MULTI_ATTRIBUTE_VALUE.to_owned());
     }
     let (name, payload) = type_descriptor(members)?;
-    from_descriptor(&name, payload)
+    from_descriptor(&name, payload, depth)
 }
 
-/// An element of an `L` or a value of an `M`, converted from the
-/// `serde_json::Value` the enclosing level already owns.
+/// Refuse a `B` payload or `BS` member that is not base64 in `value`, or in a
+/// value its `L` and `M` payloads hold, as a single `B` is refused.
+fn check_base64(value: &serde_json::Value) -> Result<(), String> {
+    use serde_json::Value;
+    let decode = |text: &Value| from_descriptor("B", text.clone(), 0).map(drop);
+    for (name, payload) in value.as_object().into_iter().flatten() {
+        match (name.as_str(), payload) {
+            ("B", Value::String(_)) => decode(payload)?,
+            ("BS", Value::Array(set)) => {
+                set.iter().filter(|m| m.is_string()).try_for_each(decode)?
+            }
+            ("L", Value::Array(items)) => items.iter().try_for_each(check_base64)?,
+            ("M", Value::Object(entries)) => entries.values().try_for_each(check_base64)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// A value `depth` maps and lists deep, converted from the `serde_json::Value`
+/// its reader owns: an element of an `L` or a value of an `M`, or a condition
+/// operand at depth 0 (`crate::serde_helpers::Operands`).
 ///
 /// The value is consumed, not cloned and re-deserialized: the earlier
 /// `serde_json::from_value(v.clone())` held one more copy of the subtree at
 /// every enclosing level, so a value nested 31 deep cost 31 copies of its
-/// leaves at once. The result and every error message are those of
-/// `serde_json::from_value::<AttributeValue>(value)`: a non-object goes
-/// through it unchanged (serde's "invalid type" text; nothing below it is
-/// visited), and an object takes the steps `visit_map` takes.
-fn from_nested(value: serde_json::Value) -> Result<AttributeValue, String> {
+/// leaves at once. A non-object goes through `serde_json::from_value`
+/// unchanged (serde's "invalid type" text; nothing below it is visited), and
+/// an object takes the steps `visit_map` takes, at `depth`.
+pub(crate) fn from_nested(
+    value: serde_json::Value,
+    depth: usize,
+) -> Result<AttributeValue, String> {
     match value {
-        serde_json::Value::Object(members) => from_members(members),
+        serde_json::Value::Object(members) => from_members(members, depth),
         other => serde_json::from_value(other).map_err(|e| e.to_string()),
     }
 }
 
 /// The value of one type descriptor: `key` is the descriptor (`S`, `L`, ...)
-/// and `value` its payload. The error is the message; the caller turns it
-/// into its deserializer's error.
-fn from_descriptor(key: &str, value: serde_json::Value) -> Result<AttributeValue, String> {
+/// and `value` its payload, of a value `depth` maps and lists deep. The error
+/// is the message; the caller turns it into its deserializer's error.
+fn from_descriptor(
+    key: &str,
+    value: serde_json::Value,
+    depth: usize,
+) -> Result<AttributeValue, String> {
     use serde_json::Value;
     match key {
         "S" => match value {
@@ -223,14 +256,16 @@ fn from_descriptor(key: &str, value: serde_json::Value) -> Result<AttributeValue
         // `L` and `M` consume their payload (see `from_nested`).
         "L" => match value {
             Value::Array(arr) => Ok(AttributeValue::L(
-                arr.into_iter().map(from_nested).collect::<Result<_, _>>()?,
+                arr.into_iter()
+                    .map(|v| from_nested(v, depth + 1))
+                    .collect::<Result<_, _>>()?,
             )),
             _ => Err("L value must be an array".to_owned()),
         },
         "M" => match value {
             Value::Object(obj) => Ok(AttributeValue::M(
                 obj.into_iter()
-                    .map(|(k, v)| from_nested(v).map(|av| (k, av)))
+                    .map(|(k, v)| from_nested(v, depth + 1).map(|av| (k, av)))
                     .collect::<Result<_, _>>()?,
             )),
             _ => Err("M value must be an object".to_owned()),
@@ -266,7 +301,7 @@ fn string_set(value: &serde_json::Value) -> Result<AttributeValue, String> {
 
 /// The refusal of a string set that holds a member twice, naming the members
 /// as written. A member that is no string is skipped.
-pub(crate) fn string_set_duplicates(members: &[serde_json::Value]) -> Result<(), String> {
+fn string_set_duplicates(members: &[serde_json::Value]) -> Result<(), String> {
     let values: Vec<&str> = members
         .iter()
         .filter_map(serde_json::Value::as_str)
@@ -582,25 +617,39 @@ mod tests {
         }
     }
 
-    /// A value with two type descriptors is refused for a string set
-    /// duplicate, then for its `N` by the PartiQL number rules, then for a
-    /// number set duplicate, and for the count only when those payloads pass.
-    /// Each row was measured on 2026-11-23 through UpdateItem, Query and
-    /// PutItem, twice: the set rows in both member orders with the same
-    /// answer, the number rows with `S` first. The rows give the members as
-    /// a list of pairs and are run in both orders, and as the
-    /// `serde_json::Value` object the engine reads.
+    /// A value with two type descriptors is refused for a `B` or `BS` payload
+    /// that is not base64 at any depth, as a single `B` is, then for the
+    /// first faulty payload in the order `SS`, `N`, `NS`, `BS`, `M`, `L`,
+    /// `NULL` (an `N` by the PartiQL number rules), and for the count only
+    /// when those payloads pass. An item attribute may hold one map or list
+    /// less than a parameter. Measured on 2026-11-23 and 2026-11-24, each
+    /// request twice: the number and set rows through UpdateItem, Query and
+    /// PutItem, the other payloads through PutItem and UpdateItem, and every
+    /// pair of two faulty payloads through PutItem in both member orders (98
+    /// values). The rows give the members as a list of pairs and are run in
+    /// both orders, and as the `serde_json::Value` object the engine reads.
     #[test]
     fn a_payload_fault_beside_a_second_descriptor_is_refused_before_the_count() {
         use crate::partiql::number::{
             OVERFLOW_MESSAGE, TOO_MANY_DIGITS_MESSAGE, UNCONVERTIBLE_PARAMETER_MESSAGE,
             UNDERFLOW_MESSAGE,
         };
+        use crate::partiql::params::{NESTING_MESSAGE, NUMBER_SET_DUPLICATES};
         let unconvertible = |text: &str| format!("{UNCONVERTIBLE_PARAMETER_MESSAGE}: {text}");
+        let invalid = |text: &str| format!("One or more parameter values were invalid: {text}");
         let with_s = |n: &str| format!(r#"[["S","x"],["N",{}]]"#, serde_json::json!(n));
-        let cases = [
+        let beside_s = |tag: &str, payload: &str| format!(r#"[["S","x"],["{tag}",{payload}]]"#);
+        // `{"S": "x"}` in `levels` lists.
+        let lists = |levels: usize| {
+            (0..levels).fold(r#"{"S":"x"}"#.to_owned(), |value, _| {
+                format!(r#"{{"L":[{value}]}}"#)
+            })
+        };
+        // DynamoDB answers a `SerializationException` with a text of its own
+        // here, as it does a single `B` that is not base64 (#1189).
+        let base64 = from_descriptor("B", serde_json::json!("!!!"), 0).unwrap_err();
+        let mut cases = vec![
             (with_s("1"), MULTI_ATTRIBUTE_VALUE.to_owned()),
-            (with_s("bob"), unconvertible("bob")),
             (with_s(""), UNCONVERTIBLE_PARAMETER_MESSAGE.to_owned()),
             (with_s("1e9999999999"), unconvertible("1e9999999999")),
             (with_s("1e-9999999999"), unconvertible("1e-9999999999")),
@@ -616,32 +665,132 @@ mod tests {
             (with_s("1.5e-2147483647"), unconvertible("1.5e-2147483647")),
             (with_s("-0.0"), MULTI_ATTRIBUTE_VALUE.to_owned()),
             (with_s("0x10"), unconvertible("0x10")),
+            (beside_s("B", r#""!!!""#), base64.clone()),
+            (beside_s("BS", r#"["!!!"]"#), base64.clone()),
+            (r#"[["N","bob"],["B","!!!"]]"#.to_owned(), base64.clone()),
+            (beside_s("L", r#"[{"B":"!!!"}]"#), base64),
             (
-                r#"[["SS",["a","a"]],["N","bob"]]"#.to_owned(),
-                "One or more parameter values were invalid: Input collection [a, a] contains \
-                 duplicates."
-                    .to_owned(),
+                beside_s("BOOL", r#""yes""#),
+                MULTI_ATTRIBUTE_VALUE.to_owned(),
+            ),
+            (beside_s("NULL", "true"), MULTI_ATTRIBUTE_VALUE.to_owned()),
+            (beside_s("BOOL", "true"), MULTI_ATTRIBUTE_VALUE.to_owned()),
+            (beside_s("B", r#""YQ==""#), MULTI_ATTRIBUTE_VALUE.to_owned()),
+            (beside_s("L", r#"[{"N":"bob"}]"#), unconvertible("bob")),
+            (beside_s("M", r#"{"k":{"N":"bob"}}"#), unconvertible("bob")),
+            // A payload of the wrong JSON type leaves the others checked.
+            (
+                r#"[["SS",["a","a"]],["BOOL","yes"]]"#.to_owned(),
+                invalid("Input collection [a, a] contains duplicates."),
             ),
             (
-                r#"[["S","x"],["SS",["a","a"]]]"#.to_owned(),
-                "One or more parameter values were invalid: Input collection [a, a] contains \
-                 duplicates."
-                    .to_owned(),
+                r#"[["S","x"],["NS",["1","1"]],["BOOL","yes"]]"#.to_owned(),
+                NUMBER_SET_DUPLICATES.to_owned(),
             ),
+            // Not measured: a payload of the wrong JSON type that the order
+            // names is not checked either (#1012).
             (
-                r#"[["S","x"],["NS",["1","1"]]]"#.to_owned(),
-                crate::partiql::params::NUMBER_SET_DUPLICATES.to_owned(),
+                beside_s("NULL", r#""yes""#),
+                MULTI_ATTRIBUTE_VALUE.to_owned(),
             ),
+            // Measured 2026-11-24: DynamoDB refuses the number in the set
+            // with a `SerializationException` (#1012). The row pins this
+            // answer until that text exists.
             (
-                r#"[["NS",["1","1"]],["N","bob"]]"#.to_owned(),
+                r#"[["SS",[1]],["N","bob"]]"#.to_owned(),
                 unconvertible("bob"),
             ),
+            (
+                beside_s("NS", "[null]"),
+                invalid("Numeric sets may not contain null"),
+            ),
+            (
+                beside_s("BS", "[null]"),
+                invalid("Binary sets may not contain null or empty values"),
+            ),
+            (
+                beside_s("BS", r#"["AQ==","AQ=="]"#),
+                invalid("Input collection [AQ==, AQ==]of type BS contains duplicates."),
+            ),
+            (
+                beside_s("L", r#"[{"SS":[]}]"#),
+                invalid("An string set  may not be empty"),
+            ),
+            (beside_s("L", "[{}]"), EMPTY_ATTRIBUTE_VALUE.to_owned()),
+            // Refused for the nesting: 33 lists in all, 32, and 32 with the
+            // value with two descriptors inside an `L`.
+            (
+                beside_s("L", &format!("[{}]", lists(32))),
+                NESTING_MESSAGE.to_owned(),
+            ),
+            (
+                beside_s("L", &format!("[{}]", lists(31))),
+                NESTING_MESSAGE.to_owned(),
+            ),
+            (
+                format!(r#"[["L",[{{"S":"x","L":[{}]}}]]]"#, lists(30)),
+                NESTING_MESSAGE.to_owned(),
+            ),
+            // A fault beside a value with two descriptors in an `L`.
+            (
+                r#"[["L",[{"SS":[]},{"S":"x","N":"1"}]]]"#.to_owned(),
+                invalid("An string set  may not be empty"),
+            ),
         ];
+        // Each fault beside an `S`, and every pair of faults of two
+        // descriptors, refused for the descriptor that comes first in `order`.
+        let null_member = "The supplied Item contains a null AttributeValue";
+        let faults = [
+            (
+                "NULL",
+                "false",
+                invalid("Null attribute value types must have the value of true"),
+            ),
+            ("SS", "[]", invalid("An string set  may not be empty")),
+            (
+                "SS",
+                "[null]",
+                invalid("An string set may not have a null string as a member"),
+            ),
+            (
+                "SS",
+                r#"["a","a"]"#,
+                invalid("Input collection [a, a] contains duplicates."),
+            ),
+            ("NS", "[]", invalid("An number set  may not be empty")),
+            ("NS", r#"["bob"]"#, unconvertible("bob")),
+            (
+                "NS",
+                r#"["1","1"]"#,
+                crate::partiql::params::NUMBER_SET_DUPLICATES.to_owned(),
+            ),
+            ("BS", "[]", invalid("Binary sets should not be empty")),
+            ("L", "[null]", null_member.to_owned()),
+            ("M", r#"{"k":null}"#, format!("{null_member}: k is null")),
+            ("N", r#""bob""#, unconvertible("bob")),
+        ];
+        let order = ["SS", "N", "NS", "BS", "M", "L", "NULL"];
+        let rank = |tag: &str| order.iter().position(|first| *first == tag);
+        for (i, (tag, payload, text)) in faults.iter().enumerate() {
+            cases.push((beside_s(tag, payload), text.clone()));
+            for (other, other_payload, other_text) in &faults[i + 1..] {
+                if other != tag {
+                    let want = if rank(tag) < rank(other) {
+                        text
+                    } else {
+                        other_text
+                    };
+                    let members = format!(r#"[["{tag}",{payload}],["{other}",{other_payload}]]"#);
+                    cases.push((members, want.clone()));
+                }
+            }
+        }
         for (json, want) in cases {
             let members: Vec<(String, serde_json::Value)> = serde_json::from_str(&json).unwrap();
             let reversed: Vec<_> = members.iter().rev().cloned().collect();
-            assert_eq!(from_members(members.clone()), Err(want.clone()), "{json}");
-            assert_eq!(from_members(reversed), Err(want.clone()), "{json} reversed");
+            let item = |members| from_members(members, 1);
+            assert_eq!(item(members.clone()), Err(want.clone()), "{json}");
+            assert_eq!(item(reversed), Err(want.clone()), "{json} reversed");
             let object = serde_json::Value::Object(members.into_iter().collect());
             let got = serde_json::from_value::<AttributeValue>(object).map_err(|e| e.to_string());
             assert_eq!(got, Err(want), "{json} as an object");

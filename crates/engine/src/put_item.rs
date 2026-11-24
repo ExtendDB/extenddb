@@ -80,6 +80,8 @@ pub async fn handle_put_item(
             || msg.contains("may not be empty")
             || msg.contains("contains duplicates")
             || extenddb_core::partiql::number::is_problem_message(&msg)
+            || msg.contains("contains a null AttributeValue")
+            || msg.contains(extenddb_core::partiql::params::NESTING_MESSAGE)
             || msg.contains("Null attribute value")
             || msg.contains("validation error detected")
             || msg.contains("must not be empty")

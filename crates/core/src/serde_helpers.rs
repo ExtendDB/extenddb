@@ -118,6 +118,82 @@ where
     )
 }
 
+/// Whether `refusal`, a text of [`crate::types::from_nested`], is one the
+/// engine's `deserialize_error` answers with a `SerializationException`.
+fn is_serialization_text(refusal: &str) -> bool {
+    refusal
+        .split_once(" value must be ")
+        .is_some_and(|(tag, _)| crate::types::TYPE_DESCRIPTORS.contains(&tag))
+        || refusal.starts_with("invalid type: ")
+        || refusal.starts_with("invalid base64: ")
+}
+
+/// Whether the value `members` describe has no single type descriptor, or
+/// holds one that has none in an `L` or an `M` at any depth.
+fn has_no_single_descriptor(members: &serde_json::Map<String, Value>) -> bool {
+    match crate::types::type_descriptor(members) {
+        Ok((tag, payload)) => match (tag.as_str(), payload) {
+            ("L", Value::Array(items)) => items
+                .iter()
+                .filter_map(Value::as_object)
+                .any(has_no_single_descriptor),
+            ("M", Value::Object(entries)) => entries
+                .values()
+                .filter_map(Value::as_object)
+                .any(has_no_single_descriptor),
+            _ => false,
+        },
+        Err(_) => true,
+    }
+}
+
+/// A request member that holds legacy condition operands: the `Value` or
+/// `AttributeValueList` of an `Expected` entry, or the `AttributeValueList`
+/// of a `KeyConditions`, `QueryFilter` or `ScanFilter` entry. Each operand is
+/// read at depth 0, as an `ExpressionAttributeValues` value is: a value with
+/// two descriptors may hold one map or list more there than in an item
+/// attribute or a key (measured 2026-11-24 through PutItem, UpdateItem,
+/// DeleteItem, Query and Scan, each request twice). Serde reads the member's
+/// JSON type and [`crate::types::from_nested`] each operand, so a member of
+/// the wrong JSON type and an operand that is not an object keep serde's
+/// text.
+pub(crate) trait Operands: Sized {
+    /// The member with each operand as JSON.
+    type Json: serde::de::DeserializeOwned;
+    fn read(json: Self::Json) -> Result<Self, String>;
+}
+
+impl Operands for AttributeValue {
+    type Json = Value;
+    fn read(json: Value) -> Result<Self, String> {
+        crate::types::from_nested(json, 0)
+    }
+}
+
+impl<T: Operands> Operands for Option<T> {
+    type Json = Option<T::Json>;
+    fn read(json: Self::Json) -> Result<Self, String> {
+        json.map(T::read).transpose()
+    }
+}
+
+impl<T: Operands> Operands for Vec<T> {
+    type Json = Vec<T::Json>;
+    fn read(json: Self::Json) -> Result<Self, String> {
+        json.into_iter().map(T::read).collect()
+    }
+}
+
+/// `deserialize_with` target of a member of legacy condition operands (see
+/// [`Operands`]).
+pub(crate) fn deserialize_operands<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Operands,
+{
+    T::read(T::Json::deserialize(deserializer)?).map_err(de::Error::custom)
+}
+
 /// Deserialize `ExpressionAttributeValues`: keys are `:<ident>` (at most 255
 /// bytes), the map is non-empty, and each `AttributeValue` carries a datatype.
 ///
@@ -136,17 +212,25 @@ where
         "ExpressionAttributeValues",
         false,
         |key, value| {
-            // A value with no type descriptor, or with two or more, is refused
-            // with the count's text or with the text of a payload the
-            // deserializer checks ahead of the count, named after its key
-            // (measured 2026-11-23 on UpdateItem and Query, each shape
-            // twice). Caught here because a serde error does not carry the
-            // key. A value with one descriptor is read by `convert`, whose
-            // refusals are bare.
-            if value
-                .as_object()
-                .is_some_and(|members| crate::types::type_descriptor(members).is_err())
-                && let Err(refusal) = AttributeValue::deserialize(value)
+            // A value that has, or holds in an `L` or an `M`, a value with no
+            // single type descriptor is refused with the deserializer's text
+            // named after its key, read at depth 0: such a value may hold one
+            // map or list more than an item attribute (measured 2026-11-23
+            // and 2026-11-24 on UpdateItem and Query, each shape twice).
+            // Caught here because a serde error does not carry the key. A
+            // refusal the engine answers with a `SerializationException` (a
+            // payload of the wrong JSON type, a value that is not an object,
+            // a `B` or `BS` payload that is not base64) keeps its bare text,
+            // as in a single value: DynamoDB gives these no wrapper in an `L`
+            // or an `M` either (measured 2026-11-24 with
+            // `{"L": [{"S": 1}, {"S": "x", "N": "1"}]}` as `:v`, twice).
+            // Where ExtendDB answers a wrong JSON type with a text of its
+            // own, as for a number in a set, the text stays wrapped (#1012).
+            // Any other value is read by `convert`, whose refusals are bare.
+            if let Some(members) = value.as_object()
+                && has_no_single_descriptor(members)
+                && let Err(refusal) = crate::types::from_nested(value.clone(), 0)
+                && !is_serialization_text(&refusal)
             {
                 return Err(format!(
                     "ExpressionAttributeValues contains invalid value: {refusal} for key {key}"
@@ -185,6 +269,20 @@ mod tests {
         serde_json::from_str::<TestValues>(json)
             .unwrap_err()
             .to_string()
+    }
+
+    const EMPTY: &str = "Supplied AttributeValue is empty, must contain exactly one of the \
+                         supported datatypes";
+    const MULTI: &str = "Supplied AttributeValue has more than one datatypes set, must contain \
+                         exactly one of the supported datatypes";
+
+    /// An `S` beside an `L`, `levels` lists in all.
+    fn beside_s(levels: usize) -> Value {
+        let lists = (1..levels).fold(
+            serde_json::json!({"S": "x"}),
+            |v, _| serde_json::json!({"L": [v]}),
+        );
+        serde_json::json!({"S": "x", "L": [lists]})
     }
 
     #[test]
@@ -280,21 +378,23 @@ mod tests {
         assert!(!msg.contains("size of key"), "{msg}");
     }
 
-    /// A value with no type descriptor (`{}`, or members the deserializer
-    /// ignores only) or with two or more is refused with the deserializer's
-    /// text named after its key: the count's text, or that of a payload
-    /// checked ahead of the count (measured 2026-11-23 on Query and
-    /// UpdateItem, each twice). A value with one descriptor keeps the
-    /// deserializer's bare text.
+    /// A value that has no single type descriptor (`{}`, members the
+    /// deserializer ignores only, or two or more), or holds one in an `L` or
+    /// an `M`, is refused with the deserializer's text named after its key:
+    /// the count's text, or that of a payload checked ahead of the count,
+    /// with one map or list more allowed than in an item attribute (measured
+    /// 2026-11-23 and 2026-11-24 on Query and UpdateItem, each twice). Any
+    /// other value, and a payload that is not base64 or is of the wrong JSON
+    /// type, keep the deserializer's bare text.
     #[test]
     fn values_with_no_single_descriptor_are_refused_by_key() {
-        const EMPTY: &str = "Supplied AttributeValue is empty, must contain exactly one of the \
-                             supported datatypes";
-        const MULTI: &str = "Supplied AttributeValue has more than one datatypes set, must \
-                             contain exactly one of the supported datatypes";
         let wrapped = |text: &str| {
             format!("ExpressionAttributeValues contains invalid value: {text} for key :v")
         };
+        let base64 = serde_json::from_value::<AttributeValue>(serde_json::json!({"B": "!!!"}))
+            .unwrap_err()
+            .to_string();
+        let deep = beside_s(32).to_string();
         let cases = [
             ("{}", wrapped(EMPTY)),
             (r#"{"X":"1"}"#, wrapped(EMPTY)),
@@ -304,6 +404,11 @@ mod tests {
             (
                 r#"{"S":"x","N":"bob"}"#,
                 wrapped("The parameter cannot be converted to a numeric value: bob"),
+            ),
+            // A request text that reads like a type text is still wrapped.
+            (
+                r#"{"S":"x","N":"a value must be b"}"#,
+                wrapped("The parameter cannot be converted to a numeric value: a value must be b"),
             ),
             (
                 r#"{"SS":["a","a"],"N":"bob"}"#,
@@ -316,9 +421,69 @@ mod tests {
                 r#"{"S":"x","NS":["1","1"]}"#,
                 wrapped(crate::partiql::params::NUMBER_SET_DUPLICATES),
             ),
-            // ExtendDB's own text for a payload of the wrong JSON type, left
-            // unwrapped (not measured; #1012 tracks these texts).
+            (r#"{"S":"x","BOOL":"yes"}"#, wrapped(MULTI)),
+            (
+                r#"{"S":"x","NULL":false}"#,
+                wrapped(
+                    "One or more parameter values were invalid: Null attribute value types \
+                     must have the value of true",
+                ),
+            ),
+            (
+                r#"{"S":"x","L":[null]}"#,
+                wrapped("The supplied Item contains a null AttributeValue"),
+            ),
+            // A value with two descriptors in an `L` or an `M`.
+            (
+                r#"{"L":[{"S":"x","N":"bob"}]}"#,
+                wrapped("The parameter cannot be converted to a numeric value: bob"),
+            ),
+            (
+                r#"{"M":{"k":{"S":"x","N":"bob"}}}"#,
+                wrapped("The parameter cannot be converted to a numeric value: bob"),
+            ),
+            (r#"{"L":[{"S":"x","N":"1"}]}"#, wrapped(MULTI)),
+            (r#"{"L":[{"S":"x","BOOL":"yes"}]}"#, wrapped(MULTI)),
+            (
+                r#"{"M":{"k":{"S":"x","SS":["a","a"]}}}"#,
+                wrapped(
+                    "One or more parameter values were invalid: Input collection [a, a] \
+                     contains duplicates.",
+                ),
+            ),
+            (
+                r#"{"L":[{"SS":[]},{"S":"x","N":"1"}]}"#,
+                wrapped(
+                    "One or more parameter values were invalid: An string set  may not be empty",
+                ),
+            ),
+            (deep.as_str(), wrapped(MULTI)),
+            // A `B` or `BS` payload that is not base64 keeps the bare text of
+            // a single `B` (DynamoDB: a `SerializationException` with no
+            // wrapper, with a text of its own, #1189).
+            (r#"{"S":"x","B":"!!!"}"#, base64.clone()),
+            (r#"{"S":"x","BS":["!!!"]}"#, base64.clone()),
+            (r#"{"N":"bob","B":"!!!"}"#, base64),
+            // A payload of the wrong JSON type, or a value that is not an
+            // object, keeps ExtendDB's bare text, alone or in an `L` or an
+            // `M` (DynamoDB: a `SerializationException` with no wrapper and a
+            // text of its own, #1012; the `L` and `M` rows measured
+            // 2026-11-24, each twice).
             (r#"{"S":1}"#, "S value must be a string".to_owned()),
+            (
+                r#"{"L":[{"S":1},{"S":"x","N":"1"}]}"#,
+                "S value must be a string".to_owned(),
+            ),
+            (
+                r#"{"M":{"a":{"BOOL":"x"},"b":{"S":"x","N":"1"}}}"#,
+                "BOOL value must be a boolean".to_owned(),
+            ),
+            (
+                r#"{"L":[1,{"S":"x","N":"1"}]}"#,
+                "invalid type: integer `1`, expected a DynamoDB AttributeValue map with \
+                 exactly one type descriptor"
+                    .to_owned(),
+            ),
         ];
         for (value, want) in cases {
             let msg = values_err(&format!(r#"{{"values":{{":v":{value}}}}}"#));
@@ -328,6 +493,150 @@ mod tests {
                 msg.starts_with(&format!("{want} at line 1 column ")),
                 "{value}: {msg}"
             );
+        }
+    }
+
+    /// A legacy condition operand is read at depth 0, so a value with two
+    /// descriptors there may hold 32 maps and lists in all, one more than an
+    /// `AttributeUpdates` value or a key, before the nesting refusal (measured
+    /// 2026-11-24 on a table that does not exist, each request twice; the
+    /// service adds `The provided starting key is invalid: ` to the
+    /// `ExclusiveStartKey` texts). The other rows pin, for each member of
+    /// operands, the answers that do not depend on the depth.
+    #[test]
+    fn a_condition_operand_may_hold_one_map_or_list_more_than_a_key() {
+        use crate::partiql::params::NESTING_MESSAGE as NESTING;
+        use crate::types::{
+            BatchGetItemInput, DeleteItemInput, PutItemInput, QueryInput, ScanInput,
+            TransactGetItemsInput, UpdateItemInput,
+        };
+        use serde_json::json;
+        fn read<T: serde::de::DeserializeOwned>(body: Value) -> Result<(), String> {
+            serde_json::from_value::<T>(body)
+                .map(drop)
+                .map_err(|e| e.to_string())
+        }
+        let invalid_type = |what: &str| {
+            format!(
+                "invalid type: {what}, expected a DynamoDB AttributeValue map with exactly one \
+                 type descriptor"
+            )
+        };
+        let base64 = serde_json::from_value::<AttributeValue>(json!({"B": "!!!"}))
+            .unwrap_err()
+            .to_string();
+        // Each place by its row name: the member it holds (`V` an `Expected`
+        // `Value`, `E` an `Expected` `AttributeValueList`, `C` that of a
+        // `Condition`, `K` a stored value or a key), the reader of the
+        // operation's input, the lists in all it was measured with, and the
+        // request around the member.
+        type Read = fn(Value) -> Result<(), String>;
+        type Request = fn(Value) -> Value;
+        let places: [(&str, char, Read, &[usize], Request); 12] = [
+            ("EV", 'V', read::<PutItemInput>, &[31, 32, 33], |m| {
+                json!({"TableName": "t", "Item": {"pk": {"S": "k"}},
+                       "Expected": {"a": {"Value": m}}})
+            }),
+            ("UE", 'V', read::<UpdateItemInput>, &[32, 33], |m| {
+                json!({"TableName": "t", "Key": {"pk": {"S": "k"}},
+                       "Expected": {"a": {"Value": m}}})
+            }),
+            ("DE", 'V', read::<DeleteItemInput>, &[32, 33], |m| {
+                json!({"TableName": "t", "Key": {"pk": {"S": "k"}},
+                       "Expected": {"a": {"Value": m}}})
+            }),
+            ("EL", 'E', read::<PutItemInput>, &[31, 32, 33], |m| {
+                json!({"TableName": "t", "Item": {"pk": {"S": "k"}},
+                       "Expected": {"a": {"ComparisonOperator": "EQ", "AttributeValueList": m}}})
+            }),
+            ("SF", 'C', read::<ScanInput>, &[31, 32, 33], |m| {
+                json!({"TableName": "t",
+                       "ScanFilter": {"a": {"ComparisonOperator": "EQ", "AttributeValueList": m}}})
+            }),
+            ("QF", 'C', read::<QueryInput>, &[32, 33], |m| {
+                json!({"TableName": "t",
+                       "KeyConditions": {"pk": {"ComparisonOperator": "EQ",
+                                                "AttributeValueList": [{"S": "k"}]}},
+                       "QueryFilter": {"a": {"ComparisonOperator": "EQ", "AttributeValueList": m}}})
+            }),
+            ("KC", 'C', read::<QueryInput>, &[31, 32, 33], |m| {
+                json!({"TableName": "t",
+                       "KeyConditions": {"pk": {"ComparisonOperator": "EQ",
+                                                "AttributeValueList": m}}})
+            }),
+            ("AU", 'K', read::<UpdateItemInput>, &[31, 32, 33], |v| {
+                json!({"TableName": "t", "Key": {"pk": {"S": "k"}},
+                       "AttributeUpdates": {"a": {"Value": v, "Action": "PUT"}}})
+            }),
+            ("XK", 'K', read::<ScanInput>, &[31, 32, 33], |v| {
+                json!({"TableName": "t",
+                       "ExclusiveStartKey": {"pk": v}})
+            }),
+            ("DK", 'K', read::<DeleteItemInput>, &[32, 33], |v| {
+                json!({"TableName": "t",
+                       "Key": {"pk": v}})
+            }),
+            ("BG", 'K', read::<BatchGetItemInput>, &[32, 33], |v| {
+                json!({"RequestItems":
+                       {"t": {"Keys": [{"pk": v}]}}})
+            }),
+            ("TG", 'K', read::<TransactGetItemsInput>, &[32, 33], |v| {
+                json!({"TransactItems": [{"Get": {"TableName": "t",
+                                                  "Key": {"pk": v}}}]})
+            }),
+        ];
+        for (name, member, read_body, measured, request) in places {
+            // The member that holds `v` alone.
+            let list = matches!(member, 'E' | 'C');
+            let member_of = |v: Value| if list { json!([v]) } else { v };
+            let limit = if member == 'K' { 31 } else { 32 };
+            for &levels in measured {
+                let want = if levels > limit { NESTING } else { MULTI };
+                let body = request(member_of(beside_s(levels)));
+                assert_eq!(read_body(body), Err(want.into()), "{name}-{levels}");
+            }
+            if member == 'K' {
+                continue;
+            }
+            let mut rows: Vec<(Value, Result<(), String>)> = [
+                (json!("x"), Err(invalid_type("string \"x\""))),
+                (json!({}), Err(EMPTY.to_owned())),
+                (json!({"S": "x"}), Ok(())),
+                (json!({"S": "x", "B": "!!!"}), Err(base64.clone())),
+                (json!({"B": "!!!"}), Err(base64.clone())),
+            ]
+            .into_iter()
+            .map(|(v, want)| (member_of(v), want))
+            .collect();
+            // A null, a member of the other JSON type, and a list read in
+            // order.
+            if list {
+                let not_a_list = |what: &str| format!("invalid type: {what}, expected a sequence");
+                let null_list = if member == 'E' {
+                    Ok(())
+                } else {
+                    Err(not_a_list("null"))
+                };
+                let first = Err("S value must be a string".to_owned());
+                rows.extend([
+                    (json!([null]), Err(invalid_type("null"))),
+                    (Value::Null, null_list),
+                    (json!({"S": "x", "N": "1"}), Err(not_a_list("map"))),
+                    (
+                        json!(["x", {"S": "x", "N": "1"}]),
+                        Err(invalid_type("string \"x\"")),
+                    ),
+                    (json!([{"S": 1}, beside_s(33)]), first),
+                ]);
+            } else {
+                rows.extend([
+                    (Value::Null, Ok(())),
+                    (json!([{"S": "x", "N": "1"}]), Err(invalid_type("sequence"))),
+                ]);
+            }
+            for (m, want) in rows {
+                assert_eq!(read_body(request(m.clone())), want, "{name} {m}");
+            }
         }
     }
 

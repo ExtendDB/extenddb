@@ -22,7 +22,8 @@
 //!   statement, and reports the first problem it reaches walking the values
 //!   in document order (see [`check_parameter_values`]): a map or list nested
 //!   past the item limit, an `N` (or `NS` member) that cannot be converted or
-//!   breaks a number rule, an attribute value with no type or with two, a
+//!   breaks a number rule, an attribute value with no type or with two (whose
+//!   payloads are checked first, see [`PAYLOAD_ORDER`]), a
 //!   null member of a set, map or list, an empty set, a set that holds a
 //!   member twice, and a NULL that is not true. These are refused as the
 //!   attribute value deserializer refuses them, but a number set whose
@@ -195,13 +196,43 @@ pub fn check_parameter_values(parameters: &[Value]) -> Result<(), String> {
 /// Walk one wire attribute value. `depth` counts the maps and lists around
 /// it. A parameter may hold 32 of them around its leaf, one more than an item
 /// attribute; 33 is refused (measured 2026-11-02). The walk stops there, so
-/// it recurses at most that deep.
-fn check_value(value: &Value, depth: usize) -> Result<(), String> {
+/// it recurses at most that deep. The attribute value deserializer walks a
+/// value with two or more type descriptors here, an item attribute with its
+/// item counted around it.
+pub(crate) fn check_value(value: &Value, depth: usize) -> Result<(), String> {
     let Value::Object(members) = value else {
         return Ok(());
     };
-    let (tag, payload) = crate::types::type_descriptor(members)?;
-    match (tag.as_str(), payload) {
+    match crate::types::type_descriptor(members) {
+        Ok((tag, payload)) => check_payload(tag, payload, depth),
+        Err(count) => {
+            // A payload of the wrong JSON type is not checked. DynamoDB reads
+            // past a `BOOL` of `"yes"` and refuses a number in a set with a
+            // `SerializationException` (#1012, measured 2026-11-24); only the
+            // deserializer walks one here.
+            for tag in PAYLOAD_ORDER {
+                let Some(payload) = members.get(tag).filter(|payload| !payload.is_null()) else {
+                    continue;
+                };
+                let alone = Value::Object(Map::from_iter([(tag.to_owned(), payload.clone())]));
+                if check_types(&alone).is_ok() {
+                    check_payload(tag, payload, depth)?;
+                }
+            }
+            Err(count.to_owned())
+        }
+    }
+}
+
+/// The order in which the service checks the payloads of a value with two or
+/// more type descriptors before it counts them, whatever order the members
+/// come in (measured 2026-11-23). The other payloads are not checked.
+const PAYLOAD_ORDER: [&str; 7] = ["SS", "N", "NS", "BS", "M", "L", "NULL"];
+
+/// Check the payload of the type descriptor `tag` of a value `depth` maps and
+/// lists deep.
+fn check_payload(tag: &str, payload: &Value, depth: usize) -> Result<(), String> {
+    match (tag, payload) {
         ("M", Value::Object(entries)) => {
             let next = enter(depth)?;
             for (name, member) in entries {
@@ -220,7 +251,7 @@ fn check_value(value: &Value, depth: usize) -> Result<(), String> {
                 check_value(item, next)?;
             }
         }
-        ("N", _) => payload_refusal(tag, payload)?,
+        ("N", Value::String(text)) => check_text(text)?,
         // The members are converted in order, and a null member is refused
         // where it stands (measured 2026-11-06: `["abc", null]` is refused
         // for `abc`, `[null, "abc"]` for the null).
@@ -231,7 +262,9 @@ fn check_value(value: &Value, depth: usize) -> Result<(), String> {
                     _ => return Err(NULL_NUMBER_SET_MEMBER.to_owned()),
                 }
             }
-            payload_refusal(tag, payload)?;
+            if has_equal_numbers(items) {
+                return Err(NUMBER_SET_DUPLICATES.to_owned());
+            }
             content_refusal(tag, payload)?;
         }
         // A null member is refused ahead of a member given twice (measured
@@ -283,30 +316,6 @@ fn enter(depth: usize) -> Result<usize, String> {
 
 fn check_text(text: &str) -> Result<(), String> {
     check_number(text).map_err(|problem| parameter_message(text, problem))
-}
-
-/// The refusal of the payload of the type descriptor `tag`, as the service
-/// finds it when it converts the value: an `N` that cannot be converted or
-/// breaks a number rule, a number set two of whose members have one value, a
-/// string set that holds a member twice. [`check_value`] runs it on a
-/// parameter's `N` and `NS` descriptors. The attribute value deserializer
-/// runs it on each descriptor of a value that has two or more, ahead of the
-/// count (measured 2026-11-23: `{"S": "x", "N": "bob"}` is refused for `bob`
-/// and `{"S": "x", "N": "1"}` for the count, in UpdateItem, Query and
-/// PutItem alike).
-///
-/// # Errors
-///
-/// Returns the service's message for the fault.
-pub(crate) fn payload_refusal(tag: &str, payload: &Value) -> Result<(), String> {
-    match (tag, payload) {
-        ("N", Value::String(text)) => check_text(text),
-        ("NS", Value::Array(items)) if has_equal_numbers(items) => {
-            Err(NUMBER_SET_DUPLICATES.to_owned())
-        }
-        ("SS", Value::Array(items)) => crate::types::string_set_duplicates(items),
-        _ => Ok(()),
-    }
 }
 
 #[cfg(test)]
@@ -463,6 +472,18 @@ mod tests {
             ),
             ("[{}]", EMPTY_ATTRIBUTE_VALUE),
             ("[{\"S\":\"a\",\"N\":\"1\"}]", MULTI_ATTRIBUTE_VALUE),
+            // A faulty payload beside a second descriptor, ahead of the count
+            // (measured 2026-11-23).
+            (
+                "[{\"S\":\"x\",\"N\":\"bob\"}]",
+                "The parameter cannot be converted to a numeric value: bob",
+            ),
+            (
+                "[{\"S\":\"x\",\"SS\":[\"a\",\"a\"]}]",
+                "One or more parameter values were invalid: Input collection [a, a] contains \
+                 duplicates.",
+            ),
+            ("[{\"S\":\"x\",\"L\":[null]}]", NULL_MEMBER),
             ("[{\"S\":\"a\"},{\"SS\":[]}]", empty_ss),
             // A null member of a set (measured 2026-11-06).
             ("[{\"SS\":[\"a\",null]}]", NULL_STRING_SET_MEMBER),
@@ -522,6 +543,14 @@ mod tests {
         let deep_list = deep(40, "{\"S\":\"leaf\"}");
         let empty = "{\"SS\":[]}";
         let bad = "{\"N\":\"abc\"}";
+        // `{"S": "x"}` in `levels` maps inside an `L`, beside an `S`. The
+        // rows were measured with lists; a map counts as a list does.
+        let beside_s = |levels| {
+            format!(
+                "[{{\"S\":\"x\",\"L\":[{}]}}]",
+                deep(levels, "{\"S\":\"x\"}")
+            )
+        };
         for (json, message) in [
             (format!("[{empty},{deep_list}]"), empty_ss),
             (format!("[{deep_list},{empty}]"), NESTING_MESSAGE),
@@ -536,6 +565,11 @@ mod tests {
                 format!("[{deep_list},{{\"M\":{{\"x\":null}}}}]"),
                 NESTING_MESSAGE,
             ),
+            // A value with two descriptors and 32 maps and lists in all is
+            // refused for the count, one with 33 for the nesting (measured
+            // 2026-11-24).
+            (beside_s(31), MULTI_ATTRIBUTE_VALUE),
+            (beside_s(32), NESTING_MESSAGE),
         ] {
             assert_eq!(
                 check_parameter_values(&doc(&json)),
