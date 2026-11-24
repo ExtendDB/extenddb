@@ -60,6 +60,13 @@ from a request sent to that service or backend.
 | U+0000 in a key attribute name, an index key attribute name or a projected attribute name | Accepted; `DescribeTable` returns each name byte for byte (measured 2026-09-18 and 2026-10-24, and again on 2026-11-04) | The same on all four backends. PostgreSQL `jsonb` cannot hold U+0000, so a PostgreSQL deployment stores these names through an escape, U+0000 as U+0001 U+0001 and U+0001 as U+0001 U+0002. Catalog migration 11 applies the escape to the names an earlier release stored (see the [Upgrade Manual](manuals/07-upgrade-manual.md#general-upgrade-procedure)) |
 | Stream disable and enable | `UpdateTable StreamEnabled=false` answers `UPDATING`; the stream reports `DISABLED` a few seconds later with every shard closed, and every write acknowledged before that lands in the closed stream. `StreamEnabled=true` afterwards creates a new stream with a later label; both streams stay listed, and a disabled stream stays describable after its table is deleted | The shards close inside the `UpdateTable` call and the response says `ACTIVE`. A write that reaches storage after the close is acknowledged and recorded in no stream (on MongoDB it is recorded past the shard's `EndingSequenceNumber` instead); the window is one write wide. A disabled stream is removed with its table. A stream created by a release before this one loses its ARN once the table is disabled and re-enabled (its label lived only in the table row) |
 
+## Streams
+
+| Area | DynamoDB | ExtendDB |
+|------|----------|------|
+| Shards | Shards open and close over time, with parent and child shards | Four shards per stream, assigned by partition key hash. They close when the stream is disabled (see Stream disable and enable under Control Plane) |
+| `AT_TIMESTAMP` iterator | The first record created at or after `Timestamp`, compared at millisecond precision; older than retention resolves to the oldest record; past the newest record resolves to after it; more than about a second in the future is a `ValidationException` | The same, on all four backends. The seek compares the record's stored creation time, taken from the same clock read as its `ApproximateCreationDateTime`. The future buffer is one second against the server clock |
+
 ## Time to Live (TTL)
 
 | Area | DynamoDB | ExtendDB |
