@@ -76,14 +76,6 @@ ON_DEFAULT_BACKENDS_ONLY = pytest.mark.skipif(
     os.environ.get("EXTENDDB_TEST_BACKEND", "") in {"mongodb", "cassandra"},
     reason="an Update is sized on the finished item (Cassandra) or unbounded (MongoDB): #818, #761",
 )
-# The fingerprint covers TransactItems only, where the service's covers
-# ReturnConsumedCapacity too (#514).
-XFAIL_ON_EXTENDDB_514 = pytest.mark.xfail(
-    bool(os.environ.get("EXTENDDB_TEST_ENDPOINT", "").strip()),
-    reason="#514: the token fingerprint does not cover ReturnConsumedCapacity",
-    raises=AssertionError,
-    strict=False,
-)
 
 
 @pytest.fixture(scope="module")
@@ -335,7 +327,6 @@ def test_a_cancellation_keeps_the_token_used(dynamodb_client, table, fault):
             dynamodb_client.delete_item(TableName=table, Key={"pk": {"S": "big"}})
 
 
-@XFAIL_ON_EXTENDDB_514
 def test_a_cancelled_token_with_other_return_parameters(dynamodb_client, table):
     """Q7a: the cancelled request sent again with ReturnConsumedCapacity is
     another request for the token."""
