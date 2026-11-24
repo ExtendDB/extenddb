@@ -352,19 +352,18 @@ impl MetadataEngine for MongoEngine {
             let tables_coll = self.catalog_db.collection::<Document>("tables");
             let id_filter =
                 doc! { "_id": { "account_id": &account_id, "table_name": &table_name } };
-            // ACTIVE only: a delete call drops the data collection after it
-            // marks the document DELETING, and create_index on a dropped
-            // collection creates it again. A build that reads the document
-            // after the mark gets TableNotFound, which the engine logs as
-            // deferred.
             let table_doc = tables_coll
-                .find_one(doc! {
-                    "_id": { "account_id": &account_id, "table_name": &table_name },
-                    "table_status": "ACTIVE",
-                })
+                .find_one(id_filter.clone())
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?
                 .ok_or_else(|| StorageError::TableNotFound(table_name.clone()))?;
+            // A delete call drops the data collection after it marks the
+            // document DELETING, and create_index on a dropped collection
+            // creates it again. A build that reads the document after the mark
+            // refuses before create_index, which the engine logs as deferred.
+            if matches!(table_doc.get_str("table_status"), Ok("DELETING")) {
+                return Err(StorageError::TableNotActive(table_name));
+            }
 
             // MongoDB interprets dots in an index key as nested traversal,
             // while DynamoDB treats them as part of the attribute name. The

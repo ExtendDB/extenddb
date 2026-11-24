@@ -118,19 +118,48 @@ async fn update_ttl_during_the_window_is_served() {
     f.finish().await;
 }
 
-/// A TTL index build that reaches a `DELETING` document after the delete call
-/// dropped the data collection creates no collection: the build reads an
-/// `ACTIVE` document only, so it answers `TableNotFound`. MongoDB would
-/// otherwise create the collection again to hold the index, and nothing would
-/// remove it once the catalog document is gone.
+/// A TTL index build answers `TableNotActive` for a `DELETING` document before
+/// `create_index`, so a build that reaches the document after the delete call
+/// dropped the data collection creates no collection. MongoDB would otherwise
+/// create the collection again to hold the index, and nothing would remove it
+/// once the catalog document is gone. A document in another status builds the
+/// index as before: an UPDATING one here.
 #[tokio::test]
-async fn a_ttl_index_build_during_the_window_creates_no_collection() {
+async fn a_ttl_index_build_refuses_a_deleting_document_only() {
     let Some(f) = Fixture::new().await else {
         return;
     };
     f.open_window().await;
-    let data_coll = f.drop_data_collection().await;
 
+    f.set_status("UPDATING").await;
+    f.engine
+        .create_ttl_index(ACCOUNT, TABLE, "ttl")
+        .await
+        .expect("the build on an UPDATING document");
+    let doc = f
+        .engine
+        .catalog_db
+        .collection::<Document>("tables")
+        .find_one(doc! { "_id": { "account_id": ACCOUNT, "table_name": TABLE } })
+        .await
+        .expect("read the table document")
+        .expect("the table document");
+    let indexes = f
+        .engine
+        .data_db
+        .collection::<Document>(&crate::data::data_collection_name(
+            doc.get_str("table_id").expect("table_id"),
+        ))
+        .list_index_names()
+        .await
+        .expect("list the data collection's indexes");
+    assert!(
+        indexes.contains(&"idx_ttl_ttl".to_owned()),
+        "no TTL index on the UPDATING table: {indexes:?}"
+    );
+
+    f.set_status("DELETING").await;
+    let data_coll = f.drop_data_collection().await;
     f.engine
         .update_ttl(ACCOUNT, TABLE, "ttl", true)
         .await
@@ -142,8 +171,8 @@ async fn a_ttl_index_build_during_the_window_creates_no_collection() {
         "{data_coll} was created again: {collections:?}"
     );
     assert!(
-        matches!(&built, Err(StorageError::TableNotFound(name)) if name == TABLE),
-        "expected TableNotFound({TABLE:?}), got {built:?}"
+        matches!(&built, Err(StorageError::TableNotActive(name)) if name == TABLE),
+        "expected TableNotActive({TABLE:?}), got {built:?}"
     );
 
     f.finish().await;
