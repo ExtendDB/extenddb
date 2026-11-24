@@ -1587,8 +1587,10 @@ impl AuthLayer {
 
 ## 10. Secret Key Encryption
 
-The implementation is `crates/storage/src/secret_cipher.rs`, on AWS-LC through
-aws-lc-rs ([ADR-0026](../adr/0026-credential-crypto-on-aws-lc.md)). `aad` is the
+The implementation is `crates/storage/src/secret_cipher.rs`. It seals and opens
+through `extenddb_core::crypto` (`crates/core/src/crypto.rs`), which uses AWS-LC
+through aws-lc-rs natively ([ADR-0026](../adr/0026-credential-crypto-on-aws-lc.md))
+and the `aes-gcm` crate on wasm32. `aad` is the
 access key id.
 
 ```rust

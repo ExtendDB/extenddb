@@ -7,7 +7,7 @@
 
 ## 1. Purpose
 
-The `core` crate contains all DynamoDB-specific business logic that is independent of the storage backend, HTTP server, and async runtime. It is synchronous Rust — types, expression parsing/evaluation, validation, capacity calculation, and error types. It also holds the crypto primitives (SHA-256, HMAC-SHA256, the constant-time compare, AES-256-GCM and random bytes) that `auth` and `storage` share, in one module, `crypto` (`src/crypto.rs`), whose doc comment names the backend on each target: AWS-LC natively, and on wasm32 the RustCrypto crates with `subtle` and `getrandom`.
+The `core` crate contains all DynamoDB-specific business logic that is independent of the storage backend, HTTP server, and async runtime. It is synchronous Rust — types, expression parsing/evaluation, validation, capacity calculation, and error types. It also holds the crypto primitives (SHA-256, HMAC-SHA256, the constant-time compare, AES-256-GCM and random bytes) that `auth` and `storage` share, in one module, `crypto` (`src/crypto.rs`), whose doc comment names the backend on each target.
 
 **Dependencies:** serde, serde_json, thiserror, time, uuid, base64, bigdecimal, flate2, md-5, sha2, zeroize, web-time, aws-lc-rs (except on wasm32), and on wasm32 the crates the manifest lists for that target (no tokio, no sqlx, no axum, no async runtime)
 

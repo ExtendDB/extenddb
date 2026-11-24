@@ -99,9 +99,14 @@ SigV4 is verified — a request signed with a different secret is rejected with
 
 Per [RFC-0002](https://github.com/ExtendDB/extenddb/blob/main/docs/rfcs), this
 backend implements the full storage trait surface. The `wasm32` build does
-not compile its `Bootstrapper` (`SqliteBootstrapper`), and its
-`SnapshotEngine` answers every table snapshot with an `Unsupported` error,
-since it has no file to copy.
+not compile its implementations of `Bootstrapper` (`SqliteBootstrapper`),
+`ServerRuntimeHooks` and `OperationsEngine`, which set up a file-backed
+server, start its background workers and give the `extenddb` lifecycle
+commands their backend helpers. Two
+methods answer `StorageError::Unsupported` there:
+`SnapshotEngine::open_table_snapshot`, for every table, since the build has
+no file to copy, and `TableEngine::update_table`, for a request that creates
+a vector index, since the build cannot run the index backfill.
 
 Mandatory traits (required for acceptance):
 

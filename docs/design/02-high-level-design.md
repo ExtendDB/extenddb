@@ -164,7 +164,7 @@ graph TD
     STORAGE --> AUTH
 ```
 
-**Key principle:** `core` depends on nothing in the workspace and has no async runtime — it is sync Rust (types, expressions, validation, capacity, errors, and the crypto primitives that `auth` and `storage` share). `auth` depends on `core` and `cache`. `storage` depends on `core` and `auth`. `engine` depends on `core`, `auth` and `storage` (and on `backup-store`, except on wasm32) and contains the async operation handlers. Backend crates depend on `storage`, `auth` and `core`. `server` depends on `core`, `storage`, `auth` and `engine`, and on `cache`, `config` and `backup-store`. `bin` wires everything together. The graph above shows the main edges only.
+**Key principle:** `core` depends on nothing in the workspace and has no async runtime — it is sync Rust (types, expressions, validation, capacity, errors, and the crypto primitives that `auth` and `storage` share). `auth` depends on `core` and `cache`. `storage` depends on `core` and `auth`. `engine` depends on `core`, `auth` and `storage` (and on `backup-store`, except on wasm32) and contains the async operation handlers. Backend crates depend on `storage`, `auth` and `core`. `server` depends on `core`, `storage`, `auth` and `engine`, and on `cache`, `config` and `backup-store`. `bin` wires everything together. The graph is a simplified view; `cargo metadata` lists every edge.
 
 ## 3. Request Lifecycle
 
