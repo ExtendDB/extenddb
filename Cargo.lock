@@ -1665,6 +1665,7 @@ dependencies = [
  "anyhow",
  "extenddb-app",
  "extenddb-config",
+ "extenddb-core",
  "extenddb-storage",
  "extenddb-storage-cassandra",
  "extenddb-storage-mongodb",
