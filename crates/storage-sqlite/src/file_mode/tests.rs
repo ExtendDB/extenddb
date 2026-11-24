@@ -154,7 +154,7 @@ fn prepare_creates_nothing_when_the_connection_would_not() {
         );
         prepare(&uri).expect("prepare");
     }
-    assert_eq!(std::fs::read_dir(&dir).expect("read_dir").count(), 0);
+    assert_eq!(std::fs::read_dir(dir).expect("read_dir").count(), 0);
 }
 
 /// Open a pool through `connect` that switches to WAL and writes in its
@@ -540,7 +540,7 @@ async fn a_decoded_file_uri_path_names_the_file_sqlite_opens() {
     for suffix in ["", "-wal", "-shm"] {
         assert_eq!(mode(&sidecar(&db, suffix)), 0o600, "{suffix}");
     }
-    let mut names: Vec<String> = std::fs::read_dir(&dir)
+    let mut names: Vec<String> = std::fs::read_dir(dir)
         .expect("read_dir")
         .map(|entry| {
             entry
@@ -581,5 +581,5 @@ async fn locations_sqlite_does_not_open_as_named_are_left_alone() {
         .await
         .expect("write");
     pool.close().await;
-    assert_eq!(std::fs::read_dir(&dir).expect("read_dir").count(), 0);
+    assert_eq!(std::fs::read_dir(dir).expect("read_dir").count(), 0);
 }

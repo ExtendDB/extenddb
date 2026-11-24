@@ -211,14 +211,14 @@ async fn a_connection_outside_the_openers_leaves_0644_files() {
                 Ok(())
             })
         })
-        .connect(&format!("sqlite://{}?mode=rwc", database_path(&dir)))
+        .connect(&format!("sqlite://{}?mode=rwc", database_path(dir)))
         .await
         .expect("connect");
     sqlx::query("CREATE TABLE t (k INTEGER PRIMARY KEY)")
         .execute(&pool)
         .await
         .expect("write");
-    let modes = modes(&dir);
+    let modes = modes(dir);
     for name in ["x.sqlite", "x.sqlite-wal", "x.sqlite-shm"] {
         assert_eq!(modes.get(name), Some(&0o644), "{name} in {modes:?}");
     }
@@ -231,23 +231,23 @@ async fn a_connection_outside_the_openers_leaves_0644_files() {
 async fn init_serve_write_stop_and_restart_leave_every_file_owner_only() {
     let tmp = deployment_dir();
     let dir = tmp.path();
-    let path = database_path(&dir);
+    let path = database_path(dir);
     let sidecars = ["x.sqlite-wal", "x.sqlite-shm"];
 
     init(&path).await;
-    assert_owner_only(&dir, "init", &["x.sqlite.lock"]);
+    assert_owner_only(dir, "init", &["x.sqlite.lock"]);
 
     let components = serve(&path, ServerComponentsOptions::default()).await;
-    assert_owner_only(&dir, "serve", &sidecars);
+    assert_owner_only(dir, "serve", &sidecars);
 
     first_write(&path, &components).await;
-    assert_owner_only(&dir, "the first write", &sidecars);
+    assert_owner_only(dir, "the first write", &sidecars);
 
     drop(components);
-    assert_owner_only(&dir, "a clean stop", &[]);
+    assert_owner_only(dir, "a clean stop", &[]);
 
     let again = serve(&path, ServerComponentsOptions::default()).await;
-    assert_owner_only(&dir, "a second serve", &sidecars);
+    assert_owner_only(dir, "a second serve", &sidecars);
     drop(again);
 }
 
@@ -257,12 +257,12 @@ async fn init_serve_write_stop_and_restart_leave_every_file_owner_only() {
 async fn a_bootstrapping_serve_creates_owner_only_files() {
     let tmp = deployment_dir();
     let dir = tmp.path();
-    let path = database_path(&dir);
+    let path = database_path(dir);
     let mut options = ServerComponentsOptions::default();
     options.bootstrap_if_uninitialized = true;
     let components = serve(&path, options).await;
     assert_owner_only(
-        &dir,
+        dir,
         "a bootstrapping serve",
         &["x.sqlite-wal", "x.sqlite-shm"],
     );
@@ -275,21 +275,21 @@ async fn a_bootstrapping_serve_creates_owner_only_files() {
 async fn serve_and_migrate_restrict_files_left_at_0644() {
     let tmp = deployment_dir();
     let dir = tmp.path();
-    let path = database_path(&dir);
+    let path = database_path(dir);
     init(&path).await;
 
-    set_every_mode(&dir, 0o644);
+    set_every_mode(dir, 0o644);
     let components = serve(&path, ServerComponentsOptions::default()).await;
     assert_owner_only(
-        &dir,
+        dir,
         "serve over 0644 files",
         &["x.sqlite-wal", "x.sqlite-shm"],
     );
     drop(components);
 
-    set_every_mode(&dir, 0o644);
+    set_every_mode(dir, 0o644);
     migrate(&path).await;
-    assert_owner_only(&dir, "migrate over 0644 files", &[]);
+    assert_owner_only(dir, "migrate over 0644 files", &[]);
 }
 
 /// The migration runner's connection creates a missing database whatever the
@@ -306,7 +306,7 @@ async fn the_migration_runner_creates_the_target_of_a_dangling_symlink_owner_onl
     let location = format!("sqlite://{}", link.display());
     let runner = SqliteMigrations::open(&location).await.expect("open");
     assert_owner_only(
-        &dir,
+        dir,
         "the migration runner's open",
         &["target.sqlite", "target.sqlite-wal", "target.sqlite-shm"],
     );
@@ -326,7 +326,7 @@ async fn the_migration_runner_creates_its_sidecars_at_0600_over_a_0644_database(
 
     let tmp = deployment_dir();
     let dir = tmp.path();
-    let path = database_path(&dir);
+    let path = database_path(dir);
     init(&path).await;
     for name in ["x.sqlite-wal", "x.sqlite-shm"] {
         let _ = std::fs::remove_file(dir.join(name));
@@ -385,13 +385,13 @@ async fn the_migration_runner_creates_its_sidecars_at_0600_over_a_0644_database(
 async fn the_bootstrapper_pool_alone_creates_owner_only_files() {
     let tmp = deployment_dir();
     let dir = tmp.path();
-    let path = database_path(&dir);
+    let path = database_path(dir);
     let tables = SqliteBootstrapper::new(&path)
         .list_table_names()
         .await
         .expect("list_table_names");
     assert!(tables.is_empty(), "{tables:?}");
-    assert_owner_only(&dir, "the bootstrapper's pool", &[]);
+    assert_owner_only(dir, "the bootstrapper's pool", &[]);
 }
 
 /// The engine's pool, which `serve` opens first.
@@ -399,11 +399,11 @@ async fn the_bootstrapper_pool_alone_creates_owner_only_files() {
 async fn the_engine_pool_alone_creates_owner_only_files() {
     let tmp = deployment_dir();
     let dir = tmp.path();
-    let path = database_path(&dir);
+    let path = database_path(dir);
     let engine = SqliteEngine::new(&path, 2, "us-east-1", 409_600)
         .await
         .expect("engine");
-    assert_owner_only(&dir, "the engine's pool", &["x.sqlite-wal", "x.sqlite-shm"]);
+    assert_owner_only(dir, "the engine's pool", &["x.sqlite-wal", "x.sqlite-shm"]);
     drop(engine);
 }
 
@@ -416,10 +416,10 @@ async fn the_engine_pool_alone_creates_owner_only_files() {
 async fn the_catalog_pool_alone_creates_owner_only_files() {
     let tmp = deployment_dir();
     let dir = tmp.path();
-    let path = database_path(&dir);
+    let path = database_path(dir);
     let store = (extenddb_storage_sqlite::backend().settings_store)(&path)
         .await
         .expect("settings store");
-    assert_owner_only(&dir, "the catalog pool", &[]);
+    assert_owner_only(dir, "the catalog pool", &[]);
     drop(store);
 }
