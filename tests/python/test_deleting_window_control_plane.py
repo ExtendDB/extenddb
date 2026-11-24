@@ -13,11 +13,17 @@ the window is ``ResourceNotFoundException`` (measured 2026-10-25).
 
 ``TagResource`` and ``UntagResource`` on the table ARN answer that same
 sentence in the window and ``ListTagsOfResource`` is served with the tags; on
-the table's stream ARN all three are served (measured 2026-10-26).
-``DescribeTimeToLive`` answers ``ValidationException`` ``Cannot describe time
-to live while table is in DELETING state: Current table state is DELETING``,
-and ``UpdateTimeToLive`` is served and answers with the specification it wrote
-(both measured 2026-10-25).
+the table's stream ARN all three are served (measured 2026-10-26). The
+table-ARN answers hold for the first 0.6 to 2.3 s after ``DeleteTable``
+returns; after that the service answers all three with
+``ResourceNotFoundException`` ``Requested resource not found: ResourceArn:
+<arn> not found`` while ``DescribeTable`` still reads ``DELETING`` (measured
+2026-11-20, five runs), and the stream ARN stays served. The tests assert the
+first answer after ``DeleteTable``. ``DescribeTimeToLive`` answers
+``ValidationException`` ``Cannot describe time to live while table is in
+DELETING state: Current table state is DELETING``, and ``UpdateTimeToLive`` is
+served and answers with the specification it wrote (both measured
+2026-10-25).
 
 Against the service these tests run on its natural window. Against ExtendDB on
 PostgreSQL the window is held open the way a slow reader would hold it: an
@@ -186,7 +192,8 @@ class TestDeletingWindowControlPlane:
     def test_tag_changes_are_being_deleted_and_tags_are_listed(self, dynamodb_client, is_extenddb):
         """TagResource and UntagResource while the table is DELETING are ResourceInUseException
         with the DELETING sentence, and ListTagsOfResource lists the tag the table had before
-        DeleteTable (measured 2026-11-03)."""
+        DeleteTable (measured 2026-11-03). On the service these are the first answers after
+        DeleteTable, which hold for 0.6 to 2.3 s (measured 2026-11-20)."""
         name = unique_name("del-window")
         lock = _open_window(dynamodb_client, is_extenddb, name)
         deleted = False
