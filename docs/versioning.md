@@ -51,7 +51,7 @@ A backup in a backup store carries a format version. A release reads each format
 
 ## Support
 
-Fixes ship in patch releases. A fix for an earlier minor release gets a patch release of its own, and the `latest` image tag stays on the newest release.
+Fixes ship in the next release from `main`, which is a minor release unless a maintainer gives the release PR a patch version ([packaging/README.md](../packaging/README.md#the-release-pr)). A fix for an earlier minor release gets a patch release of its own, and the `latest` image tag stays on the newest release.
 
 - The newest minor release gets bug fixes and security fixes.
 - The minor release before it gets security fixes for 3 months after the newest one ships.

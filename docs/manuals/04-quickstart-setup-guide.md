@@ -127,6 +127,7 @@ The binary is at `target/release/extenddb` (or `target/debug/extenddb`).
 
 Check the version:
 
+<!-- x-release-please-start-version -->
 ```bash
 ./target/release/extenddb version
 # extenddb 1.0.0
@@ -135,6 +136,7 @@ Check the version:
 # built 2026-04-17T12:00:00Z
 # test-hooks disabled
 ```
+<!-- x-release-please-end -->
 
 ### Initialization
 

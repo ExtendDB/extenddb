@@ -34,6 +34,17 @@ We suggest following the workflow below for proposing and contributing improveme
 1. Ensure all tests pass and code is properly formatted.
 1. Submit your changes as a pull request, linked to the issue and (if applicable) RFC that your
  work addresses.
+1. The PR description becomes the commit message, and release-please
+ (`.github/workflows/release.yml`) reads the title and the description. Every release from `main` is
+ a minor release, so `feat` and `fix` both go into the next one. A `!` before the colon
+ (`feat(engine)!: ...`), a line that starts with `BREAKING CHANGE:` (also inside a fenced code
+ block), or `BREAKING-CHANGE:` anywhere lists the change under breaking changes, and the release is
+ still a minor one. A line outside a code block that starts like a commit subject
+ (`feat(engine): ...`) counts as another change. A line that starts with a call with nested
+ parentheses, such as `#[cfg(not(test))]`, makes release-please skip the whole change, also inside a
+ fenced code block, so indent such a line by four spaces. A `Release-As: X.Y.Z` line in the last
+ paragraph sets the next version, for a patch or a major release. A revert titled
+ `revert: <the reverted title>` is listed under Reverts in the changelog.
 
 ### Build
 

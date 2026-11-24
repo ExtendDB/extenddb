@@ -287,11 +287,13 @@ Catalog database: extenddb_catalog
 
 extenddb runs as a daemon (background process) and logs to syslog. On startup it prints a two-line banner to stdout, the version, catalog version and bind address followed by the storage backend and its redacted connection string, then forks to background. It says "starting", not "listening": the socket is not accepting connections yet at that point.
 
+<!-- x-release-please-start-version -->
 ```bash
 ./target/release/extenddb serve --config extenddb.toml
 # extenddb 1.0.0 (catalog migration 12) starting on 127.0.0.1:18443
 #   storage: postgres (postgresql://extenddb:***@localhost:5432/extenddb_catalog)
 ```
+<!-- x-release-please-end -->
 
 Check status (includes the daemon PID):
 
@@ -1391,6 +1393,7 @@ Each runner requires its tools to be installed. The runner checks prerequisites 
 
 ## 11. Check version
 
+<!-- x-release-please-start-version -->
 ```bash
 ./target/release/extenddb version
 # extenddb 1.0.0
@@ -1399,6 +1402,7 @@ Each runner requires its tools to be installed. The runner checks prerequisites 
 # built 2026-04-17T12:00:00Z
 # test-hooks disabled
 ```
+<!-- x-release-please-end -->
 
 The `-V` flag prints the same output:
 
