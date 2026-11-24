@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Expression tokenizer — converts expression strings into token streams.
+//! Expression tokenizer: converts expression strings into token streams.
 //!
 //! Handles the complete `DynamoDB` expression grammar including identifiers,
 //! `#name` references, `:value` placeholders, operators, and keywords.
@@ -369,11 +369,11 @@ fn is_ident_char(c: u8) -> bool {
 /// The token text and the `near` window the service reports for a character
 /// the expression grammar does not accept, at byte offset `at` of `input`.
 ///
-/// Measured 2026-10-25 on FilterExpression, ConditionExpression,
-/// KeyConditionExpression, UpdateExpression and ProjectionExpression: the
-/// token is the character as sent (a whole code point, `é` or an emoji), and
-/// the window is the source text from the start of the previous token to the
-/// end of the next one, whitespace kept, each dropped when absent. Every
+/// Measured 2026-10-25 on `FilterExpression`, `ConditionExpression`,
+/// `KeyConditionExpression`, `UpdateExpression` and `ProjectionExpression`:
+/// the token is the character as sent (a whole code point, `é` or an emoji),
+/// and the window is the source text from the start of the previous token to
+/// the end of the next one, whitespace kept, each dropped when absent. Every
 /// character outside the grammar is a token of its own, so `#v = ééé` answers
 /// `token: "é", near: "= éé"`, and a name stops at the first such character,
 /// so `abéc = :v` answers `near: "abéc"`.

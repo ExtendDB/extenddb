@@ -217,13 +217,13 @@ fn tokenize_reports_the_whole_invalid_character() {
 #[test]
 fn tokenize_for_multibyte_utf8_does_not_panic() {
     // Emoji (4-byte UTF-8) should produce a validation error, not a panic.
-    let err = tokenize_for("a = 😀", 4096, super::super::ExpressionKind::Condition).unwrap_err();
+    let err = tokenize_for("a = 😀", 4096, super::super::ExpressionKind::KeyCondition).unwrap_err();
     assert!(
         matches!(err, DynamoDbError::ValidationException(ref msg) if msg.contains("Syntax error"))
     );
 
     // Accented character (2-byte UTF-8)
-    let err = tokenize_for("café", 4096, super::super::ExpressionKind::Filter).unwrap_err();
+    let err = tokenize_for("café", 4096, super::super::ExpressionKind::Projection).unwrap_err();
     assert!(
         matches!(err, DynamoDbError::ValidationException(ref msg) if msg.contains("Syntax error"))
     );
