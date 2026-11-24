@@ -7,7 +7,7 @@ ExpressionAttributeValues value the service cannot read as one type, and an
 ExpressionAttributeNames map the service refuses, in both member orders. boto3
 refuses or reshapes these bodies, so they go out as written. Every expected
 answer below was measured against the service on 2026-10-25 (11:31 UTC),
-2026-11-11, 2026-11-19 and 2026-11-23.
+2026-11-11, 2026-11-19, 2026-11-23 and 2026-11-24.
 
 Dual-target: runs against the service and against extenddb with the same
 assertions.
@@ -264,6 +264,17 @@ NO_SHAPE_FAULT = [
     ("Limit 1.5 with an invalid Select",
      {"Limit": 1.5, "Select": "NOPE", "KeyConditionExpression": "pk = :p",
       "ExpressionAttributeValues": {":p": SX}}, SELECT_NOPE),
+    # A null member and a null name (measured 2026-11-24).
+    ("ScanIndexForward null with an invalid Select",
+     {"ScanIndexForward": None, "Select": "NOPE", "KeyConditionExpression": "pk = :p",
+      "ExpressionAttributeValues": {":p": SX}}, SELECT_NOPE),
+    ("null name with an invalid Select",
+     {"ExpressionAttributeNames": {"#a": None}, "Select": "NOPE",
+      "KeyConditionExpression": "pk = :p", "ExpressionAttributeValues": {":p": SX}}, SELECT_NOPE),
+    ("null name with an invalid ReturnConsumedCapacity",
+     {"ExpressionAttributeNames": {"#a": None}, "ReturnConsumedCapacity": "NOPE",
+      "KeyConditionExpression": "pk = :p", "ExpressionAttributeValues": {":p": SX}},
+     RCC_MSG.replace("'bad'", "'NOPE'")),
 ]
 
 
@@ -273,7 +284,9 @@ class TestMembersTheServiceReadsAreNotShapeFaults:
     an unknown descriptor is a value it cannot read as one type. So none of
     them answers SerializationException, and the check's answer stands
     (measured 2026-11-23). A string such as "on" is a shape fault (see
-    SHAPE_FAULTS)."""
+    SHAPE_FAULTS). The service reads a null member as an absent one and a null
+    name as an empty name, which it reports after these checks, so the
+    check's answer stands there too (measured 2026-11-24)."""
 
     @pytest.mark.parametrize("row,body,expected", NO_SHAPE_FAULT,
                              ids=[r[0] for r in NO_SHAPE_FAULT])
