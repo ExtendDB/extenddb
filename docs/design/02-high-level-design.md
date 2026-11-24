@@ -269,7 +269,7 @@ sequenceDiagram
 
 ### 4.7 Read Consistency and the Proposed PostgreSQL Read Replica
 
-**Decision:** The PostgreSQL backend serves every item read from `data_pool`, the pool that takes the writes, so its reads are strongly consistent whatever `ConsistentRead` says. The flag is accepted and charged (0.5 RCU for eventually consistent, 1.0 RCU for strongly consistent). Routing `ConsistentRead=false` reads to a PostgreSQL streaming replica is a proposal (design document 04, section 5.3; REQ-PG-008; design document 11, Stage 2) and not code that exists.
+**Decision:** The PostgreSQL backend serves every item read from `data_pool`, the pool that takes the writes, so its base table and local secondary index reads are strongly consistent whatever `ConsistentRead` says. Global secondary index rows are maintained through the propagation queue (`index_propagation_delay_ms`, default 10 ms; design document 04, section 6), so a read on a GSI can lag the base table, as on the service. The flag is accepted and charged (0.5 RCU for eventually consistent, 1.0 RCU for strongly consistent). Routing `ConsistentRead=false` reads to a PostgreSQL streaming replica is a proposal (design document 04, section 5.3; REQ-PG-008; design document 11, Stage 2) and not code that exists.
 
 **Rationale:**
 - DynamoDB's eventual consistency is a consequence of reading from storage replicas that haven't received the latest write yet — it's not artificial delays or queues
@@ -278,7 +278,7 @@ sequenceDiagram
 - In the proposal the replica is opt-in; when it is unset, all reads go to the primary, which is what the backend does today
 - Writes always go to the primary. `ConsistentRead=true` always reads from the primary. In the proposal only `ConsistentRead=false` reads route to the replica
 - Capacity calculations always reflect the consistency mode (0.5 RCU for eventually consistent, 1.0 RCU for strongly consistent) whether or not a replica exists
-- The proposal routes on the flag inside the PostgreSQL backend, so it needs the storage trait to carry the flag (design document 11, Stage 1); with that in place it needs no change to the engine or server and is contained in the backend's pool selection
+- The proposal routes on the flag inside the PostgreSQL backend, so it depends on the storage trait carrying the flag to the backend (design document 11, Stage 1); with the flag in the trait it needs no change to the engine or server and is contained in the backend's pool selection
 
 ## 5. Data Flow
 

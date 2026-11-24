@@ -111,8 +111,7 @@ backend = "postgres"     # "postgres" | future: "sqlite", "mysql"
 [storage.postgres]
 connection_string = "postgresql://localhost:5432/extenddb"  # Set credentials via env var in production
 pool_size = 20
-connection_timeout_secs = 5
-statement_timeout_secs = 30
+# catalog_pool_size = 20   # management pool, defaults to pool_size; minimum 10
 
 [auth]
 provider = "builtin"     # "none" | "builtin" | "aws_iam" | future: "azure_ad"
