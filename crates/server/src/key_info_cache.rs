@@ -164,7 +164,8 @@ impl CachedTableKeyInfoStore {
 /// or `RestoreTableFromBackup` target; the data plane reports both as
 /// `ResourceNotFoundException`, as the service does). PostgreSQL and SQLite
 /// answer the key info for a `DELETING` row, since the service serves the data
-/// plane until the table is gone. Caching the second as a negative entry made reads on a
+/// plane until the table is gone.
+/// Caching the `CREATING` answer as a negative entry made reads on a
 /// restored table fail for up to `negative_ttl` after `DescribeTable` reported
 /// it `ACTIVE`: a probe during the copy stored the entry, and nothing
 /// invalidated it at the transition (the service's first
