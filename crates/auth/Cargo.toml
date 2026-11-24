@@ -16,13 +16,17 @@ extenddb-cache = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 thiserror = { workspace = true }
-axum = { workspace = true }
-aws-lc-rs = { workspace = true }
+# SigV4 verification needs an HTTP `HeaderMap`, which `axum` merely re-exports
+# as `axum::http`. Depending on `http` directly (the same types) drops axum's
+# hyper/tokio-net stack from this crate, which has no wasm32 target, so the
+# crate builds on wasm32 where the engine graph reaches it.
+http = { workspace = true }
 libc = { workspace = true }
 sha2 = "0.10"
 hex = "0.4"
 serde_json = { workspace = true }
 time = { workspace = true }
+web-time = { workspace = true }
 tracing = { workspace = true }
 zeroize = { workspace = true }
 urlencoding = { workspace = true }

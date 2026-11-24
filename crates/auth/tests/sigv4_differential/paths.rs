@@ -3,8 +3,8 @@
 
 //! The signature covers the request's path and query string.
 
-use axum::http::Uri;
 use extenddb_core::error::DynamoDbError;
+use http::Uri;
 
 use crate::corpus;
 use crate::harness::{

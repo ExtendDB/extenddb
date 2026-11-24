@@ -15,24 +15,26 @@ applications point their AWS SDKs at extenddb and get identical DynamoDB behavio
 
 ## Cargo Workspace
 
-The project is structured as a Cargo workspace with 13 crates. Crate boundaries enforce dependency rules at compile time.
+The project is structured as a Cargo workspace with 15 crates. Crate boundaries enforce dependency rules at compile time.
 
 ```
 extenddb/
 ├── crates/
 │   ├── app/                Application/CLI library the bin crate dispatches to
 │   ├── auth/               AuthProvider trait, SigV4 verification, IAM policy engine
+│   ├── backup-store/       Backup object store (filesystem and S3)
 │   ├── bin/                CLI entry point, config loading, daemon lifecycle
 │   ├── cache/              Stale-while-revalidate cache used by the auth and server layers
 │   ├── config/             Configuration types and loading
-│   ├── core/               Pure sync Rust: types, expressions, validation, errors
+│   ├── core/               Sync Rust: types, expressions, validation, errors, crypto
 │   ├── engine/             Async operation handlers (PutItem, Query, etc.)
 │   ├── server/             HTTP server (axum), management API, web console
 │   ├── storage/            Storage trait definitions and backend-agnostic utilities
 │   ├── storage-cassandra/  Cassandra backend implementation (experimental)
 │   ├── storage-mongodb/    MongoDB backend implementation
 │   ├── storage-postgres/   PostgreSQL backend implementation (default)
-│   └── storage-sqlite/     SQLite backend implementation (embedded)
+│   ├── storage-sqlite/     SQLite backend implementation (embedded)
+│   └── wasm-adapter/       Experimental WebAssembly build of the engine (publish = false)
 ```
 
 ## Crate Dependency Graph
@@ -47,18 +49,22 @@ bin ──→ server ──→ engine ──→ core
  │
  ├──→ storage-{postgres,sqlite,mongodb,cassandra} ──→ storage ──→ core
  └──→ core
+
+wasm-adapter ──→ engine, storage-sqlite, storage, auth, core
 ```
 
 Exactly one `storage-*` backend is linked per binary, selected by mutually exclusive Cargo features at build time.
 
-Key principle: `core` depends on nothing in the workspace and has no async runtime. It contains pure sync Rust: types,
-expression parsing and evaluation, input validation, capacity calculation, and error types. Every other crate depends on `core`.
+Key principle: `core` depends on nothing in the workspace and has no async runtime. It contains sync Rust: types,
+expression parsing and evaluation, input validation, capacity calculation, error types, and the crypto module, which
+links AWS-LC through `aws-lc-rs` natively. Every crate but `cache` and `backup-store` depends on `core`, directly or
+through another crate.
 
 ## Crate Roles
 
 ### core
 
-Pure sync Rust library. No async runtime, no database drivers, no HTTP framework.
+Sync Rust library. No async runtime, no database drivers, no HTTP framework.
 
 - **types**: `AttributeValue`, `KeySchema`, `TableMetadata`, `StreamRecord`, and all DynamoDB data types
 - **expression**: Parser and evaluator for `ConditionExpression`, `FilterExpression`, `UpdateExpression`, `ProjectionExpression`, and `KeyConditionExpression`
@@ -66,6 +72,9 @@ Pure sync Rust library. No async runtime, no database drivers, no HTTP framework
 - **error**: `DynamoDbError` enum mapping every DynamoDB error code to its HTTP status and message
 - **limits**: Configurable limits matching real DynamoDB defaults (item size, batch sizes, expression depth/tokens)
 - **capacity**: RCU/WCU calculation logic
+- **crypto**: SHA-256, HMAC-SHA256, constant-time comparison, AES-256-GCM `seal`/`open` and a random fill; AWS-LC
+  through `aws-lc-rs` natively; on `wasm32`, the RustCrypto `sha2`, `hmac` and `aes-gcm` crates, `subtle` for the
+  comparison and `getrandom` over the browser's Web Crypto for randomness
 
 ### engine
 
@@ -164,6 +173,13 @@ Thin binary that wires everything together:
 - Configuration loading (TOML + env vars)
 - Daemon lifecycle (bind socket → fork → syslog → serve)
 - Background tasks (log level polling, throttling polling, GSI delay polling, stream record cleanup, TTL expiry, metrics persistence)
+
+### wasm-adapter
+
+Experimental WebAssembly build of the engine (`publish = false`). It compiles the engine, `storage-sqlite` over an
+in-memory database, and the crates they depend on to `wasm32-unknown-unknown`, and exposes a `wasm-bindgen` surface
+that answers a DynamoDB request by calling `engine`'s `dispatch` in process, with no server. The README section
+"Experimental: WebAssembly build" lists what it does not do and what it refuses.
 
 ## Request Lifecycle
 

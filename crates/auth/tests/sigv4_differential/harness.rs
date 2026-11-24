@@ -12,13 +12,13 @@ use aws_sigv4::http_request::{
     PayloadChecksumKind, SignableBody, SignableRequest, SigningSettings, sign as sdk_sign,
 };
 use aws_sigv4::sign::v4;
-use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use extenddb_auth::sigv4::{canonical, parse};
 use extenddb_auth::{
     AuthIdentity, AuthProvider, BuiltinAuthProvider, CachedCredentialStore, CredentialStore,
     StoredCredential,
 };
 use extenddb_core::error::DynamoDbError;
+use http::{HeaderMap, HeaderName, HeaderValue};
 
 use crate::capture;
 
