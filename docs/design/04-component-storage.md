@@ -819,16 +819,27 @@ WHERE pk = $gsi_pk
 ORDER BY sk_s COLLATE "C" ASC, sk2_n ASC, base_pk COLLATE "C" ASC, base_sk_n ASC
 ```
 
-**LSI Query:** every row of an LSI partition shares the base partition key. So
-the cursor and the `ORDER BY` use the index sort key and the base sort key:
-`(sk_s COLLATE "C", base_sk_n) > ($lsi_sk, $base_sk)` forward and `<` in
-reverse. The ordering index on the LSI table is `(pk, sk_s, base_pk, base_sk_n)`,
-so after the fixed `pk` it orders by `sk_s` only. The database applies the
-cursor while it reads the index. It then sorts the rows that share an index
-sort key value by the base sort key, and applies the `LIMIT` after that sort.
-PostgreSQL adds an Incremental Sort node with `Presorted Key: sk_s`, and SQLite
-a temporary B-tree for the last `ORDER BY` term. The first page sorts the same
-way. The sort changes neither the result nor the page boundaries.
+**LSI Query:** an LSI cursor compares the index sort key, then `base_pk`, then
+the base sort key. These are the three columns of the GSI cursor above, and the
+`ORDER BY` lists them in the same order. The cursor is one row comparison. On
+every column, the cursor and the `ORDER BY` run in the direction of
+`ScanIndexForward`: `>` and `ASC` forward, `<` and `DESC` in reverse. Every row of an LSI partition
+stores the queried partition key as `base_pk`. The cursor binds the start key's
+partition key for it, and request validation refuses a start key from another
+partition. So `base_pk` compares equal on every row, and the order
+and page boundaries are those of the index sort key and the base sort key.
+Including `base_pk` makes the `ORDER BY` match the ordering index
+`(pk, sk_s, base_pk, base_sk_n)` after the fixed `pk`. The index can then return
+the page in order without a sort step. With `(sk_s, base_sk_n)` alone, the index
+orders `sk_s` only, and the database sorts the rows that share an index sort
+key value. PostgreSQL adds an Incremental Sort when the key condition leaves
+several index sort key values. It adds a Sort when an equality on the index sort
+key leaves one. SQLite adds a temporary B-tree.
+```sql
+WHERE pk = $lsi_pk
+  AND (sk_s COLLATE "C", base_pk COLLATE "C", base_sk_n) > ($lsi_sk, $base_pk, $base_sk)
+ORDER BY sk_s COLLATE "C" ASC, base_pk COLLATE "C" ASC, base_sk_n ASC
+```
 
 **Hash-only index:** there is no index sort key, so the cursor is the base
 primary key alone, `(base_pk COLLATE "C", base_sk_n) > ($base_pk, $base_sk)`
@@ -840,9 +851,9 @@ key the cursor is
 `(pk, sk_s COLLATE "C", base_pk COLLATE "C", base_sk_n) > ($last_pk, $last_sk, $base_pk, $base_sk)`,
 with `ORDER BY pk, sk_s COLLATE "C", base_pk COLLATE "C", base_sk_n`. On a
 hash-only index it is `(pk, base_pk COLLATE "C", base_sk_n) > ($last_pk, $base_pk, $base_sk)`,
-with `ORDER BY pk, base_pk COLLATE "C", base_sk_n`. The LSI Scan keeps
-`base_pk`, which the LSI Query drops, so the ordering index serves it with no
-sort step. The primary key serves the hash-only index Scan. A Scan on an index
+with `ORDER BY pk, base_pk COLLATE "C", base_sk_n`. The ordering index serves
+the LSI Scan with no sort step. The primary key serves the hash-only index
+Scan. A Scan on an index
 with more than one RANGE attribute compares and orders by the first RANGE
 column only (`sk_s`, `sk_n` or `sk_b`), ahead of `base_pk`. That is still a
 total order, because the cursor holds the full base key. The ordering index
