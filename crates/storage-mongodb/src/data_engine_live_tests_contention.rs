@@ -143,7 +143,7 @@ async fn stored_item(engine: &MongoEngine, key_info: &TableKeyInfo, pk: &str) ->
 async fn live_concurrent_unconditional_puts_on_one_key_of_a_gsi_table_all_commit() {
     const WRITERS: usize = 32;
     const PUTS: usize = 8;
-    let engine = Arc::new(engine_with_deadline(Duration::from_secs(600)).await);
+    let engine = Arc::new(engine_with_deadline(Duration::from_mins(10)).await);
     let key_info = Arc::new(gsi_path_table(&engine, "hot-key"));
     let gsi_key_schema = vec![KeySchemaElement {
         attribute_name: "gk".to_owned(),
@@ -468,7 +468,7 @@ async fn live_a_transaction_that_reaches_the_deadline_answers_a_canceled_transac
 #[tokio::test]
 #[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
 async fn live_unconditional_put_that_spends_its_attempt_budget_gives_up_with_a_transient_error() {
-    let engine = engine_with_deadline(Duration::from_secs(600)).await;
+    let engine = engine_with_deadline(Duration::from_mins(10)).await;
     let maps = ExpressionMaps::default();
     let key_info = gsi_path_table(&engine, "held-key");
     let mut holder = hold_item_in_a_transaction(&engine, &key_info, "k1").await;
@@ -513,7 +513,7 @@ async fn live_unconditional_put_that_spends_its_attempt_budget_gives_up_with_a_t
     // The 1,000 attempts take 9.5 to 12.7 s on a shared host, and the sleeps
     // alone come to 12.8 s at worst, so the upper bound is loose: what it
     // rules out is a budget that no longer ends the loop at all.
-    assert!(elapsed < Duration::from_secs(120), "took {elapsed:?}");
+    assert!(elapsed < Duration::from_mins(2), "took {elapsed:?}");
     assert_eq!(
         stored_item(&engine, &key_info, "k1").await,
         Some(item_with("k1", "held"))

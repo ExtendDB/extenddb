@@ -4091,14 +4091,14 @@ pub(crate) fn is_duplicate_key(e: &mongodb::error::Error) -> bool {
         )
 }
 
-/// The error when every attempt of an unconditional PutItem lost the create
+/// The error when every attempt of an unconditional `PutItem` lost the create
 /// race: on the sessionless path, each attempt found no item, and its insert
 /// hit an item another writer created, which was deleted again before the
 /// next attempt read it; on the transaction path, `TRANSIENT_RETRY_ATTEMPTS`
 /// attempts met a document that holds the item's `_id` without matching the
 /// key filter.
 /// `attempt` is the number of attempts made. The message is the internal
-/// error (HTTP 500) the PostgreSQL backend returns when its own retries of
+/// error (HTTP 500) the `PostgreSQL` backend returns when its own retries of
 /// this race run out.
 fn create_race_exhausted(attempt: u32) -> StorageError {
     StorageError::Internal(format!(

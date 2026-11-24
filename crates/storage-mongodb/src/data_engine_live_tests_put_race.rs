@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Live MongoDB tests for an unconditional PutItem whose insert hits the
+//! Live `MongoDB` tests for an unconditional `PutItem` whose insert hits the
 //! `_id_` unique index: the put's filter on the key finds no item, and
 //! another document already holds the item's `_id`. On the sessionless path
 //! that is how a put that loses the create race to another put fails. On the
@@ -52,7 +52,7 @@ fn document_id(item: &Item, key_info: &TableKeyInfo) -> Bson {
         .expect("document has an _id")
 }
 
-/// An unconditional PutItem whose insert keeps colliding on `_id` retries for
+/// An unconditional `PutItem` whose insert keeps colliding on `_id` retries for
 /// the whole retry budget, then gives up with the create race error, on the
 /// sessionless path and on the transaction path.
 ///
@@ -108,11 +108,11 @@ enum Obstruction {
     /// It is replaced, under the same `_id`, with the item of another put
     /// that created the key.
     BecomesTheOtherPutsItem,
-    /// It is deleted, as a DeleteItem removes the item another put created.
+    /// It is deleted, as a `DeleteItem` removes the item another put created.
     IsDeleted,
 }
 
-/// An unconditional PutItem whose first attempts collide on `_id` succeeds on
+/// An unconditional `PutItem` whose first attempts collide on `_id` succeeds on
 /// a later attempt, on the sessionless path and on the transaction path.
 ///
 /// The put starts while a document holds the item's `_id` under another
