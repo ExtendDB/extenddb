@@ -25,6 +25,18 @@ struct SettingEntry {
     value: String,
 }
 
+/// The value a route returns for the row `key`: [`MASK`] for a key that
+/// [`should_redact`] matches, with the stored value wiped first, so the route
+/// keeps no copy of a secret such as the catalog key; else the value.
+fn shown(key: &str, mut value: String) -> String {
+    if should_redact(key) {
+        zeroize::Zeroize::zeroize(&mut value);
+        MASK.to_owned()
+    } else {
+        value
+    }
+}
+
 fn op_err_to_response(e: extenddb_storage::management_store::OpError) -> Response {
     super::ops::op_err_to_response(super::ops::OpError::from_storage(e))
 }
@@ -46,11 +58,7 @@ pub async fn list_settings(
             let entries: Vec<SettingEntry> = rows
                 .into_iter()
                 .map(|(key, value)| SettingEntry {
-                    value: if should_redact(&key) {
-                        MASK.to_owned()
-                    } else {
-                        value
-                    },
+                    value: shown(&key, value),
                     key,
                 })
                 .collect();
@@ -74,18 +82,11 @@ pub async fn get_setting(
     }
 
     match state.catalog_store.get_setting(&key).await {
-        Ok(Some(value)) => {
-            let display_value = if should_redact(&key) {
-                MASK.to_owned()
-            } else {
-                value
-            };
-            Json(SettingEntry {
-                key,
-                value: display_value,
-            })
-            .into_response()
-        }
+        Ok(Some(value)) => Json(SettingEntry {
+            value: shown(&key, value),
+            key,
+        })
+        .into_response(),
         Ok(None) => (axum::http::StatusCode::NOT_FOUND, "Setting not found").into_response(),
         Err(e) => op_err_to_response(e),
     }
@@ -111,18 +112,38 @@ pub async fn set_setting(
     }
 
     match ops_settings::set_setting(&*state.catalog_store, &key, &body.value).await {
-        Ok(()) => {
-            let display_value = if should_redact(&key) {
-                MASK.to_owned()
-            } else {
-                body.value
-            };
-            Json(SettingEntry {
-                key,
-                value: display_value,
-            })
-            .into_response()
-        }
+        Ok(()) => Json(SettingEntry {
+            value: shown(&key, body.value),
+            key,
+        })
+        .into_response(),
         Err(e) => op_err_to_response(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MASK, shown};
+
+    /// A row whose key has a secret pattern is masked, the key ring of a KEK
+    /// deployment among them; any other value passes through.
+    #[test]
+    fn a_secret_row_is_masked_and_others_pass_through() {
+        for (key, value, expected) in [
+            (
+                "encryption_key",
+                "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+                MASK,
+            ),
+            ("encryption_key_ring", "{\"version\":1}", MASK),
+            (
+                "data_database_connection_string",
+                "postgresql://extenddb:apppassword@127.0.0.1/extenddb",
+                MASK,
+            ),
+            ("log_level", "info", "info"),
+        ] {
+            assert_eq!(shown(key, value.to_owned()), expected, "{key}");
+        }
     }
 }

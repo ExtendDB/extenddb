@@ -66,7 +66,7 @@ docker run --rm \
   -v "$PWD/extenddb-state:/var/lib/extenddb" \
   -e EXTENDDB_ADMIN_USER=admin \
   -e EXTENDDB_ADMIN_PASSWORD='replace-this-password' \
-  extenddb/extenddb-mongodb:0.1.8 \
+  extenddb/extenddb-mongodb:X.Y.Z \
   init --backend mongodb \
   --config /var/lib/extenddb/extenddb.toml \
   --overwrite --bind-addr 0.0.0.0 \
@@ -77,7 +77,7 @@ docker run -d --name extenddb-mongodb \
   -v "$PWD/extenddb-state:/var/lib/extenddb" \
   --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m \
   --cap-drop ALL --security-opt no-new-privileges:true \
-  extenddb/extenddb-mongodb:0.1.8
+  extenddb/extenddb-mongodb:X.Y.Z
 ```
 
 For production, inject credentials through the orchestrator's secret store,

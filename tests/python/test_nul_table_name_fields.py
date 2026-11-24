@@ -19,6 +19,7 @@ from botocore.exceptions import ClientError
 
 from helpers import (
     MEMBER_PATTERN,
+    PITR_REFUSAL,
     assert_member_pattern,
     assert_validation,
     unique_name,
@@ -85,18 +86,23 @@ class TestTableNameFieldsBeyondTableName:
             except Exception:
                 pass
 
-    def test_restore_table_to_point_in_time_names(self, raw_client, nul_table):
+    def test_restore_table_to_point_in_time_names(self, raw_client, nul_table, is_extenddb):
+        # The service checks each name; ExtendDB refuses every restore before
+        # its names are checked, because point-in-time recovery is not in this
+        # release.
         name, _ = nul_table
-        with pytest.raises(ClientError) as exc:
-            raw_client.restore_table_to_point_in_time(
-                SourceTableName=BAD, TargetTableName=unique_name("tgt"), UseLatestRestorableTime=True
-            )
-        assert_member_pattern(exc.value, "sourceTableName", BAD)
-        with pytest.raises(ClientError) as exc:
-            raw_client.restore_table_to_point_in_time(
-                SourceTableName=name, TargetTableName=BAD, UseLatestRestorableTime=True
-            )
-        assert_member_pattern(exc.value, "targetTableName", BAD)
+        for location, params in (
+            ("sourceTableName", {"SourceTableName": BAD, "TargetTableName": unique_name("tgt")}),
+            ("targetTableName", {"SourceTableName": name, "TargetTableName": BAD}),
+        ):
+            with pytest.raises(ClientError) as exc:
+                raw_client.restore_table_to_point_in_time(UseLatestRestorableTime=True, **params)
+            if is_extenddb:
+                assert_validation(
+                    exc.value, PITR_REFUSAL, code="PointInTimeRecoveryUnavailableException"
+                )
+            else:
+                assert_member_pattern(exc.value, location, BAD)
 
     def test_import_table_creation_parameters_table_name(self, raw_client):
         with pytest.raises(ClientError) as exc:
@@ -138,9 +144,9 @@ class TestTableNameFieldsBeyondTableName:
             pytest.param(
                 lambda c, t: c.update_continuous_backups(
                     TableName=t,
-                    PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": True},
+                    PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": False},
                 ),
-                id="UpdateContinuousBackups",
+                id="UpdateContinuousBackups-disable",
             ),
         ],
     )

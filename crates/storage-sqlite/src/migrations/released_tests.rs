@@ -19,7 +19,7 @@ use super::tests::{
 };
 
 /// Settings rows a released baseline seeded with an equal default in code.
-/// v1.0 seeds none of them and keeps the ones it finds, because a seeded
+/// Migration 1 seeds none of them and keeps the ones it finds, because a seeded
 /// value cannot be told from one an operator set.
 const DEV_IMAGE_SETTINGS: &[(&str, &str)] = &[
     ("control_plane_delay_seconds", "0.25"),
@@ -183,8 +183,9 @@ const BACKUP_WITH_SORT_KEYS: &str = "\
         ('arn:with-sort-keys', 'p0', 's01', '{\"pk\":{\"S\":\"p0\"},\"sk\":{\"S\":\"s01\"}}'), \
         ('arn:with-sort-keys', 'p0', 's02', '{\"pk\":{\"S\":\"p0\"},\"sk\":{\"S\":\"s02\"}}');";
 
-/// A v1.0 catalog seeded as the fixtures were: the bootstrap rows, then
-/// CreateTable `cu_orders` with its GSI, LSI and stream, and its TTL index.
+/// A catalog this binary created, seeded as the fixtures were: the
+/// bootstrap rows, then CreateTable `cu_orders` with its GSI, LSI and
+/// stream, and its TTL index.
 async fn fresh_seeded() -> BTreeMap<String, Vec<String>> {
     let db = temp_db("fresh-seeded");
     run(&db).await.expect("fresh install");
@@ -419,9 +420,9 @@ async fn the_metrics_store_keeps_two_accounts_apart() {
     pool.close().await;
 }
 
-/// A release before 1.0 that starts on a v1.0 catalog rewrites
+/// A release before 0.1.15 that starts on a migrated catalog rewrites
 /// `catalog_version` (SQLite dev builds) or the marker (`migrate --yes`).
-/// v1.0 then reports it, refuses to migrate, and `--reconverge` repairs it,
+/// This binary then reports it, refuses to migrate, and `--reconverge` repairs it,
 /// leaving the ledger rows as the first application wrote them.
 #[tokio::test]
 async fn a_catalog_an_older_release_wrote_to_is_reported_and_reconverged() {
@@ -641,11 +642,13 @@ async fn changed_ahead_and_forgotten_ledgers() {
     )
     .await;
 
-    // An unreleased id, migration 4, can be forgotten and runs again.
+    // Migration 4 can be forgotten and runs again. The runner is given a
+    // released bound of 0, so 4 is unreleased whatever bound this binary
+    // carries.
     let migrations = SqliteMigrations::open(&db.to_string_lossy())
         .await
         .expect("open");
-    let runner = Runner::new(&migrations, RELEASE);
+    let runner = Runner::new(&migrations, RELEASE).with_released_through(0);
     let four = MigrationId::IndexTableBaseKey.number();
     runner.forget(four).await.expect("forget 4");
     assert!(matches!(

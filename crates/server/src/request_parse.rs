@@ -27,10 +27,11 @@
 //! default depth on an unauthenticated connection.
 
 use serde::Deserialize;
-use serde::de::IgnoredAny;
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
+
+use crate::request_syntax::number_byte;
 
 /// Largest structural nesting (`{`/`[` openers on one path) the request parser
 /// accepts; `serde_json`'s own default is 128.
@@ -174,12 +175,6 @@ fn read_json<T>(
         .map_err(|_| serialization_refusal())
 }
 
-/// Whether `b` can be part of a number as the service reads one. The service
-/// takes a run of these bytes that starts with a digit or `-` as one number.
-fn number_byte(b: u8) -> bool {
-    matches!(b, b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
-}
-
 /// What the bytes of a number read so far spell, for [`rewrite_numbers`].
 #[derive(Clone, Copy)]
 enum Token {
@@ -246,21 +241,23 @@ fn rewrite_numbers(body: &[u8]) -> Option<Vec<u8>> {
 /// Check the JSON syntax of a request body without building it, so the handler
 /// can refuse a malformed body nested past [`UNAUTHENTICATED_PARSE_DEPTH`]
 /// before authentication, as the service does.
-/// `serde_json` skips an ignored value in one loop that keeps the kinds of the
-/// open containers on a heap stack, so the check does not recurse at any
-/// depth.
+/// [`crate::request_syntax::skip_value`] reads the body's first value in one
+/// loop that keeps the closers of the open containers on a heap stack, so the
+/// check does not recurse at any depth.
 ///
-/// The check reads one JSON value, as the service's check before
-/// authentication does: bytes after a complete body, an invalid UTF-8 byte in
-/// a string and a lone surrogate escape all pass it (measured 2026-11-19,
-/// us-east-1: unsigned, each is a `MissingAuthenticationTokenException`). A
-/// number that [`rewrite_numbers`] rewrites passes it, as it passes the
-/// parse.
+/// The check reads one JSON value with the grammar
+/// [`crate::request_syntax::skip_value`] describes.
+/// Bytes after a complete body, an invalid UTF-8 byte in a string and a lone
+/// surrogate escape pass it (measured 2026-11-19, us-east-1: unsigned, each is
+/// a `MissingAuthenticationTokenException`). So do the numbers `01`, `1.`,
+/// `1e` and `-`, the escape `\u12G4`, and NUL, VT and FF between tokens
+/// (measured 2026-11-24, us-east-1, at 63 and 20000 wrappers: unsigned, each
+/// is a `MissingAuthenticationTokenException`, and badly signed an
+/// `InvalidSignatureException`). A body that fails it gets the message-less
+/// `SerializationException` of [`serialization_refusal`], as from
+/// [`parse_request_value`].
 pub(crate) fn check_request_syntax(body: &[u8]) -> Result<(), DynamoDbError> {
-    read_json(body, |body| {
-        IgnoredAny::deserialize(&mut serde_json::Deserializer::from_slice(body))
-            .map(|IgnoredAny| ())
-    })
+    crate::request_syntax::skip_value(body).map_err(|_| serialization_refusal())
 }
 
 /// The refusal for a body with a JSON syntax fault or nested past
@@ -284,17 +281,39 @@ mod tests {
     /// maps around a string leaf: `{"M":{"n": ... {"S":"leaf"} ... }}`. Its
     /// structural depth is `3 + 2 * wrappers`.
     fn deep_body(wrappers: usize) -> Vec<u8> {
-        let mut s = String::from(r#"{"TableName":"t","Item":{"data":"#);
-        for _ in 0..wrappers {
-            s.push_str(r#"{"M":{"n":"#);
-        }
-        s.push_str(r#"{"S":"leaf"}"#);
-        for _ in 0..wrappers {
-            s.push_str("}}");
-        }
-        s.push_str("}}");
-        s.into_bytes()
+        deep_body_with_leaf(wrappers, br#"{"S":"leaf"}"#)
     }
+
+    /// [`deep_body`] with `leaf` in place of `{"S":"leaf"}`.
+    fn deep_body_with_leaf(wrappers: usize, leaf: &[u8]) -> Vec<u8> {
+        let mut body = br#"{"TableName":"t","Item":{"data":"#.to_vec();
+        for _ in 0..wrappers {
+            body.extend_from_slice(br#"{"M":{"n":"#);
+        }
+        body.extend_from_slice(leaf);
+        for _ in 0..wrappers {
+            body.extend_from_slice(b"}}");
+        }
+        body.extend_from_slice(b"}}");
+        body
+    }
+
+    /// The leaves the service's check before authentication passes where
+    /// `serde_json`'s grammar refuses them (measured 2026-11-24, us-east-1, at
+    /// 63 and 20000 wrappers: unsigned, each is a
+    /// `MissingAuthenticationTokenException`, and badly signed an
+    /// `InvalidSignatureException`): the numbers `01`, `1.`, `1e` and `-`, the
+    /// escape `\u12G4`, and FF, NUL and VT before a value.
+    const LOOSE_LEAVES: [&[u8]; 8] = [
+        br#"{"S":01}"#,
+        br#"{"S":1.}"#,
+        br#"{"S":1e}"#,
+        br#"{"S":-}"#,
+        br#"{"S":"le\u12G4af"}"#,
+        b"{\"S\":\x0c\"leaf\"}",
+        b"{\"S\":\x00\"leaf\"}",
+        b"{\"S\":\x0b\"leaf\"}",
+    ];
 
     fn parse(body: &[u8]) -> Result<Value, DynamoDbError> {
         parse_request_value(body, nesting_depth(body))
@@ -454,17 +473,24 @@ mod tests {
     #[test]
     fn a_body_with_a_syntax_fault_is_refused_with_no_message() {
         // Rows: a body that parses, a fault the parse meets, a fault within
-        // the ceiling that only the check meets before authentication, and a
-        // fault past the ceiling, each with the body that spells the value the
-        // server reads, or `None` when it refuses the body. The service sends
-        // no message field for a signed body with a syntax fault (measured
-        // 2026-11-19 and 2026-11-20, us-east-1). It reads a number written
-        // with leading zeros as the decimal number it spells, a `-` on its
-        // own as 0 and digits that end in a `.` as the digits (measured
-        // 2026-11-21, us-east-1), so such a body is read at every depth, with
-        // the bytes of its strings as sent. The parse and the check give each
-        // row the same answer. The parse recurses, so the rows run on a
-        // worker-sized stack.
+        // the ceiling that only the check meets before authentication, a
+        // fault past the ceiling, bodies with numbers written with leading
+        // zeros, a trailing `.` or a `-` on its own, and seven faults in the
+        // leaf of a 200 wrapper body, each with the body that spells the value
+        // the server reads, or `None` when it refuses the body. The service
+        // sends no message field for a signed body with a syntax fault
+        // (measured 2026-11-19 and 2026-11-20, us-east-1) and refuses each
+        // leaf fault before authentication (measured in us-east-1: the
+        // control byte and the unknown escape in a string on 2026-11-20,
+        // unsigned, badly signed and signed; the `\u` before the closing
+        // quote, SOH before a value, `tru`, the missing colon and the missing
+        // comma on 2026-11-24, unsigned and badly signed). It reads a number
+        // written with leading zeros as the decimal number it spells, a `-`
+        // on its own as 0 and digits that end in a `.` as the digits
+        // (measured 2026-11-21, us-east-1), so such a body is read at every
+        // depth, with the bytes of its strings as sent. The parse and the
+        // check give each row the same answer. The parse recurses, so the
+        // rows run on a worker-sized stack.
         let nested = |leaf: &[u8]| {
             let levels = UNAUTHENTICATED_PARSE_DEPTH + 1000;
             [b"[".repeat(levels), leaf.to_vec(), b"]".repeat(levels)].concat()
@@ -500,21 +526,32 @@ mod tests {
                 Some(br#"{"k.": "1.", "N": "-", "x": [1, 1.5, 1e5, 1E+5, -1, 0]}"#.to_vec()),
             ),
             (nested(b"-"), Some(nested(b"0"))),
+            (deep_body_with_leaf(200, br#"{"S":"le\u"}"#), None),
+            (deep_body_with_leaf(200, b"{\"S\":\x01\"leaf\"}"), None),
+            (deep_body_with_leaf(200, br#"{"S":tru}"#), None),
+            (deep_body_with_leaf(200, br#"{"S" "leaf"}"#), None),
+            (deep_body_with_leaf(200, br#"{"S":"leaf" "T":"x"}"#), None),
+            (deep_body_with_leaf(200, b"{\"S\":\"le\x01af\"}"), None),
+            (deep_body_with_leaf(200, br#"{"S":"le\qaf"}"#), None),
         ];
         // Numbers the service refuses in an integer member with "Bad number
         // format" and skips outside its model, the fractions `-.5` and `1.e7`
         // it reads (#720), and `+1`, `.5` and `0x10`, which it refuses with no
         // message (measured 2026-11-21 and 2026-11-22, us-east-1): each stays
-        // as sent, so the body is refused.
+        // as sent, so the parse refuses the body. The check before
+        // authentication is not run on these rows: it reads a number as `-`
+        // or a digit and then any run of number bytes, as the service does
+        // with `1e` and `-` (the pass test below), so it passes every row
+        // that starts that way.
         let refused = [
             "-.", "1e", "1E", "1e+", "1.e", "1.5e", "1e5.", "--1", "1-", "1.5.5", "1+1", "-e",
             "-.5", "1.e7", "+1", ".5", "0x10",
         ]
-        .map(|number| (format!(r#"{{"x": {number}}}"#).into_bytes(), None));
+        .map(|number| format!(r#"{{"x": {number}}}"#).into_bytes());
         std::thread::Builder::new()
             .stack_size(REQUEST_WORKER_STACK_SIZE)
             .spawn(move || {
-                for (row, (body, reads_as)) in rows.iter().chain(&refused).enumerate() {
+                for (row, (body, reads_as)) in rows.iter().enumerate() {
                     let parsed = parse(body);
                     if let (Ok(value), Some(spelled)) = (&parsed, reads_as) {
                         assert_eq!(*value, parse(spelled).unwrap(), "row {row}");
@@ -529,6 +566,12 @@ mod tests {
                         }
                     }
                 }
+                for (row, body) in refused.iter().enumerate() {
+                    match parse(body) {
+                        Err(DynamoDbError::SerializationException(m)) if m.is_empty() => {}
+                        answer => panic!("refused row {row}: {answer:?}"),
+                    }
+                }
             })
             .unwrap()
             .join()
@@ -537,25 +580,25 @@ mod tests {
 
     #[test]
     fn the_syntax_check_passes_what_the_service_authenticates_first() {
-        // Rows: bodies the service's check before authentication passes
+        // Rows: bodies the service's check before authentication passes.
+        // Complete bodies far past the ceiling, bytes after a complete body,
+        // an invalid UTF-8 byte in a string and a lone surrogate escape
         // (measured 2026-11-19, us-east-1: unsigned, each is a
-        // MissingAuthenticationTokenException). Complete bodies far past the
-        // ceiling, bytes after a complete body, an invalid UTF-8 byte in a
-        // string and a lone surrogate escape. This runs on the default
-        // test-thread stack, where a parse that recursed a million levels
-        // would overflow, so it also shows that the check does not recurse.
-        let leaf = |with: &[u8]| {
-            let body = deep_body(200);
-            let at = body.windows(6).position(|w| w == b"\"leaf\"").unwrap();
-            [&body[..at], with, &body[at + 6..]].concat()
-        };
-        let rows = [
+        // MissingAuthenticationTokenException), and each leaf of
+        // `LOOSE_LEAVES` at 63 and at 20000 wrappers (measured 2026-11-24).
+        // This runs on the default test-thread stack, where a parse that
+        // recursed a million levels would overflow, so it also shows that the
+        // check does not recurse.
+        let mut rows = vec![
             [b"[".repeat(1_000_000), b"]".repeat(1_000_000)].concat(),
             deep_body(20000),
             [deep_body(2000), b"x".to_vec()].concat(),
-            leaf(b"\"le\xffaf\""),
-            leaf(br#""le\ud800af""#),
+            deep_body_with_leaf(200, b"{\"S\":\"le\xffaf\"}"),
+            deep_body_with_leaf(200, br#"{"S":"le\ud800af"}"#),
         ];
+        for wrappers in [63, 20000] {
+            rows.extend(LOOSE_LEAVES.map(|leaf| deep_body_with_leaf(wrappers, leaf)));
+        }
         for body in &rows {
             let depth = nesting_depth(body);
             assert!(depth > UNAUTHENTICATED_PARSE_DEPTH, "{} bytes", body.len());
