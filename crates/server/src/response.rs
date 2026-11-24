@@ -11,6 +11,10 @@ use serde_json::Value;
 /// REQ-WIRE-012: the media type of the API's answers.
 pub(crate) const AMZ_JSON_1_0: &str = "application/x-amz-json-1.0";
 
+#[cfg(test)]
+#[path = "response_tests.rs"]
+mod message_key_tests;
+
 /// Hardcoded fallback body for when response serialization itself fails.
 const SERIALIZATION_FAILURE_BODY: &[u8] =
     br#"{"__type":"com.amazonaws.dynamodb.v20120810#InternalServerError","message":"Internal error"}"#;
@@ -54,8 +58,9 @@ pub(crate) fn success_response(body: &Value, request_id: &str) -> Response {
     wire_response(StatusCode::OK, Some(AMZ_JSON_1_0), body_bytes, request_id)
 }
 
-/// REQ-ERR-001: `__type` with prefix. REQ-ERR-002: message field.
-/// REQ-ERR-003: Omit `message` when empty (real `DynamoDB` behavior, verified 2026-05-04).
+/// REQ-ERR-001: `__type` with prefix. REQ-ERR-002: message field, under the
+/// key [`message_key`] picks. REQ-ERR-003: Omit the message field when empty
+/// (real `DynamoDB` behavior, verified 2026-05-04).
 pub(crate) fn error_response(error: &DynamoDbError, request_id: &str) -> Response {
     // Fix #14: Use full_error_type() which includes the prefix
     let mut body = serde_json::json!({
@@ -65,7 +70,7 @@ pub(crate) fn error_response(error: &DynamoDbError, request_id: &str) -> Respons
     // UnknownOperationException and other errors with no message).
     let msg = error.message();
     if !msg.is_empty() {
-        body["message"] = serde_json::Value::String(msg.to_owned());
+        body[message_key(error)] = serde_json::Value::String(msg.to_owned());
     }
     // TransactionCanceledException includes per-item CancellationReasons
     if let Some(reasons) = error.cancellation_reasons() {
@@ -81,6 +86,22 @@ pub(crate) fn error_response(error: &DynamoDbError, request_id: &str) -> Respons
         StatusCode::from_u16(error.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
     wire_response(status, Some(AMZ_JSON_1_0), body_bytes, request_id)
+}
+
+/// The key that carries the error message. `DynamoDB` sends `Message` on
+/// `TransactionCanceledException` and `IdempotentParameterMismatchException`
+/// (us-east-1, raw bodies, 2026-10-29, 2026-11-03 and 2026-11-19). It also
+/// sends `Message` on `TransactionInProgressException`, which ExtendDB does
+/// not raise, and on `AccessDeniedException` and `SerializationException`
+/// (2026-11-12 and 2026-11-19), which keep `message` here. The other errors
+/// measured carry `message`. REQ-ERR-002 in `docs/design/01-requirements.md`
+/// lists them.
+fn message_key(error: &DynamoDbError) -> &'static str {
+    match error {
+        DynamoDbError::TransactionCanceledException { .. }
+        | DynamoDbError::IdempotentParameterMismatchException(_) => "Message",
+        _ => "message",
+    }
 }
 
 /// Classify and record error metrics for a failed `DynamoDB` request.
