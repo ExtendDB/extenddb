@@ -14,15 +14,18 @@ An IndexName outside ``[a-zA-Z0-9_.-]+`` (``vidx/extra``) gets ValidationExcepti
 for every caller, before the policy decision, as Query and Scan do.
 
 The ``ROWS`` were measured on DynamoDB in us-east-1 on 2026-11-21, each
-request twice with the same answer. The ``deny(ssn)`` rows ran
+request twice with the same answer, except the ``deny(null)`` rows that
+expect ValidationException, which were not sent. The ``deny(ssn)`` rows ran
 under a session policy that allows ``dynamodb:*`` and denies ``dynamodb:*``
 under ``ForAnyValue:StringEquals {"dynamodb:Attributes": ["ssn"]}``, the
 ``deny(null)`` rows under one that denies under ``Null
 {"dynamodb:Attributes": "true"}``, and the ``allow-all`` rows with no session
 policy. The service sets no ``dynamodb:Attributes`` value on a SearchVectors
 request: it serves a projection of ``ssn`` under ``deny(ssn)``, and refuses
-every search under ``deny(null)``. ExtendDB decides the policy before it
-checks the ``ExpressionAttributeNames`` keys.
+every search under ``deny(null)``. The service makes the checks of a
+SearchVectors request that need no table, ``TopK`` and the
+``ExpressionAttributeNames`` keys among them, before the policy decision, so
+under ``deny(null)`` a request that fails one gets ValidationException.
 
 The principals are builtin-IAM users provisioned through the management API.
 The module skips when the backend does not support vector indexes, unless
@@ -359,6 +362,34 @@ ROWS = {
         },
         "AccessDeniedException",
         DENIED,
+    ),
+    "null-key-without-hash-before-the-policy": (
+        "deny(null)",
+        {"ProjectionExpression": "#n", "ExpressionAttributeNames": {"n": "cat"}},
+        "ValidationException",
+        _invalid_key("n"),
+    ),
+    "null-empty-map-before-the-policy": (
+        "deny(null)",
+        {"ProjectionExpression": "cat", "ExpressionAttributeNames": {}},
+        "ValidationException",
+        "ExpressionAttributeNames must not be empty",
+    ),
+    "null-top-k-of-zero-before-the-policy": (
+        "deny(null)",
+        {"TopK": 0, "ProjectionExpression": "cat"},
+        "ValidationException",
+        TOP_K_OF_ZERO,
+    ),
+    "null-unused-name-before-the-policy": (
+        "deny(null)",
+        {
+            "SearchConditionExpression": "cat = :v",
+            "ExpressionAttributeNames": {"#u": "ssn"},
+            "ExpressionAttributeValues": SSN_VALUE,
+        },
+        "ValidationException",
+        "Value provided in ExpressionAttributeNames unused in expressions: keys: {#u}",
     ),
     "projection-key-without-hash": (
         "deny(ssn)",

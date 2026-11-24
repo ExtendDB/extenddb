@@ -402,6 +402,12 @@ The `search_inequality_filters` runtime setting selects the accounts that get th
 
 **Who is affected.** A client that sends SearchVectors with such a map gets `ValidationException`, as it does on the other operations that take the map. No catalog migration is required.
 
+### v1.1.0: SearchVectors sets no `dynamodb:Attributes` value and checks its request before the policy
+
+**What changed.** A `SearchVectors` request carries no `dynamodb:Attributes` value, whatever its `ProjectionExpression` and `SearchConditionExpression` name, as on DynamoDB. Earlier releases put the attributes in `ProjectionExpression` in the key. SearchVectors also makes the checks that need no table, of the request body, `IndexName`, `SearchVector`, `TopK`, the expression maps, `ProjectionExpression` and `SearchConditionExpression`, before the IAM decision, as DynamoDB does. A table name the service refuses still answers first. Earlier releases made the IAM decision first.
+
+**Who is affected.** A deployment with a policy that gates `SearchVectors` on `dynamodb:Attributes`. A `Deny` on an attribute no longer refuses a search that projects it, and a `Deny` gated on `Null` `true` refuses every search, a projected one included. DynamoDB answers both the same way (measured 2026-11-21). An `Allow` gated on `ForAllValues` now grants every search its `Action` covers, because the key is absent. A caller that a policy denies and that sends a request failing one of the checks gets `ValidationException` where it got `AccessDeniedException`. No catalog migration is required.
+
 ### v1.0.0: Cassandra reads and writes at `LOCAL_QUORUM`
 
 **What changed.** The Cassandra backend runs its reads and writes at `LOCAL_QUORUM`. 0.1.15 ran many of them at `ONE`, the driver's default, in each area: items (the reads of GetItem, Query and Scan among them), transactions, TTL, streams, the catalog, IAM and `init`. A read with `ConsistentRead` `false` also runs at `LOCAL_QUORUM`. A lightweight transaction runs Paxos at `LOCAL_SERIAL` and commits at `LOCAL_QUORUM`. 0.1.15 ran many of its lightweight transactions at those levels already, and others, among them the admin user creation and most IAM writes, at the driver's defaults, `SERIAL` and `ONE`. Batches ran at `LOCAL_QUORUM` before and still do. No setting changes these levels (#945).

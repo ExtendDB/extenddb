@@ -139,6 +139,33 @@ pub(crate) async fn handle_request(
         return error_response(&e, &request_id);
     }
 
+    // The service checks a SearchVectors request before it authorizes it, as
+    // far as the checks need no table: the body, IndexName, SearchVector,
+    // TopK, the expression maps, the projection and the search condition. A
+    // table name the service refuses still answers first, from
+    // `authorize_request`.
+    if operation == "SearchVectors"
+        && crate::table_name_gate::check_table_name_chars(&operation, &input, &account_id).is_ok()
+        && let Err(e) = extenddb_engine::check_search_vectors_request(
+            &input,
+            &state.storage,
+            &account_id,
+            &state.limits,
+        )
+        .await
+    {
+        let metric_table = metric_table_name(&operation, &input, &state.limits);
+        record_error_metrics(
+            &state.metrics,
+            &e,
+            &account_id,
+            metric_table.as_deref(),
+            &operation,
+        );
+        state.metrics.record_request_count(&account_id, &operation);
+        return error_response(&e, &request_id);
+    }
+
     // --- Authz segment ---
     let authz_start = std::time::Instant::now();
     let authorized_key_info;

@@ -80,7 +80,7 @@ pub use put_item::handle_put_item;
 pub use query::handle_query;
 pub use request_limits::check_request_item_counts;
 pub use scan::handle_scan;
-pub use search_vectors::handle_search_vectors;
+pub use search_vectors::{check_search_vectors_request, handle_search_vectors};
 #[cfg(feature = "search-inequality-filters")]
 pub use search_vectors_extended::{install_search_filter_settings, search_filter_settings_changed};
 pub use streams::{SHARD_ITERATOR_EXPIRED_MESSAGE, ShardIteratorClass, classify_shard_iterator};

@@ -27,7 +27,6 @@ use crate::OperationContext;
 use crate::create_table::storage_err_to_dynamo;
 use crate::serialize_output;
 use crate::{DispatchMetrics, DispatchResult};
-use request::{MAX_TOP_K, MIN_INDEX_NAME_LENGTH, SearchVectorsInput, parse_search_vector};
 
 /// A single search result: the item plus its similarity score.
 #[derive(Debug, Serialize)]
@@ -47,6 +46,26 @@ struct SearchVectorsOutput {
     consumed_capacity: Option<extenddb_core::types::VectorCapacity>,
 }
 
+/// The checks of a `SearchVectors` request that need no table: the body,
+/// the backend's vector search, `IndexName`, `SearchVector`, `TopK`, the
+/// expression maps, the projection and the search condition. The service
+/// makes them before it authorizes the request, so the server calls this
+/// ahead of the IAM decision. The handler makes them again.
+///
+/// # Errors
+///
+/// Returns the error of the first failed check.
+pub async fn check_search_vectors_request(
+    body: &Value,
+    storage: &std::sync::Arc<dyn extenddb_storage::StorageEngine>,
+    account_id: &str,
+    limits: &extenddb_core::limits::LimitsConfig,
+) -> Result<(), DynamoDbError> {
+    request::check(body, storage, account_id, limits)
+        .await
+        .map(|_| ())
+}
+
 /// Handle a `SearchVectors` request.
 ///
 /// # Errors
@@ -57,62 +76,12 @@ pub async fn handle_search_vectors(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
-    let input: SearchVectorsInput =
-        serde_json::from_value(body).map_err(crate::deserialize_error)?;
-
-    let vector_search =
-        crate::vector_gate::ensure_search_supported(ctx.storage.as_vector_search())?;
-
-    // Request-shape validation runs before the table lookup, so a malformed
-    // request against a missing table reports the validation error rather than
-    // ResourceNotFound.
-
-    // IndexName length.
-    if input.index_name.len() < MIN_INDEX_NAME_LENGTH {
-        return Err(DynamoDbError::ValidationException(format!(
-            "1 validation error detected: Value at 'IndexName' failed to satisfy constraint: \
-             Member must have length greater than or equal to {MIN_INDEX_NAME_LENGTH}"
-        )));
-    }
-
-    // SearchVector length and element types.
-    let query_vector = parse_search_vector(&input.search_vector)?;
-
-    // TopK bounds. The lower bound reports the standard constraint message; the
-    // upper bound reports the documented range message.
-    if input.top_k < 1 {
-        return Err(DynamoDbError::ValidationException(
-            "1 validation error detected: Value at 'TopK' failed to satisfy constraint: \
-             Member must have value greater than or equal to 1"
-                .to_owned(),
-        ));
-    }
-    if input.top_k > MAX_TOP_K {
-        return Err(DynamoDbError::ValidationException(format!(
-            "Provided TopK value '{}' is out of valid range. \
-             The value must be between 1 and {MAX_TOP_K} inclusive",
-            input.top_k
-        )));
-    }
-
-    crate::search_vectors_params::check(
-        input.expression_attribute_names.as_ref(),
-        input.expression_attribute_values.as_ref(),
-        input.search_condition_expression.as_deref(),
-        input.projection_expression.as_deref(),
-        &ctx.limits,
-    )?;
-
-    let parsed = condition::parse(
-        &ctx.storage,
+    let request::Checked {
+        input,
+        query_vector,
+        parsed,
         vector_search,
-        &ctx.account_id,
-        input.search_condition_expression.as_deref(),
-        input.expression_attribute_names.as_ref(),
-        input.expression_attribute_values.as_ref(),
-        input.projection_expression.as_deref(),
-    )
-    .await?;
+    } = request::check(&body, &ctx.storage, &ctx.account_id, &ctx.limits).await?;
 
     let key_info = ctx
         .table_key_info(&input.table_name)
@@ -386,7 +355,7 @@ mod order_tests;
 #[cfg(test)]
 mod tests {
     use super::condition::resolve_search_scope;
-    use super::request::MAX_SEARCH_VECTOR_LENGTH;
+    use super::request::{MAX_SEARCH_VECTOR_LENGTH, parse_search_vector};
     use super::*;
     use extenddb_core::expression::SearchCondition;
     use extenddb_core::types::AttributeValue;
