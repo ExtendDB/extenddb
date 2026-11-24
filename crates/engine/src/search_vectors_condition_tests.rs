@@ -10,6 +10,7 @@
 //! a stored 9007199254740992, and `Cat = "A"` does not match a stored "a".
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use extenddb_core::types::{
@@ -17,7 +18,7 @@ use extenddb_core::types::{
     SearchSchemaElementType,
 };
 use extenddb_storage::StorageEngine;
-use extenddb_storage::management_store::{OpResult, SettingsStore};
+use extenddb_storage::management_store::{OpError, OpResult, SettingsStore};
 use extenddb_storage_sqlite::SqliteEngine;
 use futures::future::BoxFuture;
 
@@ -123,8 +124,15 @@ async fn routed(setting: &str, hash: bool, expr: &str, item: &Item) -> Routed {
     .await
     .unwrap();
     let schema = schema(hash);
-    let (hash_key, filters, item_filter): Scope<'_> =
-        resolve(&parsed, Some(&schema), &definitions()).unwrap();
+    let (hash_key, filters, item_filter): Scope<'_> = resolve(
+        &parsed,
+        Some(&schema),
+        &definitions(),
+        &storage,
+        "111111111111",
+    )
+    .await
+    .unwrap();
     (
         hash_key.map(|(_, v)| v.clone()),
         filters
@@ -233,4 +241,127 @@ async fn an_account_the_setting_leaves_out_keeps_the_equality_grammar() {
         routed("off", true, "Country = :c AND Price = :p", &item()).await,
         (us(), pair("Price", ":p"), None)
     );
+}
+
+/// A settings store whose every read fails, counting the reads.
+#[derive(Default)]
+struct Failing(AtomicUsize);
+
+impl SettingsStore for Failing {
+    fn get_setting(&self, _key: &str) -> BoxFuture<'_, OpResult<Option<String>>> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Err(OpError::Internal("connection reset".to_owned())) })
+    }
+
+    fn set_setting(&self, _key: &str, _value: &str) -> BoxFuture<'_, OpResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn list_settings(&self) -> BoxFuture<'_, OpResult<Vec<(String, String)>>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+/// The scope, or the error, of `expr` on a server whose settings store
+/// fails every read, and the number of reads it got.
+async fn without_the_setting(
+    expr: &str,
+    names: Option<&HashMap<String, String>>,
+) -> (Result<Routed, String>, usize) {
+    let storage: Arc<dyn StorageEngine> = Arc::new(
+        SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
+            .await
+            .expect("an in-memory database opens"),
+    );
+    let store = Arc::new(Failing::default());
+    crate::install_search_filter_settings(&storage, store.clone());
+    let served = storage
+        .as_vector_search()
+        .expect("SQLite serves vector search");
+    let values: HashMap<String, AttributeValue> = values()
+        .into_iter()
+        .filter(|(k, _)| expr.contains(k.as_str()))
+        .collect();
+    let schema = schema(true);
+    let answer = async {
+        let parsed = parse(
+            &storage,
+            served,
+            "111111111111",
+            Some(expr),
+            names,
+            Some(&values),
+            None,
+        )
+        .await?;
+        let (hash_key, filters, item_filter) = resolve(
+            &parsed,
+            Some(&schema),
+            &definitions(),
+            &storage,
+            "111111111111",
+        )
+        .await?;
+        Ok::<Routed, extenddb_core::error::DynamoDbError>((
+            hash_key.map(|(_, v)| v.clone()),
+            filters
+                .into_iter()
+                .map(|(n, v)| (n.to_owned(), v.clone()))
+                .collect(),
+            item_filter.map(|f| f.matches(&item()).unwrap()),
+        ))
+    }
+    .await
+    .map_err(|e| e.message().to_owned());
+    (answer, store.0.load(Ordering::SeqCst))
+}
+
+/// A condition that both grammars answer alike is served without a read of
+/// the setting, so a setting that cannot be read does not refuse it.
+#[tokio::test]
+async fn a_condition_both_grammars_answer_alike_does_not_read_the_setting() {
+    assert_eq!(
+        without_the_setting("Country = :c AND Cat = :s", None).await,
+        (Ok((us(), pair("Cat", ":s"), None)), 0)
+    );
+    assert_eq!(
+        without_the_setting("Country = :c AND Tag = :t", None).await,
+        (Ok((us(), pair("Tag", ":t"), None)), 0)
+    );
+    // the same schema refusal under both grammars
+    assert_eq!(
+        without_the_setting("Cat = :s", None).await,
+        (
+            Err("SearchConditionExpression must have \
+                 all HASH attributes in configured SearchSchema"
+                .to_owned()),
+            0
+        )
+    );
+    // the same unused-names refusal under both grammars
+    let names: HashMap<String, String> = [("#u".to_owned(), "x".to_owned())].into();
+    assert_eq!(
+        without_the_setting("Country = :c", Some(&names)).await,
+        (
+            Err(
+                "Value provided in ExpressionAttributeNames unused in expressions: keys: {#u}"
+                    .to_owned()
+            ),
+            0
+        )
+    );
+}
+
+/// A condition whose answer depends on the grammar reads the setting, and a
+/// read that fails before any read answered is a retryable fault.
+#[tokio::test]
+async fn a_condition_the_grammars_answer_differently_reads_the_setting() {
+    let unavailable = Err("Service is temporarily unavailable".to_owned());
+    for expr in ["Country = :c AND Cat <> :s", "Country = :c AND Price = :p"] {
+        assert_eq!(
+            without_the_setting(expr, None).await,
+            (unavailable.clone(), 1),
+            "{expr}"
+        );
+    }
 }

@@ -4,6 +4,12 @@
 //! The `SearchConditionExpression` of a `SearchVectors` request: the grammar
 //! that parses it, and the scope it hands the backend.
 //!
+//! A condition is parsed with both grammars. When both refuse it with the
+//! same error, or both accept it and give the backend the same scope, the
+//! answer does not depend on the `search_inequality_filters` setting and the
+//! setting is not read. Otherwise the setting decides, and is read only
+//! then.
+//!
 //! A condition that the extended grammar parses still goes to the backend as
 //! equality pairs when that gives the same results, so the backend can apply
 //! it in its own query. The service compares inline-filter strings and binary
@@ -16,24 +22,26 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::expression::{
-    SearchCondition, validate_conditions_against_search_schema,
-    validate_search_condition_expression,
-};
+use extenddb_core::expression::{SearchCondition, validate_conditions_against_search_schema};
 use extenddb_core::types::{
     AttributeDefinition, AttributeValue, SearchSchemaElement, SearchSchemaElementType,
 };
 use extenddb_storage::{StorageEngine, VectorItemFilter, VectorSearchEngine};
 
+#[cfg(feature = "search-inequality-filters")]
 use crate::search_vectors_extended::Extended;
 
-/// A search condition parsed by one of the two grammars.
-///
-/// With the extended grammar, `conditions` holds the equality pairs of the
-/// same condition when the equality-only grammar also accepts it.
-pub(crate) struct Parsed {
-    extended: Option<Extended>,
-    conditions: Vec<SearchCondition>,
+/// A search condition parsed by the grammars that accept it.
+pub(crate) enum Parsed {
+    /// The equality-only grammar's conditions; empty without a condition.
+    Equality(Vec<SearchCondition>),
+    /// A condition only the extended grammar serves for the caller.
+    #[cfg(feature = "search-inequality-filters")]
+    Extended(Extended),
+    /// A condition both grammars accept. Which one serves it is decided once
+    /// the index's schema is known.
+    #[cfg(feature = "search-inequality-filters")]
+    Either(Extended, Vec<SearchCondition>),
 }
 
 /// The HASH equality that selects the partition, the inline-filter
@@ -44,80 +52,151 @@ pub(crate) type Scope<'a> = (
     Option<Arc<dyn VectorItemFilter>>,
 );
 
-/// Structural validation of the filter expression (schema-independent).
-/// An account the extended grammar is enabled for gets that parser instead.
+/// Structural validation of the filter expression (schema-independent),
+/// with each grammar that may serve the caller.
+///
+/// Taking the backend's vector search engine means the grammar is only
+/// parsed once the backend has been found to serve vector search: a backend
+/// without it refuses the request before this runs.
 ///
 /// # Errors
 ///
-/// Returns the `ValidationException` of the first failed check.
+/// Returns the `ValidationException` of the first failed check, and
+/// `ServiceUnavailableException` when the answer depends on the setting and
+/// the setting cannot be read.
 pub(crate) async fn parse(
     storage: &Arc<dyn StorageEngine>,
-    vector_search: &dyn VectorSearchEngine,
+    _served_by: &dyn VectorSearchEngine,
     account_id: &str,
     expr: Option<&str>,
     names: Option<&HashMap<String, String>>,
     values: Option<&HashMap<String, AttributeValue>>,
     projection: Option<&str>,
 ) -> Result<Parsed, DynamoDbError> {
-    let extended = crate::search_vectors_extended::parse_request(
-        storage,
-        vector_search,
-        account_id,
-        expr,
-        names,
-        values,
-        projection,
-    )
-    .await?;
-    let conditions = match expr {
-        Some(expr) if extended.is_some() => {
-            validate_search_condition_expression(expr, names, values).unwrap_or_default()
-        }
-        Some(expr) => {
-            crate::search_vectors_params::equality_conditions(expr, names, values, projection)?
-        }
-        None => Vec::new(),
+    let Some(expr) = expr else {
+        return Ok(Parsed::Equality(Vec::new()));
     };
-    Ok(Parsed {
-        extended,
-        conditions,
-    })
+    let equality =
+        crate::search_vectors_params::equality_conditions(expr, names, values, projection);
+    #[cfg(feature = "search-inequality-filters")]
+    {
+        let extended = crate::search_vectors_extended::parse(expr, names, values, projection);
+        match (extended, equality) {
+            (Ok(extended), Ok(conditions)) => Ok(Parsed::Either(extended, conditions)),
+            (Err(a), Err(b)) if same_error(&a, &b) => Err(a),
+            (extended, equality) => {
+                if crate::search_vectors_extended::enabled_for(storage, account_id).await? {
+                    extended.map(Parsed::Extended)
+                } else {
+                    equality.map(Parsed::Equality)
+                }
+            }
+        }
+    }
+    #[cfg(not(feature = "search-inequality-filters"))]
+    {
+        let _ = (storage, account_id);
+        equality.map(Parsed::Equality)
+    }
 }
 
 /// The scope of the search, once the schema checks pass.
 ///
 /// # Errors
 ///
-/// Returns the `ValidationException` of the first failed schema check.
-pub(crate) fn resolve<'a>(
+/// Returns the `ValidationException` of the first failed schema check, and
+/// `ServiceUnavailableException` when the answer depends on the setting and
+/// the setting cannot be read.
+pub(crate) async fn resolve<'a>(
     parsed: &'a Parsed,
     search_schema: Option<&'a [SearchSchemaElement]>,
     attribute_definitions: &[AttributeDefinition],
+    storage: &Arc<dyn StorageEngine>,
+    account_id: &str,
 ) -> Result<Scope<'a>, DynamoDbError> {
-    Ok(match &parsed.extended {
-        Some(extended) => {
-            let (hash_key, item_filter) = crate::search_vectors_extended::resolve_scope(
+    match parsed {
+        Parsed::Equality(conditions) => {
+            let _ = (storage, account_id);
+            equality_scope(conditions, search_schema, attribute_definitions)
+        }
+        #[cfg(feature = "search-inequality-filters")]
+        Parsed::Extended(extended) => {
+            extended_scope(extended, None, search_schema, attribute_definitions)
+        }
+        #[cfg(feature = "search-inequality-filters")]
+        Parsed::Either(extended, conditions) => {
+            let equality = equality_scope(conditions, search_schema, attribute_definitions);
+            let extended = extended_scope(
                 extended,
+                Some(conditions),
                 search_schema,
                 attribute_definitions,
-            )?;
-            match equality_pairs(&parsed.conditions, search_schema) {
-                Some(filters) => (hash_key, filters, None),
-                None => (hash_key, Vec::new(), Some(item_filter)),
+            );
+            if same_scope(&equality, &extended)
+                || !crate::search_vectors_extended::enabled_for(storage, account_id).await?
+            {
+                equality
+            } else {
+                extended
             }
         }
-        None => {
-            let (hash_key, filters) =
-                resolve_search_scope(&parsed.conditions, search_schema, attribute_definitions)?;
-            (hash_key, filters, None)
-        }
-    })
+    }
+}
+
+fn equality_scope<'a>(
+    conditions: &'a [SearchCondition],
+    search_schema: Option<&'a [SearchSchemaElement]>,
+    attribute_definitions: &[AttributeDefinition],
+) -> Result<Scope<'a>, DynamoDbError> {
+    let (hash_key, filters) =
+        resolve_search_scope(conditions, search_schema, attribute_definitions)?;
+    Ok((hash_key, filters, None))
+}
+
+/// The scope of an extended-grammar condition: the equality pairs of
+/// `conditions` when they give the same results, else the item filter.
+#[cfg(feature = "search-inequality-filters")]
+fn extended_scope<'a>(
+    extended: &'a Extended,
+    conditions: Option<&'a [SearchCondition]>,
+    search_schema: Option<&'a [SearchSchemaElement]>,
+    attribute_definitions: &[AttributeDefinition],
+) -> Result<Scope<'a>, DynamoDbError> {
+    let (hash_key, item_filter) = crate::search_vectors_extended::resolve_scope(
+        extended,
+        search_schema,
+        attribute_definitions,
+    )?;
+    Ok(
+        match conditions.and_then(|c| equality_pairs(c, search_schema)) {
+            Some(filters) => (hash_key, filters, None),
+            None => (hash_key, Vec::new(), Some(item_filter)),
+        },
+    )
+}
+
+/// Whether two scopes give the backend the same search, or two refusals
+/// the same error. A scope with an item filter is never the same as
+/// another.
+#[cfg(feature = "search-inequality-filters")]
+fn same_scope(a: &Result<Scope<'_>, DynamoDbError>, b: &Result<Scope<'_>, DynamoDbError>) -> bool {
+    match (a, b) {
+        (Ok((h1, f1, None)), Ok((h2, f2, None))) => h1 == h2 && f1 == f2,
+        (Err(a), Err(b)) => same_error(a, b),
+        _ => false,
+    }
+}
+
+#[cfg(feature = "search-inequality-filters")]
+fn same_error(a: &DynamoDbError, b: &DynamoDbError) -> bool {
+    a.full_error_type() == b.full_error_type() && a.message() == b.message()
 }
 
 /// The inline-filter equalities of an extended-grammar condition that the
 /// equality pairs express with the same results, or `None` when the backend
 /// needs the item filter. The HASH equality selects the partition and is not
 /// among them.
+#[cfg(feature = "search-inequality-filters")]
 fn equality_pairs<'a>(
     conditions: &'a [SearchCondition],
     search_schema: Option<&[SearchSchemaElement]>,

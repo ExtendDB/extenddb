@@ -103,8 +103,8 @@ pub const VECTOR_ALLOCATION_PHASE_DELAY_MS: &str = "vector_allocation_phase_dela
 /// The accounts whose SearchVectors requests accept the extended
 /// `SearchConditionExpression` grammar: `all` (the default when the row is
 /// absent or empty), `off`, or a comma-separated list of 12-digit account
-/// IDs. Read on every SearchVectors request, so a change applies without a
-/// restart.
+/// IDs. Read by a SearchVectors request whose answer depends on it, so a
+/// change applies without a restart.
 #[cfg(feature = "search-inequality-filters")]
 pub const SEARCH_INEQUALITY_FILTERS: &str = "search_inequality_filters";
 

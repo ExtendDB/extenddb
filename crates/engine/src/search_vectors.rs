@@ -170,7 +170,10 @@ pub async fn handle_search_vectors(
         &parsed,
         vector_index.search_schema.as_deref(),
         &table.attribute_definitions,
-    )?;
+        &ctx.storage,
+        &ctx.account_id,
+    )
+    .await?;
 
     let search_output = vector_search
         .search_vectors(extenddb_storage::VectorSearch {
