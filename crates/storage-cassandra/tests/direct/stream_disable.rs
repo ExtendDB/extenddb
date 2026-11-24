@@ -316,8 +316,10 @@ async fn disable_closes_every_shard_and_re_enable_creates_a_new_stream() {
 }
 
 /// Of two stream changes fired at the same instant, one is applied and the
-/// other refused (the conditional catalog write); the table ends with one
-/// enabled stream of four open shards and every other shard closed.
+/// other refused (the conditional catalog write), unless a disable commits
+/// before an enable reads the table, when both apply in that order; the table
+/// ends with one enabled stream of four open shards and every other shard
+/// closed.
 #[tokio::test]
 async fn overlapping_stream_changes_apply_exactly_one() {
     if crate::helpers::skip_without_cassandra() {
@@ -364,6 +366,9 @@ async fn overlapping_stream_changes_apply_exactly_one() {
             1 => (enable.clone(), disable.clone()),
             _ => (disable.clone(), enable.clone()),
         };
+        let label_before = describe_table(&engine, &account, name)
+            .await
+            .latest_stream_label;
         let (ra, rb) = tokio::join!(
             engine.update_table(&account, input(a)),
             engine.update_table(&account, input(b)),
@@ -381,14 +386,36 @@ async fn overlapping_stream_changes_apply_exactly_one() {
                 );
             }
         }
-        assert_eq!(
-            ok, 1,
-            "round {round}: exactly one change applies: {ra:?} {rb:?}"
-        );
+        // Each round starts with the stream enabled. Two disables: the second
+        // always finds the stream disabled, so exactly one applies. An enable
+        // and a disable: the enable is refused if it reads the table first.
+        // If the disable commits before the enable reads the table, both
+        // apply one after the other (#1192). The table then ends enabled with
+        // a new label, and each answer describes the table after both writes.
+        let table = describe_table(&engine, &account, name).await;
+        let mixed = round % 3 != 0;
+        if ok == 2 {
+            assert!(mixed, "round {round}: two disables both applied: {ra:?} {rb:?}");
+            assert!(
+                table
+                    .stream_specification
+                    .as_ref()
+                    .is_some_and(|s| s.stream_enabled),
+                "round {round}: both applied, so the enable ran last: {table:?}"
+            );
+            assert_ne!(
+                table.latest_stream_label, label_before,
+                "round {round}: both applied, so the enable started a new stream"
+            );
+        } else {
+            assert_eq!(
+                ok, 1,
+                "round {round}: exactly one change applies: {ra:?} {rb:?}"
+            );
+        }
 
         // Audit: one enabled stream with four open shards at most, every
         // other shard closed.
-        let table = describe_table(&engine, &account, name).await;
         let (listed, _) = engine
             .list_streams(&account, Some(name), 100, None)
             .await
