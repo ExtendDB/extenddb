@@ -85,9 +85,8 @@ cosign verify --key extenddb-signing.pub.pem \
   docker.io/extenddb/extenddb-mongodb:X.Y.Z
 ```
 
-From the first release after the keyless migration (named in the release
-notes), signatures are keyless: the certificate names the GitHub Actions
-workflow and ref that signed the image, and no public key is needed.
+From 0.1.15, signatures are keyless: the certificate names the GitHub
+Actions workflow and ref that signed the image, and no public key is needed.
 
 ```console
 cosign verify \
@@ -106,11 +105,11 @@ images and their signatures are mirrored by digest to
 
 ## Note
 
-ExtendDB is an independent open source project managed by Amazon Web
-Services. It is not Amazon DynamoDB and does not contain any DynamoDB source
-code. "DynamoDB" is a trademark of Amazon.com, Inc. ExtendDB is a clean-room
-implementation that speaks the DynamoDB wire protocol; behavioral differences
-from the service are documented in
+ExtendDB is an open source project maintained by AWS. It is not Amazon DynamoDB
+and does not contain any DynamoDB source code. It is not an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates. ExtendDB is a
+clean-room implementation that speaks the DynamoDB wire protocol; behavioral
+differences from the service are documented in
 [Differences from DynamoDB](https://github.com/ExtendDB/extenddb/blob/main/docs/differences-from-dynamodb.md).
 
 More at [extenddb.org](https://extenddb.org) and

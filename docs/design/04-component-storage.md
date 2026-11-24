@@ -194,8 +194,18 @@ IAM-type entities.
 Runtime settings storage (key-value store):
 - `get_setting`, `set_setting`, `list_settings`, `cached_encryption_key`
 
-Settings include `control_plane_delay_seconds`, `log_level`, and the
-encryption key for access key secrets.
+Settings include `control_plane_delay_seconds`, `log_level`, and the key
+material for stored secrets: the catalog key (`encryption_key`) or, with
+`[auth.encryption] key_file` set, the key ring (`encryption_key_ring`) that
+holds the data encryption key wrapped under the key-encryption key in that
+file. One function in `crates/storage` loads the key from the two rows and the
+configured key source at startup and returns the one key the server uses, or a
+refusal that names the command that fixes the state (the admin guide's
+Encryption Key section). Each backend holds that key once, in the locked key
+store, and a store built without the key refuses to create, import or store a
+credential. The re-encryption pass of `extenddb encryption-key` is one driver in
+this crate; each backend adds a paged read of the credential rows, a batch write
+of ciphertexts by primary key, and the delete of one settings row.
 
 ### MetricsStore
 
@@ -574,7 +584,8 @@ The catalog migrations are the numbered list every backend shares
 binary at compile time via `include_str!`. The shared runner applies them in id order and records
 each body in the `extenddb_migrations` ledger of the database it changed, and every id in the
 catalog's ledger. The
-`schema_history` table of a 0.1.x catalog stays in place and is not read.
+`schema_history` table of a catalog that 0.1.14 or an earlier release
+created stays in place and is not read.
 
 Migration files are named by id:
 ```
@@ -756,6 +767,28 @@ WHERE pk = $gsi_pk
        OR (sk_s COLLATE "C" = $gsi_sk
            AND (base_pk COLLATE "C" > $base_pk
                 OR (base_pk = $base_pk AND base_sk_n > $base_sk))))
+```
+
+**LSI Query:** an LSI cursor compares the index sort key, then `base_pk`, then
+the base sort key. These are the three columns of the GSI cursor above, and the
+`ORDER BY` lists them in the same order. The cursor is one row comparison. On
+every column, the cursor and the `ORDER BY` run in the direction of
+`ScanIndexForward`: `>` and `ASC` forward, `<` and `DESC` in reverse. Every row of an LSI partition
+stores the queried partition key as `base_pk`. The cursor binds the start key's
+partition key for it, and request validation refuses a start key from another
+partition. So `base_pk` compares equal on every row, and the order
+and page boundaries are those of the index sort key and the base sort key.
+Including `base_pk` makes the `ORDER BY` match the ordering index
+`(pk, sk_s, base_pk, base_sk_n)` after the fixed `pk`. The index can then return
+the page in order without a sort step. With `(sk_s, base_sk_n)` alone, the index
+orders `sk_s` only, and the database sorts the rows that share an index sort
+key value. PostgreSQL adds an Incremental Sort when the key condition leaves
+several index sort key values. It adds a Sort when an equality on the index sort
+key leaves one. SQLite adds a temporary B-tree.
+```sql
+WHERE pk = $lsi_pk
+  AND (sk_s COLLATE "C", base_pk COLLATE "C", base_sk_n) > ($lsi_sk, $base_pk, $base_sk)
+ORDER BY sk_s COLLATE "C" ASC, base_pk COLLATE "C" ASC, base_sk_n ASC
 ```
 
 For GSI queries, the pagination key includes both the GSI key attributes and the base table primary key (needed to
@@ -1400,6 +1433,6 @@ backups).
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

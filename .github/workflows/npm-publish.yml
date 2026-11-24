@@ -9,6 +9,11 @@
 #
 #   npm dist-tag add @extenddb/dev@<version> latest   (and one per platform pkg)
 #
+# With the `dry_run` input the run ends after the build jobs: the gates and
+# the five native builds, smoke tests and launcher suites run as for a
+# release, and nothing is published; dry runs have a concurrency group of
+# their own (release-image.yml).
+#
 # Shape, and why (mirrors .github/workflows/release-image.yml):
 #
 #   gate      Runs once. Cheap checks that need no build: the dispatch input is
@@ -78,6 +83,10 @@ on:
       tag:
         description: 'Existing release tag to publish npm candidates for, e.g. v0.1.4'
         required: true
+      dry_run:
+        description: 'Rehearse only: run the gates and the five platform builds with their smoke tests and launcher suites; publish nothing'
+        type: boolean
+        default: false
 
 # Nothing is committed, so no write scope on the repo is needed. The publish
 # job adds id-token at job level, which is what both authenticates to npm
@@ -87,7 +96,7 @@ permissions:
 
 # Two launcher releases must never race.
 concurrency:
-  group: npm-publish-extenddb
+  group: npm-publish-extenddb${{ inputs.dry_run && '-dry' || '' }}
   cancel-in-progress: false
 
 jobs:
@@ -200,9 +209,36 @@ jobs:
     uses: ./.github/workflows/npm-build-matrix.yml
     with:
       ref: ${{ needs.gate.outputs.sha }}
+      # A release stops at the first failing platform; a rehearsal lets all
+      # five report.
+      fail-fast: ${{ !inputs.dry_run }}
+
+  # A rehearsal's end: the gates and the builds ran as the release runs them,
+  # and nothing was published. The publish-side jobs are skipped by their
+  # `if`, so their environments ask no approval.
+  dry-run-summary:
+    needs: [gate, build]
+    if: ${{ inputs.dry_run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Summarise the rehearsal
+        run: |
+          {
+            echo "### Dry run: gates and builds passed, nothing published"
+            echo ""
+            echo "The five platform binaries built, passed their smoke tests and the launcher suite. Dispatch again without the dry run to publish the candidates."
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| tag | \`v${{ needs.gate.outputs.version }}\` |"
+            echo "| commit | \`${{ needs.gate.outputs.sha }}\` |"
+            echo "| version (from tag) | \`${{ needs.gate.outputs.version }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   publish:
     needs: [gate, build]
+    if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # The protected environment requires reviewer approval, and its name is
