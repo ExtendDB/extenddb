@@ -261,7 +261,9 @@ def test_two_sends_of_one_request_with_one_token_apply_it_once(
     def send(client, token: str, start: threading.Barrier) -> str:
         start.wait()
         try:
-            client.transact_write_items(TransactItems=request, ClientRequestToken=token)
+            call_with_handshake_retry(
+                client.transact_write_items, TransactItems=request, ClientRequestToken=token
+            )
             return "OK"
         except ClientError as e:
             return e.response["Error"]["Code"]
