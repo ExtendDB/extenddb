@@ -138,13 +138,18 @@ fn equalities(clauses: &[(&str, usize)]) -> (KeyCondition, ExpressionMaps) {
 
 #[test]
 fn equality_clauses_are_checked_against_the_limits() {
+    // The key schema, the `attribute = :v` clauses with the bytes of each
+    // value, and the expected sentence (`None` for `Ok`).
+    type Row<'a> = (
+        &'a [KeySchemaElement],
+        &'a [(&'a str, usize)],
+        Option<&'a str>,
+    );
     let (base, idx, two) = (base_schema(), multi_range_schema(), two_hash_schema());
     let hash = Some(HASH_MSG_2048);
     let total = Some(HASH_TOTAL_MSG_2048);
     let range = Some(RANGE_MSG_1024);
-    // The key schema, the `attribute = :v` clauses with the bytes of each
-    // value, and the expected sentence (`None` for `Ok`).
-    let cases: [(&[KeySchemaElement], &[(&str, usize)], Option<&str>); 18] = [
+    let cases: [Row<'_>; 18] = [
         // Measured 2026-10-23 on a base table with HASH `pk` and RANGE `sk`:
         // the limits, and the hash sentence when both limits are exceeded.
         (&base, &[("pk", 2048)], None),
@@ -382,11 +387,13 @@ fn a_clause_on_an_attribute_outside_the_key_schema_adds_nothing() {
 
 #[test]
 fn an_undefined_reference_returns_ok_whatever_the_sizes() {
+    // A label, the key condition, and the bytes of each defined value.
+    type Row<'a> = (&'a str, KeyCondition, &'a [(&'a str, usize)]);
     let with_sort = |pk_value: &str, sk: SortKeyCondition| KeyCondition {
         sk_condition: Some(sk),
         ..hash_only("pk", pk_value)
     };
-    let cases: [(&str, KeyCondition, &[(&str, usize)]); 6] = [
+    let cases: [Row<'_>; 6] = [
         (
             "undefined value on the clause",
             hash_only("pk", "missing"),

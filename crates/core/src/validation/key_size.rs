@@ -198,7 +198,7 @@ fn sized_clause(
 ///   `sized_clause`).
 /// - If a `#name` or `:value` of any key clause is not defined, the check
 ///   returns `Ok`, because the service reports the undefined reference ahead
-///   of the size. ExtendDB refuses most such requests later on. On a key
+///   of the size. `ExtendDB` refuses most such requests later on. On a key
 ///   schema with one HASH and at most one RANGE attribute it serves
 ///   `pk = :h AND #u > :r` with `#u` undefined, which the service refuses
 ///   (#1214).
