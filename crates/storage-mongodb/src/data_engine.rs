@@ -2384,18 +2384,23 @@ impl MongoEngine {
                 index_schemas.insert(table_id, schemas);
             }
         }
-        extenddb_storage::transact_key_check_pass(ops.iter().map(|op| {
-            let idx_refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> = index_schemas
-                [op.table_id()]
+        // The index key list of each table, for both passes below.
+        let index_refs: std::collections::HashMap<&str, Vec<_>> = index_schemas
             .iter()
-            .map(|(n, ks)| extenddb_core::validation::IndexKeyRef {
-                index_name: n.as_str(),
-                key_schema: ks.as_slice(),
+            .map(|(&table_id, schemas)| {
+                let refs = schemas
+                    .iter()
+                    .map(|(n, ks)| extenddb_core::validation::IndexKeyRef {
+                        index_name: n.as_str(),
+                        key_schema: ks.as_slice(),
+                    });
+                (table_id, refs.collect())
             })
             .collect();
+        extenddb_storage::transact_key_check_pass(ops.iter().map(|op| {
             extenddb_storage::transact_op_key_checks(
                 &op.as_op(),
-                &idx_refs,
+                &index_refs[op.table_id()],
                 &op.key_info().attribute_definitions,
             )
         }))?;
@@ -2403,15 +2408,10 @@ impl MongoEngine {
         // members before it run: an empty value one of them writes from the
         // item answers ahead of the literal.
         let empty_literal = extenddb_storage::transact_first_empty_literal(ops.iter().map(|op| {
-            let idx_refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> = index_schemas
-                [op.table_id()]
-            .iter()
-            .map(|(n, ks)| extenddb_core::validation::IndexKeyRef {
-                index_name: n.as_str(),
-                key_schema: ks.as_slice(),
-            })
-            .collect();
-            extenddb_storage::transact_op_empty_literal_checks(&op.as_op(), &idx_refs)
+            extenddb_storage::transact_op_empty_literal_checks(
+                &op.as_op(),
+                &index_refs[op.table_id()],
+            )
         }));
         let run = empty_literal.as_ref().map_or(ops.len(), |(p, _)| *p);
 
