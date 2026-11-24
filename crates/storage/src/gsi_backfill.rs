@@ -104,13 +104,6 @@ impl GsiBackfills {
         }
     }
 
-    /// Whether a backfill of `index_id` has started in this process and its
-    /// index is still `CREATING`.
-    #[must_use]
-    pub fn started(&self, index_id: &str) -> bool {
-        self.lock().contains(index_id)
-    }
-
     /// The ids recorded now, for a reader to take before it reads the catalog
     /// rows it pairs them with.
     ///
@@ -183,25 +176,25 @@ mod tests {
     #[test]
     fn a_record_lasts_until_finish() {
         let running = GsiBackfills::default();
-        assert!(!running.started("i1"));
+        assert!(!running.snapshot().contains("i1"));
         running.start("i1");
-        assert!(running.clone().started("i1"));
-        assert!(!running.started("i2"));
+        assert!(running.clone().snapshot().contains("i1"));
+        assert!(!running.snapshot().contains("i2"));
         // A second build of the same index (the retry after a passing failure)
         // records it again; one finish ends it, because finish is called only
         // once the index has left CREATING.
         running.start("i1");
         running.finish("i1");
-        assert!(!running.started("i1"));
+        assert!(!running.snapshot().contains("i1"));
     }
 
     #[test]
     fn a_scoped_record_lasts_as_long_as_its_guard() {
         let running = GsiBackfills::default();
         let guard = running.start_scoped("i1");
-        assert!(running.started("i1"));
+        assert!(running.snapshot().contains("i1"));
         drop(guard);
-        assert!(!running.started("i1"));
+        assert!(!running.snapshot().contains("i1"));
     }
 
     #[test]
@@ -213,7 +206,7 @@ mod tests {
         running.start("i2");
         assert!(before.contains("i1"));
         assert!(!before.contains("i2"));
-        assert!(!running.started("i1"));
+        assert!(!running.snapshot().contains("i1"));
     }
 
     #[test]
