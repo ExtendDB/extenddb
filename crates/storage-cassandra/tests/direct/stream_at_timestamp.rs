@@ -115,13 +115,17 @@ async fn test_at_timestamp_seek_skips_a_clamped_record_older_than_t() {
         .unwrap();
     assert_eq!(got, None, "a clamped record older than T is not returned");
 
-    // T before everything: the clamped record is the first, as its
-    // created_at is the oldest.
+    // T before everything: both records pass the filter, and the first by
+    // sequence is the real one, whose prefix is 8 s before the clamped one.
     let got = engine
         .first_sequence_number_at_or_after(&shard_id, clamped_created - 1)
         .await
         .unwrap();
-    assert!(got.is_some());
+    assert_eq!(
+        got.as_deref(),
+        Some(real_seq.as_str()),
+        "the first record by sequence, the real one, is the answer"
+    );
 }
 
 /// Every stream of a table keeps its records in the partition of the shard

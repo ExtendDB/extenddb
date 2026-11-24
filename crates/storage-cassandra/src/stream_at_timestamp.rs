@@ -23,8 +23,7 @@ use crate::cassandra_util::query_rows;
 use crate::engine::CassandraEngine;
 
 /// The smallest sequence number whose millisecond prefix is `at_ms`.
-#[must_use]
-pub fn sequence_lower_bound(at_ms: i64) -> String {
+fn sequence_lower_bound(at_ms: i64) -> String {
     format!("{:013}{:06}{:04}", at_ms.max(0), 0, 0)
 }
 
