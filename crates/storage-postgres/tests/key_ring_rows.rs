@@ -12,7 +12,7 @@ mod pass_methods;
 
 use std::sync::Arc;
 
-use extenddb_storage::diagnostics::DiagnosticsStore;
+use extenddb_storage::diagnostics::{DiagError, DiagnosticsStore};
 use extenddb_storage::key_ring::{KEY_RING_SETTING, KeyRing, catalog_key_id};
 use extenddb_storage::management_store::{
     ManagementStore, SecretWrite, SettingsStore, StoredSecretRow,
@@ -356,6 +356,22 @@ async fn set_data_connection_writes_the_row_under_the_ring() {
                     .is_err(),
                 "{name}: verify's check opened the row without a key"
             );
+            // `catalog-check` opens the row as `verify` does. Without the KEK
+            // it gives the refusal alone, as for a catalog without the row.
+            store
+                .check_storage_relations(&KeySource::Kek(Zeroizing::new(KEK).into()))
+                .await
+                .unwrap_or_else(|e| panic!("{name}: catalog-check with the KEK: {e}"));
+            match store.check_storage_relations(&KeySource::CatalogKey).await {
+                Err(DiagError::NotConfigured(msg)) => assert_eq!(
+                    msg,
+                    "the catalog has a key ring, so its data_database_connection_string row is \
+                     encrypted; run the command with the configuration whose [auth.encryption] \
+                     key_file names the KEK of the ring",
+                    "{name}"
+                ),
+                other => panic!("{name}: catalog-check without the KEK gave {other:?}"),
+            }
         } else {
             assert!(result.is_err(), "{name}: not refused");
             assert_eq!(row, "unchanged", "{name}: the row changed");
