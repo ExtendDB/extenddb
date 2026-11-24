@@ -16,7 +16,7 @@
 //! connection.
 
 mod backend;
-// The CLI's migration commands.
+// `CatalogMigrations`, which the `extenddb` commands call.
 #[cfg(not(target_arch = "wasm32"))]
 mod commands;
 // The copy taken before a migration, through `libsqlite3-sys`'s online backup.

@@ -162,7 +162,8 @@ mod admin_store;
 mod authorization_store;
 mod backup;
 mod backup_catalog;
-// Sets up a file-backed server; it takes the serve lock, compiled off wasm32.
+// Creates and removes the database file for `init` and `destroy`; it takes
+// the serve lock, compiled off wasm32.
 #[cfg(not(target_arch = "wasm32"))]
 mod bootstrapper;
 mod catalog_store;

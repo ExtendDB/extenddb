@@ -99,13 +99,10 @@ SigV4 is verified — a request signed with a different secret is rejected with
 
 Per [RFC-0002](https://github.com/ExtendDB/extenddb/blob/main/docs/rfcs), this
 backend implements the full storage trait surface. The `wasm32` build does
-not compile five of those implementations: `Bootstrapper`
-(`SqliteBootstrapper`) and `ServerRuntimeHooks`, which set up a file-backed
-server and start its background workers; `OperationsEngine`, which gives the
-`extenddb` lifecycle commands their backend helpers; `CatalogMigrations`,
-which `init`, `migrate`, `verify` and `encryption-key` call, and which `serve`
-and the `backup` commands call to word their refusal of a catalog error; and
-`LockedStores`, which the `encryption-key` commands use. Two methods answer
+not compile five of those implementations, which outside tests only the
+`extenddb` command-line tool and the server it starts use: `Bootstrapper`
+(`SqliteBootstrapper`), `ServerRuntimeHooks`, `OperationsEngine`,
+`CatalogMigrations` and `LockedStores`. Two methods answer
 `StorageError::Unsupported` there:
 `SnapshotEngine::open_table_snapshot`, for every table, since its native
 implementation uses `sqlx` API that the `wasm32` build does not provide, and
