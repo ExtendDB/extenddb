@@ -94,8 +94,8 @@ fn backup_arn_field(
 /// `AccessDeniedException` whatever the rest of it, and a string
 /// [`BackupArnError::Invalid`] refuses is `Invalid Backup ARN`. The inner
 /// result is answered after the name: `BackupNotFoundException` for the
-/// service's id shape in upper-case hex, which no build issues, or the rest
-/// of [`crate::backup_requests::check_backup_arn`].
+/// service's id shape in upper-case hex in this server's partition, which no
+/// build issues, or the rest of [`crate::backup_requests::check_backup_arn`].
 fn backup_arn_member<'a>(
     body: &'a Value,
     account_id: &str,
@@ -105,15 +105,21 @@ fn backup_arn_member<'a>(
         .and_then(Value::as_str)
         .unwrap_or_default();
     let trimmed = extenddb_core::backup_format::trim_backup_arn(backup_arn);
-    if extenddb_core::arn::fields(trimmed).is_some_and(|f| f.account != account_id) {
+    let fields = extenddb_core::arn::fields(trimmed);
+    if fields.is_some_and(|f| f.account != account_id) {
         return Err(DynamoDbError::AccessDeniedException(
             "Access is denied".to_owned(),
         ));
     }
     Ok(match extenddb_storage::util::check_backup_arn(backup_arn) {
         Err(e @ BackupArnError::Invalid) => return Err(backup_arn_refusal(e)),
+        // In another partition the service answers the upper-case id as not
+        // valid (measured on DynamoDB in us-east-1 on 25 Nov 2026 for `aws-cn`).
         Err(BackupArnError::Id)
-            if extenddb_storage::util::backup_id_epoch_millis(&trimmed.to_ascii_lowercase())
+            if fields.is_some_and(|f| f.partition == extenddb_storage::util::ARN_PARTITION)
+                && extenddb_storage::util::backup_id_epoch_millis(
+                    &trimmed.to_ascii_lowercase(),
+                )
                 .is_some() =>
         {
             Err(backup_not_found(trimmed))

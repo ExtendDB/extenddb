@@ -4622,9 +4622,10 @@ async fn a_backup_stored_under_another_region_resolves_as_written() {
 /// valid` on every member that carries a backup ARN, after a restore's
 /// `TargetTableName`. One of another account is `AccessDeniedException`
 /// first, as one with an empty account is. Measured on DynamoDB in us-east-1
-/// on 21 Nov 2026 for `aws-cn` on RestoreTableFromBackup and DescribeBackup;
-/// the other partitions here are derived from it. The `ListBackups` cursor
-/// is refused before its account is compared.
+/// on 21 Nov 2026 for `aws-cn` on RestoreTableFromBackup and DescribeBackup,
+/// and on 25 Nov 2026 for the caller's account in `aws-cn` with the service's
+/// id shape in upper-case hex; the other rows here are derived from these.
+/// The `ListBackups` cursor is refused before its account is compared.
 #[tokio::test]
 async fn an_arn_in_another_partition_is_a_validation_exception() {
     let ours = arn(ACCOUNT);
@@ -4634,11 +4635,15 @@ async fn an_arn_in_another_partition_is_a_validation_exception() {
         .unwrap()
         .insert(ours.clone(), backup_description("AVAILABLE", "PROVISIONED"));
     *fake.summaries.lock().unwrap() = vec![summary(1, 1)];
-    for partition in ["aws-cn", "aws-us-gov", "aws-iso", "AWS", "x"] {
+    let id = "01791976431438-73d8d5bc";
+    let rows = ["aws-cn", "aws-us-gov", "aws-iso", "AWS", "x"]
+        .map(|partition| (partition, id))
+        .into_iter()
+        .chain([("aws-cn", "01791976431438-73D8D5BC")]);
+    for (partition, id) in rows {
         for account in [ACCOUNT, "999999999999"] {
-            let candidate = format!(
-                "arn:{partition}:dynamodb:{REGION}:{account}:table/Music/backup/01791976431438-73d8d5bc"
-            );
+            let candidate =
+                format!("arn:{partition}:dynamodb:{REGION}:{account}:table/Music/backup/{id}");
             let expected = if account == ACCOUNT {
                 "ValidationException: Invalid Request: BackupArn is not valid"
             } else {

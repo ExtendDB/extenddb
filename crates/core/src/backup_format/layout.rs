@@ -181,7 +181,9 @@ pub enum BackupArnError {
     Region,
     /// The backup id is neither the current shape nor one an earlier build
     /// issued (see [`is_backup_id`]), a control character in it included. The
-    /// service's text: `Invalid Request: BackupArn is not valid`.
+    /// service's text: `Invalid Request: BackupArn is not valid`. The engine
+    /// answers the service's id shape in upper-case hex as not found when the
+    /// partition is the one it serves.
     Id,
 }
 
