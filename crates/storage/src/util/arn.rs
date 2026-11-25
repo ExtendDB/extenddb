@@ -62,10 +62,10 @@ pub fn new_stream_label() -> String {
 ///
 /// Two shapes are accepted: the 23-byte `YYYY-MM-DDThh:mm:ss.sss` this module
 /// writes, parsed by [`crate::stream_lineage::label_millis`], and the 19-byte
-/// `YYYY-MM-DDThh:mm:ss` that SQLite, PostgreSQL and MongoDB wrote on v0.1.3
-/// to v0.1.13 and Cassandra up to v0.1.14, which a stream enabled on those
-/// versions and never re-enabled still carries. The legacy shape names the
-/// instant with a `.000` fraction. `None` for any other shape.
+/// `YYYY-MM-DDThh:mm:ss` that PostgreSQL wrote from v0.1.0, SQLite from v0.1.3
+/// and MongoDB from v0.1.4, each up to v0.1.13, which a stream enabled on
+/// those versions and never re-enabled still carries. The legacy shape names
+/// the instant with a `.000` fraction. `None` for any other shape.
 #[must_use]
 #[allow(clippy::cast_precision_loss)] // epoch ms fit f64's 53-bit mantissa
 pub fn stream_label_creation_date_time(label: &str) -> Option<f64> {
@@ -258,8 +258,8 @@ mod stream_label_tests {
             stream_label_creation_date_time("2026-10-24T11:31:45.748"),
             Some(1_792_841_505.748)
         );
-        // The 19-byte legacy label (v0.1.3 to v0.1.13 writers) is the instant
-        // with a .000 fraction.
+        // The 19-byte label that PostgreSQL, SQLite and MongoDB wrote up to
+        // v0.1.13 is the instant with a .000 fraction.
         assert_eq!(
             stream_label_creation_date_time("2026-07-04T10:20:30"),
             Some(1_783_160_430.0)
