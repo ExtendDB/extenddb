@@ -27,6 +27,14 @@ SearchVectors request that need no table, ``TopK`` and the
 ``ExpressionAttributeNames`` keys among them, before the policy decision, so
 under ``deny(null)`` a request that fails one gets ValidationException.
 
+The ``deny(not-x)`` and ``allow(not-x)`` rows were not sent to DynamoDB
+either. They gate the statement on a bare ``StringNotEquals
+{"dynamodb:Attributes": "x"}``. IAM matches a bare negated operator on an
+absent multivalued key, measured on IAM for ``dynamodb:Attributes``, and the
+service leaves the key absent on every SearchVectors, as the ``deny(null)``
+rows show. So the Deny refuses every search, a projected one included, and
+the Allow grants a search.
+
 The principals are builtin-IAM users provisioned through the management API.
 The module skips when the backend does not support vector indexes, unless
 ``EXTENDDB_EXPECT_VECTORS=1``, which makes that a failure.
@@ -304,6 +312,22 @@ DENY_SSN = {
         },
     ],
 }
+
+
+def _bare_not_equals(effect: str) -> dict:
+    statement = {
+        "Effect": effect,
+        "Action": "dynamodb:*" if effect == "Deny" else "dynamodb:SearchVectors",
+        "Resource": "*",
+        "Condition": {"StringNotEquals": {"dynamodb:Attributes": "x"}},
+    }
+    allow = [{"Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"}]
+    return {
+        "Version": "2012-10-17",
+        "Statement": (allow if effect == "Deny" else []) + [statement],
+    }
+
+
 DENY_NULL = {
     "Version": "2012-10-17",
     "Statement": [
@@ -390,6 +414,19 @@ ROWS = {
         },
         "ValidationException",
         "Value provided in ExpressionAttributeNames unused in expressions: keys: {#u}",
+    ),
+    "not-x-no-projection": ("deny(not-x)", {}, "AccessDeniedException", DENIED),
+    "not-x-projection-of-cat": (
+        "deny(not-x)",
+        {"ProjectionExpression": "cat"},
+        "AccessDeniedException",
+        DENIED,
+    ),
+    "not-x-allow-grants-a-projection": (
+        "allow(not-x)",
+        {"ProjectionExpression": "cat"},
+        None,
+        CAT_ONLY,
     ),
     "projection-key-without-hash": (
         "deny(ssn)",
@@ -479,6 +516,14 @@ def deny_null(principal):
     return principal(DENY_NULL)
 
 
+@pytest.fixture(scope="module")
+def bare_not_equals(principal):
+    return {
+        "deny(not-x)": principal(_bare_not_equals("Deny")),
+        "allow(not-x)": principal(_bare_not_equals("Allow")),
+    }
+
+
 def test_the_deny_on_ssn_refuses_a_get_item_of_ssn(deny_ssn, vector_table):
     # The control: the policy is in force for this principal.
     resp = deny_ssn.post(
@@ -493,9 +538,12 @@ def test_the_deny_on_ssn_refuses_a_get_item_of_ssn(deny_ssn, vector_table):
 
 
 @pytest.mark.parametrize("row", list(ROWS))
-def test_search_expression_attribute_names(deny_ssn, deny_null, vector_table, row):
+def test_search_expression_attribute_names(
+    deny_ssn, deny_null, bare_not_equals, vector_table, row
+):
     policy, members, error, expected = ROWS[row]
-    p = {"deny(ssn)": deny_ssn, "deny(null)": deny_null}.get(policy, vector_table["admin"])
+    principals = {"deny(ssn)": deny_ssn, "deny(null)": deny_null, **bare_not_equals}
+    p = principals.get(policy, vector_table["admin"])
     resp = _search(p, vector_table["name"], **members)
     if error is None:
         assert resp.status_code == 200, f"{row}: {resp.text}"

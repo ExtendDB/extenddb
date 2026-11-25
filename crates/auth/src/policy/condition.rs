@@ -157,8 +157,10 @@ pub fn evaluate_condition_with(
             // requests the service does. ExtendDB leaves `dynamodb:LeadingKeys`
             // absent on query shapes it cannot pin to a partition value, where
             // the service populates it. It leaves `dynamodb:Attributes` absent
-            // only on a `SearchVectors` with no `ProjectionExpression` (#729)
-            // and, on a table that does not exist, on a `GetItem`,
+            // on every `SearchVectors`, as the service does (measured
+            // 2026-11-21), so there the absent-key answer is IAM's and a bare
+            // negated operator matches. It also leaves `dynamodb:Attributes`
+            // absent, on a table that does not exist, on a `GetItem`,
             // transaction `Get` or `BatchGetItem` that names no attribute
             // outside its keys, a `Query` whose key condition the key
             // condition parser refuses and that names none elsewhere, and a
