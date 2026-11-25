@@ -278,6 +278,25 @@ class TestPrecedence:
         # the vector-index refusal.
         assert _error_message(resp).startswith("Invalid KeyConditionExpression:")
 
+    @pytest.mark.parametrize("expression", ["pk > :v", "zz > :v"])
+    def test_query_vector_refusal_fires_before_the_hash_equality_check(
+        self, vector_table, expression
+    ):
+        # Measured 2026-11-25 on a table with HASH pk and RANGE sk: with no
+        # equality on pk, the service answers the vector refusal ahead of the
+        # messages for a key condition with no HASH equality.
+        resp = _signed_post(
+            "Query",
+            {
+                "TableName": vector_table,
+                "IndexName": "vidx",
+                "KeyConditionExpression": expression,
+                "ExpressionAttributeValues": {":v": {"S": "a"}},
+            },
+        )
+        assert resp.status_code == 400, resp.text
+        assert _error_message(resp) == QUERY_REFUSAL
+
 
 class TestControlsUnaffected:
     """Base-table and GSI reads on the same table still succeed."""
