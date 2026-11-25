@@ -1,0 +1,399 @@
+#!/usr/bin/env python3
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+"""Self-test of the wasm32 clippy step, and a check that the wasm32 AES-GCM
+stack is built with its zeroize features.
+
+The header of devtools/wasm-clippy/clippy.toml says what the clippy step
+(`devtools/run-wasm-step clippy`) refuses and what it does not see. This
+script prints a FAIL line per problem, with clippy's message after it where
+there is one, and fails, unless:
+1. clippy.toml parses and holds only the disallowed-methods and
+   disallowed-types lists, each entry a table of exactly a non-empty `path`
+   and `reason`, and no path twice in a list; and devtools/wasm-clippy holds
+   no .clippy.toml, which clippy would read in its place;
+2. in a copy of the working tree (the files git tracks or does not ignore,
+   uncommitted edits included), the clippy step passes; and with the PLANTS
+   below written into the copy (tokio::time::sleep, time::sleep after `use
+   tokio::time;` and std::thread::sleep in handle_get_item, and
+   std::time::Instant::now in SqliteEngine::new_in_memory), the step, run
+   again with --keep-going, fails and reports each planted call as an error
+   at its line (an error that alone fails the step);
+3. neither run prints a warning about clippy's configuration, but for one
+   control: for the second run the copy's clippy.toml is the tree's lists,
+   written out again with MISSPELT, an entry that names no function, added,
+   and that run must warn about it. Clippy warns about an entry that does not
+   resolve only in a crate that loads the entry's crate (its code names it,
+   or a crate it loads depends on it); -D warnings does not make it an error;
+4. in the adapter's wasm32 build as `cargo tree -e normal` resolves it, each
+   of aes, aes-gcm, ghash and polyval is one package (one name, version and
+   source) with its zeroize feature on (crates/core/Cargo.toml turns it on).
+Checks 2 and 3 run only when check 1 passes. A plant whose text is not in the
+copy's file, or is there more than once, or whose path resolves out of the
+copy, stops them with a line naming the file and what is wrong. A file the
+script cannot read is left out of the copy, with a line naming it. The runs
+use the caller's cargo target directory (by default target/, which git
+ignores) and write no file git tracks or does not ignore; as the step's
+CLIPPY_CONF_DIR names the copy, they re-lint every crate, and so does the
+next clippy step in the tree. The copy is removed on exit, also on SIGINT,
+SIGTERM and SIGHUP unless the script started with that signal ignored (a
+further signal is then ignored), and a clippy run is stopped with it. Needs
+Python 3.11 or later (for tomllib) and git.
+"""
+
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 and older
+    sys.exit("error: devtools/check-wasm-clippy-guard needs Python 3.11 or later (for tomllib)")
+
+ROOT = Path(__file__).resolve().parent.parent
+CONFIG_DIR = "devtools/wasm-clippy"
+CONFIG_REL = f"{CONFIG_DIR}/clippy.toml"
+SHADOW_REL = f"{CONFIG_DIR}/.clippy.toml"
+ADAPTER = "extenddb-wasm-adapter"
+TARGET = "wasm32-unknown-unknown"
+LISTS = ("disallowed-methods", "disallowed-types")
+# The clippy step of .github/workflows/wasm.yml with JSON messages; options
+# after the step's name go to cargo.
+CLIPPY = ["devtools/run-wasm-step", "clippy", "--color", "never", "--message-format=json"]
+ZERO = "std::time::Duration::ZERO"
+# (file, the text to find once, the lines that go after the first line from
+# that text on that ends with `{`, the listed path each line calls).
+PLANTS = [
+    (
+        "crates/engine/src/get_item.rs",
+        "pub async fn handle_get_item(",
+        [
+            (f"    tokio::time::sleep({ZERO}).await;", "tokio::time::sleep"),
+            (f"    {{ use tokio::time; time::sleep({ZERO}).await; }}", "tokio::time::sleep"),
+            (f"    std::thread::sleep({ZERO});", "std::thread::sleep"),
+        ],
+    ),
+    (
+        "crates/storage-sqlite/src/store.rs",
+        "pub async fn new_in_memory(",
+        [("    let _ = std::time::Instant::now();", "std::time::Instant::now")],
+    ),
+]
+# The control of check 3.
+MISSPELT = "std::thread::sleep_misspelt_by_the_guard"
+# The crates of the wasm32 AES-256-GCM stack. Each wipes its own key material
+# only under its own `zeroize` feature, which crates/core/Cargo.toml turns on.
+ZEROIZE_CRATES = ("aes", "aes-gcm", "ghash", "polyval")
+STOPS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+STARTED_WITH = {stop: signal.getsignal(stop) for stop in STOPS}
+
+
+def config_problems(text: str) -> list[str]:
+    """Check 1 of the docstring, on the text of a clippy.toml."""
+    try:
+        config = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        return [f"{CONFIG_REL} cannot be read: {error}"]
+    others = [key for key in config if key not in LISTS]
+    found = [f"{CONFIG_REL}: {key} is not one of the two lists" for key in others]
+    for key in LISTS:
+        entries = config.get(key, [])
+        if not isinstance(entries, list):
+            found.append(f"{CONFIG_REL}: {key} is not a list")
+            continue
+        paths = []
+        for entry in entries:
+            if isinstance(entry, dict) and set(entry) == {"path", "reason"} and all(
+                isinstance(value, str) and value.strip() for value in entry.values()
+            ):
+                paths.append(entry["path"])
+            else:
+                found.append(
+                    f"{CONFIG_REL}: {key} entry {entry!r} is not a table of exactly a non-empty"
+                    " `path` and `reason`"
+                )
+        twice = sorted({path for path in paths if paths.count(path) > 1})
+        found += [f"{CONFIG_REL}: {path} is listed in {key} more than once" for path in twice]
+    return found
+
+
+def with_control(config: dict) -> str:
+    """The lists of a clippy.toml that passed check 1, as TOML, with MISSPELT
+    added to disallowed-methods."""
+    def string(text: str) -> str:  # a TOML basic string
+        escape = {c for c in text if ord(c) < 0x20 or ord(c) == 0x7F or c in '"\\'}
+        return '"' + "".join(f"\\u{ord(c):04x}" if c in escape else c for c in text) + '"'
+    control = {"path": MISSPELT, "reason": "the guard's control"}
+    lines = []
+    for key in LISTS:
+        lines.append(f"{key} = [")
+        for e in config.get(key, []) + ([control] if key == "disallowed-methods" else []):
+            lines.append(f"    {{ path = {string(e['path'])}, reason = {string(e['reason'])} }},")
+        lines.append("]")
+    return "\n".join(lines) + "\n"
+
+
+def command(argv: list[str], cwd: Path) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, errors="replace")
+    except FileNotFoundError:
+        sys.exit(f"error: {argv[0]} is not on PATH")
+
+
+def copy_tree(destination: Path) -> None:
+    """Copy the files git tracks or does not ignore, as they are now: a
+    symbolic link as the link it is, and no file beyond a link, so that no
+    copy goes through a link. A file it cannot read is left out."""
+    argv = ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"]
+    listing = subprocess.run(argv, cwd=ROOT, capture_output=True, check=False)
+    if listing.returncode != 0:
+        sys.exit(f"error: git ls-files failed in {ROOT}:\n{os.fsdecode(listing.stderr)}")
+    for rel in sorted({os.fsdecode(name) for name in listing.stdout.split(b"\0")} - {""}):
+        source, target = ROOT / rel, destination / rel
+        beyond_link = any(os.path.islink(ROOT / parent) for parent in list(Path(rel).parents)[:-1])
+        if beyond_link or not os.path.lexists(source):  # or deleted in the working tree
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if source.is_symlink():
+                os.symlink(os.readlink(source), target)
+            elif source.is_file():
+                shutil.copy(source, target)  # its contents and mode
+        except OSError as error:
+            name = os.fsencode(rel).decode("utf-8", "backslashreplace")  # printable
+            print(f"left out of the copy: {name} ({error.strerror})")
+
+
+def outside(copy: Path, rel: str) -> str | None:
+    """The problem with writing the copy's file `rel`, if its path leaves it."""
+    if not (real := Path(os.path.realpath(copy / rel))).is_relative_to(copy):
+        return f"cannot plant in {rel}: its path resolves to {real}, outside the copy"
+    return None
+
+
+def insert(copy: Path, rel: str, find: str, lines: list[str]) -> list[int] | str:
+    """Write `lines` into the copy's file `rel` after the first line ending
+    with `{` from the line holding `find` on; `find` must be there once.
+    Returns the 1-based numbers of the written lines, or the problem."""
+    path = copy / rel
+    if problem := outside(copy, rel):
+        return problem
+    try:
+        text = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    except (OSError, UnicodeDecodeError) as error:
+        return f"cannot plant in {rel}: {error}"
+    at = [index for index, line in enumerate(text) if find in line]
+    if len(at) != 1:
+        found = "is not there" if not at else f"is there {len(at)} times"
+        return f"cannot plant in {rel}: the text `{find}` the guard looks for {found}"
+    index = at[0]
+    while not text[index].rstrip().endswith("{"):
+        index += 1
+        if index == len(text):
+            return f"cannot plant in {rel}: no line ending with `{{` after `{find}`"
+    text[index + 1 : index + 1] = [line + "\n" for line in lines]
+    path.write_text("".join(text), encoding="utf-8")
+    return list(range(index + 2, index + 2 + len(lines)))
+
+
+def run_clippy(copy: Path, target_dir: str, *cargo_options: str) -> tuple[int, list[dict], str]:
+    """Run the clippy step in the copy, with `cargo_options` before its own;
+    returns its exit status, its compiler messages and its stderr."""
+    env = dict(os.environ, CARGO_TARGET_DIR=target_dir)
+    # In its own process group, so that it can be stopped with every compiler
+    # it started.
+    process = subprocess.Popen(
+        CLIPPY + list(cargo_options),
+        cwd=copy,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate()
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+    messages = []
+    for line in stdout.splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if record.get("reason") == "compiler-message":
+            messages.append(record["message"])
+    return process.returncode, messages, stderr
+
+
+def quote(text: str, copy: Path) -> str:
+    """Clippy's text with the copy's paths made relative to it, and without
+    the help to add `allow-invalid`, which check 1 refuses."""
+    lines = text.replace(f"{copy}/", "").splitlines()
+    return "\n".join(line for line in lines if "allow-invalid" not in line)
+
+
+def location(span: dict, copy: Path) -> str:
+    """A span's file, relative to the copy, and line."""
+    path = Path(span["file_name"])
+    if path.is_absolute() and path.resolve().is_relative_to(copy):
+        path = path.resolve().relative_to(copy)
+    return f"{path.as_posix()}:{span['line_start']}"
+
+
+def config_warnings(messages: list[dict], copy: Path) -> dict[str, str]:
+    """The messages about clippy's configuration (a file of the copy's
+    devtools/wasm-clippy), by their text, each with its rendered form."""
+    directory = (copy / CONFIG_DIR).resolve()
+    return {
+        quote(m["message"], copy): quote(m.get("rendered") or m["message"], copy)
+        for m in messages
+        if any(Path(s["file_name"]).resolve().is_relative_to(directory) for s in m.get("spans", []))
+        or f"{directory}/" in m["message"]
+        or "Clippy's configuration" in m["message"]
+    }
+
+
+def zeroize_problems() -> tuple[list[str], list[str]]:
+    """Check 4 of the docstring: the problems, and the build's line of each
+    crate."""
+    argv = ["cargo", "tree", "--color", "never", "--locked", "-p", ADAPTER, "--target", TARGET]
+    argv += ["-e", "normal", "--prefix", "none", "--format", "{p}|{f}"]
+    run = command(argv, ROOT)
+    if run.returncode != 0:
+        return [f"{' '.join(argv)} failed:\n{run.stderr}"], []
+    packages = {}
+    for line in run.stdout.splitlines():
+        package, _, features = line.removesuffix(" (*)").partition("|")
+        if package.partition(" ")[0] in ZEROIZE_CRATES:
+            packages.setdefault(package.partition(" ")[0], {})[package] = features.split(",")
+    found = []
+    for crate in ZEROIZE_CRATES:
+        present = packages.get(crate, {})
+        if not present:
+            found.append(f"{crate} is not in the adapter's wasm32 build; update ZEROIZE_CRATES")
+        elif len(present) > 1:
+            found.append(
+                f"{crate} is in the adapter's wasm32 build as {len(present)} packages"
+                f" ({', '.join(present)}); crates/core/Cargo.toml turns its zeroize feature on"
+                " only in the one its entry resolves to"
+            )
+        elif "zeroize" not in next(iter(present.values())):
+            found.append(
+                f"{next(iter(present))} is built without its zeroize feature, so it leaves key"
+                " material in memory; crates/core/Cargo.toml turns it on for wasm32"
+            )
+    stack = [f"{package}|{','.join(f)}" for p in packages.values() for package, f in p.items()]
+    return found, stack
+
+
+def check(copy: Path) -> list[str]:
+    """Checks 1 to 3 of the docstring, in the empty directory `copy`."""
+    try:
+        text = (ROOT / CONFIG_REL).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        return [f"{CONFIG_REL} cannot be read: {error}"]
+    problems = config_problems(text)
+    if os.path.lexists(ROOT / SHADOW_REL):
+        problems.append(f"{SHADOW_REL} exists; clippy reads it, not {CONFIG_REL}")
+    if problems:
+        return problems
+    argv = ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"]
+    metadata = command(argv, ROOT)
+    if metadata.returncode != 0:
+        return [f"{' '.join(argv)} failed:\n{metadata.stderr}"]
+    target_dir = json.loads(metadata.stdout)["target_directory"]
+    copy_tree(copy)
+
+    code, messages, stderr = run_clippy(copy, target_dir)
+    if code != 0:
+        errors = [m.get("rendered") or m["message"] for m in messages if m["level"] == "error"]
+        return [
+            f"the clippy step failed in the copy before any plant (exit status {code}):\n"
+            + quote("\n".join(errors) or stderr, copy)
+        ]
+    first = config_warnings(messages, copy)
+    problems += [f"the clippy step warned about its configuration:\n{t}" for t in first.values()]
+
+    expected = {}
+    for rel, find, lines in PLANTS:
+        written = insert(copy, rel, find, [line for line, _ in lines])
+        if isinstance(written, str):
+            return problems + [written]
+        expected |= {f"{rel}:{number}": path for number, (_, path) in zip(written, lines)}
+    if problem := outside(copy, CONFIG_REL):
+        return problems + [problem]
+    (copy / CONFIG_REL).unlink(missing_ok=True)
+    (copy / CONFIG_REL).write_text(with_control(tomllib.loads(text)), encoding="utf-8")
+
+    code, messages, _ = run_clippy(copy, target_dir, "--keep-going")
+    if code == 0:
+        problems.append("the clippy step passed in the copy with the plants")
+    reported = {}
+    for message in messages:
+        for span in message.get("spans", []):
+            if span.get("is_primary"):
+                where = location(span, copy)
+                reported.setdefault(where, []).append(f"{message['level']}: {message['message']}")
+    for where, path in expected.items():
+        if f"error: use of a disallowed method `{path}`" not in reported.get(where, []):
+            got = "; ".join(reported.get(where, ["nothing reported there"]))
+            problems.append(f"the clippy step did not refuse the plant at {where}, {path} ({got})")
+    warned = config_warnings(messages, copy)
+    if not any(MISSPELT in text for text in warned):
+        problems.append(f"the clippy step did not warn about the control entry {MISSPELT}")
+    # A warning the first run printed is reported once, above.
+    problems += [
+        f"the clippy step warned about its configuration:\n{rendered}"
+        for text, rendered in warned.items()
+        if MISSPELT not in text and text not in first
+    ]
+    if not problems:
+        print(f"plants: the clippy step passed without them and refused all {len(expected)}")
+    return problems
+
+
+def _handle(handler) -> None:
+    for stop in STOPS:
+        if STARTED_WITH[stop] is not signal.SIG_IGN:  # as under nohup, or `&` in a script
+            signal.signal(stop, handler)
+
+
+def _stop(signum: int, _frame) -> None:
+    _handle(signal.SIG_IGN)  # a further signal cannot cut the cleanup short
+    raise SystemExit(128 + signum)
+
+
+def main() -> int:
+    # Line-buffered, so the FAIL lines on stderr keep their place among these
+    # lines when both streams go to one log.
+    sys.stdout.reconfigure(line_buffering=True)
+    _handle(_stop)
+    copy = Path(tempfile.mkdtemp(prefix="wasm-clippy-guard-")).resolve()
+    try:
+        problems = check(copy)
+    finally:
+        _handle(signal.SIG_IGN)
+        shutil.rmtree(copy, ignore_errors=True)
+    _handle(_stop)
+    found, stack = zeroize_problems()
+    for problem in problems + found:
+        print(f"FAIL: {problem}", file=sys.stderr)
+    print(f"zeroize: {', '.join(stack)}")
+    return 1 if problems or found else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
