@@ -128,15 +128,30 @@ deliberate second step):
    workflows' gate and build steps on a developer's machine for the host's
    architecture (`--crates` adds the crates.io verify steps on the
    release's pinned toolchain), and a failure there costs a new commit, not
-   a new version. Then push the tag (or merge the release PR) and dispatch
-   `npm-publish`, `release-dev-image` and `release-image` (once per backend
-   image) against it with `dry_run` checked. Each runs its
+   a new version. Then push the tag and dispatch `npm-publish`,
+   `release-dev-image` and `release-image` (once per backend image)
+   against it with `dry_run` checked. Each runs its
    gates and its builds as for the release (the image workflows: both
    architectures, smoke tests, scans and SBOMs; the npm workflow: the five
    platform binaries, their smoke tests and the launcher suite) and
    publishes nothing. The `protect-release-tags` ruleset blocks any update
    or deletion of a `v*` tag, so a rehearsal failure that needs a code
-   change after the tag is pushed costs the version.
+   change after the tag is pushed costs the version. With the release
+   PR, CI runs these dry runs before the merge. Each push to the release
+   PR's branch starts `release-rehearsal.yml`, which runs them on the
+   pushed commit with the workflows' `commit` input. `release-pr.yml` has
+   one check, `release-pr`, which the admin makes required on `main`. On
+   the release PR it checks the branch (one version in the three
+   manifests, Cargo.lock, the migration freeze, and only release-please's
+   commit and at most push-release-pr's commit on top of `main`), then
+   waits for the rehearsal of the PR's head and passes only if the
+   rehearsal passed. In the merge queue it fails the release PR's entry
+   unless the entry's tree is the tree of the release PR's head, so
+   nothing queued ahead of it reaches the tagged commit; the queue drops
+   the release PR, and the next release workflow run rebuilds it. On any
+   other PR or entry it passes. The local `devtools/release-dry-run
+   --crates` run stays, because no workflow rehearses the crates.io
+   package step.
 3. A maintainer dispatches the container and npm publish workflows
    independently against the tag; the crates.io workflow runs last, after
    `promote-image`. Dispatch the `npm-publish` workflow from `main` with the
@@ -206,7 +221,8 @@ carries the version in one of these files needs markers. A new file that
 carries the version also needs an entry in `extra-files` in
 `release-please-config.json` (markers, or a JSON path for a JSON file), and
 the file must be added to `VERSIONED` in the `prepare-release-pr` job of
-`release.yml`, which otherwise refuses the release PR.
+`release.yml` and to the file list of the commit check in `release-pr.yml`;
+otherwise either refuses the release PR.
 
 Two more jobs then finish the PR. The first, `prepare-release-pr`, refuses
 the PR's branch unless it is one release-please commit on top of `main`
@@ -258,9 +274,9 @@ branch, and merge it with no merge to `main` in between. Merging it creates
 the tag `vX.Y.Z` on the merge commit and a draft GitHub release whose body
 is the changelog section. If the tag already existed on another commit,
 release-please keeps it and the run fails; do not publish that tag or its
-draft release. Then publish as for a tag pushed by hand: the dry-run
-dispatches of step 2, steps 3 to 5, `promote-image` for the container
-images, and "Releasing to crates.io" below. Publish the draft release when
+draft release. Then publish as for a tag pushed by hand: steps 3 to 5,
+`promote-image` for the container images, and "Releasing to crates.io"
+below. Publish the draft release when
 the promotions are done, with `gh release edit vX.Y.Z --draft=false
 --latest`.
 
@@ -292,13 +308,17 @@ One-time setup, before `release.yml` does anything:
   `branch: main`, no required reviewers, and the App's private key as the
   secret `RELEASE_APP_PRIVATE_KEY`. Only the two jobs that mint the App's
   token name this environment.
-- Required checks on `main`: the PR title check's `conventional` and, once
-  `release-rehearsal.yml` exists, its `release-pr`.
+- Required checks on `main`: the PR title check's `conventional` and
+  `release-pr.yml`'s `release-pr`. A PR that was open before
+  `release-pr.yml` merged has no `release-pr` result until its next push,
+  or a close and reopen. Make the check required after the open PRs have
+  been updated, or update them afterwards.
+- The merge queue keeps "Only merge non-failing pull requests" on. With
+  it off, a failing release PR entry merges with the entries behind it.
 - Last, the repository variable `RELEASE_APP_CLIENT_ID` with the App's client
   id (the App's settings page, "Client ID"). Until it is set, every job of
   `release.yml` is skipped, so `release.yml` can be on `main` before the
-  rest of the setup. Set it only after `release-rehearsal.yml` (the next
-  change in #1395) is merged and its `release-pr` check is required.
+  rest of the setup. Set it only after `release-pr` is a required check.
 
 ## Releasing to crates.io
 

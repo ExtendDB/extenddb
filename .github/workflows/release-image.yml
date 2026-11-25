@@ -54,11 +54,23 @@
 #             approval of its own; it runs only first-party pinned actions,
 #             because its OIDC token can sign as this workflow.
 #
-# Trigger: manual workflow_dispatch only. There is intentionally no
-# `push: tags:` trigger: a tag-triggered run executes the workflow definition
+# Trigger: workflow_dispatch, or workflow_call from another workflow in
+# this repository (below). There is intentionally no `push: tags:`
+# trigger: a tag-triggered run executes the workflow definition
 # from the tagged revision, which may be older than the reviewed workflow on
 # protected main. Dispatching from main runs the current definition against an
 # existing, validated tag.
+#
+# Another workflow can call this one (workflow_call) with the same inputs:
+# release-rehearsal.yml runs it with dry_run on the release PR's head
+# commit, which has no tag yet, by passing the commit input. The gate
+# accepts a commit only with dry_run and only if it is on main or is the
+# head of the release PR's branch; it then skips the tag checks, and the
+# publish jobs never run. A called run executes this file as it is in the
+# caller's commit and runs in the caller's repository. Any public
+# repository can call this file, and a signature made there would name
+# this file in its certificate, so the gate's first step refuses to run in
+# any repository other than ExtendDB/extenddb.
 #
 # One-time setup (Settings -> Environments -> dockerhub):
 #   Deployment branches: Selected, rule `branch: main` (migrated from the old
@@ -94,6 +106,26 @@ on:
         description: 'Rehearse only: run the gates and both builds with their smoke tests, scans and SBOMs; publish, sign, mirror and attest nothing'
         type: boolean
         default: false
+      commit:
+        description: 'With dry_run only: rehearse this commit (full SHA) before it is tagged. It must be on main or be the head of the release PR. The tag is the one it will get.'
+        default: ''
+  # release-rehearsal.yml calls this workflow with the same inputs. The
+  # image is a string here (workflow_call has no choice type); the gate's
+  # allowlist is what enforces it either way.
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+      image:
+        type: string
+        required: true
+      dry_run:
+        type: boolean
+        default: false
+      commit:
+        type: string
+        default: ''
 
 # Nothing is committed, so no write scope on the repo is needed.
 permissions:
@@ -128,6 +160,13 @@ jobs:
       smoke_script: ${{ steps.meta.outputs.smoke_script }}
       smoke_env: ${{ steps.meta.outputs.smoke_env }}
     steps:
+      # A called workflow runs in the caller's repository, and any public
+      # repository can call this one; refuse before any other step.
+      - name: Refuse to run outside ExtendDB/extenddb
+        run: |
+          [[ "$GITHUB_REPOSITORY" == "ExtendDB/extenddb" ]] \
+            || { echo "::error::this workflow publishes ExtendDB only; it does not run in ${GITHUB_REPOSITORY}"; exit 1; }
+
       - name: Check out main (the reviewed workflow's own ref)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
@@ -140,6 +179,8 @@ jobs:
           # environment, never by interpolation into the script source.
           RAW_TAG: ${{ inputs.tag }}
           RAW_IMAGE: ${{ inputs.image }}
+          RAW_COMMIT: ${{ inputs.commit }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
 
@@ -179,19 +220,42 @@ jobs:
               ;;
           esac
 
-          # 2. The tag must already exist; this workflow never creates tags.
-          git fetch --no-tags origin "refs/tags/${RAW_TAG}:refs/tags/${RAW_TAG}" \
-            || { echo "::error::tag ${RAW_TAG} does not exist on origin"; exit 1; }
-          SHA=$(git rev-list -n 1 "refs/tags/${RAW_TAG}")
-          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] \
-            || { echo "::error::could not resolve ${RAW_TAG} to a full commit SHA"; exit 1; }
+          if [[ -n "$RAW_COMMIT" ]]; then
+            # A rehearsal of a commit that is not tagged yet, such as the
+            # release PR's head (release-rehearsal.yml). A dry run publishes
+            # nothing, so the tag checks wait until the merge creates the
+            # tag; the version checks below still apply.
+            [[ "$DRY_RUN" == "true" ]] \
+              || { echo "::error::the commit input is accepted only with dry_run"; exit 1; }
+            [[ "$RAW_COMMIT" =~ ^[0-9a-f]{40}$ ]] \
+              || { echo "::error::commit '${RAW_COMMIT}' is not a full commit SHA"; exit 1; }
+            # GitHub serves the head of every PR by SHA, a fork's included.
+            # Only a commit on main or the release PR's head may be built
+            # here, because a run dispatched from main can write main's
+            # Actions cache, which every branch restores.
+            git fetch --no-tags origin main
+            RELEASE_PR_HEAD=$(git ls-remote origin refs/heads/release-please--branches--main--components--extenddb | cut -f1)
+            git fetch --no-tags origin "$RAW_COMMIT" \
+              || { echo "::error::commit ${RAW_COMMIT} is not on origin"; exit 1; }
+            git merge-base --is-ancestor "$RAW_COMMIT" origin/main \
+              || [[ "$RAW_COMMIT" == "$RELEASE_PR_HEAD" ]] \
+              || { echo "::error::commit ${RAW_COMMIT} is neither on main nor the head of the release PR"; exit 1; }
+            SHA="$RAW_COMMIT"
+          else
+            # 2. The tag must already exist; this workflow never creates tags.
+            git fetch --no-tags origin "refs/tags/${RAW_TAG}:refs/tags/${RAW_TAG}" \
+              || { echo "::error::tag ${RAW_TAG} does not exist on origin"; exit 1; }
+            SHA=$(git rev-list -n 1 "refs/tags/${RAW_TAG}")
+            [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] \
+              || { echo "::error::could not resolve ${RAW_TAG} to a full commit SHA"; exit 1; }
 
-          # 3. The tagged commit must be on main, so a tag pushed on an
-          #    unmerged branch cannot publish unreviewed code publicly.
-          git fetch --no-tags origin main
-          if ! git merge-base --is-ancestor "$SHA" origin/main; then
-            echo "::error::${RAW_TAG} (${SHA}) is not contained in origin/main"
-            exit 1
+            # 3. The tagged commit must be on main, so a tag pushed on an
+            #    unmerged branch cannot publish unreviewed code publicly.
+            git fetch --no-tags origin main
+            if ! git merge-base --is-ancestor "$SHA" origin/main; then
+              echo "::error::${RAW_TAG} (${SHA}) is not contained in origin/main"
+              exit 1
+            fi
           fi
 
           # 4. The tag and the workspace version at that commit must agree.
@@ -423,17 +487,20 @@ jobs:
             || { echo "::error::tagged commit has no devtools/check-image-sbom; use a tag created after it was merged"; exit 1; }
           devtools/check-image-sbom "sbom/sbom-${ARCH}.cdx.json" "$DOCKERFILE"
 
+      # The artifact names carry the image. release-rehearsal.yml calls this
+      # workflow once per image in one run, and the artifacts of a run share
+      # one set of names, so each download names its own image.
       - name: Upload the SBOM artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
-          name: sbom-${{ matrix.arch }}
+          name: sbom-${{ needs.gate.outputs.image }}-${{ matrix.arch }}
           path: sbom/
           retention-days: 7      # a failed attest job can be re-run for a week
 
       - name: Upload the image artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
-          name: image-${{ matrix.arch }}
+          name: image-${{ needs.gate.outputs.image }}-${{ matrix.arch }}
           path: image-${{ matrix.arch }}.tar.gz
           retention-days: 1
           compression-level: 0   # already gzipped
@@ -463,7 +530,8 @@ jobs:
 
   publish-candidate:
     needs: [gate, build]
-    if: ${{ !inputs.dry_run }}
+    # The gate refuses a commit without dry_run; this is the second check.
+    if: ${{ !inputs.dry_run && inputs.commit == '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment: dockerhub       # approval 1: publish + sign (the only job with Docker Hub secrets)
@@ -487,7 +555,7 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           path: images
-          pattern: image-*
+          pattern: image-${{ needs.gate.outputs.image }}-*
           merge-multiple: true
 
       - name: Load both images
@@ -745,7 +813,7 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           path: sbom
-          pattern: sbom-*
+          pattern: sbom-${{ needs.gate.outputs.image }}-*
           merge-multiple: true
 
       - name: Resolve the subjects; refuse images this run did not build
