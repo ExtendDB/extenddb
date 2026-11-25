@@ -142,7 +142,7 @@ fn an_index_name_is_refused_at_its_member_path_with_one_clause_per_constraint() 
             "globalSecondaryIndexes.2.member.indexName",
             &[PATTERN],
         ),
-        // #1135: an empty name is outside the pattern too.
+        // An empty name is outside the pattern too.
         (Gsi, "", gsi, &[SHORT, PATTERN]),
         (Lsi, "", lsi, &[SHORT, PATTERN]),
         (Vector, "", vector, &[SHORT, PATTERN]),
