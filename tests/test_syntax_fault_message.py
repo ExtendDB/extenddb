@@ -11,7 +11,10 @@ answers them with ResourceNotFoundException, since the table named does not
 exist. Each body was sent twice, signed, in us-east-1 on 2026-11-20, with the
 same answer both times. It also reads a body with a number written with
 leading zeros, as the decimal number the digits spell (the ``leading-zero``
-rows, measured the same way on 2026-11-21).
+rows, measured the same way on 2026-11-21), a number that ends in a point and
+a minus sign on its own (the ``trailing-point`` and ``lone-minus`` rows, the
+same day). It refuses ``+1``, ``.5`` and ``0x10`` as it refuses a syntax fault
+(the ``plus-sign``, ``point-first`` and ``hex`` rows, the same day).
 
 Dual-target: runs against the service and against ExtendDB.
 """
@@ -65,6 +68,12 @@ ROWS = {
     "leading-zero-map": ("DescribeTable", NAMED[:-1] + b', "x": {"y": 01}}', True),
     "leading-zero-first": ("DescribeTable", b'{"x": 01, ' + NAMED[1:], True),
     "leading-zero-limit": ("Scan", NAMED[:-1] + b', "Limit": 01}', True),
+    "trailing-point": ("DescribeTable", NAMED[:-1] + b', "x": 1.}', True),
+    "trailing-point-limit": ("Scan", NAMED[:-1] + b', "Limit": 1.}', True),
+    "lone-minus": ("DescribeTable", NAMED[:-1] + b', "x": -}', True),
+    "plus-sign": ("DescribeTable", NAMED[:-1] + b', "x": +1}', False),
+    "point-first": ("DescribeTable", NAMED[:-1] + b', "x": .5}', False),
+    "hex": ("DescribeTable", NAMED[:-1] + b', "x": 0x10}', False),
 }
 
 
