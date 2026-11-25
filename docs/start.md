@@ -8,7 +8,7 @@ slug: /start
 
 ExtendDB speaks the DynamoDB wire protocol. The AWS CLI and every AWS SDK talk to it the same way they talk to the DynamoDB service, with one change: the endpoint URL points at your server.
 
-This page gets a server running in one command and sends the first requests to it. The [Install](/start/install/) section covers the other ways to run ExtendDB: Docker Compose with PostgreSQL, and builds from source on Linux and macOS.
+This page gets a server running in one command and sends the first requests to it. The Install pages cover the other ways to run ExtendDB: [Docker Compose with PostgreSQL](local-dev-docker-compose.md), and builds from source on [Linux](manuals/08-install-linux.md) and [macOS](manuals/09-install-macos.md).
 
 ## 1. Start a server
 
@@ -29,7 +29,7 @@ curl -s http://127.0.0.1:18080/health
 {"status":"healthy"}
 ```
 
-The image has no TLS and no access control, so it is bound to the loopback interface only. It is for development and CI; the [development image](/dev-image/) page explains what it does and does not protect. For a server with TLS and PostgreSQL, use [Docker Compose](/local-dev-docker-compose/).
+The image has no TLS and no access control, so it is bound to the loopback interface only. It is for development and CI; the [development image](dev-image.md) page explains what it does and does not protect. For a server with TLS and PostgreSQL, use [Docker Compose](local-dev-docker-compose.md).
 
 ## 2. Point the AWS CLI at it
 
@@ -113,7 +113,7 @@ dynamodb = boto3.client(
 print(dynamodb.list_tables()["TableNames"])
 ```
 
-The [usage guide](/manuals/usage-guide/#sdk-configuration) has the same configuration for Java, Rust and JavaScript, and for a server with TLS, where the client also needs the server's certificate.
+The [usage guide](manuals/03-usage-guide.md#sdk-configuration) has the same configuration for Java, Rust and JavaScript, and for a server with TLS, where the client also needs the server's certificate.
 
 ## 5. Stop and clean up
 
@@ -124,7 +124,7 @@ docker volume rm extenddb
 
 ## Next
 
-- [Install](/start/install/): Docker Compose with PostgreSQL and TLS, or a build from source.
-- [Using ExtendDB](/manuals/usage-guide/): the operations, expressions, transactions and streams, with examples.
-- [Differences from DynamoDB](/differences-from-dynamodb/): every behaviour that is measured to differ from the service.
-- [Deployment](/manuals/deployment-guide/): running ExtendDB on your own servers.
+- [Docker Compose with PostgreSQL](local-dev-docker-compose.md) and TLS, or a build from source on [Linux](manuals/08-install-linux.md) or [macOS](manuals/09-install-macos.md).
+- [Using ExtendDB](manuals/03-usage-guide.md): the operations, expressions, transactions and streams, with examples.
+- [Differences from DynamoDB](differences-from-dynamodb.md): every behaviour that is measured to differ from the service.
+- [Deployment](manuals/11-deployment-guide.md): running ExtendDB on your own servers.

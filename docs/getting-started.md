@@ -6,7 +6,7 @@ description: "Build ExtendDB from source, initialize a deployment, start the ser
 
 > See [NOTICE](https://github.com/ExtendDB/extenddb/blob/main/docs/NOTICE.md) for important disclaimers.
 
-This guide builds ExtendDB from source, initializes a deployment, starts the server, and runs DynamoDB commands against it. It is the long route; for a server in one command see [Getting started](start.md), and for the two container images see [Install](/start/install/).
+This guide builds ExtendDB from source, initializes a deployment, starts the server, and runs DynamoDB commands against it. It is the long route; for a server in one command see [Getting started](start.md), and for the two container images see the [development image](dev-image.md) and [Docker Compose with PostgreSQL](local-dev-docker-compose.md).
 
 ## Platform-specific installation guides
 
@@ -48,7 +48,7 @@ and continue at [section 6](#6-try-it-out).
   - Apache Cassandra 4.1+ running locally (CI runs the `cassandra:4.1` image; see [Cassandra setup](cassandra-setup.md) and [Storage backends](storage-backends.md))
 - Rust toolchain (1.91.1+)
 - AWS CLI v2 (for testing)
-- Python 3.10+ with virtual environment (see [Python Environment Setup](https://github.com/ExtendDB/extenddb/blob/main/README.md#python-environment-setup) in the README)
+- Python 3.10+ with virtual environment (see [Python Environment Setup](https://github.com/ExtendDB/extenddb/blob/main/README.md#python-environment) in the README)
 
 ## 1. Build ExtendDB
 
