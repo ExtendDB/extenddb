@@ -18,7 +18,7 @@ use crate::index_helpers::combined_lek_key_schema;
 
 /// Validate `ExclusiveStartKey` against the (table or index) key schema for
 /// `Scan`. A start key that does not fit gets `The provided starting key is
-/// invalid`, as in a Query (measured 2026-11-19 and 2026-11-20, issue #1174).
+/// invalid`, as in a Query (measured 2026-11-19 and 2026-11-20).
 ///
 /// An index Scan names a key of another type, table keys included, ahead of a key
 /// left out or an extra attribute (measured 2026-11-14 to 2026-11-19).
