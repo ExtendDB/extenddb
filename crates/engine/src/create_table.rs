@@ -133,6 +133,7 @@ pub fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> Dynamo
             ErrorMessageKey::TableInUse,
             &[&name],
         )),
+        StorageError::TableBeingDeleted(name) => table_being_deleted(&name),
         // Only RestoreTableFromBackup raises this; its own mapping makes it
         // TableInUseException. Elsewhere (a plain CreateTable into a name
         // that is a CREATING restore target) the service's text is the one
@@ -230,6 +231,16 @@ pub fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> Dynamo
             DynamoDbError::InternalServerError("Internal server error".to_owned())
         }
     }
+}
+
+/// The service's answer to a change of a table that is `DELETING`
+/// (`DeleteTable`, `UpdateTable`, `TagResource`, `UntagResource`):
+/// `ResourceInUseException` with the `Table is being deleted` sentence.
+pub(crate) fn table_being_deleted(name: &str) -> DynamoDbError {
+    DynamoDbError::ResourceInUseException(error_message(
+        ErrorMessageKey::TableBeingDeleted,
+        &[name],
+    ))
 }
 
 /// Like [`storage_err_to_dynamo`], but includes the old item in

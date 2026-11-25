@@ -30,6 +30,16 @@ use crate::catalog_json::from_catalog_json;
 /// on these columns. Their results are still ordered correctly, because the
 /// predicates carry the collation explicitly; only the index use differs.
 const TEXT_KEY: &str = "TEXT COLLATE \"C\"";
+
+/// The status the data plane classifies a `tables` row by. `abort_restore`
+/// claims a restore target under removal (the backup reconciler's, or a failed
+/// restore's own) by marking it `DELETING` with the epoch as its transition
+/// time, a time no `DeleteTable` mark carries. That row is read as the
+/// `CREATING` restore target it was, which the data plane answers as not
+/// found, as the service answers a table it is still restoring; a row
+/// `DeleteTable` marked is served until it is gone.
+const DATA_PLANE_STATUS: &str = "CASE WHEN table_status = 'DELETING' \
+     AND status_transition_at = 'epoch' THEN 'CREATING' ELSE table_status END";
 use crate::PostgresEngine;
 
 /// Row shape returned by the table-info query: (`key_schema`, `attr_defs`, status, `table_id`, `stream_spec`).
@@ -372,12 +382,12 @@ impl PostgresEngine {
         account_id: &str,
         table_name: &str,
     ) -> Result<TableKeyInfo, StorageError> {
-        let row: Option<TableInfoRow> = sqlx::query_as(
-            "SELECT key_schema, attribute_definitions, table_status, table_id, \
+        let row: Option<TableInfoRow> = sqlx::query_as(&format!(
+            "SELECT key_schema, attribute_definitions, {DATA_PLANE_STATUS}, table_id, \
              stream_specification \
              FROM tables \
-             WHERE account_id = $1 AND table_name = $2",
-        )
+             WHERE account_id = $1 AND table_name = $2"
+        ))
         .bind(account_id)
         .bind(table_name)
         .fetch_optional(&self.pool)
@@ -388,11 +398,17 @@ impl PostgresEngine {
             row.ok_or_else(|| StorageError::TableNotFound(table_name.to_owned()))?;
 
         match status.as_str() {
-            "ACTIVE" => {}
-            // A table that is still being created, or is being deleted, is not
-            // usable for data-plane operations; DynamoDB reports it as not found
-            // (not as in-use). UPDATING keeps the not-active classification.
-            "CREATING" | "DELETING" => {
+            // DynamoDB serves reads and writes on a DELETING table until the
+            // table is gone (measured 2026-10-25); a write made in that window
+            // goes away with the table. The data tables stay until the control
+            // plane drops them, so the data plane reads a DELETING row as found;
+            // a statement that reaches a dropped data table is answered as not
+            // found by the `DataEngine` implementation.
+            "ACTIVE" | "DELETING" => {}
+            // A table that is still being created is not usable for data-plane
+            // operations; DynamoDB reports it as not found (not as in-use).
+            // UPDATING keeps the not-active classification.
+            "CREATING" => {
                 return Err(StorageError::TableNotFound(table_name.to_owned()));
             }
             _ => return Err(StorageError::TableNotActive(table_name.to_owned())),
@@ -526,9 +542,10 @@ impl PostgresEngine {
         index_name: &str,
     ) -> Result<IndexInfo, StorageError> {
         // First get the table_id and verify the table is ACTIVE
-        let row: Option<(String, String)> = sqlx::query_as(
-            "SELECT table_id, table_status FROM tables WHERE account_id = $1 AND table_name = $2",
-        )
+        let row: Option<(String, String)> = sqlx::query_as(&format!(
+            "SELECT table_id, {DATA_PLANE_STATUS} FROM tables \
+             WHERE account_id = $1 AND table_name = $2"
+        ))
         .bind(account_id)
         .bind(table_name)
         .fetch_optional(&self.pool)
@@ -539,11 +556,10 @@ impl PostgresEngine {
             row.ok_or_else(|| StorageError::TableNotFound(table_name.to_owned()))?;
 
         match status.as_str() {
-            "ACTIVE" => {}
-            // A table that is still being created, or is being deleted, is not
-            // usable for data-plane operations; DynamoDB reports it as not found
-            // (not as in-use). UPDATING keeps the not-active classification.
-            "CREATING" | "DELETING" => {
+            // Same classification as `fetch_table_key_info`: a DELETING table
+            // is served until it is gone, a CREATING one is not found.
+            "ACTIVE" | "DELETING" => {}
+            "CREATING" => {
                 return Err(StorageError::TableNotFound(table_name.to_owned()));
             }
             _ => return Err(StorageError::TableNotActive(table_name.to_owned())),

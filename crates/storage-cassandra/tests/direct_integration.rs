@@ -34,6 +34,8 @@ mod consistency_levels;
 mod consistency_shape;
 #[path = "direct/delete_item.rs"]
 mod delete_item;
+#[path = "direct/deleting_window.rs"]
+mod deleting_window;
 #[path = "direct/groups.rs"]
 mod groups;
 #[path = "direct/gsi_worker_pass.rs"]

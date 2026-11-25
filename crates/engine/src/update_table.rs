@@ -373,6 +373,9 @@ fn update_table_err_to_dynamo(
         StorageError::TableNotActive(name) => {
             DynamoDbError::ResourceInUseException(format!("Table {name} is not in ACTIVE state"))
         }
+        // The service words a DELETING table differently from the other
+        // non-ACTIVE statuses (measured 2026-10-24).
+        StorageError::TableBeingDeleted(name) => crate::create_table::table_being_deleted(&name),
         StorageError::IndexAlreadyExists(name) => DynamoDbError::ValidationException(format!(
             "One or more parameter values were invalid: Index already exists: {name}"
         )),

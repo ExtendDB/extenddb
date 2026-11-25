@@ -959,6 +959,12 @@ impl PostgresEngine {
     /// DELETING removal, so if a drop below fails, the row stays DELETING with
     /// its index rows and the control plane finishes the job later.
     ///
+    /// The claim's transition time is the epoch, a time no `DeleteTable` mark
+    /// carries, since `DeleteTable` schedules the removal at or after the time
+    /// it runs. The data plane serves a table `DeleteTable` marked until it is
+    /// gone, and reads a row with this transition time as the restore target it
+    /// was, which it never served (`DATA_PLANE_STATUS` in `data/ddl.rs`).
+    ///
     /// The relations dropped are the ones `DeleteTable` drops
     /// (`table_storage_relations`): the data table, every secondary index's
     /// table and every vector index's table, their ids read in the claiming
@@ -971,7 +977,7 @@ impl PostgresEngine {
     pub async fn abort_restore(&self, table_id: &str) -> Result<bool, StorageError> {
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         let claimed = sqlx::query(
-            "UPDATE tables SET table_status = 'DELETING', status_transition_at = NOW() \
+            "UPDATE tables SET table_status = 'DELETING', status_transition_at = 'epoch' \
              WHERE table_id = $1 AND table_status = 'CREATING' AND status_transition_at IS NULL",
         )
         .bind(table_id)
