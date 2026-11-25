@@ -89,6 +89,8 @@ DOCUMENTS = [
      "docs/manuals/13-event-ticketing-demo.md"),
     (19, "backup-and-restore", "Backup and Restore", "usage",
      "docs/manuals/14-backup-and-restore.md"),
+    (20, "configuration", "Configuration", "reference",
+     "docs/configuration.md"),
 ]
 
 
