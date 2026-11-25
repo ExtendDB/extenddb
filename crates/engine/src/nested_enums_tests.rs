@@ -128,7 +128,28 @@ fn rows() -> Vec<((&'static str, Value), Option<String>)> {
             "GlobalSecondaryIndexUpdates": [{"Create": index("gsi", "g", "ALL_ATTRIBUTES")}],
         })
     };
+    // A table keyed on pk and sk, with an LSI on l.
+    let bad_lsi = || {
+        json!({
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"},
+            ],
+            "LocalSecondaryIndexes": [{
+                "IndexName": "lsi",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "l", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "INCLUDES"},
+            }],
+        })
+    };
     let gsi_fault = projection("EVERY_ATTRIBUTE", "globalSecondaryIndexes.1.member");
+    let create_fault = projection(
+        "ALL_ATTRIBUTES",
+        "globalSecondaryIndexUpdates.1.member.create",
+    );
     let sse_bogus = refused("BOGUS", SSE_TYPE, SSE_SET);
     let kms_key = |key: &str| json!({"Enabled": true, "KMSMasterKeyId": key});
     let key_2049 = "k".repeat(2049);
@@ -150,21 +171,10 @@ fn rows() -> Vec<((&'static str, Value), Option<String>)> {
             projection("keys_only", "globalSecondaryIndexes.2.member"),
         ),
         (
-            create(json!({
-                "AttributeDefinitions": defs(&["pk", "sk", "l"]),
-                "KeySchema": [
-                    {"AttributeName": "pk", "KeyType": "HASH"},
-                    {"AttributeName": "sk", "KeyType": "RANGE"},
-                ],
-                "LocalSecondaryIndexes": [{
-                    "IndexName": "lsi",
-                    "KeySchema": [
-                        {"AttributeName": "pk", "KeyType": "HASH"},
-                        {"AttributeName": "l", "KeyType": "RANGE"},
-                    ],
-                    "Projection": {"ProjectionType": "INCLUDES"},
-                }],
-            })),
+            create(with(
+                bad_lsi(),
+                json!({"AttributeDefinitions": defs(&["pk", "sk", "l"])}),
+            )),
             projection("INCLUDES", "localSecondaryIndexes.1.member"),
         ),
         (
@@ -271,12 +281,66 @@ fn rows() -> Vec<((&'static str, Value), Option<String>)> {
     for view in ["NEW_AND_OLD_IMAGE", "keys_only", "", "TOTAL"] {
         rows.push((update(stream(true, view)), refused(view, VIEW, VIEW_SET)));
     }
-    // A member of the wrong JSON type answers first.
+    // Two members outside their sets (measured 2026-11-17). The service lists
+    // the GSIs, then the stream view type, then the LSIs, and on UpdateTable
+    // the `Create` entries, then the stream view type.
+    rows.extend([
+        (
+            create(json!({
+                "AttributeDefinitions": defs(&["pk", "g", "l"]),
+                "GlobalSecondaryIndexes": [
+                    index("gsi", "g", "EVERY_ATTRIBUTE"),
+                    index("gsi2", "l", "keys_only"),
+                ],
+            })),
+            both(
+                gsi_fault.clone(),
+                projection("keys_only", "globalSecondaryIndexes.2.member"),
+            ),
+        ),
+        (
+            create(with(bad_gsi(), stream(true, "NEW_IMAGES"))),
+            both(gsi_fault.clone(), refused("NEW_IMAGES", VIEW, VIEW_SET)),
+        ),
+        (
+            create(with(
+                bad_lsi(),
+                with(
+                    bad_gsi(),
+                    json!({"AttributeDefinitions": defs(&["pk", "sk", "g", "l"])}),
+                ),
+            )),
+            both(
+                gsi_fault.clone(),
+                projection("INCLUDES", "localSecondaryIndexes.1.member"),
+            ),
+        ),
+        (
+            update(with(bad_create(), stream(true, "NEW_IMAGES"))),
+            both(create_fault.clone(), refused("NEW_IMAGES", VIEW, VIEW_SET)),
+        ),
+        (
+            update(json!({
+                "AttributeDefinitions": defs(&["g", "l"]),
+                "GlobalSecondaryIndexUpdates": [
+                    {"Create": index("gsi", "g", "ALL_ATTRIBUTES")},
+                    {"Create": index("gsi2", "l", "keys_only")},
+                ],
+            })),
+            both(
+                create_fault,
+                projection("keys_only", "globalSecondaryIndexUpdates.2.member.create"),
+            ),
+        ),
+    ]);
+    // A member of the wrong JSON type answers first. `ReplicaUpdates` holds
+    // objects (measured 2026-11-25).
     for (operation, body) in [
         create(with(bad_gsi(), json!({"AttributeDefinitions": "x"}))),
         create(with(bad_gsi(), json!({"Tags": "x"}))),
         update(with(bad_create(), json!({"AttributeDefinitions": "x"}))),
         update(with(bad_create(), json!({"ReplicaUpdates": "x"}))),
+        update(json!({"ReplicaUpdates": ["x"]})),
     ] {
         rows.push(((operation, body), None));
     }

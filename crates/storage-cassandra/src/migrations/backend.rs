@@ -20,10 +20,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use cdrs_tokio::consistency::Consistency;
-use extenddb_storage::management_store::ManagementStore;
+use extenddb_storage::management_store::{ManagementStore, SettingsStore};
 use extenddb_storage::migrations::{
-    CatalogTraces, Done, HasManagementStore, LedgerColumns, LedgerRow, Migration, MigrationBackend,
-    MigrationError, MigrationId, Released, Step, StoreKind, StoreRef, record_rows,
+    CatalogTraces, Done, HasManagementStore, LedgerColumns, LedgerRow, LockedStores, Migration,
+    MigrationBackend, MigrationError, MigrationId, Released, Step, StoreKind, StoreRef,
+    record_rows,
 };
 
 use super::agreement::{AGREEMENT_TIMEOUT, wait_for_agreement_with};
@@ -62,14 +63,15 @@ fn stopped_by_hook() -> MigrationError {
 }
 
 impl CassandraStores {
-    fn new(
+    pub(super) fn new(
         session: Arc<CassandraSession>,
         keyspace_prefix: &str,
         lease: Option<LeaseHandle>,
     ) -> Self {
         Self {
             management: LeasedManagementStore::new(
-                CassandraCatalogStore::catalog_only(session.clone(), keyspace_prefix.to_owned()),
+                CassandraCatalogStore::catalog_only(session.clone(), keyspace_prefix.to_owned())
+                    .reading_key_rows_at_all(),
                 lease.clone(),
             ),
             session,
@@ -156,6 +158,19 @@ impl CassandraStores {
 
 impl HasManagementStore for CassandraStores {
     fn management_store(&self) -> &dyn ManagementStore {
+        &self.management
+    }
+}
+
+/// The catalog's stores for the encryption-key commands, which open them
+/// under the lock they hold as a migration does: every call checks the
+/// lease first and is bounded by the request timeout.
+impl LockedStores for CassandraStores {
+    fn management(&self) -> &dyn ManagementStore {
+        &self.management
+    }
+
+    fn settings(&self) -> &dyn SettingsStore {
         &self.management
     }
 }

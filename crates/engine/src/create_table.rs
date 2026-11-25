@@ -125,15 +125,15 @@ pub async fn handle_create_table(
 }
 
 /// The service's refusals of an `SSESpecification` whose members do not go
-/// together. They come after the member faults. Only an `Enabled` of `true`
-/// or `false` is checked.
+/// together. They come after the member faults. An `Enabled` that is neither
+/// a boolean nor a string is not checked.
 pub(crate) fn check_sse_specification(spec: Option<&Value>) -> Result<(), DynamoDbError> {
     let Some(spec) = spec else {
         return Ok(());
     };
     let sse_type = spec.get("SSEType").and_then(Value::as_str);
     let key = spec.get("KMSMasterKeyId").is_some_and(|k| !k.is_null());
-    let reason = match spec.get("Enabled").and_then(Value::as_bool) {
+    let reason = match sse_enabled(spec) {
         Some(false) if sse_type.is_some() => "SSEType can not be specified if Enabled is false",
         Some(false) if key => "KMSMasterKeyId can not be specified if Enabled is false",
         Some(true) if sse_type == Some("AES256") => "SSEType AES256 is not supported",
@@ -145,6 +145,17 @@ pub(crate) fn check_sse_specification(spec: Option<&Value>) -> Result<(), Dynamo
     Err(DynamoDbError::ValidationException(format!(
         "One or more parameter values were invalid: {reason}"
     )))
+}
+
+/// The `Enabled` of an `SSESpecification`. The service reads the string
+/// `"false"` as false and any other string as true (measured on UpdateTable,
+/// 2026-11-25).
+fn sse_enabled(spec: &Value) -> Option<bool> {
+    match spec.get("Enabled")? {
+        Value::Bool(enabled) => Some(*enabled),
+        Value::String(enabled) => Some(enabled != "false"),
+        _ => None,
+    }
 }
 
 /// Map a storage-layer error to its `DynamoDB` wire error.

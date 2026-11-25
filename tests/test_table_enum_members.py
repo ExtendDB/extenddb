@@ -4,15 +4,15 @@
 """CreateTable and UpdateTable refuse members outside their sets.
 
 Measured against Amazon DynamoDB in us-east-1 on 13 and 14 Nov 2026, and
-beside a member of the wrong JSON type on 17 Nov 2026. The TableClass and
-SSESpecification rows were measured on 13, 14 and 18 Nov 2026. Each request
-went out twice with the same answer.
+beside another such member or a member of the wrong JSON type on 17 Nov 2026.
+The TableClass and SSESpecification rows were measured on 13, 14 and 18 Nov
+2026. Each request went out twice with the same answer.
 
 - The service answers ``ValidationException`` with the enum text, the member
   path and the set in its own order.
 - A member of the wrong JSON type answers ``SerializationException`` first.
-  Its text there is "Unexpected field type", which ExtendDB does not send,
-  so these rows check the exception only.
+  Its text there, such as "Unexpected field type", is not the text ExtendDB
+  sends, so these rows check the exception only.
 - A TableClass outside its set gets the service's own sentence. A member of
   the wrong JSON type and a table name of a bad length answer ahead of it.
   It answers ahead of every member fault.
@@ -110,12 +110,13 @@ LSI = {
                   {"AttributeName": "l", "KeyType": "RANGE"}],
     "Projection": {"ProjectionType": "INCLUDES"},
 }
+GSI_FAULT = _projection("EVERY_ATTRIBUTE", "globalSecondaryIndexes.1.member")
+CREATE_FAULT = _projection("ALL_ATTRIBUTES", "globalSecondaryIndexUpdates.1.member.create")
 
 # (id, operation, body without TableName, the answer's message or SERIALIZATION).
 # UpdateTable rows name a table that does not exist.
 ROWS = [
-    ("ct-gsi", "CreateTable", {**TABLE, "GlobalSecondaryIndexes": BAD_GSI},
-     _projection("EVERY_ATTRIBUTE", "globalSecondaryIndexes.1.member")),
+    ("ct-gsi", "CreateTable", {**TABLE, "GlobalSecondaryIndexes": BAD_GSI}, GSI_FAULT),
     ("ct-second-gsi", "CreateTable",
      {**TABLE, "AttributeDefinitions": _defs("pk", "g", "l"),
       "GlobalSecondaryIndexes": [_index("gsi", "g", "ALL"),
@@ -128,11 +129,36 @@ ROWS = [
      _projection("INCLUDES", "localSecondaryIndexes.1.member")),
     ("ut-gsi-create", "UpdateTable",
      {"AttributeDefinitions": _defs("g"), "GlobalSecondaryIndexUpdates": BAD_CREATE},
-     _projection("ALL_ATTRIBUTES", "globalSecondaryIndexUpdates.1.member.create")),
+     CREATE_FAULT),
     ("ct-stream-disabled", "CreateTable",
      {**TABLE, "StreamSpecification": _stream(False, "NEW_IMAGES")}, _view("NEW_IMAGES")),
     ("ct-stream-enabled", "CreateTable",
      {**TABLE, "StreamSpecification": _stream(True, "NEW_IMAGES")}, _view("NEW_IMAGES")),
+    # Two members outside their sets (measured 17 Nov 2026). The service lists
+    # the GSIs, then the stream view type, then the LSIs, and on UpdateTable
+    # the Create entries, then the stream view type.
+    ("ct-two-gsis", "CreateTable",
+     {**TABLE, "AttributeDefinitions": _defs("pk", "g", "l"),
+      "GlobalSecondaryIndexes": BAD_GSI + [_index("gsi2", "l", "keys_only")]},
+     _both(GSI_FAULT, _projection("keys_only", "globalSecondaryIndexes.2.member"))),
+    ("ct-gsi-stream", "CreateTable",
+     {**TABLE, "GlobalSecondaryIndexes": BAD_GSI,
+      "StreamSpecification": _stream(True, "NEW_IMAGES")},
+     _both(GSI_FAULT, _view("NEW_IMAGES"))),
+    ("ct-gsi-lsi", "CreateTable",
+     {**TABLE, "AttributeDefinitions": _defs("pk", "sk", "g", "l"),
+      "KeySchema": HASH + [{"AttributeName": "sk", "KeyType": "RANGE"}],
+      "GlobalSecondaryIndexes": BAD_GSI, "LocalSecondaryIndexes": [LSI]},
+     _both(GSI_FAULT, _projection("INCLUDES", "localSecondaryIndexes.1.member"))),
+    ("ut-gsi-create-stream", "UpdateTable",
+     {"AttributeDefinitions": _defs("g"), "GlobalSecondaryIndexUpdates": BAD_CREATE,
+      "StreamSpecification": _stream(True, "NEW_IMAGES")},
+     _both(CREATE_FAULT, _view("NEW_IMAGES"))),
+    ("ut-two-gsi-creates", "UpdateTable",
+     {"AttributeDefinitions": _defs("g", "l"),
+      "GlobalSecondaryIndexUpdates": BAD_CREATE + [{"Create": _index("gsi2", "l", "keys_only")}]},
+     _both(CREATE_FAULT,
+           _projection("keys_only", "globalSecondaryIndexUpdates.2.member.create"))),
 ] + [
     (f"ut-stream-{view or 'empty'}", "UpdateTable",
      {"StreamSpecification": _stream(True, view)}, _view(view))
@@ -147,6 +173,9 @@ ROWS = [
     ("ut-defs", "UpdateTable",
      {"AttributeDefinitions": "x", "GlobalSecondaryIndexUpdates": BAD_CREATE},
      SERIALIZATION),
+    # ReplicaUpdates holds objects (measured 25 Nov 2026). The service's text
+    # here is "Unexpected value type in payload".
+    ("ut-replica-update-string", "UpdateTable", {"ReplicaUpdates": ["x"]}, SERIALIZATION),
     ("ut-replica-updates", "UpdateTable",
      {"AttributeDefinitions": _defs("g"), "GlobalSecondaryIndexUpdates": BAD_CREATE,
       "ReplicaUpdates": "x"},
@@ -157,7 +186,6 @@ ROWS = [
 # table keyed on pk alone. The ct-table-class-name row sends its own
 # TableName.
 PLAIN = {**TABLE, "AttributeDefinitions": _defs("pk")}
-GSI_FAULT = _projection("EVERY_ATTRIBUTE", "globalSecondaryIndexes.1.member")
 SSE_BOGUS = _refused("BOGUS", SSE_TYPE, SSE_SET)
 KEY_2049 = "k" * 2049
 KEY_FAULT = _too_long(KEY_2049, "sSESpecification.kMSMasterKeyId", 2048)
