@@ -32,8 +32,9 @@ use extenddb_core::expression::{
 };
 use extenddb_core::types::{
     AttributeDefinition, AttributeValue, EMPTY_ATTRIBUTE_VALUE, MULTI_ATTRIBUTE_VALUE, QueryInput,
+    duplicates_as_sent,
 };
-use extenddb_core::validation::number::{NOT_A_NUMBER, NUMBER_SET_DUPLICATES, has_equal_numbers};
+use extenddb_core::validation::number::NOT_A_NUMBER;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 
@@ -497,24 +498,29 @@ fn first_fault<'a>(value: &'a Value, member: Option<&'a str>, sets: bool) -> Opt
 }
 
 /// The service's refusal of a set of type `descriptor` whose `members` are
-/// strings, beside a second type descriptor: [`NUMBER_SET_DUPLICATES`] for an
-/// `NS` two of whose members have one value, else the deserializer's text for
-/// an empty set or an `SS` or `BS` that holds a member twice. Measured
-/// 2026-11-24, each body twice, as `ExpressionAttributeValues contains invalid
-/// value: ... for key :z`: `{"SS": ["a", "a"], "N": "1"}` answers `One or more
-/// parameter values were invalid: Input collection [a, a] contains
-/// duplicates.`, `{"NS": ["1", "1"], "S": "x"}` `Input collection contains
-/// duplicates`, `{"BS": ["YQ==", "YQ=="], "N": "1"}` `One or more parameter
-/// values were invalid: Input collection [YQ==, YQ==]of type BS contains
-/// duplicates.`, and an empty `SS`, `NS` or `BS` beside a second descriptor
-/// the deserializer's empty set text. A member of another JSON type is left
-/// to the shape fault check.
+/// strings, beside a second type descriptor: for a set that holds a member
+/// twice, the text of [`duplicates_as_sent`], which lists the members of an
+/// `SS` or a `BS` as sent and names no member of an `NS`, else the
+/// deserializer's text for an empty set. Measured 2026-11-24,
+/// each body twice, as `ExpressionAttributeValues contains invalid value: ...
+/// for key :z`: `{"SS": ["a", "a"], "N": "1"}` answers `One or more parameter
+/// values were invalid: Input collection [a, a] contains duplicates.`,
+/// `{"NS": ["1", "1"], "S": "x"}` `Input collection contains duplicates`,
+/// `{"BS": ["YQ==", "YQ=="], "N": "1"}` `One or more parameter values were
+/// invalid: Input collection [YQ==, YQ==]of type BS contains duplicates.`, and
+/// an empty `SS`, `NS` or `BS` beside a second descriptor the deserializer's
+/// empty set text. Measured 2026-11-25 the same way: `{"SS": ["b", "a", "b"],
+/// "N": "1"}` answers `... Input collection [b, a, b] contains duplicates.` and
+/// the `BS` of the base64 of `b`, `a` and `b` beside `"N": "1"` `... Input
+/// collection [Yg==, YQ==, Yg==]of type BS contains duplicates.`, the members
+/// as sent. A `BS` member that `decode_padded_base64` refuses is left to the
+/// deserializer, and a member of another JSON type to the shape fault check.
 fn set_fault<'a>(descriptor: &str, members: &[Value]) -> Option<Fault<'a>> {
     if !members.iter().all(Value::is_string) {
         return None;
     }
-    if descriptor == "NS" && has_equal_numbers(members) {
-        return Some(Fault::Set(NUMBER_SET_DUPLICATES.to_owned()));
+    if let Some(text) = duplicates_as_sent(descriptor, members) {
+        return Some(Fault::Set(text));
     }
     let set = Value::Object(Map::from_iter([(
         descriptor.to_owned(),

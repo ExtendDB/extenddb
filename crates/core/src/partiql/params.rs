@@ -25,9 +25,10 @@
 //!   breaks a number rule, an attribute value with no type or with two, a
 //!   null member of a set, map or list, an empty set, a set that holds a
 //!   member twice, and a NULL that is not true. These are refused as the
-//!   attribute value deserializer refuses them, but a number set whose
-//!   members have one value, which is "Input collection contains
-//!   duplicates", and a null member, which has a message for each kind of
+//!   attribute value deserializer refuses them, but a set that holds a
+//!   member twice, whose text lists the members as sent, as
+//!   `BatchWriteItem`'s does (a number set's is "Input collection contains
+//!   duplicates"), and a null member, which has a message for each kind of
 //!   value. So `[deep, {"N": "abc"}]` is a nesting error and
 //!   `[{"N": "abc"}, deep]` a conversion error (measured 2026-11-02), and
 //!   `[{"SS": []}, deep]` and `{"L": [{"SS": []}, deep]}` are refused for the
@@ -49,10 +50,8 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use super::number::{check_number, parameter_message};
-use crate::types::{AttributeValue, decode_padded_base64};
+use crate::types::{AttributeValue, decode_padded_base64, duplicates_as_sent};
 use crate::validation::MAX_ITEM_NESTING_DEPTH;
-pub use crate::validation::number::NUMBER_SET_DUPLICATES;
-use crate::validation::number::has_equal_numbers;
 
 /// The service's nesting-depth message, the same for parameters as for items.
 pub const NESTING_MESSAGE: &str = "Nesting Levels have exceeded supported limits: \
@@ -246,9 +245,6 @@ fn check_value(value: &Value, depth: usize) -> Result<(), String> {
                     _ => return Err(NULL_NUMBER_SET_MEMBER.to_owned()),
                 }
             }
-            if has_equal_numbers(items) {
-                return Err(NUMBER_SET_DUPLICATES.to_owned());
-            }
             content_refusal(tag, payload)?;
         }
         // A null member is refused ahead of a member given twice (measured
@@ -270,12 +266,19 @@ fn check_value(value: &Value, depth: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// The refusal the attribute value deserializer gives the value of type
-/// `tag` that holds `payload`: an empty set, a set that holds a member twice,
-/// or a NULL that is not true. The payload has the JSON type its type takes
-/// and no null member, so every refusal of the deserializer is one for the
-/// content.
+/// The refusal of the value of type `tag` that holds `payload`: a set that
+/// holds a member twice gets the text with the members as sent (see
+/// `duplicates_as_sent`), and an empty set or a NULL that is not true the
+/// attribute value deserializer's refusal. The payload has the JSON type its
+/// type takes and no null member, so every refusal of the deserializer is
+/// one for the content.
 fn content_refusal(tag: &str, payload: &Value) -> Result<(), String> {
+    if let Some(text) = payload
+        .as_array()
+        .and_then(|members| duplicates_as_sent(tag, members))
+    {
+        return Err(text);
+    }
     let value = Value::Object(Map::from_iter([(tag.to_owned(), payload.clone())]));
     AttributeValue::deserialize(&value)
         .map(drop)
@@ -298,6 +301,7 @@ fn check_text(text: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::partiql::number::UNDERFLOW_MESSAGE;
+    use crate::validation::number::NUMBER_SET_DUPLICATES;
 
     fn doc(json: &str) -> Vec<Value> {
         match serde_json::from_str::<Value>(json).unwrap() {

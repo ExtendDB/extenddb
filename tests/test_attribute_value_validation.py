@@ -623,3 +623,137 @@ class TestSanityValidPayloadsStillAccepted:
         dynamodb_client.put_item(TableName=hash_table, Item=item)
         resp = dynamodb_client.get_item(TableName=hash_table, Key={"pk": {"S": pk}})
         assert resp["Item"] == item
+
+
+# ---------------------------------------------------------------------------
+# A set that holds a member twice
+# ---------------------------------------------------------------------------
+
+# Measured against the service in us-east-1 on 2026-11-22, each request
+# twice, on a table keyed on pk (S). PutItem (an item at any depth),
+# UpdateItem and DeleteItem put "1 validation error detected: " ahead of a
+# text that lists the members sorted: the members ahead of the first one
+# equal to an earlier one sorted, then the rest as sent. TransactWriteItems,
+# Query and Scan give that text as it is. BatchWriteItem lists the members as
+# sent, and so does every operation for a BS with a member that only the
+# second reading decodes (Y=Q= is the bytes FF F4, which //Q= encodes).
+
+_INVALID = "One or more parameter values were invalid: "
+_SS = {"SS": ["b", "a", "b"]}
+_NS = {"NS": ["1", "1.0"]}
+_BS = {"BS": ["Yg==", "YQ==", "Yg"]}
+_SORTED_SS = 'Input collection ["a", "b", "b"] contains duplicates.'
+_SORTED_BS = 'Input collection ["YQ==","Yg==","Yg=="]of type BS contains duplicates.'
+_NO_LIST = "Input collection contains duplicates."
+
+
+def _bare(text):
+    return ("ValidationException", _INVALID + text)
+
+
+def _single(text):
+    return ("ValidationException", "1 validation error detected: " + _INVALID + text)
+
+
+def _bs(members):
+    return f"Input collection {members}of type BS contains duplicates."
+
+
+def _put(value):
+    return "PutItem", lambda t: {"TableName": t, "Item": {"pk": {"S": "dup"}, "s": value}}
+
+
+def _put_item(item):
+    return "PutItem", lambda t: {"TableName": t, "Item": {"pk": {"S": "dup"}, **item}}
+
+
+def _update(value):
+    return "UpdateItem", lambda t: {"TableName": t, "Key": {"pk": {"S": "dup"}},
+                                    "UpdateExpression": "SET s = :v",
+                                    "ExpressionAttributeValues": {":v": value}}
+
+
+def _batch(value):
+    return "BatchWriteItem", lambda t: {"RequestItems": {t: [
+        {"PutRequest": {"Item": {"pk": {"S": "dup"}, "s": value}}}]}}
+
+
+def _transact_put(value):
+    return "TransactWriteItems", lambda t: {"TransactItems": [
+        {"Put": {"TableName": t, "Item": {"pk": {"S": "dup"}, "s": value}}}]}
+
+
+SET_DUPLICATE_ROWS = [
+    ("D1", _put({"BS": ["Yg==", "Yg=="]}), _single(_bs('["Yg==","Yg=="]'))),
+    ("D2", _put({"BS": ["Yg==", "Yg"]}), _single(_bs('["Yg==","Yg=="]'))),
+    ("D6", _put({"BS": ["Yg", "Yg"]}), _single(_bs('["Yg==","Yg=="]'))),
+    ("D3", _put({"BS": ["YQ==", "Yg==", "YQ=="]}), _single(_bs('["YQ==","Yg==","YQ=="]'))),
+    ("D4", _put({"BS": ["Yg==", "YQ==", "Yg"]}), _single(_bs('["YQ==","Yg==","Yg=="]'))),
+    ("D5", _put({"BS": ["Yw==", "Yg==", "YQ==", "Yg=="]}),
+     _single(_bs('["YQ==","Yg==","Yw==","Yg=="]'))),
+    ("D11", _put({"BS": ["gA==", "AA==", "gA=="]}), _single(_bs('["AA==","gA==","gA=="]'))),
+    ("D12", _put({"BS": ["/A==", "AA==", "/A=="]}), _single(_bs('["AA==","/A==","/A=="]'))),
+    ("D14", _put({"BS": ["Yg==", "YQ==", "YQ=="]}), _single(_bs('["YQ==","Yg==","YQ=="]'))),
+    ("D7", _put({"SS": ["a", "a"]}), _single('Input collection ["a", "a"] contains duplicates.')),
+    ("D8", _put({"SS": ["b", "a", "b"]}), _single(_SORTED_SS)),
+    ("D15", _put({"SS": ["b", "a", "a"]}),
+     _single('Input collection ["a", "b", "a"] contains duplicates.')),
+    ("D16", _put({"SS": ["c", "b", "a", "a"]}),
+     _single('Input collection ["a", "b", "c", "a"] contains duplicates.')),
+    ("D13", _put({"SS": ["\ue000", "\U0001f600", "\ue000"]}),
+     _single('Input collection ["\\u{e000}", "\U0001f600", "\\u{e000}"] contains duplicates.')),
+    ("D9", _put({"NS": ["1", "1"]}), _single(_NO_LIST)),
+    ("D10", _put({"NS": ["2", "1", "2"]}), _single(_NO_LIST)),
+    ("N1", _put({"NS": ["1", "1.0"]}), _single(_NO_LIST)),
+    ("N2", _put({"NS": ["2", "1", "2.0"]}), _single(_NO_LIST)),
+    ("P1", _put({"BS": ["Y=Q=", "YQ==", "//Q="]}), _bare(_bs("[//Q=, YQ==, //Q=]"))),
+    ("P2", _put({"BS": ["YQ==", "//Q=", "Y=Q="]}), _bare(_bs("[YQ==, //Q=, //Q=]"))),
+    ("P3", _put({"BS": ["//Q=", "Yg==", "YQ==", "Y=Q="]}), _bare(_bs("[//Q=, Yg==, YQ==, //Q=]"))),
+    ("P4", _put({"BS": ["Y=Q=", "YQ==", "YQ=="]}), _bare(_bs("[//Q=, YQ==, YQ==]"))),
+    ("P5", _put({"BS": ["YQ==", "YQ==", "Y=Q="]}), _bare(_bs("[YQ==, YQ==, //Q=]"))),
+    ("P6", _put({"BS": ["YQ==", "Y=Q=", "YQ=="]}), _bare(_bs("[YQ==, //Q=, YQ==]"))),
+    ("O1", _update(_SS), _single(_SORTED_SS)),
+    ("O2", _update(_BS), _single(_SORTED_BS)),
+    ("O3", _update(_NS), _single(_NO_LIST)),
+    ("O4", ("UpdateItem", lambda t: {"TableName": t, "Key": {"pk": {"S": "dup"}},
+                                     "AttributeUpdates": {"s": {"Action": "PUT", "Value": _SS}}}),
+     _single(_SORTED_SS)),
+    ("O5", _batch(_SS), _bare("Input collection [b, a, b] contains duplicates.")),
+    ("O6", _transact_put(_SS), _bare(_SORTED_SS)),
+    ("O7", ("Query", lambda t: {"TableName": t, "KeyConditionExpression": "pk = :k",
+                                "FilterExpression": "s = :v",
+                                "ExpressionAttributeValues": {":k": {"S": "x"}, ":v": _SS}}),
+     _bare(_SORTED_SS)),
+    ("O8", ("Scan", lambda t: {"TableName": t, "FilterExpression": "s = :v",
+                               "ExpressionAttributeValues": {":v": _BS}}),
+     _bare(_SORTED_BS)),
+    ("O9", _put_item({"m": {"M": {"s": _SS}}}), _single(_SORTED_SS)),
+    ("O10", _put_item({"l": {"L": [_BS]}}), _single(_SORTED_BS)),
+    ("O11", ("DeleteItem", lambda t: {"TableName": t, "Key": {"pk": {"S": "dup"}},
+                                      "ConditionExpression": "s = :v",
+                                      "ExpressionAttributeValues": {":v": _NS}}),
+     _single(_NO_LIST)),
+    # "a" and "b" stand for the service's "s" and "n": they come in this
+    # order whether or not the server keeps the order of a JSON map.
+    ("O12", _put_item({"a": _SS, "b": _NS}), _single(_SORTED_SS)),
+    ("O13", _batch(_NS), ("ValidationException", "Input collection contains duplicates")),
+    ("O14", _batch(_BS), ("SerializationException",
+                          "Base64 encoded length is expected a multiple of 4 bytes but found: 2")),
+    ("O15", ("TransactWriteItems", lambda t: {"TransactItems": [{"Update": {
+        "TableName": t, "Key": {"pk": {"S": "dup"}}, "UpdateExpression": "SET s = :v",
+        "ExpressionAttributeValues": {":v": _SS}}}]}), _bare(_SORTED_SS)),
+    ("O16", _transact_put(_NS), _bare(_NO_LIST)),
+    ("O17", _transact_put(_BS), _bare(_SORTED_BS)),
+    ("O18", _batch({"BS": ["Y=Q=", "YQ==", "//Q="]}), _bare(_bs("[//Q=, YQ==, //Q=]"))),
+]
+
+
+@pytest.mark.parametrize("row,request_,expected", SET_DUPLICATE_ROWS,
+                         ids=[row for row, _, _ in SET_DUPLICATE_ROWS])
+def test_a_set_that_holds_a_member_twice(hash_table, row, request_, expected):
+    operation, body = request_
+    resp = _signed_post(operation, body(hash_table))
+    assert resp.status_code == 400, resp.text
+    payload = resp.json()
+    code = payload.get("__type", "").rsplit("#", 1)[-1]
+    assert (code, payload.get("message", payload.get("Message"))) == expected, payload

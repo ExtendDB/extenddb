@@ -644,3 +644,70 @@ fn a_value_that_is_not_base64_gets_the_service_text() {
         assert_eq!(got, want, "{set}");
     }
 }
+
+/// The service's text for a set that holds a member twice (measured
+/// 2026-11-22 with `PutItem`, each value twice; `PutItem` puts `1 validation
+/// error detected: ` ahead of each text but the `P` rows', which list the
+/// members as sent). A set inside an `M` or an `L` gets the same text
+/// (measured on the same day for an `SS` in an `M` and a `BS` in an `L`).
+#[test]
+fn a_set_that_holds_a_member_twice_gets_the_service_text() {
+    let bs = |list: &str| {
+        format!(
+            "One or more parameter values were invalid: Input collection {list}of type BS \
+             contains duplicates."
+        )
+    };
+    let ss = |list: &str| {
+        format!(
+            "One or more parameter values were invalid: Input collection {list} contains duplicates."
+        )
+    };
+    let ns = || {
+        "One or more parameter values were invalid: Input collection contains duplicates."
+            .to_owned()
+    };
+    let json = |text: &str| serde_json::from_str::<serde_json::Value>(text).unwrap();
+    #[rustfmt::skip]
+    let rows: [(&str, &str, String); 24] = [
+        ("D1", r#"{"BS": ["Yg==", "Yg=="]}"#, bs(r#"["Yg==","Yg=="]"#)),
+        ("D2", r#"{"BS": ["Yg==", "Yg"]}"#, bs(r#"["Yg==","Yg=="]"#)),
+        ("D6", r#"{"BS": ["Yg", "Yg"]}"#, bs(r#"["Yg==","Yg=="]"#)),
+        ("D3", r#"{"BS": ["YQ==", "Yg==", "YQ=="]}"#, bs(r#"["YQ==","Yg==","YQ=="]"#)),
+        ("D4", r#"{"BS": ["Yg==", "YQ==", "Yg"]}"#, bs(r#"["YQ==","Yg==","Yg=="]"#)),
+        ("D5", r#"{"BS": ["Yw==", "Yg==", "YQ==", "Yg=="]}"#, bs(r#"["YQ==","Yg==","Yw==","Yg=="]"#)),
+        ("D11", r#"{"BS": ["gA==", "AA==", "gA=="]}"#, bs(r#"["AA==","gA==","gA=="]"#)),
+        ("D12", r#"{"BS": ["/A==", "AA==", "/A=="]}"#, bs(r#"["AA==","/A==","/A=="]"#)),
+        ("D14", r#"{"BS": ["Yg==", "YQ==", "YQ=="]}"#, bs(r#"["YQ==","Yg==","YQ=="]"#)),
+        ("D7", r#"{"SS": ["a", "a"]}"#, ss(r#"["a", "a"]"#)),
+        ("D8", r#"{"SS": ["b", "a", "b"]}"#, ss(r#"["a", "b", "b"]"#)),
+        ("D15", r#"{"SS": ["b", "a", "a"]}"#, ss(r#"["a", "b", "a"]"#)),
+        ("D16", r#"{"SS": ["c", "b", "a", "a"]}"#, ss(r#"["a", "b", "c", "a"]"#)),
+        ("D13", r#"{"SS": ["\ue000", "\ud83d\ude00", "\ue000"]}"#, ss("[\"\\u{e000}\", \"\u{1f600}\", \"\\u{e000}\"]")),
+        ("D9", r#"{"NS": ["1", "1"]}"#, ns()),
+        ("D10", r#"{"NS": ["2", "1", "2"]}"#, ns()),
+        ("N1", r#"{"NS": ["1", "1.0"]}"#, ns()),
+        ("N2", r#"{"NS": ["2", "1", "2.0"]}"#, ns()),
+        ("P1", r#"{"BS": ["Y=Q=", "YQ==", "//Q="]}"#, bs("[//Q=, YQ==, //Q=]")),
+        ("P2", r#"{"BS": ["YQ==", "//Q=", "Y=Q="]}"#, bs("[YQ==, //Q=, //Q=]")),
+        ("P3", r#"{"BS": ["//Q=", "Yg==", "YQ==", "Y=Q="]}"#, bs("[//Q=, Yg==, YQ==, //Q=]")),
+        ("P4", r#"{"BS": ["Y=Q=", "YQ==", "YQ=="]}"#, bs("[//Q=, YQ==, YQ==]")),
+        ("P5", r#"{"BS": ["YQ==", "YQ==", "Y=Q="]}"#, bs("[YQ==, YQ==, //Q=]")),
+        ("P6", r#"{"BS": ["YQ==", "Y=Q=", "YQ=="]}"#, bs("[YQ==, //Q=, YQ==]")),
+    ];
+    let mut wrong = Vec::new();
+    for (row, value, want) in rows {
+        let value = json(value);
+        for nested in [
+            serde_json::json!({"M": {"x": value.clone()}}),
+            serde_json::json!({"L": [value.clone()]}),
+            value,
+        ] {
+            let got = serde_json::from_value::<AttributeValue>(nested.clone()).map(drop);
+            if got.map_err(|e| e.to_string()) != Err(want.clone()) {
+                wrong.push(format!("{row} {nested}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}

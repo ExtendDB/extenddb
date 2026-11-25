@@ -252,6 +252,23 @@ pub(crate) fn deserialize_error(e: serde_json::Error) -> DynamoDbError {
     }
 }
 
+/// A refusal of the `PutItem`, `UpdateItem` or `DeleteItem` deserializer.
+/// Those operations put `1 validation error detected: ` ahead of a set's
+/// duplicates text that lists the members sorted, and give every other text
+/// as it is (measured 2026-11-22; see
+/// `extenddb_core::types::is_listed_duplicates`).
+pub(crate) fn single_write_refusal(error: DynamoDbError) -> DynamoDbError {
+    use extenddb_core::validation::number::operations::SINGLE_WRITE_PREFIX;
+    match error {
+        DynamoDbError::ValidationException(message)
+            if extenddb_core::types::is_listed_duplicates(&message) =>
+        {
+            DynamoDbError::ValidationException(format!("{SINGLE_WRITE_PREFIX}{message}"))
+        }
+        other => other,
+    }
+}
+
 /// The `SerializationException` for a deserializer's text. The text of a `B`
 /// value that does not decode is the service's own and goes out as it is, an
 /// empty one as no message (see `extenddb_core::types::decode_base64`). Any

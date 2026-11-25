@@ -13,8 +13,10 @@ use extenddb_core::expression::ExpressionMaps;
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{
     BatchWriteItemInput, BatchWriteItemOutput, Item, KeySchemaElement, ReturnItemCollectionMetrics,
-    TableKeyInfo, WriteRequest, check_binaries, decode_padded_base64, extract_key, item_size_bytes,
+    TableKeyInfo, WriteRequest, check_binaries, decode_padded_base64, extract_key,
+    first_duplicates_as_sent, is_listed_duplicates, item_size_bytes,
 };
+use extenddb_core::validation::number::NUMBER_SET_DUPLICATES;
 use extenddb_core::validation::{
     AttributeNameRequestForm, IndexKeyRef, validate_attribute_name_sizes, validate_batch_item_keys,
     validate_batch_key_only, validate_index_keys, validate_item_nesting_depth, validate_item_size,
@@ -54,8 +56,26 @@ pub async fn handle_batch_write_item(
     // members of the body are the deserializer's.
     check_binaries(&body["RequestItems"], decode_padded_base64)
         .map_err(crate::serialization_exception)?;
+    // A set that holds a member twice lists its members as sent here, and a
+    // number set's text has no `One or more parameter values were invalid: `
+    // and no period (measured 2026-11-22). The deserializer lists them
+    // sorted, so its text is replaced with that of the first such set in the
+    // raw RequestItems, the set it refused. A number set's text names no
+    // member, so the walk skips number sets and the deserializer's text for
+    // one is replaced with that constant.
+    let as_sent = first_duplicates_as_sent(&body["RequestItems"]);
     let input: BatchWriteItemInput =
-        serde_json::from_value(body).map_err(crate::deserialize_error)?;
+        serde_json::from_value(body).map_err(|e| match crate::deserialize_error(e) {
+            DynamoDbError::ValidationException(message) if is_listed_duplicates(&message) => {
+                let number_set = message.ends_with(&format!("{NUMBER_SET_DUPLICATES}."));
+                DynamoDbError::ValidationException(if number_set {
+                    NUMBER_SET_DUPLICATES.to_owned()
+                } else {
+                    as_sent.unwrap_or(message)
+                })
+            }
+            other => other,
+        })?;
 
     // Validate the table and request counts: RequestItems not empty, at most
     // 25 tables, at most 25 requests per table and in total, at least one
@@ -591,6 +611,8 @@ fn collect_icm_if_needed(
 mod padding_tests;
 #[cfg(test)]
 mod scripted;
+#[cfg(test)]
+mod set_duplicates_tests;
 #[cfg(test)]
 mod write_batch_deferral_tests;
 #[cfg(test)]

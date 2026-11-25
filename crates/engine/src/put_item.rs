@@ -86,7 +86,7 @@ pub async fn handle_put_item(
             || msg.contains("AttributeValue is empty")
             || msg.contains("AttributeValue has more than one datatypes set")
         {
-            DynamoDbError::ValidationException(msg)
+            crate::single_write_refusal(DynamoDbError::ValidationException(msg))
         } else {
             crate::serialization_exception(msg)
         }
