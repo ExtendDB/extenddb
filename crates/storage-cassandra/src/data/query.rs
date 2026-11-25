@@ -24,14 +24,17 @@ impl SortKeyValueExt for SortKeyValue {
 }
 
 use super::ddl::data_table_name;
+use super::index::sk_to_value;
 use super::query_helpers::{
     query_with_pk_pk_sk, query_with_pk_sk_pk, query_with_pk_sk_pk_sk, query_with_pk_sk_sk,
     query_with_pk_sks,
 };
+use super::resolve_expr_to_av;
+use super::rows::{RUN_READ_ROWS, read_halving, row_items, row_sort_key, rows_of};
 use super::sk_range::SkRange;
-use super::{json_to_item, resolve_expr_to_av};
 use crate::CassandraEngine;
 use crate::cassandra_util;
+use cdrs_tokio::types::value::Value;
 
 /// Extra pagination bind values for index queries.
 ///
@@ -148,12 +151,21 @@ impl CassandraEngine {
 
         // Step 2: Determine if there's a sort key condition
         let sk_info_opt = sk_info(&query_key_schema, &key_info.attribute_definitions);
+        // A base-table read also selects the sort key, so that a read whose
+        // rows all hold no item can go on after its last row.
+        let read_on_sk = sk_info_opt
+            .filter(|_| index_name.is_none())
+            .map(|(_, sk_type)| sk_type);
 
         // Step 3: Build query
         let account_keyspace = self.account_keyspace(&key_info.account_id);
 
-        let mut query =
-            format!("SELECT item_data FROM {account_keyspace}.{table_name} WHERE pk = ?");
+        let sk_select = read_on_sk
+            .map(|sk_type| format!(", {}", sk_column(sk_type)))
+            .unwrap_or_default();
+        let mut query = format!(
+            "SELECT item_data{sk_select} FROM {account_keyspace}.{table_name} WHERE pk = ?"
+        );
 
         // Step 4: the sort key range the key condition asks for.
         let mut sk_range = match (&key_condition.sk_condition, sk_info_opt) {
@@ -238,7 +250,15 @@ impl CassandraEngine {
         };
 
         // Single query: the sort key clauses and their binds, in order. The
-        // two-query path renders the range per sub-query below.
+        // two-query path renders the range per sub-query below. A read that
+        // goes on after a row keeps the key condition's bound on the far side.
+        let far_bound = read_on_sk
+            .and(if forward {
+                sk_range.upper.as_ref()
+            } else {
+                sk_range.lower.as_ref()
+            })
+            .map(|(op, value)| (*op, sk_to_value(value)));
         let sk_binds = match sk_info_opt {
             Some((_, sk_type)) if !needs_two_query_pagination => {
                 let (clause, binds) = sk_range.render(sk_column(sk_type));
@@ -641,20 +661,64 @@ impl CassandraEngine {
             }
         };
 
-        // Step 8: Parse results
-        let items: Vec<Item> = rows
-            .into_iter()
-            .map(|row| {
-                let json_str: String =
-                    cassandra_util::get_column(&row, "item_data", "query parse")?;
-                json_to_item(json_str)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // Step 9: Enforce limit and detect pagination
+        // Step 8: Parse results. A row without `item_data` holds no item: the
+        // static-only row of a partition whose items have all been deleted
+        // (on a table with a sort key), the row a TTL claim on an absent key
+        // writes (`prepared_txn_id` and `prepared_txn_timestamp` only), and
+        // the row a transaction prepare leaves when its `UPDATE ... IF
+        // prepared_txn_id = null` lands on an item deleted after the
+        // transaction read it. When every row of a full base-table read holds
+        // no item, the read goes on after the last row's sort key, with the
+        // key condition's bound on the far side. Each further read takes up to
+        // twice as many rows and at most `max(RUN_READ_ROWS, LIMIT + 1)`, and
+        // is read again with half the rows when Cassandra refuses it.
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         let actual_limit = limit.map_or(1_000_000_usize, |l| l.max(0) as usize);
-        let has_more = items.len() > actual_limit;
+        let fetch_limit = actual_limit + 1;
+        let session = self.session_arc();
+        let mut rows = rows;
+        let mut read_limit = fetch_limit;
+        let mut ceiling = RUN_READ_ROWS.max(fetch_limit);
+        let (items, full) = loop {
+            let full = rows.len() >= read_limit;
+            let resume = match (read_on_sk, rows.last()) {
+                (Some(sk_type), Some(row)) if full => Some((sk_type, row_sort_key(row, sk_type)?)),
+                _ => None,
+            };
+            let items = row_items(&rows, "query")?;
+            // A static-only row has no sort key: its partition holds no
+            // other row, so nothing follows it.
+            let Some((sk_type, Some(after))) = resume.filter(|_| items.is_empty()) else {
+                break (items, full);
+            };
+            let col = sk_column(sk_type);
+            let (cmp, dir) = if forward { (">", "ASC") } else { ("<", "DESC") };
+            let far_clause = far_bound
+                .as_ref()
+                .map(|(op, _)| format!(" AND {col} {op} ?"))
+                .unwrap_or_default();
+            let read_on = format!(
+                "SELECT item_data, {col} FROM {account_keyspace}.{table_name} \
+                 WHERE pk = ? AND {col} {cmp} ?{far_clause} ORDER BY {col} {dir}"
+            );
+            let mut values = vec![Value::from(pk_text.as_str()), after];
+            values.extend(far_bound.iter().map(|(_, value)| value.clone()));
+            read_limit = read_limit.saturating_mul(2).min(ceiling);
+            let (session, read_on, values) = (&session, &read_on, &values);
+            rows = read_halving(&mut read_limit, &mut ceiling, move |limit| {
+                let values = values.clone();
+                async move {
+                    let cql = format!("{read_on} LIMIT {limit}");
+                    rows_of(session, &cql, values, "query_read_on").await
+                }
+            })
+            .await?;
+        };
+
+        // Step 9: Enforce limit and detect pagination. A read that filled its
+        // LIMIT may have items after it, even when rows without an item leave
+        // this page short; the caller reads on from the last item.
+        let has_more = full || items.len() > actual_limit;
 
         let final_items: Vec<Item> = items.into_iter().take(actual_limit).collect();
 

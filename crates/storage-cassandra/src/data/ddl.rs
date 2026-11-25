@@ -440,22 +440,42 @@ pub(crate) async fn backfill_gsi(
     let idx_table = index_table_name(index_id);
     let idx_sks = all_sort_key_info(index_key_schema, attr_defs);
     let base_sks = all_sort_key_info(base_key_schema, base_attr_defs);
+    let base_sk_type = base_sks.first().map(|(_, sk_type)| *sk_type);
 
     // Token-based full-table scan matching the pattern used by scan_impl.
     // First page: no lower bound. Subsequent pages: token(pk) > last_token.
-    let first_page_query = format!(
-        "SELECT pk, item_data, version FROM {account_keyspace}.{base_table} \
-             LIMIT {PAGE_SIZE} ALLOW FILTERING"
+    // A page that ends inside a partition is followed by the rest of that
+    // partition, after the last row's sort key, before the cursor moves on:
+    // rows that hold no item count toward the page, and a partition can
+    // hold more rows than a page.
+    let select = format!(
+        "SELECT pk, item_data, version{} FROM {account_keyspace}.{base_table}",
+        base_sk_type
+            .map(|sk_type| format!(", {}", sk_column(sk_type)))
+            .unwrap_or_default()
     );
-    let next_page_query = format!(
-        "SELECT pk, item_data, version FROM {account_keyspace}.{base_table} \
-             WHERE token(pk) > ? LIMIT {PAGE_SIZE} ALLOW FILTERING"
-    );
+    let first_page_query = format!("{select} LIMIT {PAGE_SIZE} ALLOW FILTERING");
+    let next_page_query = format!("{select} WHERE token(pk) > ? LIMIT {PAGE_SIZE} ALLOW FILTERING");
+    let partition_page_query = base_sk_type.map(|sk_type| {
+        let col = sk_column(sk_type);
+        format!("{select} WHERE pk = ? AND {col} > ? LIMIT {PAGE_SIZE}")
+    });
 
     let mut last_token: Option<i64> = None;
+    // The partition key and the sort key to read on after, inside a partition.
+    let mut in_partition: Option<(String, cdrs_tokio::types::value::Value)> = None;
 
     loop {
-        let rows = if let Some(tok) = last_token {
+        let rows = if let (Some((pk, after)), Some(query)) = (&in_partition, &partition_page_query)
+        {
+            crate::cassandra_util::query_rows::<StorageError>(
+                session,
+                query,
+                cdrs_tokio::query_values!(pk.as_str(), after.clone()),
+                "backfill_gsi",
+            )
+            .await?
+        } else if let Some(tok) = last_token {
             crate::cassandra_util::query_rows::<StorageError>(
                 session,
                 &next_page_query,
@@ -473,7 +493,7 @@ pub(crate) async fn backfill_gsi(
             .await?
         };
 
-        if rows.is_empty() {
+        if rows.is_empty() && in_partition.is_none() {
             break;
         }
 
@@ -481,9 +501,13 @@ pub(crate) async fn backfill_gsi(
         let mut batch_has_rows = false;
 
         for row in &rows {
-            let item_json: String =
-                crate::cassandra_util::get_column(row, "item_data", "backfill_gsi")?;
-            let item = super::json_to_item(item_json)?;
+            // A row without `item_data` holds no item: the static-only row of
+            // an emptied partition, the row a TTL claim on an absent key
+            // writes, or the row a prepare leaves on an item deleted after
+            // its transaction read it.
+            let Some(item) = super::rows::row_item(row, "backfill_gsi")? else {
+                continue;
+            };
 
             if !item_has_index_keys(&item, index_key_schema) {
                 continue;
@@ -540,38 +564,48 @@ pub(crate) async fn backfill_gsi(
             tracing::warn!("backfill_gsi: failed to update heartbeat for {index_name}: {e}");
         }
 
-        // Advance the token cursor using the last pk in this page.
-        // If we got fewer rows than PAGE_SIZE we've reached the end.
+        // Advance the cursor. A full page whose last row has a sort key goes
+        // on inside that row's partition. Otherwise the token cursor moves
+        // past the last row's partition, or the scan ends after a short page.
         #[allow(clippy::cast_possible_truncation)]
-        if (rows.len() as i64) < PAGE_SIZE {
-            break;
-        }
-
-        // Get the token of the last pk to use as the next page cursor.
-        if let Some(last_row) = rows.last() {
+        let full = rows.len() as i64 >= PAGE_SIZE;
+        if full
+            && let (Some(sk_type), Some(last_row)) = (base_sk_type, rows.last())
+            && let Some(after) = super::rows::row_sort_key(last_row, sk_type)?
+        {
             let pk: String = crate::cassandra_util::get_column(last_row, "pk", "backfill_gsi")?;
-            let token_query = format!(
-                "SELECT token(pk) AS tok FROM {account_keyspace}.{base_table} WHERE pk = ?"
-            );
-            let tok_rows = crate::cassandra_util::query_rows::<StorageError>(
-                session,
-                &token_query,
-                cdrs_tokio::query_values!(pk.as_str()),
-                "backfill_gsi_token",
-            )
-            .await?;
-            if let Some(tok_row) = tok_rows.first() {
-                let tok: i64 =
-                    crate::cassandra_util::get_column(tok_row, "tok", "backfill_gsi_token")?;
-                // Guard against token collisions: if the token hasn't
-                // advanced, there are no more distinct partitions to scan.
-                if Some(tok) == last_token {
-                    break;
+            in_partition = Some((pk, after));
+            continue;
+        }
+        let pk = match in_partition.take() {
+            Some((pk, _)) => pk,
+            None if !full => break,
+            None => match rows.last() {
+                Some(last_row) => {
+                    crate::cassandra_util::get_column(last_row, "pk", "backfill_gsi")?
                 }
-                last_token = Some(tok);
-            } else {
+                None => break,
+            },
+        };
+
+        // Get the token of the partition to use as the next page cursor.
+        let token_query =
+            format!("SELECT token(pk) AS tok FROM {account_keyspace}.{base_table} WHERE pk = ?");
+        let tok_rows = crate::cassandra_util::query_rows::<StorageError>(
+            session,
+            &token_query,
+            cdrs_tokio::query_values!(pk.as_str()),
+            "backfill_gsi_token",
+        )
+        .await?;
+        if let Some(tok_row) = tok_rows.first() {
+            let tok: i64 = crate::cassandra_util::get_column(tok_row, "tok", "backfill_gsi_token")?;
+            // Guard against token collisions: if the token hasn't
+            // advanced, there are no more distinct partitions to scan.
+            if Some(tok) == last_token {
                 break;
             }
+            last_token = Some(tok);
         } else {
             break;
         }

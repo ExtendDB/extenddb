@@ -63,7 +63,7 @@ use extenddb_storage::util::{SortKeyValue, composite_pk_to_text, parse_sk, sk_co
 
 use super::ddl::{data_table_name, index_table_name};
 use super::index::fetch_index_by_name;
-use super::rows::{RUN_READ_ROWS, read_halving, row_item, row_position, scan_rows};
+use super::rows::{RUN_READ_ROWS, read_halving, row_items, row_position, scan_rows};
 use crate::cassandra_util;
 
 /// Compute the inclusive `[lower, upper]` token bounds for a parallel-scan
@@ -219,11 +219,7 @@ impl crate::CassandraEngine {
                 }
                 _ => None,
             };
-            let items = rows
-                .iter()
-                .map(|row| row_item(row, "scan"))
-                .filter_map(Result::transpose)
-                .collect::<Result<Vec<_>, _>>()?;
+            let items = row_items(&rows, "scan")?;
             match resume {
                 Some(resume) if items.is_empty() => {
                     position = Some(resume);
