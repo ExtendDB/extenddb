@@ -143,7 +143,10 @@ class TestValidationOrder:
 
 class TestIndexKeyAttributeUndefined:
     """A secondary index key attribute that AttributeDefinitions does not
-    define."""
+    define. UpdateTable picks the sentence by the member's shape: absent names
+    the index, fewer definitions than the index has keys has its own sentence,
+    and otherwise the sentence lists every key of the index and every
+    definition."""
 
     TABLE_ROWS = [
         pytest.param(
@@ -180,6 +183,30 @@ class TestIndexKeyAttributeUndefined:
         assert "GlobalSecondaryIndexes" not in desc
 
     NEVER_CREATED_ROWS = [
+        pytest.param(
+            "update_table",
+            {
+                "AttributeDefinitions": _definitions("g"),
+                "GlobalSecondaryIndexUpdates": _gsi_create(
+                    "idx1", [("g", "HASH"), ("r", "RANGE")], "KEYS_ONLY"
+                ),
+            },
+            NO_DEFINITION,
+            id="update-table-fewer-definitions-than-keys",
+        ),
+        pytest.param(
+            "update_table",
+            {
+                "AttributeDefinitions": _definitions("r", "pk"),
+                "GlobalSecondaryIndexUpdates": _gsi_create(
+                    "idx1", [("r", "HASH"), ("g", "RANGE")], "KEYS_ONLY"
+                ),
+            },
+            "One or more parameter values were invalid: "
+            "Some index key attributes are not defined in AttributeDefinitions. "
+            "Keys: [r, g], AttributeDefinitions: [r, pk]",
+            id="update-table-lists-every-key-of-the-index",
+        ),
         pytest.param(
             "create_table",
             {
