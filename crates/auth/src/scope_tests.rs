@@ -9,7 +9,7 @@ use super::tests::{
     signed_headers,
 };
 use super::*;
-use axum::http::{HeaderMap, HeaderValue};
+use http::{HeaderMap, HeaderValue};
 
 /// Measured 2026-09-16: a scope wrong in both region and service reports
 /// both sentences in one message, region first.
