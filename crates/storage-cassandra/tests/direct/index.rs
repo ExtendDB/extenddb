@@ -1488,7 +1488,7 @@ async fn test_every_write_path_stamps_the_index_row_with_the_stored_version() {
 }
 
 /// The index's status, backfill heartbeat and id in the catalog.
-async fn index_state(
+pub(crate) async fn index_state(
     engine: &CassandraEngine,
     table_id: &str,
     index_name: &str,
@@ -1525,7 +1525,11 @@ async fn index_state(
 }
 
 /// The rows of an index's data table.
-async fn index_rows(engine: &CassandraEngine, account_keyspace: &str, index_id: &str) -> i64 {
+pub(crate) async fn index_rows(
+    engine: &CassandraEngine,
+    account_keyspace: &str,
+    index_id: &str,
+) -> i64 {
     use cdrs_tokio::types::IntoRustByName as _;
 
     let rows = extenddb_storage_cassandra::cassandra_util::query_rows::<
@@ -1549,7 +1553,7 @@ async fn index_rows(engine: &CassandraEngine, account_keyspace: &str, index_id: 
 
 /// The `UpdateTable` input that creates the GSI `StatusIndex`, keyed on
 /// `status`, on the table `table_name`.
-fn status_index_creation(table_name: &str) -> extenddb_core::types::UpdateTableInput {
+pub(crate) fn status_index_creation(table_name: &str) -> extenddb_core::types::UpdateTableInput {
     use extenddb_core::types::{CreateGsiAction, GlobalSecondaryIndexUpdate, UpdateTableInput};
 
     UpdateTableInput {

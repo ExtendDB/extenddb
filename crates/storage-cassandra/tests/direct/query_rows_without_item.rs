@@ -13,7 +13,8 @@
 //! LastEvaluatedKey, so a reader paging on from the last item reads every
 //! item. A run of such rows is read on after its last row, in reads of at
 //! most 1,000 rows (or the read's own LIMIT, if larger), and no row is read
-//! twice.
+//! twice. The GSI backfill reads the rest of a partition after a page that
+//! ends inside it.
 
 use cdrs_tokio::types::value::Value;
 use extenddb_core::expression::{Expr, ExpressionMaps, KeyCondition, PathElement};
@@ -370,5 +371,91 @@ async fn test_query_reads_again_with_half_the_rows_when_cassandra_refuses_a_read
     assert_eq!(
         query(&engine, &table, true, Some(1), None).await,
         (vec!["s0".to_string()], Some(at("s0")))
+    );
+}
+
+/// A GSI added by UpdateTable to a table with one partition of 600 items
+/// and one of 1,000 rows without an item ahead of the items `z1` and `z2`.
+/// The backfill reads 500 rows a page. After a page that ends inside a
+/// partition it reads the rest of that partition, so the index goes ACTIVE
+/// with all 602 items. A backfill that moved its token cursor past the
+/// partition of a full page wrote 500.
+#[tokio::test]
+async fn test_a_gsi_backfill_reads_the_rest_of_a_partition() {
+    use extenddb_storage::TableEngine as _;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = Arc::new(
+        CassandraEngine::new(&crate::helpers::test_config(), "us-east-1")
+            .await
+            .expect("engine"),
+    );
+    let table = TestTable::new(&engine, "QueryBackfillPaging", true).await;
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    engine
+        .process_control_plane_transitions()
+        .await
+        .expect("activate the table");
+
+    let indexed = |pk: &str, sk: String| {
+        let mut item = key(pk, Some(AttributeValue::S(sk)));
+        item.insert("status".to_string(), AttributeValue::S("x".to_string()));
+        item
+    };
+    let big: Vec<String> = (0..600).map(|i| format!("s{i:03}")).collect();
+    futures::stream::iter(&big)
+        .for_each_concurrent(32, |sk| put(&engine, &table, indexed("big", sk.clone())))
+        .await;
+    let claims: Vec<String> = (0..1000).map(|i| format!("a{i:04}")).collect();
+    futures::stream::iter(&claims)
+        .for_each_concurrent(32, |sk| {
+            claim_row(&engine, &table, "claimed", Some(Value::from(sk.as_str())))
+        })
+        .await;
+    for sk in ["z1", "z2"] {
+        put(&engine, &table, indexed("claimed", sk.to_string())).await;
+    }
+
+    let shutdown = extenddb_storage::CancellationToken::new();
+    let worker = extenddb_storage_cassandra::workers::spawn_gsi_backfill_recovery_for_tests(
+        engine.clone(),
+        &table.key_info.account_id,
+        Duration::from_secs(120),
+        Duration::from_secs(60),
+        shutdown.clone(),
+    );
+    engine
+        .update_table(
+            &table.key_info.account_id,
+            crate::index::status_index_creation(&table.key_info.table_name),
+        )
+        .await
+        .expect("add the index");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let index_id = loop {
+        let (status, _, index_id) =
+            crate::index::index_state(&engine, &table.key_info.table_id, "StatusIndex").await;
+        if status == "ACTIVE" {
+            break index_id;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the index is {status} after 120 s"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(30), worker)
+        .await
+        .expect("the worker returns within 30 s of its token")
+        .expect("the worker does not panic");
+    let account_keyspace = engine.account_keyspace(&table.key_info.account_id);
+    assert_eq!(
+        crate::index::index_rows(&engine, &account_keyspace, &index_id).await,
+        602
     );
 }
