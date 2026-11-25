@@ -386,8 +386,9 @@ impl AuthorizationStore for MongoCatalogStore {
 }
 
 /// The fields that name the owner of a stored IAM document: its account,
-/// principal, group, session, policy, resource or tag key. None of them holds
-/// a policy, a tag value or a credential.
+/// principal, group, session, policy, resource or tag key. The log line gives
+/// a string value of these fields and the BSON type of any other value, so it
+/// holds no policy, tag value or credential.
 const OWNER_FIELDS: [&str; 10] = [
     "account_id",
     "principal_type",
@@ -401,12 +402,18 @@ const OWNER_FIELDS: [&str; 10] = [
     "tag_key",
 ];
 
-/// The owner fields that `d` holds, as `field=value` pairs with each value as
-/// BSON displays it, for the log line of a document that cannot be read.
+/// The owner fields that `d` holds, as `field=value` pairs, for the log line
+/// of a document that cannot be read. A string value is quoted and escaped.
+/// Any other value gives only its BSON type, such as `<Int32>`.
 fn owner(d: &Document) -> String {
     OWNER_FIELDS
         .iter()
-        .filter_map(|field| d.get(field).map(|value| format!("{field}={value}")))
+        .filter_map(|field| {
+            d.get(field).map(|value| match value.as_str() {
+                Some(s) => format!("{field}={s:?}"),
+                None => format!("{field}=<{:?}>", value.element_type()),
+            })
+        })
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -495,7 +502,7 @@ mod tests {
             ),
             (
                 doc! { "account_id": "444455556666", "group_name": 7, "user_name": "bob" },
-                r#"account_id="444455556666" user_name="bob" group_name=7"#,
+                r#"account_id="444455556666" user_name="bob" group_name=<Int32>"#,
             ),
             (
                 doc! {
@@ -515,6 +522,10 @@ mod tests {
                     "tag_value": "a",
                 },
                 r#"resource_arn="arn:aws:dynamodb:us-east-1:444455556666:table/t" tag_key="team""#,
+            ),
+            (
+                doc! { "user_name": "b\"\nx", "tag_key": { "Key": "team", "Value": "a" } },
+                r#"user_name="b\"\nx" tag_key=<EmbeddedDocument>"#,
             ),
         ];
         for (d, want) in rows {

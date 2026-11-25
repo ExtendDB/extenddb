@@ -423,7 +423,7 @@ db.iam_role_tags.find({ $expr: { $or: [{ $ne: [{ $type: "$tag_key" }, "string"] 
 db.tags.find({ $expr: { $or: [{ $ne: [{ $type: "$tag_key" }, "string"] }, { $ne: [{ $type: "$tag_value" }, "string"] }] } })
 ```
 
-They do not find a Decimal128 or binary value nested inside one of those documents. The server log names each such document when the authorization of a request reads it. The log line gives the collection, the `_id`, and each owner field that the document holds, with its stored value: `account_id`, `principal_type`, `principal_name`, `user_name`, `group_name`, `role_name`, `session_name`, `policy_name`, `resource_arn` and `tag_key`. Repair a document from its source with the command that wrote it. For a user policy, take the names from the log line, and run this command with the admin password in `EXTENDDB_PASSWORD`:
+They do not find a Decimal128 or binary value nested inside one of those documents. The server log names each such document when the authorization of a request reads it. The log line gives the collection, the `_id`, and each owner field that the document holds, with its value when it is a string and its BSON type otherwise: `account_id`, `principal_type`, `principal_name`, `user_name`, `group_name`, `role_name`, `session_name`, `policy_name`, `resource_arn` and `tag_key`. Repair a document from its source with the command that wrote it. For a user policy, take the names from the log line, and run this command with the admin password in `EXTENDDB_PASSWORD`:
 
 ```bash
 extenddb manage --config /path/to/extenddb.toml --user ADMIN_NAME put-user-policy \
