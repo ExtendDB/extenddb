@@ -404,6 +404,10 @@ def _stream_enabled(table: dict) -> bool:
     return table.get("StreamSpecification", {}).get("StreamEnabled", False)
 
 
+def _table_class(table: dict) -> str:
+    return table.get("TableClassSummary", {}).get("TableClass", "STANDARD")
+
+
 def _index_units(table: dict) -> list:
     return [(g["IndexName"], g["ProvisionedThroughput"]) for g in table["GlobalSecondaryIndexes"]]
 
@@ -433,6 +437,9 @@ def test_a_stream_change_beside_an_index_or_table_class_change(
     if _stream_enabled(table) != before:
         _set_stream(ddb, provisioned, KEYS_ONLY if before else DISABLED)
         table = _wait_all_active(ddb, provisioned)
+    if _table_class(table) != "STANDARD":
+        ddb.update_table(TableName=provisioned, TableClass="STANDARD")
+        table = _wait_all_active(ddb, provisioned)
     members = _change(change, table["GlobalSecondaryIndexes"][0])
     row = _call(ddb.update_table, TableName=provisioned, StreamSpecification=stream, **members)
     after = _wait_all_active(ddb, provisioned)
@@ -440,7 +447,7 @@ def test_a_stream_change_beside_an_index_or_table_class_change(
         _refused(row, "ValidationException", refusal.format(name=provisioned))
         assert _stream_enabled(after) == before
         assert _index_units(after) == _index_units(table)
-        assert after.get("TableClassSummary", {}).get("TableClass", "STANDARD") == "STANDARD"
+        assert _table_class(after) == "STANDARD"
         return
     assert row["status"] == 200, row
     assert _stream_enabled(after) == stream["StreamEnabled"]
