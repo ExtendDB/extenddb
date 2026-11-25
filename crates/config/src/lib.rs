@@ -89,8 +89,8 @@ pub struct ServerConfig {
     /// request, and any request to `/management` or `/metrics`, only under an
     /// IP address, `localhost`, a `.localhost` name or one of these names.
     /// `docs/manuals/05-admin-guide.md` describes the setting. A production
-    /// build does not use the value, but a value that is not a string still
-    /// stops it at startup.
+    /// build does not use the value, but an array or a table still stops it at
+    /// startup.
     #[serde(default)]
     pub dev_allowed_hosts: Option<String>,
 }
