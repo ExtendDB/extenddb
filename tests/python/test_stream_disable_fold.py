@@ -335,6 +335,7 @@ def test_enabling_it_creates_the_first_stream(run):
 
 NO_INDEX_THROUGHPUT = pytest.mark.xfail(
     not ON_SERVICE,
+    strict=True,
     reason="ExtendDB does not change an index's ProvisionedThroughput "
     "(UpdateGlobalSecondaryIndex is not yet supported)",
 )
