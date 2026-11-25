@@ -3,7 +3,9 @@
 
 //! Live MongoDB tests for `get_stream_records`: the shard is resolved against
 //! the stream its iterator names, and a page is streamed record by record so
-//! its size is bounded by `Limit`, not by the 16 MB document cap.
+//! its size is bounded by `Limit`, not by the 16 MB document cap. The
+//! `AT_TIMESTAMP` seek is pinned here too, on records with known
+//! `created_at` values.
 //!
 //! They read a MongoDB URI from `EXTENDDB_TEST_MONGODB_URI` (a replica set is
 //! not needed here) and are `#[ignore]`d so `cargo test --lib` passes without
@@ -93,21 +95,34 @@ impl Fixture {
 
     async fn write_records(&self, shard_id: &str, table_id: &str, seqs: &[u64], blob: usize) {
         for seq in seqs {
-            let record_bson = bson::to_bson(&record_json(*seq, blob)).expect("record json to bson");
-            self.engine
-                .data_db
-                .collection::<Document>("stream_records")
-                .insert_one(doc! {
-                    "sequence_number": format!("{seq:021}"),
-                    "shard_id": shard_id,
-                    "table_id": table_id,
-                    "event_name": "INSERT",
-                    "record_data": record_bson,
-                    "created_at": bson::DateTime::now(),
-                })
-                .await
-                .expect("record");
+            self.write_record(shard_id, table_id, *seq, blob, bson::DateTime::now())
+                .await;
         }
+    }
+
+    /// One record in the shape the engine writes, with the `created_at` given.
+    async fn write_record(
+        &self,
+        shard_id: &str,
+        table_id: &str,
+        seq: u64,
+        blob: usize,
+        created_at: bson::DateTime,
+    ) {
+        let record_bson = bson::to_bson(&record_json(seq, blob)).expect("record json to bson");
+        self.engine
+            .data_db
+            .collection::<Document>("stream_records")
+            .insert_one(doc! {
+                "sequence_number": format!("{seq:021}"),
+                "shard_id": shard_id,
+                "table_id": table_id,
+                "event_name": "INSERT",
+                "record_data": record_bson,
+                "created_at": created_at,
+            })
+            .await
+            .expect("record");
     }
 
     async fn relabel(&self, account: &str, name: &str, label: &str) {
@@ -393,6 +408,50 @@ async fn records_live_an_idle_shard_reads_an_empty_page() {
             .unwrap_or_else(|e| panic!("{case}: {e:?}"));
         assert!(records.is_empty(), "{case}: no record to read");
         assert_eq!(last, None, "{case}: no last sequence number");
+    }
+    f.finish().await;
+}
+
+/// The `AT_TIMESTAMP` seek answers the first record of the shard created at
+/// or after the millisecond asked for: a record's own millisecond returns it,
+/// the next one does not, and another shard's records do not count. The rows
+/// are those of the SQLite `stream_tests`. The other shard's record has the
+/// lowest sequence number and a `created_at` inside the table's range, so
+/// without the shard filter it is the answer to the first five rows.
+#[tokio::test]
+#[ignore = "needs a MongoDB server in EXTENDDB_TEST_MONGODB_URI"]
+async fn records_live_at_timestamp_seek_is_at_or_after_the_records_millisecond() {
+    let f = Fixture::new().await;
+    let table_id = f.stream_table(ACCOUNT, "t", LABEL).await;
+    let own = legacy_shard_id(&table_id, 0);
+    let other = legacy_shard_id(&table_id, 1);
+    let base = 1_700_000_000_250;
+    let at = bson::DateTime::from_millis;
+    f.write_record(&own, &table_id, 5, 10, at(base)).await;
+    f.write_record(&own, &table_id, 6, 10, at(base + 1)).await;
+    f.write_record(&own, &table_id, 7, 10, at(base + 750)).await;
+    f.write_record(&other, &table_id, 4, 10, at(base + 2)).await;
+
+    let cases: &[(i64, Option<u64>)] = &[
+        (0, Some(5)),
+        (base - 1, Some(5)),
+        (base, Some(5)),
+        (base + 1, Some(6)),
+        (base + 2, Some(7)),
+        (base + 750, Some(7)),
+        (base + 751, None),
+    ];
+    for (at_ms, expected) in cases {
+        let got = f
+            .engine
+            .first_sequence_number_at_or_after(&own, *at_ms)
+            .await
+            .expect("seek");
+        assert_eq!(
+            got,
+            expected.map(|seq| format!("{seq:021}")),
+            "at_ms={at_ms}"
+        );
     }
     f.finish().await;
 }

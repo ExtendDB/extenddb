@@ -31,6 +31,12 @@ pub struct WorkerContext {
 /// Returns `true` when the interval elapsed (run another cycle) and `false`
 /// when `token` was cancelled (stop looping), which makes the canonical worker
 /// loop `while sleep_or_shutdown(&token, INTERVAL).await { work().await; }`.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "its callers are background worker loops: extenddb-server's workers.rs, the \
+              engine's backup reconciler, and the workers of the SQLite, PostgreSQL, MongoDB \
+              and Cassandra backends; the wasm build compiles none of them"
+)]
 pub async fn sleep_or_shutdown(token: &CancellationToken, interval: std::time::Duration) -> bool {
     tokio::select! {
         () = token.cancelled() => false,

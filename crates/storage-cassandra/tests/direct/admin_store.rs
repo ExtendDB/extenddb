@@ -168,4 +168,66 @@ mod tests {
             .await
             .expect("Failed to delete admin");
     }
+
+    /// `create_admin` inserts the `admin_users` row with an LWT, so
+    /// `change_admin_password` and `delete_admin` must be LWTs too. ADR-0021
+    /// says a plain write on such a row corrupts `system.paxos`.
+    ///
+    /// An LWT on a partition saves a new last-commit id in the node's
+    /// `system.paxos` row for it. A plain write does not. This test calls
+    /// each write on its own admin and checks that the id changes. The row is
+    /// found by partition key, so other tests do not change the result.
+    #[tokio::test]
+    async fn test_admin_changes_are_lwts() {
+        if crate::helpers::skip_without_cassandra() {
+            return;
+        }
+        let engine = setup_engine().await;
+        if !crate::helpers::is_one_node_cluster(&engine).await {
+            eprintln!("skipping: system.paxos is checked on a one-node cluster only");
+            return;
+        }
+        let config = test_config();
+        let catalog_store = crate::helpers::create_catalog_store(&engine, &config);
+        let catalog_keyspace = engine.catalog_keyspace();
+        let admin_name = format!("lwt-test-admin-{}", crate::helpers::unique_test_id());
+        let last_commit = || {
+            crate::helpers::paxos_last_commit(
+                &engine,
+                &catalog_keyspace,
+                "admin_users",
+                &admin_name,
+            )
+        };
+
+        catalog_store
+            .create_admin(&admin_name, "hash-1")
+            .await
+            .expect("create admin");
+        let after_create = last_commit().await;
+        assert!(
+            after_create.is_some(),
+            "create_admin is an LWT: the node holds Paxos state for the admin"
+        );
+
+        catalog_store
+            .change_admin_password(&admin_name, "hash-2")
+            .await
+            .expect("change password");
+        let after_change = last_commit().await;
+        assert_ne!(
+            after_change, after_create,
+            "change_admin_password is an LWT: it saves a new Paxos commit"
+        );
+
+        catalog_store
+            .delete_admin(&admin_name)
+            .await
+            .expect("delete admin");
+        let after_delete = last_commit().await;
+        assert_ne!(
+            after_delete, after_change,
+            "delete_admin is an LWT: it saves a new Paxos commit"
+        );
+    }
 }

@@ -63,7 +63,7 @@ pub async fn run(args: VerifyArgs, release: &str) -> anyhow::Result<u8> {
     // exist is reported, not created.
     let migrations = extenddb_storage::migrations::installed()
         .ok_or_else(|| anyhow::anyhow!("no storage backend is installed"))?;
-    let status_code = check_migrations(
+    let (status_code, key_source) = check_migrations(
         migrations,
         config_file.as_deref(),
         &app_config,
@@ -100,7 +100,7 @@ pub async fn run(args: VerifyArgs, release: &str) -> anyhow::Result<u8> {
     .await
     .map_err(|e| anyhow::anyhow!("Failed to create diagnostics store: {e}"))?;
 
-    match diag_store.test_data_database_connection().await {
+    match diag_store.test_data_database_connection(&key_source).await {
         Ok(db_name) => println!("  OK: Connected to data database '{db_name}'."),
         Err(e) => {
             println!("  FAIL: {e}");
@@ -172,20 +172,34 @@ fn ledger_note_lines(rows: &[extenddb_storage::migrations::LedgerRow], all: bool
 
 /// Print the catalog status, what its pending migrations change, and the
 /// notes the ledger records (each migration's first [`NOTES_SHOWN`], or
-/// every note with `all_notes`), and return the status's exit code.
+/// every note with `all_notes`), and return the status's exit code with the
+/// key the status read used, which the data database check uses too.
 async fn check_migrations(
     migrations: &dyn extenddb_storage::migrations::CatalogMigrations,
     config_file: Option<&str>,
     app_config: &config::AppConfig,
     release: &str,
     all_notes: bool,
-) -> u8 {
+) -> (u8, extenddb_storage::server_components::KeySource) {
     use extenddb_storage::migrations::advice::{self, AdviceFor};
     use extenddb_storage::migrations::{CatalogStatus, Target};
 
     println!("--- Checking catalog migrations...");
     let location = app_config.storage.connection_config();
-    let target = Target::at(location);
+    let key_source = match crate::util::status_key_source(app_config) {
+        Ok(key_source) => key_source,
+        Err(e) => {
+            println!("  FAIL: {e:#}");
+            return (
+                extenddb_storage::migrations::exit::ERROR,
+                extenddb_storage::server_components::KeySource::None,
+            );
+        }
+    };
+    let target = Target {
+        key_source,
+        ..Target::at(location)
+    };
     // The backup clause names the data store the catalog records.
     let named = Target {
         data_store: migrations.data_store_name(&target).await,
@@ -203,7 +217,7 @@ async fn check_migrations(
         Ok(status) => status,
         Err(e) => {
             println!("  FAIL: {}", advice::error_message(&e, &advice));
-            return e.exit_code();
+            return (e.exit_code(), target.key_source);
         }
     };
     match &status {
@@ -238,7 +252,7 @@ async fn check_migrations(
             println!("{line}");
         }
     }
-    status.exit_code()
+    (status.exit_code(), target.key_source)
 }
 
 #[cfg(test)]
