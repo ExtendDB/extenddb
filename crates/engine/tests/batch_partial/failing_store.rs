@@ -4,13 +4,14 @@
 //! for a chosen set of partition key values and succeed for every other key,
 //! recording the writes it applied.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use extenddb_core::backup_format::BackupArn;
 use extenddb_core::error::{
-    DynamoDbError, PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE, ThrottlingReason,
+    DynamoDbError, PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE, REQUEST_LIMIT_EXCEEDED_MESSAGE,
+    THROTTLING_EXCEPTION_MESSAGE, ThrottlingReason,
 };
 use extenddb_core::expression::{Expr, ExpressionMaps, KeyCondition, UpdateAction};
 use extenddb_core::types::{
@@ -53,9 +54,9 @@ pub struct FailingStore {
     tables: HashMap<String, bool>,
     /// Items served by `get_item`, by partition key value.
     items: BTreeMap<String, Item>,
-    /// Partition key values whose data calls fail with `error`.
-    failing: HashSet<String>,
-    /// The error returned for a failing key.
+    /// Partition key values whose data calls fail, with the error each gets.
+    failing: HashMap<String, DynamoDbError>,
+    /// The error `failing_on` gives a key.
     error: DynamoDbError,
     /// Writes that reached the backend, in call order.
     applied: Mutex<Vec<Applied>>,
@@ -66,7 +67,7 @@ impl FailingStore {
         Self {
             tables: HashMap::from([("T".to_owned(), true), ("U".to_owned(), false)]),
             items: BTreeMap::new(),
-            failing: HashSet::new(),
+            failing: HashMap::new(),
             error,
             applied: Mutex::new(Vec::new()),
         }
@@ -94,12 +95,23 @@ impl FailingStore {
     }
 
     pub fn failing_on(mut self, pks: &[&str]) -> Self {
-        self.failing = pks.iter().map(|p| (*p).to_owned()).collect();
+        for pk in pks {
+            self.failing.insert((*pk).to_owned(), self.error.clone());
+        }
         self
     }
 
-    fn fails(&self, key_or_item: &Item) -> bool {
-        self.failing.contains(&pk_of(key_or_item))
+    /// The data calls for `pk` fail with `error`.
+    pub fn failing_with(mut self, pk: &str, error: DynamoDbError) -> Self {
+        self.failing.insert(pk.to_owned(), error);
+        self
+    }
+
+    /// The error the data calls for this key or item fail with, if any.
+    fn failure(&self, key_or_item: &Item) -> Option<StorageError> {
+        self.failing
+            .get(&pk_of(key_or_item))
+            .map(|e| StorageError::Service(e.clone()))
     }
 
     pub fn applied(&self) -> Vec<Applied> {
@@ -108,13 +120,31 @@ impl FailingStore {
 }
 
 pub fn throttle_error(reason: &str) -> DynamoDbError {
-    DynamoDbError::provisioned_throughput_exceeded(
-        PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE,
+    throttle_errors(reason)[0].clone()
+}
+
+pub fn table_arn(table: &str) -> String {
+    format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/{table}")
+}
+
+/// The three throttle errors a backend can report, each with its service
+/// message and one reason naming table T: the provisioned capacity error,
+/// the on-demand `ThrottlingException` and the account `RequestLimitExceeded`.
+pub fn throttle_errors(reason: &str) -> [DynamoDbError; 3] {
+    let reasons = || {
         vec![ThrottlingReason {
             reason: reason.to_owned(),
-            resource: format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/T"),
-        }],
-    )
+            resource: table_arn("T"),
+        }]
+    };
+    [
+        DynamoDbError::provisioned_throughput_exceeded(
+            PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE,
+            reasons(),
+        ),
+        DynamoDbError::throttling(THROTTLING_EXCEPTION_MESSAGE, reasons()),
+        DynamoDbError::request_limit_exceeded(REQUEST_LIMIT_EXCEEDED_MESSAGE, reasons()),
+    ]
 }
 
 pub fn pk_of(item: &Item) -> String {
@@ -241,8 +271,8 @@ impl DataEngine for FailingStore {
         _maps: &ExpressionMaps,
         _stream: Option<&StreamCapture>,
     ) -> BoxedFuture<'_, Result<Option<Item>, StorageError>> {
-        let result = if self.fails(&item) {
-            Err(StorageError::Service(self.error.clone()))
+        let result = if let Some(e) = self.failure(&item) {
+            Err(e)
         } else {
             self.applied
                 .lock()
@@ -258,8 +288,8 @@ impl DataEngine for FailingStore {
         _key_info: &TableKeyInfo,
         key: &Item,
     ) -> BoxedFuture<'_, Result<Option<Item>, StorageError>> {
-        let result = if self.fails(key) {
-            Err(StorageError::Service(self.error.clone()))
+        let result = if let Some(e) = self.failure(key) {
+            Err(e)
         } else {
             Ok(self.items.get(&pk_of(key)).cloned())
         };
@@ -275,8 +305,8 @@ impl DataEngine for FailingStore {
         _maps: &ExpressionMaps,
         _stream: Option<&StreamCapture>,
     ) -> BoxedFuture<'_, Result<Option<Item>, StorageError>> {
-        let result = if self.fails(key) {
-            Err(StorageError::Service(self.error.clone()))
+        let result = if let Some(e) = self.failure(key) {
+            Err(e)
         } else {
             self.applied
                 .lock()
