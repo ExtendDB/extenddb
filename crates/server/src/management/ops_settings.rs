@@ -224,3 +224,7 @@ pub async fn set_setting(
     );
     Ok(())
 }
+
+#[cfg(all(test, feature = "search-inequality-filters"))]
+#[path = "ops_settings_search_tests.rs"]
+mod search_tests;
