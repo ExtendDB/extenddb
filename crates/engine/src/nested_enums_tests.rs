@@ -4,7 +4,9 @@
 //! DynamoDB's answers to `CreateTable` and `UpdateTable` requests with a
 //! `ProjectionType` or `StreamViewType` outside its set (measured in
 //! us-east-1 on 2026-11-13 and 2026-11-14, and beside a member of the wrong
-//! JSON type on 2026-11-17).
+//! JSON type on 2026-11-17), and with a `TableClass` or an
+//! `SSESpecification` the service refuses (measured on 2026-11-13,
+//! 2026-11-14 and 2026-11-18).
 
 use extenddb_core::error::DynamoDbError;
 use serde_json::{Value, json};
@@ -15,6 +17,10 @@ use crate::partiql::test_context::context;
 const PROJECTION_SET: &str = "ALL, INCLUDE, KEYS_ONLY";
 const VIEW_SET: &str = "OLD_IMAGE, KEYS_ONLY, NEW_AND_OLD_IMAGES, NEW_IMAGE";
 const VIEW: &str = "streamSpecification.streamViewType";
+const SSE_SET: &str = "AES256, KMS";
+const SSE_TYPE: &str = "sSESpecification.sSEType";
+const TABLE_CLASS: &str = "Invalid table-class parameter provided. Please try again with a \
+                           valid table-class value: [STANDARD, STANDARD_INFREQUENT_ACCESS].";
 const ONE: &str = "1 validation error detected: ";
 
 /// One fault of a `ValidationException` that lists member faults.
@@ -26,6 +32,19 @@ fn clause(value: &str, path: &str, constraint: &str) -> String {
 /// `SerializationException`.
 fn refused(value: &str, path: &str, set: &str) -> Option<String> {
     let constraint = format!("Member must satisfy enum value set: [{set}]");
+    Some(format!("{ONE}{}", clause(value, path, &constraint)))
+}
+
+/// The service's sentence for an `SSESpecification` whose members do not go
+/// together.
+fn invalid(reason: &str) -> Option<String> {
+    Some(format!(
+        "One or more parameter values were invalid: {reason}"
+    ))
+}
+
+fn too_long(value: &str, path: &str, max: usize) -> Option<String> {
+    let constraint = format!("Member must have length less than or equal to {max}");
     Some(format!("{ONE}{}", clause(value, path, &constraint)))
 }
 
@@ -88,6 +107,19 @@ fn stream(enabled: bool, view: &str) -> Value {
     json!({"StreamSpecification": {"StreamEnabled": enabled, "StreamViewType": view}})
 }
 
+/// A `CreateTable` of the issue's table, keyed on `pk` alone, with
+/// `members`.
+fn plain(members: Value) -> (&'static str, Value) {
+    create(with(
+        json!({"AttributeDefinitions": defs(&["pk"])}),
+        members,
+    ))
+}
+
+fn sse(spec: Value) -> (&'static str, Value) {
+    plain(json!({"SSESpecification": spec}))
+}
+
 fn rows() -> Vec<((&'static str, Value), Option<String>)> {
     let bad_gsi = || json!({"GlobalSecondaryIndexes": [index("gsi", "g", "EVERY_ATTRIBUTE")]});
     let bad_create = || {
@@ -118,6 +150,11 @@ fn rows() -> Vec<((&'static str, Value), Option<String>)> {
         "ALL_ATTRIBUTES",
         "globalSecondaryIndexUpdates.1.member.create",
     );
+    let sse_bogus = refused("BOGUS", SSE_TYPE, SSE_SET);
+    let kms_key = |key: &str| json!({"Enabled": true, "KMSMasterKeyId": key});
+    let key_2049 = "k".repeat(2049);
+    let key_fault = too_long(&key_2049, "sSESpecification.kMSMasterKeyId", 2048);
+    let name_256 = "t".repeat(256);
     let mut rows = vec![
         (
             create(bad_gsi()),
@@ -154,6 +191,91 @@ fn rows() -> Vec<((&'static str, Value), Option<String>)> {
         (
             create(stream(true, "NEW_IMAGES")),
             refused("NEW_IMAGES", VIEW, VIEW_SET),
+        ),
+        // A `TableClass` or an `SSESpecification` the service refuses.
+        (
+            sse(json!({"Enabled": true, "SSEType": "AES256"})),
+            invalid("SSEType AES256 is not supported"),
+        ),
+        (
+            sse(json!({"Enabled": false, "SSEType": "KMS"})),
+            invalid("SSEType can not be specified if Enabled is false"),
+        ),
+        (
+            sse(kms_key("alias/no-such-key")),
+            invalid("SSEType KMS is required if KMSMasterKeyId is specified"),
+        ),
+        (
+            sse(json!({"Enabled": false, "KMSMasterKeyId": "alias/no-such-key"})),
+            invalid("KMSMasterKeyId can not be specified if Enabled is false"),
+        ),
+        (
+            sse(json!({"Enabled": true, "SSEType": "KMS", "KMSMasterKeyId": key_2049})),
+            key_fault.clone(),
+        ),
+        // The service lists the key's length ahead of the SSEType.
+        (
+            sse(json!({"Enabled": true, "SSEType": "BOGUS", "KMSMasterKeyId": key_2049})),
+            both(key_fault.clone(), sse_bogus.clone()),
+        ),
+        // The service counts the key's length in characters.
+        (
+            sse(kms_key(&"k".repeat(2048))),
+            invalid("SSEType KMS is required if KMSMasterKeyId is specified"),
+        ),
+        (
+            sse(kms_key(&"\u{1F600}".repeat(1025))),
+            invalid("SSEType KMS is required if KMSMasterKeyId is specified"),
+        ),
+        (
+            create(with(
+                bad_gsi(),
+                json!({"SSESpecification": {"Enabled": true, "SSEType": "BOGUS"}}),
+            )),
+            both(gsi_fault.clone(), sse_bogus.clone()),
+        ),
+        (
+            plain(with(
+                stream(true, "NEW_IMAGES"),
+                json!({"SSESpecification": {"Enabled": true, "SSEType": "BOGUS"}}),
+            )),
+            both(sse_bogus.clone(), refused("NEW_IMAGES", VIEW, VIEW_SET)),
+        ),
+        (
+            create(with(
+                bad_gsi(),
+                json!({"SSESpecification": {"Enabled": true, "SSEType": "AES256"}}),
+            )),
+            gsi_fault.clone(),
+        ),
+        (
+            plain(json!({"TableClass": "STANDARD_IA"})),
+            Some(TABLE_CLASS.to_owned()),
+        ),
+        (
+            plain(json!({"BillingMode": "ON_DEMAND", "TableClass": "PAY_PER_REQUEST"})),
+            Some(TABLE_CLASS.to_owned()),
+        ),
+        (
+            create(with(bad_gsi(), json!({"TableClass": "BOGUS"}))),
+            Some(TABLE_CLASS.to_owned()),
+        ),
+        (
+            plain(json!({"TableName": name_256, "TableClass": "BOGUS"})),
+            too_long(&name_256, "tableName", 255),
+        ),
+        (plain(json!({"TableClass": "BOGUS", "Tags": "x"})), None),
+        (
+            update(json!({"TableClass": "STANDARD_IA"})),
+            Some(TABLE_CLASS.to_owned()),
+        ),
+        (
+            update(json!({"BillingMode": "ALSO_BOGUS", "TableClass": "BOGUS"})),
+            Some(TABLE_CLASS.to_owned()),
+        ),
+        (
+            update(json!({"TableClass": "BOGUS", "AttributeDefinitions": "x"})),
+            None,
         ),
     ];
     for view in ["NEW_AND_OLD_IMAGE", "keys_only", "", "TOTAL"] {
@@ -221,6 +343,12 @@ fn rows() -> Vec<((&'static str, Value), Option<String>)> {
         update(json!({"ReplicaUpdates": ["x"]})),
     ] {
         rows.push(((operation, body), None));
+    }
+    for sse_type in ["BOGUS", "AES"] {
+        rows.push((
+            sse(json!({"Enabled": true, "SSEType": sse_type})),
+            refused(sse_type, SSE_TYPE, SSE_SET),
+        ));
     }
     rows
 }
