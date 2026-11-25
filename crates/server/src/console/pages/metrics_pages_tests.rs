@@ -89,6 +89,7 @@ fn session(identity: CallerIdentity) -> SessionData {
     SessionData {
         identity,
         csrf_token: "csrf-token".to_owned(),
+        tabs: std::sync::Arc::from(Vec::new()),
     }
 }
 
@@ -235,14 +236,14 @@ fn nav_bar_links_the_admin_only_pages_for_admins_only() {
 
     // An admin's bar lists the three links after Accounts, in this order,
     // and before the spacer.
-    let admin_nav = html::nav_bar(&identity_label(&admin()));
+    let admin_nav = html::nav_bar(&identity_label(&admin()), &[]);
     let admin_row = format!("{accounts}\n{}\n{spacer}", admin_links.join("\n"));
     assert!(admin_nav.contains(&admin_row), "{admin_nav}");
 
     // An IAM user's bar has no Accounts link either: Dashboard comes right
     // before the spacer.
     let dashboard = r#"<a href="/console">Dashboard</a>"#;
-    let user_nav = html::nav_bar(&identity_label(&iam_user()));
+    let user_nav = html::nav_bar(&identity_label(&iam_user()), &[]);
     for link in admin_links {
         assert!(!user_nav.contains(link), "{user_nav}");
     }

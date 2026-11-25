@@ -21,7 +21,7 @@ use crate::management::cache_invalidate::{
     self, InvalidateRequest, Scope, Selectors, apply as apply_invalidation,
 };
 
-use super::{identity_label, require_admin, require_csrf, require_session};
+use super::{require_admin, require_csrf, require_session};
 
 /// Confirmation token the operator must type for `scope=all`. Mirrors
 /// the CLI's `--yes` requirement; intentionally distinctive so the
@@ -38,7 +38,7 @@ pub async fn cache_page(State(state): State<Arc<ConsoleState>>, headers: HeaderM
         return redirect;
     }
 
-    let nav = html::nav_bar(&identity_label(&session.identity));
+    let nav = session.nav_bar();
     let crumbs = html::breadcrumb(&[("Console", Some("/console")), ("Cache", None)]);
 
     let content = format!(
@@ -259,7 +259,7 @@ fn render_success(
     session: &super::SessionData,
     resp: &cache_invalidate::InvalidateResponse,
 ) -> Response {
-    let nav = html::nav_bar(&identity_label(&session.identity));
+    let nav = session.nav_bar();
     let crumbs = html::breadcrumb(&[
         ("Console", Some("/console")),
         ("Cache", Some("/console/cache")),
@@ -291,7 +291,7 @@ fn render_success(
 }
 
 fn render_error(session: &super::SessionData, msg: &str) -> Response {
-    let nav = html::nav_bar(&identity_label(&session.identity));
+    let nav = session.nav_bar();
     let crumbs = html::breadcrumb(&[
         ("Console", Some("/console")),
         ("Cache", Some("/console/cache")),

@@ -12,7 +12,8 @@ use axum::routing::get;
 use tower::ServiceExt;
 
 use super::{
-    ExtensionMountError, Extensions, body_hash, mount_extensions, validate_extension_prefix,
+    CONSOLE_RESERVED_SLUGS, ConsoleTab, ExtensionMountError, Extensions, body_hash,
+    mount_extensions, validate_console_slug, validate_console_slugs, validate_extension_prefix,
     validate_extension_prefixes,
 };
 
@@ -218,4 +219,96 @@ fn the_builders_fill_the_fields() {
     assert_eq!(ext.http[0].0, "/_a");
     assert_eq!(ext.http[1].0, "/_b");
     assert!(ext.request_observer.is_some());
+}
+
+#[test]
+fn a_console_tab_slug_is_one_lower_case_segment_not_reserved_and_not_taken() {
+    assert!(validate_console_slug("chaos", &[]).is_ok());
+    assert!(validate_console_slug("my-tab-2", &[]).is_ok());
+    for slug in ["", "Chaos", "my tab", "a/b", "a_b", "tab.", "/x", "ä"] {
+        assert!(
+            matches!(validate_console_slug(slug, &[]), Err(ExtensionMountError::BadSlug(s)) if s == slug),
+            "{slug:?} must be refused as a bad slug"
+        );
+    }
+    for reserved in CONSOLE_RESERVED_SLUGS {
+        match validate_console_slug(reserved, &[]) {
+            Err(ExtensionMountError::ReservedSlug(s)) => assert_eq!(s, *reserved),
+            other => panic!("{reserved} must be reserved, got {other:?}"),
+        }
+    }
+    let taken = vec!["chaos".to_owned()];
+    assert!(matches!(
+        validate_console_slug("chaos", &taken),
+        Err(ExtensionMountError::RepeatedSlug(s)) if s == "chaos"
+    ));
+    assert!(validate_console_slug("chaos2", &taken).is_ok());
+    assert_eq!(
+        ExtensionMountError::ReservedSlug("login".to_owned()).to_string(),
+        "console tab slug 'login' is a built-in console route"
+    );
+    assert_eq!(
+        ExtensionMountError::RepeatedSlug("chaos".to_owned()).to_string(),
+        "console tab slug 'chaos' is used by an earlier tab"
+    );
+}
+
+#[test]
+fn validate_console_slugs_checks_the_list_in_order() {
+    let tabs = vec![
+        ConsoleTab {
+            label: "A".to_owned(),
+            slug: "a".to_owned(),
+            router: probe_router(),
+        },
+        ConsoleTab {
+            label: "A again".to_owned(),
+            slug: "a".to_owned(),
+            router: probe_router(),
+        },
+    ];
+    let err = validate_console_slugs(&tabs).expect_err("the second slug repeats the first");
+    assert!(matches!(err, ExtensionMountError::RepeatedSlug(ref s) if s == "a"));
+    assert!(validate_console_slugs(&[]).is_ok());
+    for label in ["", " \t"] {
+        let tabs = [ConsoleTab {
+            label: label.to_owned(),
+            slug: "blank".to_owned(),
+            router: probe_router(),
+        }];
+        let err = validate_console_slugs(&tabs).expect_err("an empty label is refused");
+        assert_eq!(
+            err.to_string(),
+            "console tab 'blank' has an empty label, which would show as an empty link in \
+             the navigation bar",
+            "{label:?}"
+        );
+    }
+    let ext = Extensions::default().with_console_tab("Chaos", "chaos", probe_router());
+    assert_eq!(ext.console_tabs.len(), 1);
+    assert_eq!(ext.console_tabs[0].label, "Chaos");
+    assert_eq!(ext.console_tabs[0].slug, "chaos");
+    assert!(validate_console_slugs(&ext.console_tabs).is_ok());
+}
+
+/// The reserved slugs are the first segments of the console router's routes,
+/// both ways: a segment missing from the list lets a tab collide with a route
+/// (axum panics when the tab is nested), and an entry that is not a segment
+/// refuses a slug no route uses. axum has no method that lists a router's
+/// routes; its `Debug` output lists each route's path, so the test reads the
+/// quoted paths from it, and a change to that output fails the test.
+#[test]
+fn the_reserved_slugs_are_the_console_routers_first_segments() {
+    let routes = format!("{:?}", crate::console::router());
+    let mut segments: Vec<&str> = routes
+        .split('"')
+        .filter_map(|text| text.strip_prefix('/'))
+        .filter_map(|path| path.split('/').next())
+        .filter(|segment| !segment.is_empty() && !segment.starts_with('{'))
+        .collect();
+    segments.sort_unstable();
+    segments.dedup();
+    let mut reserved = CONSOLE_RESERVED_SLUGS.to_vec();
+    reserved.sort_unstable();
+    assert_eq!(segments, reserved);
 }

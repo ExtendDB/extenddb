@@ -15,7 +15,7 @@ use crate::console::html;
 
 use super::account_scope::require_user_session;
 use super::user_pages::user_breadcrumb;
-use super::{CsrfOnly, identity_label, op_error_message, require_csrf};
+use super::{CsrfOnly, op_error_message, require_csrf};
 
 /// POST /console/accounts/{id}/users/{name}/access-keys/new
 pub async fn create_access_key(
@@ -33,7 +33,7 @@ pub async fn create_access_key(
         return r;
     }
 
-    let nav = html::nav_bar(&identity_label(&session.identity));
+    let nav = session.nav_bar();
     let eid = html::escape(&account_id);
     let eun = html::escape(&user_name);
 
@@ -125,7 +125,7 @@ pub async fn delete_access_key(
                 .into_response()
         }
         Err(e) => {
-            let nav = html::nav_bar(&identity_label(&session.identity));
+            let nav = session.nav_bar();
             let content = format!("<h1>Error</h1>{}", html::alert_error(&op_error_message(e)));
             Html(html::layout_csrf(
                 "Error",

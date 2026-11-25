@@ -21,6 +21,7 @@ fn session(identity: CallerIdentity) -> SessionData {
     SessionData {
         identity,
         csrf_token: "csrf-token".to_owned(),
+        tabs: std::sync::Arc::from(Vec::new()),
     }
 }
 

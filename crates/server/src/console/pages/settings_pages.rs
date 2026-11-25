@@ -20,7 +20,7 @@ use crate::console::html;
 // the static config display cannot drift apart.
 use extenddb_config::{MASK, should_redact};
 
-use super::{identity_label, require_admin, require_session};
+use super::{require_admin, require_session};
 
 /// Runtime settings the page always lists, with the server's default for a
 /// key the server reads. A key the storage engine reads has no entry here:
@@ -59,7 +59,7 @@ pub async fn settings_page(State(state): State<Arc<ConsoleState>>, headers: Head
         return redirect;
     }
 
-    let nav = html::nav_bar(&identity_label(&session.identity));
+    let nav = session.nav_bar();
     let crumbs = html::breadcrumb(&[("Console", Some("/console")), ("Settings", None)]);
 
     // --- Static configuration from .toml ---

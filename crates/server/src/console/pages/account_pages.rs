@@ -17,10 +17,7 @@ use crate::console::html;
 use crate::management::CallerIdentity;
 
 use super::account_scope::require_account_session;
-use super::{
-    CsrfOnly, SessionData, identity_label, is_admin, op_error_message, require_csrf,
-    require_session,
-};
+use super::{CsrfOnly, SessionData, is_admin, op_error_message, require_csrf, require_session};
 
 /// GET /console/: the dashboard with quick links. An admin session also sees
 /// the deployment's account and admin counts.
@@ -54,7 +51,7 @@ fn render_dashboard(
     counts: Option<(i64, i64)>,
     version_info: &str,
 ) -> Response {
-    let nav = html::nav_bar(&identity_label(&session.identity));
+    let nav = session.nav_bar();
 
     let cards = match &session.identity {
         CallerIdentity::Admin(_) => {
@@ -116,7 +113,7 @@ pub async fn list_accounts(State(state): State<Arc<ConsoleState>>, headers: Head
         return Redirect::to("/console").into_response();
     }
 
-    let nav = html::nav_bar(&identity_label(&session.identity));
+    let nav = session.nav_bar();
     let crumbs = html::breadcrumb(&[("Dashboard", Some("/console")), ("Accounts", None)]);
 
     let rows: Vec<(String, String)> = state
@@ -167,7 +164,7 @@ pub async fn new_account_form(
         return Redirect::to("/console").into_response();
     }
 
-    let nav = html::nav_bar(&identity_label(&session.identity));
+    let nav = session.nav_bar();
     let crumbs = html::breadcrumb(&[
         ("Dashboard", Some("/console")),
         ("Accounts", Some("/console/accounts")),
@@ -235,7 +232,7 @@ pub async fn create_account(
 
     // Validate account ID format (must be 12-digit numeric string).
     if account_id.len() != 12 || !account_id.chars().all(|c| c.is_ascii_digit()) {
-        let nav = html::nav_bar(&identity_label(&session.identity));
+        let nav = session.nav_bar();
         let content = format!(
             "{}<h1>Create Account</h1>{}",
             html::breadcrumb(&[
@@ -262,7 +259,7 @@ pub async fn create_account(
     match result {
         Ok(()) => Redirect::to(&format!("/console/accounts/{account_id}")).into_response(),
         Err(e) => {
-            let nav = html::nav_bar(&identity_label(&session.identity));
+            let nav = session.nav_bar();
             let msg = op_error_message(e);
             let content = format!(
                 "{}<h1>Create Account</h1>{}",
@@ -300,7 +297,7 @@ pub async fn account_detail(
         return Redirect::to("/console").into_response();
     }
 
-    let nav = html::nav_bar(&identity_label(&session.identity));
+    let nav = session.nav_bar();
     let eid = html::escape(&account_id);
     let crumbs = html::breadcrumb(&[
         ("Dashboard", Some("/console")),
@@ -434,7 +431,7 @@ pub async fn delete_account(
             Redirect::to("/console/accounts").into_response()
         }
         Err(e) => {
-            let nav = html::nav_bar(&identity_label(&session.identity));
+            let nav = session.nav_bar();
             let msg = op_error_message(e);
             let content = format!("<h1>Delete Account</h1>{}", html::alert_error(&msg));
             Html(html::layout_csrf(

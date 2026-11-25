@@ -26,9 +26,7 @@ use crate::console::ConsoleState;
 use crate::console::html;
 use crate::management::CallerIdentity;
 
-use super::{
-    SessionData, identity_label, is_admin, metrics_content, require_admin, require_session,
-};
+use super::{SessionData, is_admin, metrics_content, require_admin, require_session};
 
 /// Data plane operations (reads + writes on items).
 const DATA_OPS: &[&str] = &[
@@ -62,7 +60,7 @@ fn render_metrics_page(session: &SessionData, version_info: &str) -> Response {
         return redirect;
     }
 
-    let nav = html::nav_bar(&identity_label(&session.identity));
+    let nav = session.nav_bar();
     let breadcrumb = html::breadcrumb(&[("Console", Some("/console")), ("Metrics", None)]);
 
     // Build the data-ops list for JS to classify control vs data plane.
