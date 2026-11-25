@@ -6,7 +6,7 @@ status: "Draft"
 crate: "extenddb-auth"
 ---
 
-# Component design: Authentication and authorization
+# Component design: Authentication and authorization (v2)
 
 :::note
 This is the second revision of the authentication design. [Authentication and authorization (v3)](05-component-auth-v3.md) supersedes it.

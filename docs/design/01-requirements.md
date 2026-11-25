@@ -230,7 +230,9 @@ These are the core CRUD operations. All must be fully implemented.
 - REQ-STREAM-004: Stream records must be ordered by sequence number within a shard
 - REQ-STREAM-005: Detailed shard management and retention design is deferred
 
-### 3.5 Global Tables Operations (In Scope, Detail Deferred)
+### 3.5 Global Tables Operations (not implemented)
+
+Written in April 2026 as in scope. None of these operations is implemented: each answers `UnknownOperationException` (see [Feature Status](../differences-from-dynamodb.md#feature-status)).
 
 | # | Operation | Description |
 |---|-----------|-------------|
@@ -262,7 +264,7 @@ These are the core CRUD operations. All must be fully implemented.
 
 ### 4.1.1 Auth Modes
 
-ExtendDB supports two authentication modes, selectable by configuration: Mode 2 (local credential store) and Mode 3 (AWS IAM). Mode 1 (no auth) existed in early builds and has been removed. The mode determines how credentials are validated and how authorization decisions are made.
+ExtendDB supports one authentication mode, Mode 2 (local credential store). Mode 1 (no auth) existed in early builds and has been removed. Mode 3 (AWS IAM), below, is not implemented: `serve` refuses `auth.provider = "aws_iam"` with `Unknown auth provider 'aws_iam'. Only 'builtin' is supported.` and exits 1. The mode determines how credentials are validated and how authorization decisions are made.
 
 **Mode 1: No auth** (removed: `auth.provider = "none"` is no longer accepted)
 Previously accepted any request regardless of the Authorization header. This mode has been removed. The server refuses to start with `provider = "none"`.
@@ -270,7 +272,7 @@ Previously accepted any request regardless of the Authorization header. This mod
 **Mode 2: Local credential store** (`auth.provider = "builtin"`)
 ExtendDB maintains its own credential store and policy documents. SigV4 signatures are validated against locally stored secret keys. Authorization is evaluated against locally stored IAM-style policies. Credentials and policies are managed via the management API or seed configuration. This is the default for production in disconnected or semi-connected environments.
 
-**Mode 3: AWS IAM** (`auth.provider = "aws_iam"`)
+**Mode 3: AWS IAM** (`auth.provider = "aws_iam"`, not implemented)
 When ExtendDB has network connectivity to AWS (e.g., running on EC2), it delegates authentication and authorization to real AWS IAM. This mode has three sub-capabilities:
 
 - REQ-AUTH-008: **STS authentication via pre-signed GetCallerIdentity token.** The client generates a pre-signed STS `GetCallerIdentity` URL (signed for the `sts` service) and sends it as an `X-Extenddb-Auth-Token` header alongside the normal DynamoDB request. ExtendDB calls STS using this pre-signed URL to validate the credential and resolve the caller's IAM ARN, account ID, and user ID. Cache validated identities with configurable TTL to avoid per-request STS calls. This is the same pattern used by EKS (`aws-iam-authenticator`) and Vault's AWS auth method.

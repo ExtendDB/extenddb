@@ -410,7 +410,7 @@ There is no in-memory locking (no `Mutex`, `RwLock`, or similar) on the data pat
 
 ## 7. Design Choices Recorded for Streams and Global Tables
 
-This section records the design space as it stood when the document was written (April 2026). DynamoDB Streams has since been implemented; see the [DynamoDB Streams component design](07-component-streams.md). Global Tables remain not implemented.
+This section records the design space as it stood when the document was written (April 2026). DynamoDB Streams has since been implemented; see the [DynamoDB Streams component design](07-component-streams.md). Global Tables are not implemented; the [Feature Status](../differences-from-dynamodb.md#feature-status) table is the current record.
 
 ### 7.1 DynamoDB Streams
 
