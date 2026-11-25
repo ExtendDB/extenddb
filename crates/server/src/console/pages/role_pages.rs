@@ -16,7 +16,7 @@ use crate::console::ConsoleState;
 use crate::console::html;
 
 use super::account_scope::require_account_session;
-use super::{CsrfOnly, identity_label, is_admin, op_error_message, require_csrf};
+use super::{CsrfOnly, is_admin, op_error_message, require_csrf};
 
 /// GET /console/accounts/{id}/roles/new
 pub async fn new_role_form(
@@ -32,7 +32,7 @@ pub async fn new_role_form(
         return Redirect::to("/console").into_response();
     }
 
-    let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
+    let nav = session.nav_bar();
     let eid = html::escape(&account_id);
     let crumbs = html::breadcrumb(&[
         ("Dashboard", Some("/console")),
@@ -101,7 +101,7 @@ pub async fn create_role(
 
     // Same name rule as the management API (`management::iam_role::create_role`).
     if !crate::management::is_valid_iam_name(&form.role_name) {
-        let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
+        let nav = session.nav_bar();
         let content = format!(
             "<h1>Create Role</h1>{}",
             html::alert_error(
@@ -120,7 +120,7 @@ pub async fn create_role(
     // Validate trust policy is valid JSON.
     let tp: Result<serde_json::Value, _> = serde_json::from_str(&form.trust_policy);
     let Ok(tp) = tp else {
-        let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
+        let nav = session.nav_bar();
         let content = format!(
             "<h1>Create Role</h1>{}",
             html::alert_error("Trust policy is not valid JSON")
@@ -145,7 +145,7 @@ pub async fn create_role(
             .map(|msg| format!("Invalid trust policy: {msg}"))
     };
     if let Some(msg) = invalid {
-        let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
+        let nav = session.nav_bar();
         let content = format!("<h1>Create Role</h1>{}", html::alert_error(&msg));
         return Html(html::layout_csrf(
             "New Role",
@@ -167,7 +167,7 @@ pub async fn create_role(
         ))
         .into_response(),
         Err(e) => {
-            let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
+            let nav = session.nav_bar();
             let content = format!(
                 "<h1>Create Role</h1>{}",
                 html::alert_error(&op_error_message(e))
@@ -199,7 +199,7 @@ pub async fn role_detail(
         return Redirect::to("/console").into_response();
     }
 
-    let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
+    let nav = session.nav_bar();
     let eid = html::escape(&account_id);
     let ern = html::escape(&role_name);
     let crumbs = html::breadcrumb(&[
@@ -345,7 +345,7 @@ pub async fn delete_role(
             Redirect::to(&format!("/console/accounts/{account_id}")).into_response()
         }
         Err(e) => {
-            let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
+            let nav = session.nav_bar();
             let content = format!(
                 "<h1>Delete Role</h1>{}",
                 html::alert_error(&op_error_message(e))

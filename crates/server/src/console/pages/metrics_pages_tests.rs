@@ -89,6 +89,7 @@ fn session(identity: CallerIdentity) -> SessionData {
     SessionData {
         identity,
         csrf_token: "csrf-token".to_owned(),
+        tabs: std::sync::Arc::from(Vec::new()),
     }
 }
 
@@ -199,7 +200,7 @@ async fn admin_gets_every_accounts_rows_from_the_data_feed() {
 
 #[test]
 fn iam_user_is_redirected_from_the_metrics_page() {
-    let response = render_metrics_page(&session(iam_user()), "test-version", &[]);
+    let response = render_metrics_page(&session(iam_user()), "test-version");
 
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
     let location = response
@@ -211,7 +212,7 @@ fn iam_user_is_redirected_from_the_metrics_page() {
 
 #[tokio::test]
 async fn admin_gets_the_metrics_page() {
-    let response = render_metrics_page(&session(admin()), "test-version", &[]);
+    let response = render_metrics_page(&session(admin()), "test-version");
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;

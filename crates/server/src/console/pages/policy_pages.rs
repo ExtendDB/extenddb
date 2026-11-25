@@ -15,7 +15,7 @@ use crate::console::ConsoleState;
 use crate::console::html;
 
 use super::account_scope::require_account_session;
-use super::{CsrfOnly, identity_label, is_admin, op_error_message, require_csrf};
+use super::{CsrfOnly, is_admin, op_error_message, require_csrf};
 
 // ── User policies ──────────────────────────────────────────────────────
 
@@ -199,7 +199,7 @@ async fn policy_form(
         return Redirect::to("/console").into_response();
     }
 
-    let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
+    let nav = session.nav_bar();
     let eid = html::escape(account_id);
     let een = html::escape(principal_name);
     let eet = html::escape(principal_type);
@@ -270,7 +270,7 @@ async fn put_policy(
 
     // Same name rule as the management API (`management::iam_policy::put_policy`).
     if !crate::management::is_valid_iam_name(&form.policy_name) {
-        let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
+        let nav = session.nav_bar();
         let content = format!(
             "<h1>Add Policy</h1>{}",
             html::alert_error(
@@ -290,7 +290,7 @@ async fn put_policy(
     let doc: serde_json::Value = if let Ok(v) = serde_json::from_str(&form.policy_document) {
         v
     } else {
-        let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
+        let nav = session.nav_bar();
         let content = format!(
             "<h1>Add Policy</h1>{}",
             html::alert_error("Policy document is not valid JSON")
@@ -315,7 +315,7 @@ async fn put_policy(
             .map(|e| format!("Invalid policy document: {e}"))
     };
     if let Some(msg) = invalid {
-        let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
+        let nav = session.nav_bar();
         let content = format!("<h1>Add Policy</h1>{}", html::alert_error(&msg));
         return Html(html::layout_csrf(
             "New Policy",
@@ -354,7 +354,7 @@ async fn put_policy(
             Redirect::to(redirect_url).into_response()
         }
         Err(e) => {
-            let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
+            let nav = session.nav_bar();
             let content = format!(
                 "<h1>Add Policy</h1>{}",
                 html::alert_error(&op_error_message(e))
@@ -403,7 +403,7 @@ async fn delete_policy(
             Redirect::to(redirect_url).into_response()
         }
         Err(e) => {
-            let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
+            let nav = session.nav_bar();
             let content = format!(
                 "<h1>Delete Policy</h1>{}",
                 html::alert_error(&op_error_message(e))

@@ -21,7 +21,7 @@ use crate::management::cache_invalidate::{
     self, InvalidateRequest, Scope, Selectors, apply as apply_invalidation,
 };
 
-use super::{identity_label, require_admin, require_csrf, require_session};
+use super::{require_admin, require_csrf, require_session};
 
 /// Confirmation token the operator must type for `scope=all`. Mirrors
 /// the CLI's `--yes` requirement; intentionally distinctive so the
@@ -38,7 +38,7 @@ pub async fn cache_page(State(state): State<Arc<ConsoleState>>, headers: HeaderM
         return redirect;
     }
 
-    let nav = html::nav_bar(&identity_label(&session.identity), &state.tabs);
+    let nav = session.nav_bar();
     let crumbs = html::breadcrumb(&[("Console", Some("/console")), ("Cache", None)]);
 
     let content = format!(
@@ -192,7 +192,7 @@ pub async fn invalidate_cache(
 
     let scope = match parse_scope(&form.scope) {
         Ok(s) => s,
-        Err(msg) => return render_error(&session, &state.tabs, &msg),
+        Err(msg) => return render_error(&session, &msg),
     };
 
     // The console form-confirmation pattern: scope=all requires the
@@ -201,7 +201,6 @@ pub async fn invalidate_cache(
     if scope == Scope::All && !confirm_ok {
         return render_error(
             &session,
-            &state.tabs,
             &format!(
                 r#"scope "all" requires typing "{ALL_CONFIRMATION_TOKEN}" in the confirmation field"#
             ),
@@ -234,8 +233,8 @@ pub async fn invalidate_cache(
     let request = InvalidateRequest { scope, selectors };
 
     match apply_invalidation(&state.auth_cache, request, &admin_name).await {
-        Ok(resp) => render_success(&session, &state.tabs, &resp),
-        Err(msg) => render_error(&session, &state.tabs, &msg),
+        Ok(resp) => render_success(&session, &resp),
+        Err(msg) => render_error(&session, &msg),
     }
 }
 
@@ -258,10 +257,9 @@ fn optional(s: &str) -> Option<String> {
 
 fn render_success(
     session: &super::SessionData,
-    tabs: &[(String, String)],
     resp: &cache_invalidate::InvalidateResponse,
 ) -> Response {
-    let nav = html::nav_bar(&identity_label(&session.identity), tabs);
+    let nav = session.nav_bar();
     let crumbs = html::breadcrumb(&[
         ("Console", Some("/console")),
         ("Cache", Some("/console/cache")),
@@ -292,8 +290,8 @@ fn render_success(
     .into_response()
 }
 
-fn render_error(session: &super::SessionData, tabs: &[(String, String)], msg: &str) -> Response {
-    let nav = html::nav_bar(&identity_label(&session.identity), tabs);
+fn render_error(session: &super::SessionData, msg: &str) -> Response {
+    let nav = session.nav_bar();
     let crumbs = html::breadcrumb(&[
         ("Console", Some("/console")),
         ("Cache", Some("/console/cache")),

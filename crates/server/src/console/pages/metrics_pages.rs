@@ -26,9 +26,7 @@ use crate::console::ConsoleState;
 use crate::console::html;
 use crate::management::CallerIdentity;
 
-use super::{
-    SessionData, identity_label, is_admin, metrics_content, require_admin, require_session,
-};
+use super::{SessionData, is_admin, metrics_content, require_admin, require_session};
 
 /// Data plane operations (reads + writes on items).
 const DATA_OPS: &[&str] = &[
@@ -50,23 +48,19 @@ const DATA_OPS: &[&str] = &[
 /// dashboard.
 pub async fn metrics_page(State(state): State<Arc<ConsoleState>>, headers: HeaderMap) -> Response {
     match require_session(&headers, &state).await {
-        Ok(session) => render_metrics_page(&session, &state.version_info, &state.tabs),
+        Ok(session) => render_metrics_page(&session, &state.version_info),
         Err(redirect) => redirect,
     }
 }
 
 /// The dashboard page for `session`, or a redirect to the console dashboard
 /// when the session is not an admin's.
-fn render_metrics_page(
-    session: &SessionData,
-    version_info: &str,
-    tabs: &[(String, String)],
-) -> Response {
+fn render_metrics_page(session: &SessionData, version_info: &str) -> Response {
     if let Err(redirect) = require_admin(session) {
         return redirect;
     }
 
-    let nav = html::nav_bar(&identity_label(&session.identity), tabs);
+    let nav = session.nav_bar();
     let breadcrumb = html::breadcrumb(&[("Console", Some("/console")), ("Metrics", None)]);
 
     // Build the data-ops list for JS to classify control vs data plane.

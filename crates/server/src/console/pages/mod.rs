@@ -51,10 +51,21 @@ use crate::console::html;
 use crate::console::session::SessionCheck;
 use crate::management::CallerIdentity;
 
-/// Session data returned by `require_session`: identity + CSRF token.
+/// Session data returned by `require_session`: identity, CSRF token and the
+/// extension tabs for the navigation bar.
 pub struct SessionData {
     pub identity: CallerIdentity,
     pub csrf_token: String,
+    pub tabs: Arc<[(String, String)]>,
+}
+
+impl SessionData {
+    /// The navigation bar of a console page for this session: the built-in
+    /// links its identity may open, then the extension tabs. Every built-in
+    /// page builds its bar here, so no page passes a tab list of its own.
+    pub(super) fn nav_bar(&self) -> String {
+        html::nav_bar(&identity_label(&self.identity), &self.tabs)
+    }
 }
 
 /// Extract the session from the cookie header and check it against the
@@ -69,13 +80,19 @@ pub(super) async fn require_session(
     let Some(token) = extract_session_token(headers) else {
         return Err(Redirect::to("/console/login").into_response());
     };
-    session_response(state.sessions.validate(&token, &*state.catalog_store).await)
+    session_response(
+        state.sessions.validate(&token, &*state.catalog_store).await,
+        &state.tabs,
+    )
 }
 
 /// The session data for a session that passed its check, or the response a
 /// console request gets when it did not.
 #[allow(clippy::result_large_err)]
-fn session_response(check: SessionCheck) -> Result<SessionData, Response> {
+fn session_response(
+    check: SessionCheck,
+    tabs: &Arc<[(String, String)]>,
+) -> Result<SessionData, Response> {
     match check {
         SessionCheck::Valid {
             identity,
@@ -83,6 +100,7 @@ fn session_response(check: SessionCheck) -> Result<SessionData, Response> {
         } => Ok(SessionData {
             identity,
             csrf_token,
+            tabs: Arc::clone(tabs),
         }),
         SessionCheck::Invalid => Err(Redirect::to("/console/login").into_response()),
         SessionCheck::Unavailable => Err((
@@ -194,19 +212,25 @@ mod tests {
 
     #[test]
     fn a_passed_check_returns_the_session() {
-        let Ok(session) = session_response(SessionCheck::Valid {
-            identity: CallerIdentity::Admin("alice".to_owned()),
-            csrf_token: "csrf".to_owned(),
-        }) else {
+        let tabs: Arc<[(String, String)]> =
+            Arc::from(vec![("T".to_owned(), "/console/t".to_owned())]);
+        let Ok(session) = session_response(
+            SessionCheck::Valid {
+                identity: CallerIdentity::Admin("alice".to_owned()),
+                csrf_token: "csrf".to_owned(),
+            },
+            &tabs,
+        ) else {
             panic!("a session that passed its check was refused");
         };
         assert!(matches!(session.identity, CallerIdentity::Admin(ref n) if n == "alice"));
         assert_eq!(session.csrf_token, "csrf");
+        assert_eq!(&*session.tabs, &*tabs);
     }
 
     #[test]
     fn an_ended_session_gets_the_login_redirect() {
-        let Err(response) = session_response(SessionCheck::Invalid) else {
+        let Err(response) = session_response(SessionCheck::Invalid, &Arc::from(Vec::new())) else {
             panic!("an ended session was accepted");
         };
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
@@ -218,7 +242,8 @@ mod tests {
 
     #[test]
     fn an_unreadable_catalog_gets_503() {
-        let Err(response) = session_response(SessionCheck::Unavailable) else {
+        let Err(response) = session_response(SessionCheck::Unavailable, &Arc::from(Vec::new()))
+        else {
             panic!("a request was accepted while the catalog could not be read");
         };
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
