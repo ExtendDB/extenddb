@@ -112,6 +112,13 @@ fn lsi_scan_body() -> Value {
 const SENT_AND_EXPECTED: [(Option<bool>, bool); 3] =
     [(Some(true), true), (Some(false), false), (None, false)];
 
+/// The one storage read `storage` received.
+fn only_read(storage: &Fake) -> ReadCall {
+    let reads = storage.reads();
+    assert_eq!(reads.len(), 1, "{} storage reads: {reads:?}", reads.len());
+    reads.into_iter().next().unwrap()
+}
+
 /// Runs one handler over a fresh recording storage and returns the single
 /// read it made.
 async fn single_read(op: &str, body: Value) -> ReadCall {
@@ -124,9 +131,7 @@ async fn single_read(op: &str, body: Value) -> ReadCall {
         other => panic!("no handler for {other}"),
     };
     let _ = result.unwrap_or_else(|e| panic!("{op} failed before storage: {e:?}"));
-    let reads = storage.reads();
-    assert_eq!(reads.len(), 1, "{op} made {} storage reads", reads.len());
-    reads.into_iter().next().unwrap()
+    only_read(&storage)
 }
 
 #[tokio::test]

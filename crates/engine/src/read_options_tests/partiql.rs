@@ -17,7 +17,7 @@ use extenddb_core::types::{AttributeValue, Item};
 use extenddb_storage::error::StorageError;
 
 use super::fixtures::{EVENTS, LSI, ORDERS};
-use super::recording::{self, Fake, ReadCall};
+use super::recording::{self, Fake};
 use super::{SENT_AND_EXPECTED, context, with_consistent_read};
 use crate::OperationContext;
 use crate::partiql::PartiqlExecutor;
@@ -53,21 +53,9 @@ fn nested(levels: usize) -> Value {
     value
 }
 
-/// The single storage read a write that failed at its item made.
-fn single_read_of_failed_write(storage: &Fake) -> ReadCall {
-    let reads = storage.reads();
-    assert_eq!(
-        reads.len(),
-        1,
-        "the write made {} storage reads: {reads:?}",
-        reads.len()
-    );
-    reads.into_iter().next().unwrap()
-}
-
 /// `SELECT` of an attribute the LSI does not project reads each walked row's
 /// item back from the table; that read carries the client's `ConsistentRead`,
-/// as the LSI read it follows does.
+/// as the LSI read it follows does, and the test checks both.
 #[tokio::test]
 async fn lsi_read_that_reaches_back_carries_the_clients_consistent_read() {
     for (sent, expected) in SENT_AND_EXPECTED {
@@ -95,6 +83,11 @@ async fn lsi_read_that_reaches_back_carries_the_clients_consistent_read() {
         );
         assert_eq!(reads[0].op, "Query");
         assert_eq!(reads[0].index_name.as_deref(), Some(LSI));
+        assert_eq!(
+            reads[0].opts.consistent_read, expected,
+            "ConsistentRead {sent:?} reached the index read as {}",
+            reads[0].opts.consistent_read
+        );
         for read in &reads[1..] {
             assert_eq!(read.op, "GetItem");
             assert_eq!(read.table, EVENTS);
@@ -132,7 +125,7 @@ async fn an_update_past_the_item_limit_reads_its_item_consistent() {
             ),
             "a missing item fails the update's condition: {result:?}"
         );
-        let call = single_read_of_failed_write(&storage);
+        let call = super::only_read(&storage);
         assert_eq!(call.op, "GetItem");
         assert_eq!(call.table, ORDERS);
         assert!(
@@ -168,7 +161,7 @@ async fn a_failed_batch_write_sizes_its_charge_from_a_consistent_read() {
             "the member must fail at its item: {}",
             response.body
         );
-        let call = single_read_of_failed_write(&storage);
+        let call = super::only_read(&storage);
         assert_eq!(call.op, "GetItem");
         assert_eq!(call.table, ORDERS);
         assert!(

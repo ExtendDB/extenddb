@@ -7,9 +7,9 @@
 //! it received, finds no item on `get_item`, and answers `query` and `scan`
 //! from `read_pages` (an empty last page once those are used up).
 //! `table_key_info`, `index_info` and `describe_table` (the export handler
-//! describes the table before it scans it) answer from the fixtures; every
-//! other method is unreachable from the handlers under test and fails as
-//! unused.
+//! describes the table before it scans it) answer from the fixtures, and
+//! `update_item` fails with `update_error` when a test sets one; every other
+//! method is unreachable from the handlers under test and fails as unused.
 
 use std::sync::Arc;
 
