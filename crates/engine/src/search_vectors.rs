@@ -85,6 +85,7 @@ pub async fn handle_search_vectors(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
+    let raw_names = body.get("ExpressionAttributeNames").cloned();
     let input: SearchVectorsInput =
         serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
@@ -121,6 +122,17 @@ pub async fn handle_search_vectors(
              The value must be between 1 and {MAX_TOP_K} inclusive",
             input.top_k
         )));
+    }
+
+    // The ExpressionAttributeNames checks of the other operations: the keys,
+    // an empty map and an empty name. They run after the checks above. The
+    // service answers an IndexName of two characters, an empty SearchVector
+    // and a TopK of 0 ahead of a bad key (measured 2026-11-21). A value that
+    // is not a string already failed the parse of the input, as on the
+    // service.
+    if let Some(raw) = raw_names {
+        extenddb_core::serde_helpers::deserialize_expression_names(raw)
+            .map_err(crate::deserialize_error)?;
     }
 
     // Structural validation of the filter expression (schema-independent).
