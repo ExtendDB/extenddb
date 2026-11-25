@@ -403,7 +403,13 @@ No catalog migration or configuration change is required.
 
 **What changed.** `extenddb init` takes an empty `EXTENDDB_ADMIN_USER` or `EXTENDDB_ADMIN_PASSWORD` as unset on every backend: it names the admin `admin`, or generates a password. On MongoDB and Cassandra, 1.0.0 took the empty string as the name or the password. On Cassandra, `init` with `EXTENDDB_ADMIN_PASSWORD` set and `EXTENDDB_ADMIN_USER` not set no longer prints the supplied password (#1339).
 
-**Who is affected.** A MongoDB or Cassandra catalog that an earlier release initialized with an empty `EXTENDDB_ADMIN_PASSWORD` keeps an admin whose password is empty. Give it a password with `extenddb manage change-admin-password`, with `EXTENDDB_PASSWORD` set to an empty value for the login. The output of a Cassandra `init` from an earlier release with only `EXTENDDB_ADMIN_PASSWORD` set holds that password, so change it if that output was kept. No catalog migration is required.
+**Who is affected.** MongoDB and Cassandra catalogs that an earlier release initialized with an empty `EXTENDDB_ADMIN_PASSWORD` or an empty `EXTENDDB_ADMIN_USER`.
+
+- An empty `EXTENDDB_ADMIN_PASSWORD` gave the admin an empty password. Log in with an empty `EXTENDDB_PASSWORD` and give the admin a password: `EXTENDDB_PASSWORD= extenddb manage --user <name> change-admin-password --admin-name <name> --new-password <password>`.
+- On MongoDB, an empty `EXTENDDB_ADMIN_USER` gave the admin an empty name, and `list-admins` shows it as `"admin_name": ""`. That admin logs in with `--user ''`, and `change-admin-password --admin-name ''` changes its password. `delete-admin --admin-name ''` fails with `HTTP 404`, because the request path `/management/admins/` names no admin. To delete the admin, first create another one: `extenddb manage --user '' create-admin --admin-name <name> --admin-password <password>`. Then delete its document in `mongosh`: `db.getSiblingDB("extenddb_catalog").admin_users.deleteOne({_id: ""})`.
+- On Cassandra, `init` with an empty `EXTENDDB_ADMIN_USER` stopped with `Error: Create admin user: Internal error: Database error` and wrote no admin, because Cassandra refuses an empty key. Run the same `init` command with this release. It finishes the catalog and creates the admin, named `admin` when `EXTENDDB_ADMIN_USER` is empty or unset.
+
+The output of a Cassandra `init` from an earlier release with only `EXTENDDB_ADMIN_PASSWORD` set holds that password, so change it if that output was kept. No catalog migration is required.
 
 ### v1.0.0: Cassandra reads and writes at `LOCAL_QUORUM`
 
