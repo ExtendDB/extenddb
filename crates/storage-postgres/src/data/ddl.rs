@@ -726,6 +726,19 @@ pub(crate) async fn drop_table_relations(
     Ok(())
 }
 
+/// Set `conn`'s transaction-local `lock_timeout` to `timeout`, and to 1 ms when
+/// `timeout` is shorter (`0` would disable the timeout).
+pub(super) async fn set_lock_timeout(
+    conn: &mut sqlx::PgConnection,
+    timeout: std::time::Duration,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT set_config('lock_timeout', $1, true)")
+        .bind(format!("{}ms", timeout.as_millis().max(1)))
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
 /// Set `conn`'s transaction-local `lock_timeout` to the time left until
 /// `deadline`, and to 1 ms once it has passed (`0` would disable the
 /// timeout).
@@ -733,12 +746,11 @@ async fn set_lock_timeout_until(
     conn: &mut sqlx::PgConnection,
     deadline: std::time::Instant,
 ) -> Result<(), sqlx::Error> {
-    let left = deadline.saturating_duration_since(std::time::Instant::now());
-    sqlx::query("SELECT set_config('lock_timeout', $1, true)")
-        .bind(format!("{}ms", left.as_millis().max(1)))
-        .execute(&mut *conn)
-        .await?;
-    Ok(())
+    set_lock_timeout(
+        conn,
+        deadline.saturating_duration_since(std::time::Instant::now()),
+    )
+    .await
 }
 
 /// SQLSTATE `lock_not_available` (55P03), which `lock_timeout` raises.

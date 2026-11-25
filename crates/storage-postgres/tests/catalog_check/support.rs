@@ -48,6 +48,14 @@ pub(crate) fn skip(test: &str) {
     eprintln!("SKIP {test}: EXTENDDB_TEST_PG_CONNECTION_STRING is not set.");
 }
 
+/// `msg` without the ` at line <n>` that sqlx 0.9 adds to the text of a
+/// PostgreSQL error. `<n>` is a line of the server's source, so it changes
+/// with the server version.
+pub(crate) fn without_server_line(msg: &str) -> &str {
+    let text = msg.trim_end_matches(|c: char| c.is_ascii_digit());
+    text.strip_suffix(" at line ").unwrap_or(msg)
+}
+
 struct Parts {
     host: String,
     port: u16,
@@ -118,9 +126,11 @@ impl Drop for Deployment {
                     return;
                 };
                 for n in names {
-                    let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{n}\" WITH (FORCE)"))
-                        .execute(&admin)
-                        .await;
+                    let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+                        "DROP DATABASE IF EXISTS \"{n}\" WITH (FORCE)"
+                    )))
+                    .execute(&admin)
+                    .await;
                 }
                 admin.close().await;
             });
@@ -255,19 +265,19 @@ impl Deployment {
         setting: &str,
         value: &str,
     ) -> PostgresCatalogStore {
-        // The server splits the startup options at spaces; a backslash keeps
-        // one inside the value.
+        // The server splits the startup options at spaces. sqlx escapes the
+        // spaces and backslashes of the value.
         let options = self
             .catalog_url()
             .parse::<PgConnectOptions>()
             .expect("the catalog URL")
-            .options([(setting, value.replace(' ', "\\ "))]);
+            .options([(setting, value)]);
         let pool = PgPoolOptions::new()
             .max_connections(2)
             .connect_with(options)
             .await
             .expect("a pool with the setting");
-        let set: String = sqlx::query_scalar(&format!("SHOW {setting}"))
+        let set: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SHOW {setting}")))
             .fetch_one(&pool)
             .await
             .expect("read the setting");
@@ -378,22 +388,24 @@ impl Deployment {
     /// engine uses, and return its name.
     pub(crate) async fn plant_orphan(&self) -> String {
         let name = format!("_ddb_{}", uuid::Uuid::new_v4());
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "CREATE TABLE \"{name}\" (pk TEXT PRIMARY KEY, item_data JSONB)"
-        ))
+        )))
         .execute(&self.data)
         .await
         .expect("plant the orphan");
-        sqlx::query(&format!("INSERT INTO \"{name}\" VALUES ('x', '{{}}')"))
-            .execute(&self.data)
-            .await
-            .expect("fill the orphan");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO \"{name}\" VALUES ('x', '{{}}')"
+        )))
+        .execute(&self.data)
+        .await
+        .expect("fill the orphan");
         name
     }
 
     /// Drop `relation` from the data database, as a server's drop would.
     pub(crate) async fn remove_relation(&self, relation: &str) {
-        sqlx::query(&format!("DROP TABLE \"{relation}\""))
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE \"{relation}\"")))
             .execute(&self.data)
             .await
             .expect("drop a data relation");
@@ -439,14 +451,16 @@ impl Deployment {
     }
 
     async fn row_count(&self, relation: &str) -> i64 {
-        sqlx::query_scalar(&format!("SELECT COUNT(*) FROM \"{relation}\""))
-            .fetch_one(&self.data)
-            .await
-            .expect("count the rows")
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM \"{relation}\""
+        )))
+        .fetch_one(&self.data)
+        .await
+        .expect("count the rows")
     }
 
     pub(crate) async fn set_status(&self, sql: &str, status: &str) {
-        sqlx::query(sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(status)
             .execute(&self.catalog)
             .await
@@ -536,9 +550,9 @@ impl Deployment {
         let mut data = PgConnection::connect(&self.data_url())
             .await
             .expect("a data session for the index add");
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "CREATE TABLE \"{relation}\" (pk TEXT PRIMARY KEY)"
-        ))
+        )))
         .execute(&mut data)
         .await
         .expect("create and commit the index relation");
@@ -594,7 +608,7 @@ pub(crate) async fn hold(url: &str, statement: &str) -> PgConnection {
         .execute(&mut conn)
         .await
         .expect("begin");
-    sqlx::query(statement)
+    sqlx::query(sqlx::AssertSqlSafe(statement))
         .execute(&mut conn)
         .await
         .unwrap_or_else(|e| panic!("{statement}: {e}"));
