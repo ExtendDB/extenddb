@@ -18,17 +18,23 @@
 //! reports a skip and passes, the same convention the wire suites use.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use extenddb_core::expression::ExpressionMaps;
+use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{
     AttributeDefinition, AttributeValue, BillingMode, CreateTableInput, DeleteTableInput,
     DescribeTableInput, Item, KeySchemaElement, KeyType, ScalarAttributeType, TableDescription,
     TableKeyInfo, TableStatus, UpdateTableInput,
 };
+use extenddb_engine::{
+    BackupRuntime, ItemAccess, ItemAuthorization, ItemAuthorizer, OperationContext, dispatch,
+};
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{DataEngine, TableEngine};
 use extenddb_storage_postgres::{PostgresConfig, PostgresEngine, hold_gsi_backfill_for_tests};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 
@@ -464,14 +470,14 @@ async fn update_table_returns_while_the_backfill_runs() {
     assert_eq!(status, "CREATING");
     assert_eq!(index_row_count(&s.db, &index_id).await, 0);
 
-    // Measured 2026-10-30: a Query or Scan naming the index while it backfills
-    // is a ValidationException with this text.
+    // A read of the index while it backfills is refused as backfilling, which
+    // the engine answers with the measured text (see
+    // `reads_of_a_creating_index_through_the_engine`).
     let read = s.engine.index_info_by_table_id(&table_id, "gidx").await;
     assert!(
         matches!(
             &read,
-            Err(StorageError::Validation(msg))
-                if msg == "Cannot read from backfilling global secondary index: gidx"
+            Err(StorageError::IndexBackfilling(name)) if name == "gidx"
         ),
         "a read of the CREATING index answered {read:?}"
     );
@@ -602,5 +608,168 @@ async fn a_restart_during_the_backfill_still_reaches_active() {
     assert_eq!(ids(&s.db).await.2, "ACTIVE");
     assert_eq!(gidx_status(&describe(&s).await), "ACTIVE");
     assert_index_matches_base(&s.db, &table_id, &index_id).await;
+    s.cleanup().await;
+}
+
+/// Allows every access.
+struct AllowAll;
+
+impl ItemAuthorizer for AllowAll {
+    fn authorize<'a>(&'a self, _access: &'a ItemAccess) -> ItemAuthorization<'a> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// A request context on the scratch engine. Without an item authorizer every
+/// PartiQL statement is refused with AccessDeniedException.
+fn context(s: &Scratch, authorizer: Option<Arc<dyn ItemAuthorizer>>) -> OperationContext {
+    OperationContext {
+        storage: Arc::new(s.engine.clone()),
+        backup: Arc::new(BackupRuntime::new(1)),
+        limits: Arc::new(LimitsConfig::default()),
+        region: Arc::from(REGION),
+        account_id: Arc::from(ACCOUNT),
+        import_paths: Arc::from(Vec::new()),
+        export_paths: Arc::from(Vec::new()),
+        authorized_key_info: Default::default(),
+        auth_cache: extenddb_auth::AuthCacheRegistry::empty(),
+        table_key_info_lookup: None,
+        item_authorizer: authorizer,
+    }
+}
+
+/// The answer to `operation`: the response body, or the error's type and
+/// message.
+async fn call(ctx: &OperationContext, operation: &str, body: Value) -> Result<Value, String> {
+    dispatch(operation, body, ctx, "127.0.0.1:0")
+        .await
+        .map(|r| r.body)
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// The PartiQL reads of the index `index`: a batch whose second statement
+/// reads an item of the base table, a batch that counts the index, and one
+/// statement.
+fn partiql_reads(index: &str) -> [(&'static str, Value); 3] {
+    let read = format!("SELECT * FROM \"{TABLE}\".\"{index}\" WHERE g = 'g0'");
+    [
+        (
+            "BatchExecuteStatement",
+            json!({"Statements": [
+                {"Statement": read},
+                {"Statement": format!("SELECT * FROM \"{TABLE}\" WHERE pk = 'p0' AND sk = 0")},
+            ]}),
+        ),
+        (
+            "BatchExecuteStatement",
+            json!({"Statements": [
+                {"Statement": format!("SELECT COUNT(*) FROM \"{TABLE}\".\"{index}\"")},
+            ]}),
+        ),
+        ("ExecuteStatement", json!({"Statement": read})),
+    ]
+}
+
+/// While the index is `CREATING`, each PartiQL read of it answers what the
+/// same read of an index the table does not have answers, for a caller who
+/// may read the table and for one who may not, and a Query or Scan of it is
+/// refused with the backfilling text (measured 2026-10-30).
+#[tokio::test]
+async fn reads_of_a_creating_index_through_the_engine() {
+    let test = "reads_of_a_creating_index_through_the_engine";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let s = scratch().await;
+    let key_info = create_table(&s).await;
+    put(&s, &key_info, item(0, Some("g0"), Some(0))).await;
+    let table_id = data_table_id(&s.db).await;
+    hold_gsi_backfill_for_tests(&table_id, Some(0));
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        s.engine.update_table(ACCOUNT, add_gidx()),
+    )
+    .await
+    .expect("UpdateTable returned while the build was held")
+    .expect("add the GSI");
+
+    let allowed = context(&s, Some(Arc::new(AllowAll)));
+    let refused = context(&s, None);
+    let item = json!({"pk": {"S": "p0"}, "sk": {"N": "0"}, "g": {"S": "g0"}, "r": {"N": "0"}});
+    let denied = json!({
+        "Error": {"Code": "AccessDenied", "Message": "Not authorized to perform this action"},
+        "TableName": TABLE,
+    });
+    let count = Ok(json!({"Responses": [{"Error": {
+        "Code": "ValidationError",
+        "Message": "Unexpected path component at 1:8:5",
+    }}]}));
+    // The answers for an index the table does not have, in the order of
+    // `partiql_reads`, for a caller allowed every access and for one with none.
+    let cases = [
+        (
+            &allowed,
+            "allowed",
+            [
+                Ok(json!({"Responses": [
+                    {"Error": {
+                        "Code": "ValidationError",
+                        "Message": "The table does not have the specified index",
+                    }},
+                    {"Item": item, "TableName": TABLE},
+                ]})),
+                count.clone(),
+                Err(
+                    "ValidationException(\"The table does not have the specified index\")"
+                        .to_owned(),
+                ),
+            ],
+        ),
+        (
+            &refused,
+            "refused",
+            [
+                Ok(json!({"Responses": [denied, denied]})),
+                count,
+                Err("AccessDeniedException(\"Not authorized to perform this action\")".to_owned()),
+            ],
+        ),
+    ];
+    for (ctx, caller, answers) in cases {
+        let reads = partiql_reads("gidx").into_iter().zip(partiql_reads("nope"));
+        for (((operation, creating), (_, missing)), want) in reads.zip(answers) {
+            assert_eq!(
+                call(ctx, operation, missing).await,
+                want,
+                "{caller} {operation} of a missing index"
+            );
+            assert_eq!(
+                call(ctx, operation, creating).await,
+                want,
+                "{caller} {operation} of the CREATING index"
+            );
+        }
+    }
+
+    let backfilling = Err(
+        "ValidationException(\"Cannot read from backfilling global secondary index: gidx\")"
+            .to_owned(),
+    );
+    let query = json!({
+        "TableName": TABLE,
+        "IndexName": "gidx",
+        "KeyConditionExpression": "g = :g",
+        "ExpressionAttributeValues": {":g": {"S": "g0"}},
+    });
+    let scan = json!({"TableName": TABLE, "IndexName": "gidx"});
+    for (operation, body) in [("Query", query), ("Scan", scan)] {
+        assert_eq!(
+            call(&allowed, operation, body).await,
+            backfilling,
+            "{operation}"
+        );
+    }
+    assert_eq!(ids(&s.db).await.2, "CREATING", "the build stayed held");
+    hold_gsi_backfill_for_tests(&table_id, None);
     s.cleanup().await;
 }

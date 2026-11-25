@@ -733,9 +733,10 @@ indexes to many tables in a row does not start every build at once. While a GSI 
 naming it is refused with ValidationException "Cannot read from backfilling global secondary index: <name>", the
 service's answer in its backfilling phase; DeleteTable is refused with ResourceInUseException; and a GSI Create,
 or a Delete of another GSI, on the table is refused with LimitExceededException. A Delete of the building GSI is not
-refused. A DeleteTable that goes ahead stops the propagation queue for the table (a `vector_index_holds` row, which the
-claim query honours) and deletes its pending rows before it drops any data table, so a worker holding a claimed row
-and waiting on the base table cannot deadlock with the drop.
+refused. A PartiQL statement that reads the building GSI gets the answers for an index the table does not have,
+because the service's answer to that read is not measured. A DeleteTable that goes ahead stops the propagation queue
+for the table (a `vector_index_holds` row, which the claim query honours) and deletes its pending rows before it drops
+any data table, so a worker holding a claimed row and waiting on the base table cannot deadlock with the drop.
 
 ## 7. Pagination Token Encoding
 

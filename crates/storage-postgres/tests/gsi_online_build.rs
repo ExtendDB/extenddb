@@ -752,8 +752,8 @@ async fn a_creating_gsi_refuses_a_second_change_and_reads() {
     assert!(
         matches!(
             s.engine.index_info_by_table_id(&table_id, "gidx").await,
-            Err(extenddb_storage::error::StorageError::Validation(msg))
-                if msg == "Cannot read from backfilling global secondary index: gidx"
+            Err(extenddb_storage::error::StorageError::IndexBackfilling(name))
+                if name == "gidx"
         ),
         "a read of a CREATING index is refused as backfilling"
     );

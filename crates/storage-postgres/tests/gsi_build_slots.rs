@@ -422,8 +422,7 @@ async fn a_build_waits_for_a_free_slot_holding_no_session() {
     assert!(
         matches!(
             &read,
-            Err(StorageError::Validation(msg))
-                if msg == "Cannot read from backfilling global secondary index: gidx"
+            Err(StorageError::IndexBackfilling(name)) if name == "gidx"
         ),
         "a read of the waiting index answered {read:?}"
     );

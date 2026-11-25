@@ -5,7 +5,7 @@
 
 use extenddb_core::types::{
     AttributeDefinition, IndexInfo, IndexType, KeySchemaElement, Projection, StreamSpecification,
-    TableKeyInfo, VECTOR_INDEX_BACKFILLING_SCAN_PREFIX,
+    TableKeyInfo,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{sk_column, sk_column_n};
@@ -573,8 +573,8 @@ impl PostgresEngine {
         // "The table does not have the specified index", the answer before it
         // turned true, and Queries about 45 s after it got the backfilling
         // text. This backend has no allocation phase, so every CREATING index
-        // gets the backfilling refusal. `Validation` reaches the wire verbatim
-        // as a ValidationException.
+        // gets the backfilling refusal, which the engine answers with that text
+        // for a Query or Scan and as a missing index for a PartiQL statement.
         let idx_row: Option<(String, String, String, serde_json::Value, serde_json::Value)> =
             sqlx::query_as(
                 "SELECT index_type, index_id, index_status, key_schema, projection \
@@ -589,9 +589,7 @@ impl PostgresEngine {
         let (idx_type_str, idx_id, idx_status, ks_json, proj_json) =
             idx_row.ok_or_else(|| StorageError::IndexNotFound(index_name.to_owned()))?;
         if idx_status == "CREATING" {
-            return Err(StorageError::Validation(format!(
-                "{VECTOR_INDEX_BACKFILLING_SCAN_PREFIX}{index_name}"
-            )));
+            return Err(StorageError::IndexBackfilling(index_name.to_owned()));
         }
 
         let index_type = match idx_type_str.as_str() {
