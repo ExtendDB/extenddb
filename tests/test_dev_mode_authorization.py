@@ -55,6 +55,9 @@ _ADMIN_AUTH = (
 # which shows that a request passed the host guard.
 _WRONG_ADMIN_AUTH = ("admin", "not-the-password")
 _REBIND_HOST = "rebind.example"
+# The CI dev-mode job lists this name in EXTENDDB__SERVER__DEV_ALLOWED_HOSTS.
+_LISTED_HOST = "app.test"
+_ALLOWED_HOSTS = os.environ.get("EXTENDDB__SERVER__DEV_ALLOWED_HOSTS", "").lower()
 _GUARD_MESSAGE = "Developer mode refused a request"
 # The answer to an unsigned ListTables that passed the host guard.
 _MISSING_TOKEN = {
@@ -312,13 +315,15 @@ def _base(endpoint_url: str | None) -> str:
     return endpoint_url.rstrip("/")
 
 
-def _list_tables_unsigned(endpoint_url: str | None, extra_headers: dict[str, str]):
-    """POST an unsigned ListTables under the rebinding host."""
+def _list_tables_unsigned(
+    endpoint_url: str | None, extra_headers: dict[str, str], host: str = _REBIND_HOST
+):
+    """POST an unsigned ListTables under `host`."""
     return requests.post(
         f"{_base(endpoint_url)}/",
         data=b"{}",
         headers={
-            "Host": _REBIND_HOST,
+            "Host": host,
             "Content-Type": "application/x-amz-json-1.0",
             "X-Amz-Target": "DynamoDB_20120810.ListTables",
             **extra_headers,
@@ -365,6 +370,27 @@ class TestDevModeHostGuard:
     def test_admin_get_under_the_endpoint_host_is_not_refused(self, endpoint_url):
         resp = requests.get(
             f"{_base(endpoint_url)}/management/accounts", auth=_WRONG_ADMIN_AUTH, timeout=10
+        )
+        assert (resp.status_code, resp.text) == (401, "Invalid credentials")
+
+    @pytest.mark.skipif(
+        _LISTED_HOST not in _ALLOWED_HOSTS.replace(" ", "").split(","),
+        reason=f"requires EXTENDDB__SERVER__DEV_ALLOWED_HOSTS to list {_LISTED_HOST}",
+    )
+    def test_a_listed_host_is_not_refused(self, endpoint_url):
+        """server.dev_allowed_hosts reaches the guard. The server and this test
+        read EXTENDDB__SERVER__DEV_ALLOWED_HOSTS, which the CI dev-mode job sets
+        for every step."""
+        resp = _list_tables_unsigned(
+            endpoint_url, {"Origin": f"http://{_LISTED_HOST}"}, host=_LISTED_HOST
+        )
+        assert resp.status_code == 400, resp.text
+        assert resp.json() == _MISSING_TOKEN
+        resp = requests.get(
+            f"{_base(endpoint_url)}/management/accounts",
+            headers={"Host": _LISTED_HOST},
+            auth=_WRONG_ADMIN_AUTH,
+            timeout=10,
         )
         assert (resp.status_code, resp.text) == (401, "Invalid credentials")
 
