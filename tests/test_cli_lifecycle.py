@@ -338,7 +338,8 @@ class TestCliLifecycle:
 
     def test_serve_checks_the_port_a_daemon_bound_with_port_0(self, cli_env):
         """With --port 0 the system picks the daemon's port, and serve checks that
-        port: it reports the daemon started at once and names the port."""
+        port: it reports the daemon started at once and names the port. The PID
+        file is named for that port, so status and stop find the daemon there."""
         import re
 
         _run_extenddb(
@@ -346,18 +347,18 @@ class TestCliLifecycle:
             config=cli_env["config_path"],
             env_override={"EXTENDDB_ADMIN_PASSWORD": "TestPass1!"},
         )
+        result = _run_extenddb("serve", "--port", "0", config=cli_env["config_path"], check=False)
+        started = re.search(r"server started \(pid (\d+), 127\.0\.0\.1:(\d+)\)", result.stdout)
+        assert result.returncode == 0 and started, result.stdout + result.stderr
+        pid, port = started.groups()
         try:
-            result = _run_extenddb(
-                "serve", "--port", "0", config=cli_env["config_path"], check=False
-            )
-            assert result.returncode == 0, result.stdout + result.stderr
             assert "has not answered /health" not in result.stderr, result.stderr
-            started = re.search(r"server started \(pid \d+, 127\.0\.0\.1:(\d+)\)", result.stdout)
-            assert started and int(started.group(1)) != 0, result.stdout
+            assert port != "0", result.stdout
+            status = _run_extenddb("status", "--port", port, config=cli_env["config_path"])
+            assert status.stdout == f"extenddb is running on port {port} (pid {pid})\n"
         finally:
-            _run_extenddb(
-                "stop", "--port", "0", config=cli_env["config_path"], check=False, timeout=10
-            )
+            stop = _run_extenddb("stop", "--port", port, config=cli_env["config_path"], check=False)
+        assert (stop.returncode, stop.stdout) == (0, f"extenddb stopped (pid {pid})\n"), stop.stderr
 
     def test_destroy_without_yes_fails(self, cli_env):
         """extenddb destroy without --yes should fail."""

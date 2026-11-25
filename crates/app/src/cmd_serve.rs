@@ -147,8 +147,8 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     std_listener
         .set_nonblocking(true)
         .map_err(|e| anyhow::anyhow!("Failed to set listener non-blocking: {e}"))?;
-    // With port 0 the system picks the port: the banner and the start check
-    // name the bound one.
+    // With port 0 the system picks the port: the banner, the PID file and the
+    // start check name the bound one.
     let bound = std_listener.local_addr()?;
 
     // D-2: Print startup banner before daemonizing so the user gets
@@ -214,7 +214,7 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     } else {
         std::fs::create_dir_all(&run_dir)
             .map_err(|e| anyhow::anyhow!("Failed to create run directory {run_dir}: {e}"))?;
-        Some(pid_file_path(&run_dir, port))
+        Some(pid_file_path(&run_dir, bound.port()))
     };
 
     // P57 Bug 7 fix: Use execute() instead of start() so the parent can
