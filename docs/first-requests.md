@@ -62,7 +62,7 @@ aws dynamodb create-table \
     --billing-mode PAY_PER_REQUEST
 ```
 
-The table is created in the `CREATING` state and becomes `ACTIVE` shortly after, as on the service. Wait for it before writing:
+The table is created in the `CREATING` state and becomes `ACTIVE` after the control-plane delay (0.25 s by default; the service takes several seconds). Wait for it before writing:
 
 ```bash
 aws dynamodb wait table-exists --table-name MyTable

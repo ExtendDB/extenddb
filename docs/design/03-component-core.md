@@ -11,9 +11,9 @@ description: "The core crate: DynamoDB types, expression parsing and evaluation,
 
 ## 1. Purpose
 
-The `core` crate contains all DynamoDB-specific business logic that is independent of the storage backend, HTTP server, and async runtime. It is pure synchronous Rust — types, expression parsing/evaluation, validation, capacity calculation, and error types.
+The `core` crate contains all DynamoDB-specific business logic that is independent of the storage backend, HTTP server, and async runtime. It is synchronous Rust — types, expression parsing/evaluation, validation, capacity calculation, and error types. It also holds the crypto primitives (SHA-256, HMAC-SHA256, the constant-time compare, AES-256-GCM and random bytes) that `auth` and `storage` share, in one module, `crypto` (`src/crypto.rs`), whose doc comment names the backend on each target.
 
-**Dependencies:** serde, serde_json, thiserror, time, uuid, base64, bigdecimal (no tokio, no sqlx, no axum, no async runtime)
+**Dependencies:** serde, serde_json, thiserror, time, uuid, base64, bigdecimal, flate2, md-5, sha2, zeroize, web-time, aws-lc-rs (except on wasm32), and on wasm32 the crates the manifest lists for that target (no tokio, no sqlx, no axum, no async runtime)
 
 > **Note:** Operation handlers (PutItem, GetItem, Query, etc.) live in the `engine` crate, not here. The `engine` crate is async and depends on both `core` and `storage`. This keeps `core` free of async runtime dependencies and testable without a database.
 

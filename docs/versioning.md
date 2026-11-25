@@ -47,6 +47,7 @@ A backup in a backup store carries a format version. A release reads each format
 - Preview settings, such as `enable_multipart_keys`.
 - The fields of a `/metrics` response.
 - Backends in the experimental [tier](https://github.com/ExtendDB/extenddb/blob/main/README.md#storage-backends).
+- The experimental [WebAssembly build](https://github.com/ExtendDB/extenddb/blob/main/README.md#experimental-webassembly-build) and the `extenddb-wasm-adapter` crate: its surface may change or be removed in any release.
 
 ## Support
 

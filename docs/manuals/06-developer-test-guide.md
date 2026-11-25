@@ -13,7 +13,7 @@ extenddb/
 ├── Cargo.toml                 Workspace root
 ├── extenddb.sample.toml           Configuration template
 ├── crates/
-│   ├── core/                  Pure sync Rust: types, expressions, validation, errors
+│   ├── core/                  Sync Rust: types, expressions, validation, errors
 │   ├── engine/                Async operation handlers
 │   ├── storage/               Storage trait definitions
 │   ├── storage-postgres/      PostgreSQL backend
@@ -56,7 +56,7 @@ Both debug and release builds must pass before any phase exit.
 
 ### Crate Boundaries
 
-- `core` is pure sync Rust: no async runtime, no database drivers, no HTTP framework
+- `core` is sync Rust: no async runtime, no database drivers, no HTTP framework
 - `storage` defines traits and backend-agnostic utilities (ARN, key parsing)
 - `engine` contains async operation handlers that call storage traits
 - `storage-postgres` implements storage traits for PostgreSQL
@@ -132,10 +132,10 @@ The integration suites run against a server backed by a local PostgreSQL or Mong
 |---------|-------|
 | Host | `localhost` |
 | Port | `5432` |
-| Database | `extenddb` |
+| Database | `extenddb_catalog` (the catalog database `init` creates) |
 | User | `extenddb` |
 | Password | `extenddb-local-dev` |
-| Connection string | `postgresql://extenddb:extenddb-local-dev@localhost:5432/extenddb` |
+| Connection string | `postgresql://extenddb:extenddb-local-dev@localhost:5432/extenddb_catalog` |
 | Admin user | the OS user that ran `initdb` (trusted via local socket) |
 
 The paths below are the Amazon Linux 2 setup from the install page (PostgreSQL 15 from the PGDG repository, data directory `~/pgdata`, running as the current user). If `initdb` fails there, the current user may need to be in the `postgres` group; check its log.
@@ -197,13 +197,17 @@ Or via environment variable:
 export EXTENDDB__STORAGE__MONGODB__CONNECTION_STRING="mongodb://localhost:27017/?replicaSet=rs0"
 ```
 
-Verify the connection once the server is up:
+Verify the connection once the server is up. `list-tables` needs an access key that this server issued. The server answers `UnrecognizedClientException` to any other key. Create one as in the [smoke test](../install-from-source.md#6-smoke-test) of the install page, then:
 
 ```bash
 # Health check
 curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
 
 # List tables (should return empty)
+export AWS_ACCESS_KEY_ID=<access-key-from-create-access-key>
+export AWS_SECRET_ACCESS_KEY=<secret-key-from-create-access-key>
+export AWS_REGION=us-east-1
+export AWS_CA_BUNDLE=~/.extenddb/tls/cert.pem
 aws dynamodb list-tables \
     --endpoint-url https://127.0.0.1:18443 \
     --region us-east-1
@@ -495,7 +499,7 @@ python3 docs/build-docs.py --list
 python3 docs/build-docs.py --doc 4
 ```
 
-If you haven't set up the virtual environment yet, see the [Python Environment Setup](https://github.com/ExtendDB/extenddb/blob/main/README.md#python-environment-setup) section in the README.
+If you haven't set up the virtual environment yet, see the [Python Environment Setup](https://github.com/ExtendDB/extenddb/blob/main/README.md#python-environment) section in the README.
 
 Output goes to `pdfs/` (gitignored).
 

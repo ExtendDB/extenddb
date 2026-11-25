@@ -391,7 +391,7 @@ Stream records must be written in the same transaction as data writes. A backend
 
 ### No Caching
 
-ExtendDB prohibits in-process caching of database state. Multiple ExtendDB instances may share the same backend. Any caching requires a cross-instance invalidation design and explicit human approval.
+ExtendDB prohibits in-process caching of database state, so that more than one instance can share a backend in a later release (not supported today, see the [deployment guide](11-deployment-guide.md#multi-instance-considerations)). Any caching requires a cross-instance invalidation design and explicit human approval.
 
 ### Sequence Monotonicity
 

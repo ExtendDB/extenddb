@@ -14,13 +14,17 @@ REQ-TEST-002, REQ-TEST-003
 from __future__ import annotations
 
 import os
+import ssl
+import sys
 import time
+import traceback
 import uuid
 
 import boto3
 import pytest
 import urllib3
 from botocore.config import Config
+from botocore.exceptions import BotoCoreError, SSLError
 
 # D4: Suppress InsecureRequestWarning for self-signed TLS certs from ``extenddb init``.
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -250,6 +254,55 @@ def scoped_table(
             client.delete_table(TableName=name)
         except client.exceptions.ResourceNotFoundException:
             pass  # Already deleted by the test itself.
+
+
+def _in_tls_handshake(error: BaseException) -> bool:
+    """Whether the `ssl.SSLError` that `error` wraps was raised in a TLS
+    handshake. Follows the wrapping botocore and urllib3 record on the error
+    (`BotoCoreError.kwargs["error"]`, `HTTPError.args[0]`), not `__context__`.
+    botocore stores an error and raises it again later. When that happens inside
+    the caller's `except` block, Python sets `__context__` to the error the
+    block handles, so a post-send failure raised next to a handshake failure
+    would look like one."""
+    e: BaseException | None = error
+    for _ in range(4):
+        if isinstance(e, ssl.SSLError):
+            return any(f.name == "do_handshake" for f in traceback.extract_tb(e.__traceback__))
+        if isinstance(e, BotoCoreError):
+            e = e.kwargs.get("error")
+        elif isinstance(e, urllib3.exceptions.HTTPError) and e.args:
+            e = e.args[0]
+        else:
+            return False
+    return False
+
+
+def call_with_handshake_retry(fn, *args, attempts: int = 4, **kwargs):
+    """Call `fn(*args, **kwargs)`, retrying an `SSLError` raised in the TLS
+    handshake of a new connection, before the request was sent. Every other
+    error, a `ClientError` or a connection the server closed after the
+    request was sent included, is raised at once, so a test still sees every
+    answer and every dropped request. Each retried error is printed, so the
+    failures stay in the job log. The last error is raised once the attempts
+    run out.
+
+    A retried request was never sent, so the retry is safe for a client that
+    does not retry by itself (total_max_attempts=1), even for a
+    TransactWriteItems that gets a new ClientRequestToken. With a client that
+    retries, an earlier attempt can send the request before a later handshake
+    fails.
+    """
+    if attempts < 1:
+        raise ValueError("attempts must be at least 1")
+    for attempt in range(attempts):
+        try:
+            return fn(*args, **kwargs)
+        except SSLError as e:
+            if not _in_tls_handshake(e) or attempt == attempts - 1:
+                raise
+            sys.stdout.write(f"retrying after a TLS handshake failure: {e!r}\n")
+            time.sleep(0.05 * (attempt + 1))
+
 
 # Shared CLI/lifecycle fixture (used by lifecycle + GSI-queue integration tests).
 from lifecycle_helpers import cli_env  # noqa: F401
