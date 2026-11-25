@@ -4,8 +4,8 @@
 """CreateTable and UpdateTable refuse a ProjectionType or StreamViewType outside its set.
 
 Measured against Amazon DynamoDB in us-east-1 on 13 and 14 Nov 2026, and
-beside a member of the wrong JSON type on 17 Nov 2026. Each request went out
-twice with the same answer.
+beside another such member or a member of the wrong JSON type on 17 Nov 2026.
+Each request went out twice with the same answer.
 
 - The service answers ``ValidationException`` with the enum text, the member
   path and the set in its own order.
@@ -34,13 +34,20 @@ REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 SERIALIZATION = "SerializationException"
 PROJECTION_SET = "[ALL, INCLUDE, KEYS_ONLY]"
 VIEW_SET = "[OLD_IMAGE, KEYS_ONLY, NEW_AND_OLD_IMAGES, NEW_IMAGE]"
+ONE = "1 validation error detected: "
+
+
+def _clause(value: str, path: str, constraint: str) -> str:
+    return f"Value '{value}' at '{path}' failed to satisfy constraint: {constraint}"
 
 
 def _refused(value: str, path: str, values: str) -> str:
-    return (
-        f"1 validation error detected: Value '{value}' at '{path}' failed to "
-        f"satisfy constraint: Member must satisfy enum value set: {values}"
-    )
+    return ONE + _clause(value, path, f"Member must satisfy enum value set: {values}")
+
+
+def _both(first: str, second: str) -> str:
+    """The faults of two texts with one fault each, in that order."""
+    return f"2 validation errors detected: {first.removeprefix(ONE)}; {second.removeprefix(ONE)}"
 
 
 def _projection(value: str, member: str) -> str:
@@ -78,12 +85,13 @@ LSI = {
                   {"AttributeName": "l", "KeyType": "RANGE"}],
     "Projection": {"ProjectionType": "INCLUDES"},
 }
+GSI_FAULT = _projection("EVERY_ATTRIBUTE", "globalSecondaryIndexes.1.member")
+CREATE_FAULT = _projection("ALL_ATTRIBUTES", "globalSecondaryIndexUpdates.1.member.create")
 
 # (id, operation, body without TableName, the answer's message or SERIALIZATION).
 # UpdateTable rows name a table that does not exist.
 ROWS = [
-    ("ct-gsi", "CreateTable", {**TABLE, "GlobalSecondaryIndexes": BAD_GSI},
-     _projection("EVERY_ATTRIBUTE", "globalSecondaryIndexes.1.member")),
+    ("ct-gsi", "CreateTable", {**TABLE, "GlobalSecondaryIndexes": BAD_GSI}, GSI_FAULT),
     ("ct-second-gsi", "CreateTable",
      {**TABLE, "AttributeDefinitions": _defs("pk", "g", "l"),
       "GlobalSecondaryIndexes": [_index("gsi", "g", "ALL"),
@@ -96,11 +104,36 @@ ROWS = [
      _projection("INCLUDES", "localSecondaryIndexes.1.member")),
     ("ut-gsi-create", "UpdateTable",
      {"AttributeDefinitions": _defs("g"), "GlobalSecondaryIndexUpdates": BAD_CREATE},
-     _projection("ALL_ATTRIBUTES", "globalSecondaryIndexUpdates.1.member.create")),
+     CREATE_FAULT),
     ("ct-stream-disabled", "CreateTable",
      {**TABLE, "StreamSpecification": _stream(False, "NEW_IMAGES")}, _view("NEW_IMAGES")),
     ("ct-stream-enabled", "CreateTable",
      {**TABLE, "StreamSpecification": _stream(True, "NEW_IMAGES")}, _view("NEW_IMAGES")),
+    # Two members outside their sets (measured 17 Nov 2026). The service lists
+    # the GSIs, then the stream view type, then the LSIs, and on UpdateTable
+    # the Create entries, then the stream view type.
+    ("ct-two-gsis", "CreateTable",
+     {**TABLE, "AttributeDefinitions": _defs("pk", "g", "l"),
+      "GlobalSecondaryIndexes": BAD_GSI + [_index("gsi2", "l", "keys_only")]},
+     _both(GSI_FAULT, _projection("keys_only", "globalSecondaryIndexes.2.member"))),
+    ("ct-gsi-stream", "CreateTable",
+     {**TABLE, "GlobalSecondaryIndexes": BAD_GSI,
+      "StreamSpecification": _stream(True, "NEW_IMAGES")},
+     _both(GSI_FAULT, _view("NEW_IMAGES"))),
+    ("ct-gsi-lsi", "CreateTable",
+     {**TABLE, "AttributeDefinitions": _defs("pk", "sk", "g", "l"),
+      "KeySchema": HASH + [{"AttributeName": "sk", "KeyType": "RANGE"}],
+      "GlobalSecondaryIndexes": BAD_GSI, "LocalSecondaryIndexes": [LSI]},
+     _both(GSI_FAULT, _projection("INCLUDES", "localSecondaryIndexes.1.member"))),
+    ("ut-gsi-create-stream", "UpdateTable",
+     {"AttributeDefinitions": _defs("g"), "GlobalSecondaryIndexUpdates": BAD_CREATE,
+      "StreamSpecification": _stream(True, "NEW_IMAGES")},
+     _both(CREATE_FAULT, _view("NEW_IMAGES"))),
+    ("ut-two-gsi-creates", "UpdateTable",
+     {"AttributeDefinitions": _defs("g", "l"),
+      "GlobalSecondaryIndexUpdates": BAD_CREATE + [{"Create": _index("gsi2", "l", "keys_only")}]},
+     _both(CREATE_FAULT,
+           _projection("keys_only", "globalSecondaryIndexUpdates.2.member.create"))),
 ] + [
     (f"ut-stream-{view or 'empty'}", "UpdateTable",
      {"StreamSpecification": _stream(True, view)}, _view(view))

@@ -15,14 +15,26 @@ use crate::partiql::test_context::context;
 const PROJECTION_SET: &str = "ALL, INCLUDE, KEYS_ONLY";
 const VIEW_SET: &str = "OLD_IMAGE, KEYS_ONLY, NEW_AND_OLD_IMAGES, NEW_IMAGE";
 const VIEW: &str = "streamSpecification.streamViewType";
+const ONE: &str = "1 validation error detected: ";
+
+/// One fault of a `ValidationException` that lists member faults.
+fn clause(value: &str, path: &str, constraint: &str) -> String {
+    format!("Value '{value}' at '{path}' failed to satisfy constraint: {constraint}")
+}
 
 /// The text of the `ValidationException`, or `None` for a
 /// `SerializationException`.
 fn refused(value: &str, path: &str, set: &str) -> Option<String> {
-    Some(format!(
-        "1 validation error detected: Value '{value}' at '{path}' failed to satisfy \
-         constraint: Member must satisfy enum value set: [{set}]"
-    ))
+    let constraint = format!("Member must satisfy enum value set: [{set}]");
+    Some(format!("{ONE}{}", clause(value, path, &constraint)))
+}
+
+/// The faults of `first`, then of `second`, each the text of a
+/// `ValidationException` with one fault.
+fn both(first: Option<String>, second: Option<String>) -> Option<String> {
+    let fault = |text: Option<String>| text.expect("one fault").replacen(ONE, "", 1);
+    let (first, second) = (fault(first), fault(second));
+    Some(format!("2 validation errors detected: {first}; {second}"))
 }
 
 fn projection(value: &str, member: &str) -> Option<String> {
@@ -84,6 +96,28 @@ fn rows() -> Vec<((&'static str, Value), Option<String>)> {
             "GlobalSecondaryIndexUpdates": [{"Create": index("gsi", "g", "ALL_ATTRIBUTES")}],
         })
     };
+    // A table keyed on pk and sk, with an LSI on l.
+    let bad_lsi = || {
+        json!({
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"},
+            ],
+            "LocalSecondaryIndexes": [{
+                "IndexName": "lsi",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "l", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "INCLUDES"},
+            }],
+        })
+    };
+    let gsi_fault = projection("EVERY_ATTRIBUTE", "globalSecondaryIndexes.1.member");
+    let create_fault = projection(
+        "ALL_ATTRIBUTES",
+        "globalSecondaryIndexUpdates.1.member.create",
+    );
     let mut rows = vec![
         (
             create(bad_gsi()),
@@ -100,21 +134,10 @@ fn rows() -> Vec<((&'static str, Value), Option<String>)> {
             projection("keys_only", "globalSecondaryIndexes.2.member"),
         ),
         (
-            create(json!({
-                "AttributeDefinitions": defs(&["pk", "sk", "l"]),
-                "KeySchema": [
-                    {"AttributeName": "pk", "KeyType": "HASH"},
-                    {"AttributeName": "sk", "KeyType": "RANGE"},
-                ],
-                "LocalSecondaryIndexes": [{
-                    "IndexName": "lsi",
-                    "KeySchema": [
-                        {"AttributeName": "pk", "KeyType": "HASH"},
-                        {"AttributeName": "l", "KeyType": "RANGE"},
-                    ],
-                    "Projection": {"ProjectionType": "INCLUDES"},
-                }],
-            })),
+            create(with(
+                bad_lsi(),
+                json!({"AttributeDefinitions": defs(&["pk", "sk", "l"])}),
+            )),
             projection("INCLUDES", "localSecondaryIndexes.1.member"),
         ),
         (
@@ -136,6 +159,58 @@ fn rows() -> Vec<((&'static str, Value), Option<String>)> {
     for view in ["NEW_AND_OLD_IMAGE", "keys_only", "", "TOTAL"] {
         rows.push((update(stream(true, view)), refused(view, VIEW, VIEW_SET)));
     }
+    // Two members outside their sets (measured 2026-11-17). The service lists
+    // the GSIs, then the stream view type, then the LSIs, and on UpdateTable
+    // the `Create` entries, then the stream view type.
+    rows.extend([
+        (
+            create(json!({
+                "AttributeDefinitions": defs(&["pk", "g", "l"]),
+                "GlobalSecondaryIndexes": [
+                    index("gsi", "g", "EVERY_ATTRIBUTE"),
+                    index("gsi2", "l", "keys_only"),
+                ],
+            })),
+            both(
+                gsi_fault.clone(),
+                projection("keys_only", "globalSecondaryIndexes.2.member"),
+            ),
+        ),
+        (
+            create(with(bad_gsi(), stream(true, "NEW_IMAGES"))),
+            both(gsi_fault.clone(), refused("NEW_IMAGES", VIEW, VIEW_SET)),
+        ),
+        (
+            create(with(
+                bad_lsi(),
+                with(
+                    bad_gsi(),
+                    json!({"AttributeDefinitions": defs(&["pk", "sk", "g", "l"])}),
+                ),
+            )),
+            both(
+                gsi_fault.clone(),
+                projection("INCLUDES", "localSecondaryIndexes.1.member"),
+            ),
+        ),
+        (
+            update(with(bad_create(), stream(true, "NEW_IMAGES"))),
+            both(create_fault.clone(), refused("NEW_IMAGES", VIEW, VIEW_SET)),
+        ),
+        (
+            update(json!({
+                "AttributeDefinitions": defs(&["g", "l"]),
+                "GlobalSecondaryIndexUpdates": [
+                    {"Create": index("gsi", "g", "ALL_ATTRIBUTES")},
+                    {"Create": index("gsi2", "l", "keys_only")},
+                ],
+            })),
+            both(
+                create_fault,
+                projection("keys_only", "globalSecondaryIndexUpdates.2.member.create"),
+            ),
+        ),
+    ]);
     // A member of the wrong JSON type answers first.
     for (operation, body) in [
         create(with(bad_gsi(), json!({"AttributeDefinitions": "x"}))),

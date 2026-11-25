@@ -94,6 +94,8 @@ impl EnumFaults {
     }
 }
 
+// The row test takes its context from `partiql::test_context`, so it runs
+// only with the `partiql` feature, which is on by default.
 #[cfg(all(test, feature = "partiql"))]
 #[path = "nested_enums_tests.rs"]
 mod tests;
