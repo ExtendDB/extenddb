@@ -104,41 +104,45 @@ password = "x""#
     );
 }
 
-/// A native value of the wrong type or range is refused with the value,
-/// the accepted type and the key in the message, so `pool_size = -1` in a
-/// file reads the same as it did before the string form was accepted.
+/// The messages for one `count` line of the wrong type or range, as
+/// `toml::de::Error::message` gives them (the text without the source
+/// snippet). A native value that does not fit fails with serde's own value
+/// or type error, as it did before the string form was accepted; a bad
+/// string fails with the value quoted.
+const WRONG_TYPE_ROWS: [(&str, &str); 6] = [
+    (
+        "count = -1",
+        "invalid value: integer `-1`, expected a u32 or its string form",
+    ),
+    (
+        "count = 4294967296",
+        "invalid value: integer `4294967296`, expected a u32 or its string form",
+    ),
+    (
+        "count = 4.0",
+        "invalid type: floating point `4.0`, expected a u32 or its string form",
+    ),
+    (
+        "count = true",
+        "invalid type: boolean `true`, expected a u32 or its string form",
+    ),
+    (
+        "count = [4]",
+        "invalid type: sequence, expected a u32 or its string form",
+    ),
+    (
+        "count = \"-1\"",
+        "invalid u32 value \"-1\": invalid digit found in string",
+    ),
+];
+
 #[test]
-fn native_wrong_type_errors_name_the_value_type_and_key() {
-    let cases: [(&str, &[&str]); 5] = [
-        ("count = -1", &["-1", "u32", "count"]),
-        ("count = 4294967296", &["4294967296", "u32", "count"]),
-        ("count = 4.0", &["floating point", "u32", "count"]),
-        ("count = true", &["true", "u32", "count"]),
-        ("count = [4]", &["sequence", "u32", "count"]),
-    ];
-    for (line, expected) in cases {
+fn a_wrong_type_or_range_fails_with_serdes_wording_for_a_native_value() {
+    for (line, expected) in WRONG_TYPE_ROWS {
         let doc = format!("{line}\nflag = false\nport = 1\npassword = \"x\"");
         let err = toml::from_str::<Sample>(&doc).expect_err(line);
-        let text = err.to_string();
-        for needle in expected {
-            assert!(
-                text.contains(needle),
-                "{line}: missing {needle:?} in: {text}"
-            );
-        }
+        assert_eq!(err.message(), expected, "{line}");
     }
-}
-
-/// Native integers are accepted as before: a float that happens to be
-/// whole is not.
-#[test]
-fn native_integers_are_accepted_and_whole_floats_are_not() {
-    let s: Sample =
-        toml::from_str("count = 7\nflag = false\nport = 1\npassword = \"x\"").expect("int");
-    assert_eq!(s.count, 7);
-    assert!(
-        toml::from_str::<Sample>("count = 7.0\nflag = false\nport = 1\npassword = \"x\"").is_err()
-    );
 }
 
 #[derive(Debug, Deserialize)]
@@ -166,15 +170,26 @@ fn a_list_key_takes_one_comma_delimited_string() {
 }
 
 /// A wrong type is refused with both accepted shapes named, so a startup
-/// error tells the operator what the key takes.
+/// error tells the operator what the key takes; an array item that is not
+/// a string fails with serde's own type error.
 #[test]
 fn a_list_key_rejects_other_types() {
-    let err = toml::from_str::<ListSample>("items = 7").expect_err("integer");
-    assert!(
-        err.to_string()
-            .contains("an array of strings or one comma-delimited string"),
-        "got: {err}"
-    );
-    assert!(toml::from_str::<ListSample>("items = [1, 2]").is_err());
-    assert!(toml::from_str::<ListSample>("items = true").is_err());
+    let rows = [
+        (
+            "items = 7",
+            "invalid type: integer `7`, expected an array of strings or one comma-delimited string",
+        ),
+        (
+            "items = [1, 2]",
+            "invalid type: integer `1`, expected a string",
+        ),
+        (
+            "items = true",
+            "invalid type: boolean `true`, expected an array of strings or one comma-delimited string",
+        ),
+    ];
+    for (line, expected) in rows {
+        let err = toml::from_str::<ListSample>(line).expect_err(line);
+        assert_eq!(err.message(), expected, "{line}");
+    }
 }

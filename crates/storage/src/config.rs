@@ -189,10 +189,13 @@ pub mod string_coerce {
     }
 
     /// Accepts a scalar as its native type (integer or boolean) or as a string
-    /// that parses to it. Every native value goes through `FromStr` as well, so
-    /// an out-of-range or negative integer fails with the same message shape
-    /// as a bad string (`invalid u32 value "-1": ...`). A float, array or
-    /// table is a type error naming what was found and what is accepted.
+    /// that parses to it. A native value goes through `FromStr` as well, so
+    /// `bool` accepts a native boolean and `u32` a native integer; one that
+    /// does not fit fails with serde's own value or type error (``invalid
+    /// value: integer `-1`, expected a u32 or its string form``), and a bad
+    /// string with the value quoted (`invalid u32 value "four": ...`). A
+    /// float, array or table is a type error naming what was found and what
+    /// is accepted.
     struct Scalar<T> {
         what: &'static str,
         _target: PhantomData<T>,
@@ -214,19 +217,21 @@ pub mod string_coerce {
         }
 
         fn visit_u64<E: Error>(self, v: u64) -> Result<T, E> {
-            parse(&v.to_string(), self.what)
+            v.to_string()
+                .parse()
+                .map_err(|_| E::invalid_value(Unexpected::Unsigned(v), &self))
         }
 
         fn visit_i64<E: Error>(self, v: i64) -> Result<T, E> {
-            parse(&v.to_string(), self.what)
+            v.to_string()
+                .parse()
+                .map_err(|_| E::invalid_value(Unexpected::Signed(v), &self))
         }
 
         fn visit_bool<E: Error>(self, v: bool) -> Result<T, E> {
-            parse(&v.to_string(), self.what)
-        }
-
-        fn visit_f64<E: Error>(self, v: f64) -> Result<T, E> {
-            Err(E::invalid_type(Unexpected::Float(v), &self))
+            v.to_string()
+                .parse()
+                .map_err(|_| E::invalid_type(Unexpected::Bool(v), &self))
         }
     }
 
