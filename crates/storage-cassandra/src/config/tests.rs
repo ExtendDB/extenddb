@@ -112,32 +112,42 @@ fn table(toml_str: &str) -> toml::Table {
     toml::from_str(toml_str).expect("test TOML parses")
 }
 
-/// Issue #540: a misspelled key fails at startup with the key named,
-/// instead of silently leaving the default in force.
+/// The refusals of `deserialize_config`, each with the key named. Issue
+/// #540: a misspelled key, or a key from another backend's section, fails
+/// at startup instead of silently leaving the default in force. A string
+/// field is never reinterpreted, so a numeric password is still a type
+/// error, and a numeric field in its string form must parse.
 #[test]
-fn deserialize_rejects_unknown_field() {
-    let err = deserialize_config(&table(
-        r#"
-        contact_points = ["localhost:9042"]
-        replication_factr = 3
-    "#,
-    ))
-    .expect_err("unknown key must be rejected");
-    assert!(err.contains("unknown field"), "got: {err}");
-    assert!(err.contains("replication_factr"), "got: {err}");
-}
-
-/// A key that belongs to another backend's section is unknown here.
-#[test]
-fn deserialize_rejects_another_backends_key() {
-    let err = deserialize_config(&table(
-        r#"
-        contact_points = ["localhost:9042"]
-        pool_size = 10
-    "#,
-    ))
-    .expect_err("pool_size is a postgres key");
-    assert!(err.contains("pool_size"), "got: {err}");
+fn deserialize_refuses_with_the_key_named() {
+    const KNOWN: &str = "expected one of `contact_points`, `username`, `password`, \
+                         `keyspace_prefix`, `replication_factor`, `datacenter`, `max_connections`";
+    let rows = [
+        (
+            "replication_factr = 3",
+            format!("Failed to parse cassandra config: unknown field `replication_factr`, {KNOWN}"),
+        ),
+        (
+            "pool_size = 10",
+            format!("Failed to parse cassandra config: unknown field `pool_size`, {KNOWN}"),
+        ),
+        (
+            "replication_factor = \"three\"",
+            "Failed to parse cassandra config: replication_factor: invalid u32 value \"three\": \
+             invalid digit found in string"
+                .to_owned(),
+        ),
+        (
+            "password = 12345",
+            "Failed to parse cassandra config: password: invalid type: integer `12345`, expected a \
+             string"
+                .to_owned(),
+        ),
+    ];
+    for (line, expected) in rows {
+        let doc = format!("contact_points = [\"localhost:9042\"]\n{line}");
+        let err = deserialize_config(&table(&doc)).expect_err(line);
+        assert_eq!(err, expected, "{line}");
+    }
 }
 
 /// Issue #539: `EXTENDDB__STORAGE__CASSANDRA__REPLICATION_FACTOR=5` and
@@ -179,7 +189,8 @@ fn deserialize_accepts_contact_points_as_a_comma_delimited_string() {
 }
 
 /// String fields are never reinterpreted: a numeric-looking password
-/// stays a string, and a numeric password is still a type error.
+/// stays a string (`deserialize_refuses_with_the_key_named` has the numeric
+/// password).
 #[test]
 fn deserialize_leaves_string_fields_alone() {
     let boxed = deserialize_config(&table(
@@ -194,30 +205,6 @@ fn deserialize_leaves_string_fields_alone() {
         .downcast_ref::<CassandraStorageConfig>()
         .expect("cassandra config");
     assert_eq!(config.password.as_deref(), Some("12345"));
-    assert!(
-        deserialize_config(&table(
-            r#"
-        contact_points = ["localhost:9042"]
-        password = 12345
-    "#
-        ))
-        .is_err()
-    );
-}
-
-#[test]
-fn deserialize_rejects_a_replication_factor_that_is_not_a_number() {
-    let err = deserialize_config(&table(
-        r#"
-        contact_points = ["localhost:9042"]
-        replication_factor = "three"
-    "#,
-    ))
-    .expect_err("non-numeric replication_factor must be rejected");
-    assert!(
-        err.contains("three"),
-        "error should quote the value, got: {err}"
-    );
 }
 
 #[test]

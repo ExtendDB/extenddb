@@ -150,10 +150,8 @@ pub fn backend() -> extenddb_storage::Backend {
         },
         operations: &operations::PostgresOperationsEngine,
         storage_config: |table| {
-            let config: PostgresStorageConfig = table
-                .clone()
-                .try_into()
-                .map_err(|e: toml::de::Error| format!("Failed to parse postgres config: {e}"))?;
+            let config: PostgresStorageConfig =
+                extenddb_storage::config::parse_table(table, "postgres")?;
             Ok(Box::new(config) as Box<dyn extenddb_storage::config::StorageConfig>)
         },
         settings_store: |connection_string| {

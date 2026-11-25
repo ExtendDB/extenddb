@@ -145,6 +145,28 @@ fn a_wrong_type_or_range_fails_with_serdes_wording_for_a_native_value() {
     }
 }
 
+/// The backends hand their `[storage.<backend>]` table to `parse_table`,
+/// whose deserializer has no source text to point at, so the message carries
+/// the key itself; an unknown or missing field names its key already.
+#[test]
+fn parse_table_names_the_key_of_a_wrong_value() {
+    for (line, expected) in WRONG_TYPE_ROWS {
+        let doc = format!("{line}\nflag = false\nport = 1\npassword = \"x\"");
+        let table: toml::Table = toml::from_str(&doc).expect(line);
+        let err = super::parse_table::<Sample>(&table, "sample").expect_err(line);
+        assert_eq!(
+            err,
+            format!("Failed to parse sample config: count: {expected}"),
+            "{line}"
+        );
+    }
+    let table: toml::Table = toml::from_str("count = 1\nflag = false\nport = 1").expect("toml");
+    assert_eq!(
+        super::parse_table::<Sample>(&table, "sample").expect_err("missing field"),
+        "Failed to parse sample config: missing field `password`"
+    );
+}
+
 #[derive(Debug, Deserialize)]
 struct ListSample {
     #[serde(default, deserialize_with = "super::string_coerce::string_list")]

@@ -284,10 +284,8 @@ impl extenddb_storage::config::StorageConfig for CassandraStorageConfig {
 pub fn deserialize_config(
     table: &toml::Table,
 ) -> Result<Box<dyn extenddb_storage::config::StorageConfig>, String> {
-    let mut config: CassandraStorageConfig = table
-        .clone()
-        .try_into()
-        .map_err(|e: toml::de::Error| format!("Failed to parse cassandra config: {e}"))?;
+    let mut config: CassandraStorageConfig =
+        extenddb_storage::config::parse_table(table, "cassandra")?;
     config.ensure_cached_connection_string();
     Ok(Box::new(config))
 }

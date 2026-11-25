@@ -176,7 +176,7 @@ pub mod string_coerce {
     use serde::{Deserialize, Deserializer, de::Error, de::Unexpected, de::Visitor};
 
     /// Parses one scalar from its string form; the error quotes the value and
-    /// names the type, and serde appends the key.
+    /// names the type, and [`super::parse_table`] prefixes the key.
     fn parse<T, E>(s: &str, what: &str) -> Result<T, E>
     where
         T: std::str::FromStr,
@@ -377,6 +377,35 @@ pub mod string_coerce {
 
         deserializer.deserialize_any(ListVisitor)
     }
+}
+
+/// Deserialize a backend's `[storage.<backend>]` table into its config struct.
+///
+/// The table arrives as a `toml::Table`, whose deserializer has no source text
+/// to point at; its error puts the key on a second line (``in `pool_size` ``).
+/// This helper names the key in front of the message on one line instead:
+/// `Failed to parse sqlite config: pool_size: invalid u32 value "-1": invalid
+/// digit found in string`. An unknown-field or missing-field message already
+/// names its key and is passed through.
+///
+/// # Errors
+///
+/// Returns the deserialization error as text: an unknown key, a value of the
+/// wrong type, or a missing field.
+pub fn parse_table<T: serde::de::DeserializeOwned>(
+    table: &toml::Table,
+    backend: &str,
+) -> Result<T, String> {
+    serde_path_to_error::deserialize(toml::Value::Table(table.clone())).map_err(|e| {
+        let path = e.path().to_string();
+        let inner = e.into_inner();
+        let message = inner.message();
+        if path == "." || message.starts_with("unknown field") {
+            format!("Failed to parse {backend} config: {message}")
+        } else {
+            format!("Failed to parse {backend} config: {path}: {message}")
+        }
+    })
 }
 
 /// Deserializer function type for storage configurations.

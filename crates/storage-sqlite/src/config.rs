@@ -108,10 +108,7 @@ impl StorageConfig for SqliteConfig {
 
 /// Deserialize a `[storage.sqlite]` TOML table into a boxed `StorageConfig`.
 pub fn deserialize_config(table: &toml::Table) -> Result<Box<dyn StorageConfig>, String> {
-    let mut config: SqliteConfig = table
-        .clone()
-        .try_into()
-        .map_err(|e: toml::de::Error| format!("Failed to parse sqlite config: {e}"))?;
+    let mut config: SqliteConfig = extenddb_storage::config::parse_table(table, "sqlite")?;
     config.path = resolve_path(config.path);
     Ok(Box::new(config))
 }
@@ -193,9 +190,10 @@ mod tests {
         let mut t = toml::Table::new();
         t.insert("pool_size".into(), toml::Value::String("four".into()));
         let err = deserialize_config(&t).expect_err("non-numeric pool_size must be rejected");
-        assert!(
-            err.contains("four"),
-            "error should quote the value, got: {err}"
+        assert_eq!(
+            err,
+            "Failed to parse sqlite config: pool_size: invalid u32 value \"four\": invalid digit \
+             found in string"
         );
     }
 }
