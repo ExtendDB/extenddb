@@ -473,12 +473,12 @@ pub(super) fn flatten_and_lossy<'a>(expr: &'a WhereExpr, out: &mut Vec<&'a Where
 /// Per-statement failures inside a batch surface as short Codes without the
 /// `Exception` suffix, and the call itself stays HTTP 200. `TableName` is echoed
 /// only for an authorization refusal and the failures of the item operation a
-/// statement runs as (see [`StatementError::from_item_error`]); the errors of
-/// reading and translating a statement carry the `Error` object alone,
-/// matching the service. A conditional failure on a
-/// statement that set `ReturnValuesOnConditionCheckFailure` to `ALL_OLD`
-/// carries the existing item on the `Error` itself, never on the entry
-/// (measured 2026-11-02).
+/// statement runs as, other than a write that lost to contention (see
+/// [`StatementError::from_item_error`]); the errors of reading and translating
+/// a statement carry the `Error` object alone, matching the service. A
+/// conditional failure on a statement that set
+/// `ReturnValuesOnConditionCheckFailure` to `ALL_OLD` carries the existing
+/// item on the `Error` itself, never on the entry (measured 2026-11-02).
 pub(super) struct StatementError {
     pub code: &'static str,
     pub message: String,
@@ -516,6 +516,24 @@ impl StatementError {
                 include_table_name: true,
                 item: None,
             },
+            // A write the backend could not apply now. On MongoDB that is a
+            // write that reached its contention deadline or spent its attempt
+            // budget, which a single-item request answers 503. The engine
+            // answers a transient storage fault, a lost connection among them,
+            // with the same 503, so it takes this entry too. An item that a
+            // transaction holds arrives as `TransactionConflictException`. The
+            // service answers a statement whose item concurrent transactions
+            // hold with this code and message, and no `TableName` (measured
+            // 2026-11-25).
+            DynamoDbError::ServiceUnavailable(_)
+            | DynamoDbError::TransactionConflictException(_) => Self {
+                code: "TransactionConflict",
+                message: CancellationReason::transaction_conflict()
+                    .message
+                    .unwrap_or_default(),
+                include_table_name: false,
+                item: None,
+            },
             // Everything else a well-formed statement can raise per-statement is
             // a validation error (partial key, bad value, key-type mismatch).
             other => Self {
@@ -528,18 +546,18 @@ impl StatementError {
     }
 
     /// Map an error of the item operation a statement runs as: as
-    /// [`Self::from_error`], carrying the statement's `TableName`. The service
-    /// names the table on each of them: a key value past its size limit
-    /// (measured 2026-11-02 for SELECT, INSERT, UPDATE and DELETE), an
-    /// UPDATE of a key attribute, a secondary index key of the wrong type,
-    /// an update the item cannot take, and the refusal of
-    /// [`condition_key_refusal`] (measured 2026-11-05). The errors of reading
-    /// and translating a statement name none: a key value of the wrong type,
-    /// a missing parameter, a WHERE without the full key, a path into a key
-    /// attribute tested against values.
+    /// [`Self::from_error`], carrying the statement's `TableName` unless the
+    /// write lost to contention. The service names the table on each of the
+    /// others: a key value past its size limit (measured 2026-11-02 for
+    /// SELECT, INSERT, UPDATE and DELETE), an UPDATE of a key attribute, a
+    /// secondary index key of the wrong type, an update the item cannot take,
+    /// and the refusal of [`condition_key_refusal`] (measured 2026-11-05).
+    /// The errors of reading and translating a statement name none: a key
+    /// value of the wrong type, a missing parameter, a WHERE without the full
+    /// key, a path into a key attribute tested against values.
     pub(super) fn from_item_error(err: &DynamoDbError) -> Self {
         let mut error = Self::from_error(err);
-        error.include_table_name = true;
+        error.include_table_name = error.code != "TransactionConflict";
         error
     }
 

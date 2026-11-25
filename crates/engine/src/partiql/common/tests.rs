@@ -183,6 +183,34 @@ fn an_error_of_the_item_operation_names_the_batch_table() {
     }
 }
 
+/// A write that lost to contention, answered 503 on the single-item API or
+/// held by a transaction, is the service's entry for an item that concurrent
+/// transactions hold, with no `TableName` (measured 2026-11-25).
+#[test]
+fn a_write_that_lost_to_contention_answers_transaction_conflict() {
+    let conflict = json!({
+        "Error": {
+            "Code": "TransactionConflict",
+            "Message": "Transaction is ongoing for the item"
+        }
+    });
+    for error in [
+        DynamoDbError::ServiceUnavailable("Service is temporarily unavailable".to_owned()),
+        DynamoDbError::TransactionConflictException("held".to_owned()),
+    ] {
+        assert_eq!(
+            StatementError::from_item_error(&error).into_entry(Some("t")),
+            conflict,
+            "{error:?}"
+        );
+        assert_eq!(
+            StatementError::from_error(&error).into_entry(Some("t")),
+            conflict,
+            "{error:?}"
+        );
+    }
+}
+
 #[test]
 fn a_conditional_failure_without_an_item_has_none() {
     let err = DynamoDbError::ConditionalCheckFailedException(

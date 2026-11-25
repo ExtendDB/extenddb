@@ -39,6 +39,12 @@ from conftest import scoped_table
 DEADLINE = 10
 SLACK = 3
 HOLD = DEADLINE + SLACK + 2
+# The entry Amazon DynamoDB answers for a BatchExecuteStatement statement whose
+# item concurrent TransactWriteItems calls hold, in a batch that answers 200
+# (measured 2026-11-25). A statement the server gives up on answers it too.
+CONFLICT = {
+    "Error": {"Code": "TransactionConflict", "Message": "Transaction is ongoing for the item"}
+}
 
 
 @pytest.fixture()
@@ -216,7 +222,8 @@ def test_the_statements_of_a_batch_execute_statement_share_one_contention_deadli
     first statement gives up when the deadline passes, and the other two give
     up after one attempt each, because the deadline is measured from the start
     of the batch. A deadline per statement would keep the batch open until the
-    holds end and let the later statements commit.
+    holds end and let the later statements commit. Each statement answers
+    CONFLICT.
     """
     pks = [f"s{i}-{uuid.uuid4().hex[:8]}" for i in range(3)]
     for pk in pks:
@@ -242,5 +249,6 @@ def test_the_statements_of_a_batch_execute_statement_share_one_contention_deadli
 
     print(f"the batch answered in {elapsed:.2f} s: {resp['Responses']}")
     assert elapsed < DEADLINE + SLACK, f"the batch answered in {elapsed:.2f} s"
-    assert all("Error" in r for r in resp["Responses"]), resp["Responses"]
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+    assert resp["Responses"] == [CONFLICT] * 3, resp["Responses"]
     assert [_w(dynamodb_client, gsi_table, pk) for pk in pks] == ["v0"] * 3
