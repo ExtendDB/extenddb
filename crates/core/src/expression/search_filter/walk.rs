@@ -423,27 +423,35 @@ fn each_operand<'a>(
 }
 
 /// The expression's bytes plus the bytes each substitution adds, counted at
-/// every use.
+/// every use. Each distinct name and value is sized once and multiplied by
+/// its uses, so a list or map value used many times is walked once.
 pub(super) fn combined_bytes(src: &str, node: &Node, maps: &Maps<'_>) -> usize {
-    let mut total = src.len();
+    let mut names: HashMap<&str, usize> = HashMap::new();
+    let mut values: HashMap<&str, usize> = HashMap::new();
     each_operand(
         node,
-        |o| {
-            total += match o {
-                Operand::Path(elements) => elements
-                    .iter()
-                    .map(|e| match e {
-                        Element::Name(n) if n.starts_with('#') => maps.name(n).map_or(0, str::len),
-                        Element::Name(_) | Element::Index(_) => 0,
-                    })
-                    .sum(),
-                Operand::Value(reference) => maps
-                    .value(reference)
-                    .map_or(0, crate::types::attribute_value_size),
-                Operand::Call(_) => 0,
-            };
+        |o| match o {
+            Operand::Path(elements) => {
+                for e in elements {
+                    if let Element::Name(n) = e
+                        && n.starts_with('#')
+                    {
+                        *names.entry(n.as_str()).or_default() += 1;
+                    }
+                }
+            }
+            Operand::Value(reference) => *values.entry(reference.as_str()).or_default() += 1,
+            Operand::Call(_) => {}
         },
         |_| {},
     );
-    total
+    let names: usize = names
+        .into_iter()
+        .map(|(n, uses)| maps.name(n).map_or(0, str::len) * uses)
+        .sum();
+    let values: usize = values
+        .into_iter()
+        .map(|(v, uses)| maps.value(v).map_or(0, crate::types::attribute_value_size) * uses)
+        .sum();
+    src.len() + names + values
 }
