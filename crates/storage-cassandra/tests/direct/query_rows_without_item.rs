@@ -17,7 +17,9 @@
 //! ends inside it.
 
 use cdrs_tokio::types::value::Value;
-use extenddb_core::expression::{Expr, ExpressionMaps, KeyCondition, PathElement};
+use extenddb_core::expression::{
+    CompareOp, Expr, ExpressionMaps, KeyCondition, PathElement, SortKeyCondition,
+};
 use extenddb_core::types::{AttributeValue, Item};
 use extenddb_storage::DataEngine;
 use extenddb_storage_cassandra::CassandraEngine;
@@ -42,16 +44,37 @@ async fn query(
     limit: Option<i64>,
     start: Option<&Item>,
 ) -> (Vec<String>, Option<Item>) {
+    query_where(engine, table, None, forward, limit, start).await
+}
+
+/// A Query of partition `p`, with `sort <op> <value>` when `sk` is given:
+/// the sort keys of the items it answers, and its LastEvaluatedKey.
+async fn query_where(
+    engine: &CassandraEngine,
+    table: &TestTable,
+    sk: Option<(CompareOp, &str)>,
+    forward: bool,
+    limit: Option<i64>,
+    start: Option<&Item>,
+) -> (Vec<String>, Option<Item>) {
     let condition = KeyCondition {
         pk_path: vec![PathElement::Attribute("id".to_string())],
         pk_value: Expr::Placeholder(":p".to_string()),
-        sk_condition: None,
+        sk_condition: sk.map(|(op, _)| SortKeyCondition::Compare {
+            path: vec![PathElement::Attribute("sort".to_string())],
+            op,
+            value: Expr::Placeholder(":s".to_string()),
+        }),
         extra_pk_conditions: vec![],
         extra_sk_conditions: vec![],
     };
     let mut maps = ExpressionMaps::default();
     maps.values
         .insert(":p".to_string(), AttributeValue::S("p".to_string()));
+    if let Some((_, value)) = sk {
+        maps.values
+            .insert(":s".to_string(), AttributeValue::S(value.to_string()));
+    }
     let (items, last_key) = engine
         .query(
             &table.key_info,
@@ -372,6 +395,36 @@ async fn test_query_reads_again_with_half_the_rows_when_cassandra_refuses_a_read
         query(&engine, &table, true, Some(1), None).await,
         (vec!["s0".to_string()], Some(at("s0")))
     );
+}
+
+/// 3,000 rows without an item inside the key condition, then two items
+/// outside it. The read on keeps the condition's bound on its far side, so
+/// Limit 1 answers no item and no key, forward with `sort < b` and backward
+/// with `sort > b`.
+#[tokio::test]
+async fn test_query_past_rows_without_an_item_keeps_the_key_condition() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    for (name, forward, claims, items, op) in [
+        ("QueryFarForward", true, "a", ["c0", "c1"], CompareOp::Lt),
+        ("QueryFarBackward", false, "c", ["a0", "a1"], CompareOp::Gt),
+    ] {
+        let table = TestTable::new(&engine, name, true).await;
+        let claim_keys: Vec<String> = (0..3000).map(|i| format!("{claims}{i:04}")).collect();
+        futures::stream::iter(&claim_keys)
+            .for_each_concurrent(32, |sk| claim(&engine, &table, sk))
+            .await;
+        for sk in items {
+            put(&engine, &table, at(sk)).await;
+        }
+        assert_eq!(
+            query_where(&engine, &table, Some((op, "b")), forward, Some(1), None).await,
+            (Vec::new(), None),
+            "{name}"
+        );
+    }
 }
 
 /// A GSI added by UpdateTable to a table with one partition of 600 items
