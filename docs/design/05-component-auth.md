@@ -1587,9 +1587,10 @@ impl AuthLayer {
 
 ## 10. Secret Key Encryption
 
-The implementation is `crates/storage/src/secret_cipher.rs`, on AWS-LC through
-aws-lc-rs ([ADR-0026](../adr/0026-credential-crypto-on-aws-lc.md)). `aad` is the
-access key id.
+The implementation is `crates/storage/src/secret_cipher.rs`. It seals and opens
+through `extenddb_core::crypto` (`crates/core/src/crypto.rs`), whose doc comment
+names the backend on each target ([ADR-0026](../adr/0026-credential-crypto-on-aws-lc.md)
+gives the native one). `aad` is the access key id.
 
 ```rust
 pub fn encrypt_secret(plaintext: &str, key_b64: &str, aad: &str) -> Result<Vec<u8>, String> {
@@ -1611,6 +1612,6 @@ pub fn decrypt_secret(encrypted: &[u8], key_b64: &str, aad: &str) -> Result<Stri
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

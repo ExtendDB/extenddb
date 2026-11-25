@@ -15,7 +15,8 @@ use crate::request_limits;
 use crate::serialize_output;
 use crate::stream_capture;
 use crate::transact_write_helpers::{
-    PreparedOp, compute_fingerprint, validate_client_request_token, validate_no_key_updates,
+    IDEMPOTENT_MISMATCH_MESSAGE, PreparedOp, compute_fingerprint, validate_client_request_token,
+    validate_no_key_updates,
 };
 use crate::{DispatchMetrics, DispatchResult};
 use extenddb_core::error::DynamoDbError;
@@ -48,11 +49,20 @@ pub async fn handle_transact_write_items(
         serde_json::from_value(body.clone()).map_err(crate::deserialize_error)?;
 
     // Compute fingerprint keyed by the client request token for collision
-    // resistance. Must happen after parsing so the token is available.
+    // resistance. Must happen after parsing so the token is available. The
+    // two Return fields are part of the fingerprint: the service refuses a
+    // replay that changes either of them.
     let fingerprint = input
         .client_request_token
         .as_deref()
-        .map(|t| compute_fingerprint(&body, t))
+        .map(|t| {
+            compute_fingerprint(
+                &body,
+                t,
+                input.return_consumed_capacity,
+                input.return_item_collection_metrics,
+            )
+        })
         .unwrap_or_default();
 
     // At least one and at most 100 items. The server runs the same check
@@ -77,6 +87,15 @@ pub async fn handle_transact_write_items(
         }
     }
 
+    // The client request token's length and pattern are checked ahead of the
+    // actions (measured 2026-10-27: a 37-character token is reported ahead of
+    // a missing table, a condition syntax error and a malformed key number;
+    // measured 2026-11-11: ahead of an attribute name over the size limit and
+    // a number the service cannot read).
+    if let Some(ref token) = input.client_request_token {
+        validate_client_request_token(token)?;
+    }
+
     // Attribute names over the size limit are request-shape validation of
     // each member, run for every member in request order before any member's
     // table lookup: a request whose first member names a missing table
@@ -91,6 +110,18 @@ pub async fn handle_transact_write_items(
     let mut prepared: Vec<PreparedOp> = Vec::with_capacity(input.transact_items.len());
     let mut seen_targets: HashSet<String> = HashSet::with_capacity(input.transact_items.len());
     for twi in &input.transact_items {
+        // Each action's numbers are checked before the action is prepared, so
+        // a Put item is not sized while it holds a number the service cannot
+        // read: sizing one builds a string as long as the exponent and ends
+        // the process. Within an action the service answers the number ahead
+        // of a missing table, a condition or update syntax error, an unused
+        // value, an empty key, a key update and an item over the size limit
+        // (6 of 6 sends each, measured 2026-11-12); beside a value nested too
+        // deep it answered either (2 and 4 of 6). Across actions an earlier
+        // action's fault still comes first: the service agrees for a condition
+        // syntax error and an unused value, and answers the later number for a
+        // missing table (6 of 6), as the base does too.
+        extenddb_core::validation::number::operations::transact_write_item(twi)?;
         let op = prepare_write_op(twi, ctx).await?;
         let target_key = op.canonical_target();
         if !seen_targets.insert(target_key) {
@@ -158,10 +189,6 @@ pub async fn handle_transact_write_items(
     // The token is passed to the storage layer and checked atomically within
     // the write transaction, guaranteeing that token storage and data writes
     // commit together.
-    if let Some(ref token) = input.client_request_token {
-        validate_client_request_token(token)?;
-    }
-
     let idempotency =
         input
             .client_request_token
@@ -211,9 +238,7 @@ pub async fn handle_transact_write_items(
         }
         Err(extenddb_storage::error::StorageError::IdempotentMismatch) => {
             return Err(DynamoDbError::IdempotentParameterMismatchException(
-                "The request uses the same client token as a previous, \
-                 but different, request."
-                    .to_owned(),
+                IDEMPOTENT_MISMATCH_MESSAGE.to_owned(),
             ));
         }
         Err(e) => return Err(storage_err_to_dynamo(e)),

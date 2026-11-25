@@ -4,7 +4,7 @@
 """Catalog migration tests against a live PostgreSQL deployment.
 
 The vector index schema and the backup table definitions are part of
-migration 1, which creates the v1.0 catalog on an empty database and brings a
+migration 1, which creates the catalog schema on an empty database and brings a
 released catalog to the same schema, and migration 5 drops the
 `continuous_backups` table. These tests load a deployment of a release from
 before the vector index schema, from its committed fixture, and check that
@@ -61,6 +61,10 @@ LISTED = re.compile(
 # The same lines, for a migration that is not convergent.
 NOT_CONVERGENT = re.compile(r"^\s*(\d+)\s+\S+\s+(?:breaking|additive)\s+not convergent\s")
 
+# The line of a migration that does not apply on PostgreSQL. The runner
+# records it in the catalog's ledger and has no body to run again.
+NOT_APPLICABLE = re.compile(r"^\s*(\d+)\s+\S+\s+not applicable: ")
+
 
 @functools.cache
 def _not_convergent():
@@ -75,12 +79,24 @@ def _not_convergent():
 
 
 @functools.cache
+def _not_applicable():
+    """The ids `migrate --list` marks as not applicable on PostgreSQL."""
+    listed = _run_extenddb("migrate", "--list")
+    return {
+        int(match.group(1))
+        for match in map(NOT_APPLICABLE.match, listed.stdout.splitlines())
+        if match
+    }
+
+
+@functools.cache
 def _listed():
     """The stores of every migration the binary carries, by id, from
     `migrate --list`, which opens no database. Adding a migration then needs
-    no edit here; a literal id in a test means that migration itself."""
+    no edit here; a literal id in a test means that migration itself. A
+    migration that does not apply records its row in the catalog only."""
     listed = _run_extenddb("migrate", "--list")
-    stores = {}
+    stores = {i: ["catalog"] for i in _not_applicable()}
     for line in listed.stdout.splitlines():
         match = LISTED.match(line)
         if match:
@@ -237,7 +253,7 @@ def _load_released_state(cli_env, state):
 
 
 class TestVectorCatalogMigration:
-    """Migrations from a catalog a release before 1.0 created, on the ledger."""
+    """Migrations from a catalog a release before 0.1.15 created, on the ledger."""
 
     def test_init_creates_the_catalog_at_the_current_migration(self, cli_env):
         """A fresh init records every migration in both ledgers and the version.
@@ -282,7 +298,7 @@ class TestVectorCatalogMigration:
         ledger, catalog version 0.0.2, no vector tables. A fresh install with
         its ledger removed is not the same state: it also holds what later
         migrations added, which migration 1's check of its result refuses as
-        not part of the v1.0 schema.
+        not part of migration 1's schema.
         """
         _init(cli_env)
         _patch_config_port(cli_env["config_path"], cli_env["port"])
@@ -345,10 +361,10 @@ class TestVectorCatalogMigration:
     ):
         """`migrate --yes --reconverge` runs each convergent migration again on
         a catalog at the latest migration, names each one that is not
-        convergent as skipped, and leaves the catalog current, with its ledger
-        rows as they were.
+        convergent as skipped, names none that does not apply, and leaves the
+        catalog current, with its ledger rows as they were.
 
-        This is the command an operator runs after a release before 1.0 wrote
+        This is the command an operator runs after a release before 0.1.15 wrote
         to a migrated catalog. Migration 1's check of its result does not run
         again, because a later migration may have changed what it created.
         Migration 2 is not convergent: it would rewrite policies written
@@ -367,7 +383,9 @@ class TestVectorCatalogMigration:
         assert rerun.returncode == 0, output
         assert 2 in _not_convergent(), _not_convergent()
         for i in _ids_in("catalog"):
-            if i in _not_convergent():
+            if i in _not_applicable():
+                assert not re.search(rf"^\s*(?:Skipped|Ran again) {i} ", output, re.M), output
+            elif i in _not_convergent():
                 assert re.search(rf"^\s*Skipped {i} \S+: ", output, re.M), output
                 assert f"Ran again {i} " not in output, output
             else:

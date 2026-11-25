@@ -42,8 +42,12 @@ def test_update_item_rejects_malformed_number_in_expression(
         _update_set(dynamodb_client, table_with_item, {"N": "12e"})
     err = ei.value.response["Error"]
     assert err["Code"] == "ValidationException"
-    assert "ExpressionAttributeValues contains invalid value" in err["Message"]
-    assert "cannot be converted to a numeric value: 12e" in err["Message"]
+    # Measured 2026-11-11: the prefix and the number message, with no
+    # ExpressionAttributeValues wrapper.
+    assert err["Message"] == (
+        "1 validation error detected: "
+        "The parameter cannot be converted to a numeric value: 12e"
+    )
 
 
 def test_update_item_rejects_number_overflow_in_expression(

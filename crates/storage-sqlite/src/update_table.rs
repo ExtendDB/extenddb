@@ -314,50 +314,23 @@ impl SqliteEngine {
             )
             .await?;
         }
-        if let Some(spec) = &input.stream_specification {
-            let j =
-                serde_json::to_string(spec).map_err(|e| StorageError::Internal(e.to_string()))?;
-            update_col(
+        if let Some(spec) = &input.stream_specification
+            && let Some(refusal) = Self::apply_stream_specification(
                 &mut tx,
                 account_id,
                 &input.table_name,
-                "stream_specification",
-                &j,
+                &table_id,
+                spec,
             )
-            .await?;
-            if spec.stream_enabled {
-                let existing: Option<(String,)> =
-                    sqlx::query_as("SELECT shard_id FROM stream_shards WHERE table_id = ? LIMIT 1")
-                        .bind(&table_id)
-                        .fetch_optional(&mut *tx)
-                        .await
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
-                if existing.is_none() {
-                    Self::init_stream_shards(&mut tx, account_id, &input.table_name, &table_id)
-                        .await?;
-                } else {
-                    let label: Option<String> = sqlx::query_scalar(
-                        "SELECT stream_label FROM tables WHERE account_id = ? AND table_name = ?",
-                    )
-                    .bind(account_id)
-                    .bind(&input.table_name)
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    if label.is_none() {
-                        sqlx::query(
-                            "UPDATE tables SET stream_label = ? \
-                             WHERE account_id = ? AND table_name = ?",
-                        )
-                        .bind(extenddb_storage::util::new_stream_label())
-                        .bind(account_id)
-                        .bind(&input.table_name)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    }
-                }
-            }
+            .await?
+        {
+            // A disable of an already disabled stream: the request is refused,
+            // and the transaction holds only the close of the shards the first
+            // disable left open (a stream change travels alone in the request).
+            tx.commit()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            return Err(refusal);
         }
 
         // WarmThroughput on the table and on updated indexes: stored as sent,
@@ -709,6 +682,22 @@ impl SqliteEngine {
             }
         }
 
+        // The WebAssembly build cannot run a vector index backfill: it is a
+        // detached tokio task timed by tokio's clock, and that build runs no
+        // tokio runtime. So a request that creates a vector index is refused
+        // here, after every check above has answered and before the commit:
+        // dropping `tx` rolls back every catalog change of the request.
+        #[cfg(target_arch = "wasm32")]
+        if !vec_created.is_empty() {
+            return Err(StorageError::Unsupported(
+                extenddb_core::error::webassembly_unsupported_message(
+                    "UpdateTable",
+                    "it cannot build a vector index; create the table with its vector indexes \
+                     instead",
+                ),
+            ));
+        }
+
         tx.commit()
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -869,6 +858,11 @@ impl SqliteEngine {
     /// That means a half-populated data table is now reachable in principle, so the
     /// guarantee rests on the engine refusing to route a search to an index that is
     /// not `ACTIVE` rather than, as before, on the backfill being one transaction.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "its only caller is update_table_impl, which on wasm32 refuses a request that \
+                  creates a vector index before the catalog commit and so never calls it there"
+    )]
     async fn build_vector_index(
         &self,
         table_id: &str,
@@ -1021,7 +1015,11 @@ impl SqliteEngine {
         });
         Ok(())
     }
+}
 
+// Recovery of interrupted index builds, run only by the server's startup and GSI worker.
+#[cfg(not(target_arch = "wasm32"))]
+impl SqliteEngine {
     /// Rebuild any GSI left in `CREATING` by a crash between the catalog commit
     /// and the completion of its data-table backfill. Runs once at startup: for
     /// each such index it drops any partial data table, recreates and backfills

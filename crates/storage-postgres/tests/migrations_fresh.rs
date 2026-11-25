@@ -188,7 +188,7 @@ async fn the_status_names_each_state_and_writes_nothing() {
 
     s.migrate_through(MigrationId::LATEST).await;
     assert_eq!(s.status().await, CatalogStatus::Current { version: LATEST });
-    // A release before 1.0 ran its `migrate`, which inserts the marker again.
+    // A release before 0.1.15 ran its `migrate`, which inserts the marker again.
     sqlx::query("INSERT INTO settings (key, value) VALUES ('resource_tag_migration', 'applied')")
         .execute(&catalog)
         .await
@@ -315,12 +315,13 @@ async fn the_post_check_stops_a_different_shape_and_accepts_the_pre_release_one(
         .expect_err("refused");
     let message = err.to_string();
     assert!(
-        message.contains("differs from the v1.0 schema in 2 place(s)")
-            && message.contains("column accounts.extra is not part of the v1.0 schema; drop it")
+        message.contains("differs from migration 1's schema in 2 place(s)")
+            && message
+                .contains("column accounts.extra is not part of migration 1's schema; drop it")
             && message.contains("column accounts.created_at has default '2020-01-01")
             && message.contains(
-                "where v1.0 has now(); change it to timestamp with time zone NOT NULL DEFAULT \
-                 now()"
+                "where migration 1 has now(); change it to timestamp with time zone NOT NULL \
+                 DEFAULT now()"
             )
             && message.contains("then run migrate --yes again")
             && !message.contains("Column {"),

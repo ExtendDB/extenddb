@@ -4,21 +4,23 @@
 //! Authentication and authorization for extenddb.
 //!
 //! Defines the `AuthProvider` trait for pluggable auth backends. Ships with
-//! `BuiltinAuthProvider` (full `SigV4` verification with local credential store).
+//! `BuiltinAuthProvider` (full `SigV4` verification over the signing-key
+//! cache of a local credential store) and the locked key store (`secmem`).
 
 pub mod cache_registry;
 pub mod credential_cache;
 pub mod policy;
+pub mod secmem;
 pub mod sigv4;
 
 pub use cache_registry::{AuthCacheRegistry, AuthzCacheInvalidator, TableKeyInfoCacheInvalidator};
-pub use credential_cache::CachedCredentialStore;
+pub use credential_cache::{CachedCredential, CachedCredentialStore, ResolvedCredential};
 
-use axum::http::HeaderMap;
 use extenddb_core::error::DynamoDbError;
+use http::HeaderMap;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-/// Auth provider trait — pluggable authentication.
+/// Auth provider trait: pluggable authentication.
 ///
 /// `BuiltinAuthProvider` performs `SigV4` verification.
 /// Fix #11: Accept `&HeaderMap` directly to avoid per-request `HashMap` allocation.
@@ -102,25 +104,30 @@ pub trait CredentialStore: Send + Sync {
     ) -> Result<Option<StoredCredential>, DynamoDbError>;
 }
 
-/// `SigV4` auth provider with local credential store.
+/// `SigV4` auth provider over the signing-key cache.
 ///
-/// Parses the `Authorization` header, looks up the access key, decrypts the
-/// secret, verifies the `SigV4` signature, and validates the request timestamp.
-/// Handles both long-lived (AKIA*) and temporary (ASIA* + X-Amz-Security-Token)
-/// credentials.
-pub struct BuiltinAuthProvider<C: CredentialStore> {
-    credential_store: C,
+/// Parses the `Authorization` header, validates the request timestamp, checks
+/// the credential scope, looks the access key up in the cache and verifies the
+/// `SigV4` signature under the cached signing key, in that order (the
+/// service's order). Handles both long-lived (AKIA*) and temporary (ASIA* +
+/// X-Amz-Security-Token) credentials. The credential scope must name the
+/// cache's region, which is this server's region.
+pub struct BuiltinAuthProvider {
+    credentials: CachedCredentialStore,
 }
 
-impl<C: CredentialStore> BuiltinAuthProvider<C> {
-    /// Create a new `BuiltinAuthProvider` with the given credential store.
-    pub fn new(credential_store: C) -> Self {
-        Self { credential_store }
+impl BuiltinAuthProvider {
+    /// Create a new `BuiltinAuthProvider` over `credentials`. A request whose
+    /// credential scope names a region other than the cache's is rejected, as
+    /// the service rejects a scope for a region other than the endpoint's.
+    #[must_use]
+    pub fn new(credentials: CachedCredentialStore) -> Self {
+        Self { credentials }
     }
 }
 
 #[async_trait::async_trait]
-impl<C: CredentialStore + 'static> AuthProvider for BuiltinAuthProvider<C> {
+impl AuthProvider for BuiltinAuthProvider {
     async fn authenticate(
         &self,
         headers: &HeaderMap,
@@ -137,51 +144,69 @@ impl<C: CredentialStore + 'static> AuthProvider for BuiltinAuthProvider<C> {
         // Parse Authorization header
         let parsed = sigv4::parse::parse_authorization(auth_header)?;
 
-        // Look up credential before timestamp validation — real DynamoDB returns
-        // an invalid-key error even when the timestamp is also expired.
-        let credential = self
-            .credential_store
-            .lookup_credential(&parsed.access_key_id)
+        // The service checks the request timestamp, then the credential
+        // scope, then looks the key up (measured 2026-10-23: an unknown key
+        // with a stale date answers the timestamp error, an unknown key with
+        // a wrong region answers the scope message, an unknown key with a
+        // scope date of the previous day answers the scope date message, and
+        // a stale date with a wrong region answers the timestamp error).
+        // Neither check reads the stored credential, so running them first
+        // leaves the S-5 timing argument below unchanged.
+        //
+        // Validate timestamp (within 15 minutes). The X-Amz-Date value it
+        // returns is what the scope date is compared against.
+        let timestamp = sigv4::verify::validate_timestamp(headers)?;
+
+        // The credential scope must name this server's region, the dynamodb
+        // service and the date of X-Amz-Date; the service reports every
+        // complaint in one message when more than one is wrong.
+        sigv4::verify::check_scope(&parsed, self.credentials.region(), &timestamp)?;
+
+        let resolved = self
+            .credentials
+            .lookup(&parsed.access_key_id, &parsed.date)
             .await?
             .ok_or_else(|| {
                 DynamoDbError::UnrecognizedClientException(
                     "The security token included in the request is invalid.".to_owned(),
                 )
             })?;
+        let credential = resolved.credential();
 
         // S-5: Track inactive status but do NOT return early. Continue through
-        // timestamp validation and signature verification to ensure constant-time
-        // failure paths — no timing difference between inactive, invalid, and
-        // absent keys.
+        // signature verification to ensure constant-time failure paths: no
+        // timing difference between inactive, invalid, and absent keys.
         let is_inactive = !credential.is_active;
 
-        // Validate timestamp (±15 minute window) after credential lookup.
-        sigv4::verify::validate_timestamp(headers)?;
-
-        // For session credentials, verify X-Amz-Security-Token matches the stored token.
+        // Session tokens. For a session credential the presented token must
+        // match the stored one. For a long-term key no token may be presented:
+        // the service validates any presented token and a long-term key has
+        // none, so the request fails as an invalid token.
         // CB-12: Session expiration is enforced at the credential store layer (fail-closed).
-        // Expired sessions are never returned — the storage layer returns
+        // Expired sessions are never returned: the storage layer returns
         // ExpiredTokenException on the cache-miss path, and CachedCredentialStore
         // re-validates `expires_at` on every cache hit before returning so cached
         // entries cannot survive past their issued lifetime.
-        // S-5: Compare the session token in constant time and defer the
+        // S-5: Compare the token's hash in constant time and defer the
         // rejection until after signature verification, so neither the token's
         // byte contents nor its presence changes the failure-path timing.
+        // A header value that is not visible ASCII cannot be compared with
+        // the stored token, and it is still a token the client presented, so
+        // presence is read from the header map and the value from its text.
+        let token_header_present = headers.contains_key("x-amz-security-token");
+        let presented_token = headers
+            .get("x-amz-security-token")
+            .and_then(|v| v.to_str().ok());
         let session_token_ok = if credential.is_session {
-            let token = headers
-                .get("x-amz-security-token")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            let expected = credential.session_token.as_deref().unwrap_or("");
-            sigv4::verify::constant_time_eq(token.as_bytes(), expected.as_bytes())
+            credential.session_token_matches(presented_token.unwrap_or(""))
         } else {
-            true
+            !token_header_present
         };
 
-        // Verify SigV4 signature — always, even for inactive keys (S-5).
+        // Verify the SigV4 signature, always, even for inactive keys (S-5).
         sigv4::verify::verify_signature(
             &parsed,
-            &credential.secret_key,
+            resolved.signing_key(),
             "POST", // DynamoDB is always POST
             "/",    // DynamoDB is always /
             "",     // DynamoDB has no query string
@@ -191,14 +216,21 @@ impl<C: CredentialStore + 'static> AuthProvider for BuiltinAuthProvider<C> {
 
         // S-5: Reject inactive keys or a mismatched session token only after
         // full signature verification, to prevent timing side-channels.
-        if is_inactive || !session_token_ok {
+        // The service's message for a presented token that does not resolve
+        // has no trailing period; its message for an unknown key or a missing
+        // token does (both measured 2026-09-16).
+        if is_inactive || (credential.is_session && presented_token.is_none()) {
             return Err(DynamoDbError::UnrecognizedClientException(
                 "The security token included in the request is invalid.".to_owned(),
             ));
         }
+        if !session_token_ok {
+            return Err(DynamoDbError::UnrecognizedClientException(
+                "The security token included in the request is invalid".to_owned(),
+            ));
+        }
 
-        // Build identity from credential (clone fields because ZeroizeOnDrop
-        // prevents moving out of the struct).
+        // Build identity from the cached fields.
         if credential.is_session {
             Ok(AuthIdentity::RoleSession {
                 account_id: credential.account_id.clone(),
@@ -215,112 +247,6 @@ impl<C: CredentialStore + 'static> AuthProvider for BuiltinAuthProvider<C> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::http::{HeaderMap, HeaderValue};
-
-    /// In-memory credential store for unit tests.
-    struct MockCredentialStore {
-        /// `Some(credential)` for found credentials, `None` for not found.
-        credential: Option<StoredCredential>,
-        /// If set, `lookup_credential` returns this error instead.
-        error: Option<&'static str>,
-    }
-
-    #[async_trait::async_trait]
-    impl CredentialStore for MockCredentialStore {
-        async fn lookup_credential(
-            &self,
-            _access_key_id: &str,
-        ) -> Result<Option<StoredCredential>, DynamoDbError> {
-            if let Some(msg) = self.error {
-                return Err(DynamoDbError::ExpiredTokenException(msg.to_owned()));
-            }
-            Ok(self.credential.clone())
-        }
-    }
-
-    fn make_headers_with_auth(access_key: &str, token: Option<&str>) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        // Use current time for the date to pass timestamp validation.
-        let now = time::OffsetDateTime::now_utc();
-        let date_str = format!(
-            "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
-            now.year(),
-            now.month() as u8,
-            now.day(),
-            now.hour(),
-            now.minute(),
-            now.second(),
-        );
-        let date_short = &date_str[..8];
-        // Signature is fake — these tests exercise error paths (expired token,
-        // unknown key) that trigger before signature verification in
-        // authenticate().
-        let auth = format!(
-            "AWS4-HMAC-SHA256 Credential={}/{}/us-east-1/dynamodb/aws4_request, \
-             SignedHeaders=content-type;host;x-amz-date;x-amz-target, \
-             Signature=0000000000000000000000000000000000000000000000000000000000000000",
-            access_key, date_short
-        );
-        headers.insert("authorization", HeaderValue::from_str(&auth).unwrap());
-        headers.insert("x-amz-date", HeaderValue::from_str(&date_str).unwrap());
-        headers.insert("host", HeaderValue::from_static("localhost:18443"));
-        headers.insert(
-            "content-type",
-            HeaderValue::from_static("application/x-amz-json-1.0"),
-        );
-        headers.insert(
-            "x-amz-target",
-            HeaderValue::from_static("DynamoDB_20120810.ListTables"),
-        );
-        if let Some(t) = token {
-            headers.insert("x-amz-security-token", HeaderValue::from_str(t).unwrap());
-        }
-        headers
-    }
-
-    #[tokio::test]
-    async fn expired_session_returns_expired_token_exception() {
-        // CB-12: The credential store returns ExpiredTokenException directly
-        // for expired sessions (fail-closed). The auth layer propagates it.
-        let store = MockCredentialStore {
-            credential: None,
-            error: Some("The security token included in the request is expired"),
-        };
-        let provider = BuiltinAuthProvider::new(store);
-        let headers = make_headers_with_auth("ASIAEXTENDDB00000000", Some("test-token-value"));
-
-        let result = provider.authenticate(&headers, b"{}").await;
-        match result {
-            Err(DynamoDbError::ExpiredTokenException(msg)) => {
-                assert!(
-                    msg.contains("expired"),
-                    "Expected 'expired' in message: {msg}"
-                );
-            }
-            other => panic!("Expected ExpiredTokenException, got: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn nonexistent_key_returns_unrecognized_client() {
-        let store = MockCredentialStore {
-            credential: None,
-            error: None,
-        };
-        let provider = BuiltinAuthProvider::new(store);
-        let headers = make_headers_with_auth("AKIAXXXXXXXXXXXXXXXX", None);
-
-        let result = provider.authenticate(&headers, b"{}").await;
-        match result {
-            Err(DynamoDbError::UnrecognizedClientException(msg)) => {
-                assert!(
-                    msg.contains("invalid"),
-                    "Expected 'invalid' in message: {msg}"
-                );
-            }
-            other => panic!("Expected UnrecognizedClientException, got: {other:?}"),
-        }
-    }
-}
+mod test_support;
+#[cfg(test)]
+mod tests;
