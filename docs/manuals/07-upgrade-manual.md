@@ -4,7 +4,7 @@
 
 ## Current Status
 
-1.0.0 carries the same catalog migrations as 0.1.15, 1 to 12. A catalog that 0.1.15 migrated is Current under 1.0.0, so a deployment on 0.1.15 stops its servers and starts the 1.0.0 binary with no `migrate` step, and a rollback to 0.1.15 starts the 0.1.15 binary on the same catalog and configuration while the deployment has not run `extenddb encryption-key switch`. 1.0.0 also refuses to start on a catalog key that is not 32 bytes in base64 (0.1.15 started on one and failed every signed request), keeps the key in locked memory, and adds an optional KEK file outside the catalog (see [the v1.0.0 entry](#v100-the-catalog-key-is-checked-at-startup-and-kept-in-locked-memory-a-kek-file-is-optional)). On Cassandra, 1.0.0 reads and writes at `LOCAL_QUORUM` where 0.1.15 read at `ONE`, so a request fails while fewer than a quorum of its keyspace's replicas are up, which at a replication factor of 2 means one replica down: use a replication factor of 3 before the upgrade (see [the v1.0.0 entry](#v100-cassandra-reads-and-writes-at-local_quorum)). The paragraphs below on catalog migrations 1 to 12, and on a rollback to 0.1.14 or an earlier release, are for a deployment on 0.1.14 or an earlier release. The notes on `[backup.store]` and on backups taken by 0.1.14 and earlier releases apply to every deployment.
+1.0.0 carries the same catalog migrations as 0.1.15, 1 to 12. A catalog that 0.1.15 migrated is Current under 1.0.0, so a deployment on 0.1.15 stops its servers and starts the 1.0.0 binary with no `migrate` step, and a rollback to 0.1.15 starts the 0.1.15 binary on the same catalog and configuration while the deployment has not run `extenddb encryption-key switch`. 1.0.0 also refuses to start on a catalog key that is not 32 bytes in base64 (0.1.15 started on one and failed every signed request), keeps the key in locked memory, and adds an optional KEK file outside the catalog (see [the v1.0.0 entry](#v100-the-catalog-key-is-checked-at-startup-and-kept-in-locked-memory-a-kek-file-is-optional)). On Cassandra, 1.0.0 reads and writes at `LOCAL_QUORUM` where 0.1.15 read many of its rows at `ONE`, so a request fails while fewer than a quorum of its keyspace's replicas are up, which at a replication factor of 2 means one replica down: use a replication factor of 3 before the upgrade (see [the v1.0.0 entry](#v100-cassandra-reads-and-writes-at-local_quorum)). The paragraphs below on catalog migrations 1 to 12, and on a rollback to 0.1.14 or an earlier release, are for a deployment on 0.1.14 or an earlier release. The notes on `[backup.store]` and on backups taken by 0.1.14 and earlier releases apply to every deployment.
 
 This release versions the PostgreSQL, SQLite, Cassandra and MongoDB catalogs by a migration ledger and carries catalog migrations 1 to 12, which `extenddb migrate --list` prints. **Every deployment created by 0.1.14 or an earlier release runs `extenddb migrate --yes` once** before a server of this release starts on it: the server refuses a catalog with pending migrations. Migration 1 brings the catalog of every earlier release to migration 1's schema, migration 5 drops `continuous_backups`, a table and on MongoDB a collection (see [Catalog 0.0.5](#catalog-005)), and migration 6 adds the backup catalog index and the restore job records ([below](#migration-6-the-backup-catalog-index)). Migration 7 adds the `stream_pending` table to the PostgreSQL data database, where a write stores its stream record until the record gets its sequence number after the write commits; it does not apply to the other backends. Migration 8 adds the `restore_progress` table to the PostgreSQL data database, where a store-backed restore records each data file it applied; it does not apply on the other backends either.
 
@@ -98,7 +98,7 @@ Writing a catalog migration is contributor work. The procedure, with a worked ex
 
 ## General Upgrade Procedure
 
-For releases that include catalog changes. An upgrade from 0.1.14 or an earlier release to 1.0.0 takes every step. From 0.1.15, step 4's `migrate` reports the catalog Current and exits 0, and `migrate --yes` changes nothing. Before step 1, check the catalog key as [the v1.0.0 entry](#v100-the-catalog-key-is-checked-at-startup-and-kept-in-locked-memory-a-kek-file-is-optional) describes: `migrate` and `verify` do not check it, and `serve` refuses one that is not 32 bytes. On Cassandra, before step 1, raise each keyspace with a replication factor below 3 as [Keyspace replication](../cassandra-setup.md#keyspace-replication) describes ([v1.0.0](#v100-cassandra-reads-and-writes-at-local_quorum) reads and writes at `LOCAL_QUORUM`). The names below in angle brackets are the ones chosen at `extenddb init`: `<catalog-db>` and `<data-db>` (`--catalog-db`, `--data-db`; defaults `extenddb_catalog` and `extenddb`) and `<owner>`, the application role (`--extenddb-user`, default `extenddb`). `<admin>` is the PostgreSQL role `init` connected as (`--pg-user`).
+For releases that include catalog changes. An upgrade from 0.1.14 or an earlier release to 1.0.0 takes every step. From 0.1.15, step 4's `migrate` prints `Up to date` and exits 0, and `migrate --yes` changes nothing. Before step 1, check the catalog key as [the v1.0.0 entry](#v100-the-catalog-key-is-checked-at-startup-and-kept-in-locked-memory-a-kek-file-is-optional) describes: `migrate` and `verify` do not check it, and `serve` refuses one that is not 32 bytes. On Cassandra, before step 1, raise each keyspace with a replication factor below 3 as [Keyspace replication](../cassandra-setup.md#keyspace-replication) describes ([v1.0.0](#v100-cassandra-reads-and-writes-at-local_quorum) reads and writes at `LOCAL_QUORUM`). The names below in angle brackets are the ones chosen at `extenddb init`: `<catalog-db>` and `<data-db>` (`--catalog-db`, `--data-db`; defaults `extenddb_catalog` and `extenddb`) and `<owner>`, the application role (`--extenddb-user`, default `extenddb`). `<admin>` is the PostgreSQL role `init` connected as (`--pg-user`).
 
 1. **Stop the server**
 
@@ -390,7 +390,7 @@ deployment, even when no catalog migration is required.
 
 ### v1.0.0: Cassandra reads and writes at `LOCAL_QUORUM`
 
-**What changed.** The Cassandra backend runs its reads and writes at `LOCAL_QUORUM`. 0.1.15 ran many of them at `ONE`, the driver's default, in each area: items (the reads of GetItem, Query and Scan among them), transactions, TTL, streams, the catalog, IAM and `init`. A read with `ConsistentRead` `false` also runs at `LOCAL_QUORUM`. A lightweight transaction runs Paxos at `LOCAL_SERIAL` and commits at `LOCAL_QUORUM`, where 0.1.15 used `SERIAL` and `ONE`. Batches ran at `LOCAL_QUORUM` before and still do. No setting changes these levels (#945).
+**What changed.** The Cassandra backend runs its reads and writes at `LOCAL_QUORUM`. 0.1.15 ran many of them at `ONE`, the driver's default, in each area: items (the reads of GetItem, Query and Scan among them), transactions, TTL, streams, the catalog, IAM and `init`. A read with `ConsistentRead` `false` also runs at `LOCAL_QUORUM`. A lightweight transaction runs Paxos at `LOCAL_SERIAL` and commits at `LOCAL_QUORUM`. 0.1.15 ran many of its lightweight transactions at those levels already, and others, among them the admin user creation and most IAM writes, at the driver's defaults, `SERIAL` and `ONE`. Batches ran at `LOCAL_QUORUM` before and still do. No setting changes these levels (#945).
 
 **Who is affected.** A Cassandra deployment while fewer than a quorum of a keyspace's replicas in the datacenter are up: at a replication factor of 2, one replica down; at 3, two down. At a replication factor of 1 both levels need the one replica, so nothing changes. 0.1.15 kept answering those reads with one replica up; 1.0.0 fails them with HTTP 500 (`InternalServerError`). On one node, with an account keyspace at a replication factor of 2, 0.1.15 answered GetItem, Query and Scan and 1.0.0 answered each with HTTP 500; PutItem got HTTP 500 on both releases.
 
@@ -406,7 +406,7 @@ deployment, even when no catalog migration is required.
 
 **New and opt-in.** `[auth.encryption] key_file`, or `EXTENDDB__AUTH__ENCRYPTION__KEY_FILE`, names a key-encryption key (KEK) file outside the catalog, and the `extenddb encryption-key` commands (`status`, `switch`, `rewrap`, `rotate`, `reset`, `set-data-connection`) move the secrets under it and manage its keys. The admin guide's [Encryption Key](05-admin-guide.md#encryption-key) section gives the file rule, the delivery routes and the procedure. With `key_file` set, a server that cannot lock its key store refuses to start unless `require_locked_memory = false`, and a server whose catalog has not been switched refuses to start and changes nothing.
 
-**Before upgrading**, check the catalog key. If signed requests to the 0.1.15 server succeed, the key passes. On PostgreSQL, `SELECT length(decode(value, 'base64')) FROM settings WHERE key = 'encryption_key';` in the catalog database prints 32; on the other backends the value is 44 characters of base64 ending in `=`. The key that `extenddb init` writes passes. A key that fails was changed after `init`: restore its original value before starting 1.0.0, since every stored secret is encrypted under it.
+**Before upgrading**, check the catalog key. If signed requests to the 0.1.15 server succeed, the key passes. On PostgreSQL, `SELECT value ~ '^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$' FROM settings WHERE key = 'encryption_key';` in the catalog database prints `t`; on the other backends the value must match that pattern: 44 characters of base64 ending in `=`, with no space or line break. The key that `extenddb init` writes passes. A key that fails was changed after `init`: restore its original value before starting 1.0.0, since every stored secret is encrypted under it.
 
 **Rollback.** Without a switch, 0.1.15 starts on the same catalog: a configuration that sets `key_file` makes 0.1.15 exit 1 with ``unknown field `encryption` ``, so delete the `[auth.encryption]` section. After `encryption-key switch`, follow [The switch to a KEK file: rollback](#the-switch-to-a-kek-file-rollback).
 
@@ -1249,6 +1249,51 @@ No catalog migration is required. Before upgrading, check the policies of each a
 - Expression nesting depth (#1000). Each parenthesis and each `if_not_exists` or `list_append` call in an `UpdateExpression`, and each nested `size` call in a condition or filter, counts one level against `max_expression_depth` under `[limits]` (default 150). Past it the request gets `ValidationException` "Invalid UpdateExpression: expression nesting depth exceeded" (or "Invalid ConditionExpression: ..." or "Invalid FilterExpression: ..."), and nothing is written. Earlier releases had no limit there, and a debug build of the server stopped with a stack overflow on 681 nested parentheses in a `SET` value. PartiQL, new in this release, applies the same limit: at the default, a PartiQL `UPDATE` with 76 or more nested `if_not_exists(a, a + ...)` steps gets `ValidationException` "expression nesting depth exceeded".
 
 **Who is affected.** A client that sends malformed numbers, names or ARNs, or deeply nested expressions, and relied on the earlier answer: it now gets `ValidationException`, and its batch or transaction writes nothing. A client that matches error text changes for the messages above. An item stored under an invalid number key before the upgrade can be read only by Scan or Query, which do not check the number yet, and removed only with its table. No catalog migration is required.
+
+---
+
+### v1.1.0: a `ClientRequestToken` retry compares `ReturnConsumedCapacity` and `ReturnItemCollectionMetrics`
+
+**What changed.** `TransactWriteItems` decides whether a request with a known
+`ClientRequestToken` is a replay. It compares a fingerprint of the request with
+the fingerprint stored for the token. Before this release the fingerprint
+covered `TransactItems` only. It now also covers `ReturnConsumedCapacity` when
+the value is `TOTAL` or `INDEXES`, and `ReturnItemCollectionMetrics` when the
+value is `SIZE`. A retry that keeps the token and the items but changes either
+field now answers `IdempotentParameterMismatchException`, as Amazon DynamoDB
+does (measured 2026-10-24). Earlier releases served it as a replay. A request
+with neither field, or with both set to `NONE`, has the same fingerprint as in
+earlier releases. An `ExecuteTransaction` write uses the same fingerprint with
+the request's `ReturnConsumedCapacity`, and the service answers its retries the
+same way (measured 2026-11-10).
+
+**Who is affected.** Clients that retry a `TransactWriteItems` or
+`ExecuteTransaction` request with the same token across an upgrade or a
+downgrade. The change affects requests that set `ReturnConsumedCapacity` to
+`TOTAL` or `INDEXES`, or `ReturnItemCollectionMetrics` to `SIZE`. 0.1.15 and
+1.0.0 serve `ExecuteTransaction` with the earlier fingerprint. A token that
+either release stored for an `ExecuteTransaction` write therefore gets the same
+answers as one stored for a `TransactWriteItems` request.
+
+**Impact.** After an upgrade, a token that the earlier release stored for such
+a request answers `IdempotentParameterMismatchException` to an identical retry.
+The server replays a retry without the field. After a downgrade, a token that
+this release stored for such a request answers
+`IdempotentParameterMismatchException` to every retry. This includes an
+identical retry and a retry without the field. A token for a request with
+neither field, or with both set to `NONE`, replays in both directions. On
+PostgreSQL, MongoDB and Cassandra nothing stops servers of both releases from
+sharing one database during a rolling upgrade (see the deployment guide's
+[Multi-Instance Considerations](11-deployment-guide.md#multi-instance-considerations)).
+A retry that reaches a server of the other release then gets the same answers.
+On SQLite, run the two releases one after the other. On Linux and macOS a
+second server refuses to start while another process holds the lock on
+`<database>.lock`. On Windows the server takes no lock (#642). PostgreSQL,
+SQLite and MongoDB keep a token for 10 minutes. On those backends every token
+that the release you upgrade or downgrade from stored expires at most 10
+minutes after its last server stops. The Cassandra backend does not expire
+tokens, so there a later retry with such a token gets these answers at any time.
+No catalog migration is required.
 
 ---
 
