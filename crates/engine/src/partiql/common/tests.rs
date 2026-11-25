@@ -191,20 +191,18 @@ fn an_error_of_the_item_operation_names_the_batch_table() {
 fn an_error_of_the_item_operation_keeps_the_listed_code_of_its_class() {
     for (error, code) in [
         (
-            DynamoDbError::ProvisionedThroughputExceededException(
-                "The level of configured provisioned throughput for the table was exceeded."
-                    .to_owned(),
+            DynamoDbError::provisioned_throughput_exceeded(
+                "The level of configured provisioned throughput for the table was exceeded.",
+                vec![],
             ),
             "ProvisionedThroughputExceeded",
         ),
         (
-            DynamoDbError::ThrottlingException(
-                "Throughput exceeds the current capacity.".to_owned(),
-            ),
+            DynamoDbError::throttling("Throughput exceeds the current capacity.", vec![]),
             "ThrottlingError",
         ),
         (
-            DynamoDbError::RequestLimitExceeded("Throughput exceeds the account quota.".to_owned()),
+            DynamoDbError::request_limit_exceeded("Throughput exceeds the account quota.", vec![]),
             "RequestLimitExceeded",
         ),
         (

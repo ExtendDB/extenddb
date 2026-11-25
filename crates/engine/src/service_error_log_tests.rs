@@ -69,7 +69,7 @@ pub(crate) fn rows() -> Vec<(DynamoDbError, Value)> {
             body("InternalServerError", internal),
         ),
         (
-            DynamoDbError::ProvisionedThroughputExceededException(capacity.to_owned()),
+            DynamoDbError::provisioned_throughput_exceeded(capacity, vec![]),
             body("ProvisionedThroughputExceededException", capacity),
         ),
         (
