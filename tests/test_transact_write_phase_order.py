@@ -3,12 +3,14 @@
 
 """Where four per-item checks sit in TransactWriteItems validation.
 
-Amazon DynamoDB reports them in two places (measured 2026-10-27):
+Amazon DynamoDB reports them in two places (measured 2026-10-27; the order of
+a Put's item nesting re-measured 2026-11-12):
 
   * before any table is looked up, one item after another, in the pass that
-    also checks the expressions: the nesting of every ExpressionAttributeValues
-    value of the item, and for a Put the attribute name size, then the item
-    size, then the item nesting;
+    also checks the expressions: for a Put the attribute name size and the
+    item nesting, ahead of the item's expressions, then the nesting of every
+    ExpressionAttributeValues value of the item, and for a Put the item size
+    after the expressions;
   * after every table is looked up and after the 4 MB total, in the key pass,
     one item after another: a key that does not fit the schema, then a key
     attribute named in an Update (both a ValidationError cancellation reason
@@ -46,7 +48,6 @@ KEY_UPDATE = (
 KEY_UPDATE_SK = KEY_UPDATE.replace("attribute pk.", "attribute sk.")
 KEY_MISMATCH = "The provided key element does not match the schema"
 PUT_MISMATCH_SK = "One or more parameter values were invalid: Type mismatch for key sk expected: S actual: N"
-ITEM_SIZE = "Item size has exceeded the maximum allowed size"
 UNDEFINED_VALUE = (
     "Invalid ConditionExpression: An expression attribute value used in "
     "expression is not defined; attribute value: :q"
@@ -182,24 +183,18 @@ class TestBeforeTheLookup:
             check(dynamodb_client, [defect, undefined])
             _top(dynamodb_client, [undefined, defect], UNDEFINED_VALUE)
 
-    def test_a_put_reports_name_size_then_item_size_then_nesting(self, dynamodb_client, table):
+    def test_a_put_reports_name_size_then_nesting_then_item_size(self, dynamodb_client, table):
         pad = {"S": "x" * 410_000}
         name_and_size = {"pk": {"S": "w"}, "sk": {"S": "a"}, "a" * 65536: {"S": "v"}, "pad": pad}
         nesting_and_size = {"pk": {"S": "w"}, "sk": {"S": "a"}, "d": _deep(40), "pad": pad}
         nesting_and_name = {"pk": {"S": "w"}, "sk": {"S": "a"}, "d": _deep(40), "a" * 65536: {"S": "v"}}
         _attribute_name_error(dynamodb_client, [_put(table, name_and_size)])
-        _top(dynamodb_client, [_put(table, nesting_and_size)], ITEM_SIZE)
+        _top(dynamodb_client, [_put(table, nesting_and_size)], NESTING)
         _attribute_name_error(dynamodb_client, [_put(table, nesting_and_name)])
 
-    def test_inside_one_item_the_expressions_come_first_and_the_value_nesting_before_them(
-        self, dynamodb_client, table
-    ):
+    def test_inside_one_item_the_nesting_comes_before_the_expressions(self, dynamodb_client, table):
         deep_item = {"pk": {"S": "w"}, "sk": {"S": "a"}, "d": _deep(40)}
-        _top(
-            dynamodb_client,
-            [_put(table, deep_item, ConditionExpression="note = :q")],
-            UNDEFINED_VALUE,
-        )
+        _top(dynamodb_client, [_put(table, deep_item, ConditionExpression="note = :q")], NESTING)
         _top(dynamodb_client, [_update(table, GOOD_KEY, "SET d = ", {":v": _deep(40)})], VALUE_NESTING)
         _top(
             dynamodb_client,
