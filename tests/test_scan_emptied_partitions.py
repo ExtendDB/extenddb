@@ -5,13 +5,14 @@
 
 Amazon DynamoDB answers such a Scan with every live item and counts only
 live items in ScannedCount, with no Limit, with a Limit, across parallel
-segments, with Select COUNT and with a FilterExpression. With Limit 1, a
-Scan of 59 live items among 100 partitions whose items were deleted took 60
-pages: 59 with one item and a last one with none. Measured on 2026-10-26 at
-15:29 UTC (us-east-1), each case twice. A table whose 50 items have all been
-deleted, with a sort key or hash only, answers Count 0, ScannedCount 0 and
-no LastEvaluatedKey with no Limit and with Limit 1 and 7. Measured at 16:39
-UTC, each case twice.
+segments, with Select COUNT and with a FilterExpression. Measured on
+2026-10-26 at 15:29 UTC (us-east-1), each case twice. The measurement wrote
+30 live items and 100 partitions whose one item it put and then deleted, in
+a table that already held 29 other items. With Limit 1, a Scan of that
+table's 59 live items took 60 pages: 59 with one item and a last one with
+none. A table whose 50 items have all been deleted, with a sort key or hash
+only, answers Count 0, ScannedCount 0 and no LastEvaluatedKey with no Limit
+and with Limit 1 and 7. Measured at 16:39 UTC, each case twice.
 
 Dual-target against Amazon DynamoDB and extenddb.
 """
@@ -85,11 +86,20 @@ def test_scan_with_no_limit(dynamodb_client, table):
 
 @pytest.mark.parametrize("limit", [1, 7, 50])
 def test_scan_pages_through_every_item(dynamodb_client, table, limit):
+    """On this file's table of 30 items, the service answers 31 pages with
+    Limit 1 (30 with one item and a last one with none) and 5 pages with
+    Limit 7, measured in the review of #612 on 2026-11-24
+    (https://github.com/ExtendDB/extenddb/pull/612#pullrequestreview-6049018549).
+    No page count is pinned for Limit 50, which has no such measurement.
+    """
     pks, pages = _page_all(dynamodb_client, table, Limit=limit)
     assert sorted(pks) == LIVE
     first = pages[0]
     expected = min(limit, 30)
     assert (first["Count"], first["ScannedCount"]) == (expected, expected)
+    measured_pages = {1: 31, 7: 5}.get(limit)
+    if measured_pages is not None:
+        assert len(pages) == measured_pages
 
 
 def test_parallel_scan_reads_every_item(dynamodb_client, table):
