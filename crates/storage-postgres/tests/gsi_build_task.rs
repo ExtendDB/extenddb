@@ -18,9 +18,7 @@
 //! server whose role may create and drop databases. Without it every test here
 //! reports a skip and passes, the same convention the wire suites use.
 
-// `base_conn` comes from the fixture that the stream tests share. It fails a
-// test under `EXTENDDB_TEST_PG_REQUIRED`. Nothing else in the fixture is used
-// here.
+// `ACCOUNT`, `REGION`, `base_conn` and `shipped_migrations` come from the stream tests' fixture.
 #[path = "common/stream_disable_fixture.rs"]
 #[allow(unused_imports)]
 mod fixture;
@@ -38,12 +36,10 @@ use extenddb_storage::{DataEngine, TableEngine};
 use extenddb_storage_postgres::{
     PostgresConfig, PostgresEngine, hold_gsi_backfill_for_tests, reconcile_creating_gsis,
 };
-use fixture::base_conn;
+use fixture::{ACCOUNT, REGION, base_conn, shipped_migrations};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 
-const ACCOUNT: &str = "123456789012";
-const REGION: &str = "us-east-1";
 const TABLE: &str = "t_gsi_build_task";
 /// More than two backfill pages of 256 keys, so a build can be stopped between
 /// pages.
@@ -78,23 +74,6 @@ impl Scratch {
         .expect("drop the scratch database");
         admin.close().await;
     }
-}
-
-fn shipped_migrations() -> Vec<String> {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut out = Vec::new();
-    for dir in ["migrations", "data_migrations"] {
-        let mut files: Vec<_> = std::fs::read_dir(root.join(dir))
-            .expect("read the migrations directory")
-            .map(|e| e.expect("directory entry").path())
-            .filter(|p| p.extension().is_some_and(|e| e == "sql"))
-            .collect();
-        files.sort();
-        for f in files {
-            out.push(std::fs::read_to_string(&f).expect("read a migration file"));
-        }
-    }
-    out
 }
 
 fn skip(test: &str) {
