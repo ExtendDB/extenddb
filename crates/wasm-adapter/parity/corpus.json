@@ -1255,6 +1255,22 @@
       ]
     },
     {
+      "name": "Scan Page with Segment 0 of 3 counts k0 and k2, the keys whose CRC32 modulo 3 is 0",
+      "op": "Scan",
+      "body": {
+        "TableName": "Page",
+        "Segment": 0,
+        "TotalSegments": 3
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/Count",
+          "equals": 2
+        }
+      ]
+    },
+    {
       "name": "TransactWriteItems writes two items atomically",
       "op": "TransactWriteItems",
       "body": {

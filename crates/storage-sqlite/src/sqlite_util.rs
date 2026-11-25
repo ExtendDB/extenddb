@@ -8,7 +8,12 @@
 use std::ffi::c_int;
 
 use extenddb_storage::util::scan_segment;
+// SQLite's C API: the C library on native targets, and on wasm32 the SQLite
+// that `sqlite-wasm-rs` bundles, which exports the same names.
+#[cfg(not(target_arch = "wasm32"))]
 use libsqlite3_sys as ffi;
+#[cfg(target_arch = "wasm32")]
+use sqlite_wasm_rs as ffi;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
