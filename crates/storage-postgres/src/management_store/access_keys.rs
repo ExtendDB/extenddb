@@ -3,8 +3,9 @@
 
 //! Access key, session, and caller-tag operations for `PostgresCatalogStore`.
 
+use extenddb_storage::CatalogStore as _;
 use extenddb_storage::management_store::{AccessKeyCreated, OpError, OpResult};
-use extenddb_storage::secret_cipher::encrypt_secret;
+use extenddb_storage::secret_keys::{SecretRow, require_keys};
 
 use super::database_error;
 use crate::catalog_store::PostgresCatalogStore;
@@ -18,27 +19,18 @@ impl PostgresCatalogStore {
         account_id: &str,
         user_name: &str,
     ) -> OpResult<AccessKeyCreated> {
-        // P119: Use cached encryption key if available, fall back to DB query.
-        let enc_key: String = if let Some(cached) = self.encryption_key() {
-            cached.to_string()
-        } else {
-            let row: Option<String> =
-                sqlx::query_scalar("SELECT value FROM settings WHERE key = 'encryption_key'")
-                    .fetch_optional(self.pool())
-                    .await
-                    .map_err(|e| {
-                        tracing::error!("create_access_key fetch encryption key: {e}");
-                        OpError::Internal("Database error".to_owned())
-                    })?;
-            row.ok_or_else(|| OpError::Internal("Encryption key not configured".to_owned()))?
-        };
-
+        let keys = require_keys(self.secret_keys())?;
         let access_key_id = generate_access_key_id();
         let secret_key = generate_secret_key();
-        let encrypted = encrypt_secret(&secret_key, &enc_key, &access_key_id).map_err(|e| {
-            tracing::error!("create_access_key encryption: {e}");
-            OpError::Internal("Database error".to_owned())
-        })?;
+        let encrypted = keys
+            .encrypt(
+                &SecretRow::access_key(&access_key_id, account_id, user_name),
+                &secret_key,
+            )
+            .map_err(|e| {
+                tracing::error!("create_access_key encryption: {e}");
+                OpError::Internal("Database error".to_owned())
+            })?;
 
         sqlx::query(
             "INSERT INTO access_keys (access_key_id, account_id, user_name, secret_key_encrypted) \
@@ -117,23 +109,13 @@ impl PostgresCatalogStore {
         access_key_id: &str,
         secret_access_key: &str,
     ) -> OpResult<()> {
-        // P119: Use cached encryption key if available, fall back to DB query.
-        let enc_key: String = if let Some(cached) = self.encryption_key() {
-            cached.to_string()
-        } else {
-            let row: Option<String> =
-                sqlx::query_scalar("SELECT value FROM settings WHERE key = 'encryption_key'")
-                    .fetch_optional(self.pool())
-                    .await
-                    .map_err(|e| {
-                        tracing::error!("import_access_key fetch encryption key: {e}");
-                        OpError::Internal("Database error".to_owned())
-                    })?;
-            row.ok_or_else(|| OpError::Internal("Encryption key not configured".to_owned()))?
-        };
-
-        let encrypted =
-            encrypt_secret(secret_access_key, &enc_key, access_key_id).map_err(|e| {
+        let keys = require_keys(self.secret_keys())?;
+        let encrypted = keys
+            .encrypt(
+                &SecretRow::access_key(access_key_id, account_id, user_name),
+                secret_access_key,
+            )
+            .map_err(|e| {
                 tracing::error!("import_access_key encryption: {e}");
                 OpError::Internal("Database error".to_owned())
             })?;
@@ -178,6 +160,9 @@ impl PostgresCatalogStore {
         session_policy: &Option<serde_json::Value>,
         expires_at: time::OffsetDateTime,
     ) -> OpResult<()> {
+        require_keys(self.secret_keys())?;
+        // AssumeRole truncated `expires_at` to whole seconds before its
+        // encrypt, so the stored value is the one in the secret's AAD.
         sqlx::query(
             "INSERT INTO iam_sessions \
              (session_token, access_key_id, secret_key_encrypted, account_id, role_name, \

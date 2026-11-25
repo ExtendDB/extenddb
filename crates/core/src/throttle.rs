@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use web_time::Instant;
 
 /// Default burst window: 300 seconds of accumulated capacity.
 const BURST_SECONDS: f64 = 300.0;
