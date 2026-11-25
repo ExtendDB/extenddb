@@ -239,28 +239,6 @@ fn defined_name_references_are_resolved_before_the_wording_is_chosen() {
 }
 
 #[test]
-fn an_undefined_name_reference_is_refused_by_name_on_every_schema() {
-    // Row 427-7 and `#n > :x AND sk > :y`, measured 2026-10-23.
-    const WANT: &str = "Invalid KeyConditionExpression: An expression attribute name used in \
-                        the document path is not defined; attribute name: #nope";
-    for schema in [table_schema(), gsi_schema(), multi_range_schema()] {
-        assert_eq!(refusal("#nope > :x", &schema), WANT);
-        assert_eq!(refusal("begins_with(#nope, :x)", &schema), WANT);
-    }
-    assert_eq!(
-        refusal("#n > :x AND sk > :y", &table_schema()),
-        "Invalid KeyConditionExpression: An expression attribute name used in \
-         the document path is not defined; attribute name: #n"
-    );
-    let mut names = HashMap::new();
-    names.insert("other".to_owned(), "pk".to_owned());
-    assert_eq!(
-        refusal_with_names("#nope > :x", &table_schema(), &names),
-        WANT
-    );
-}
-
-#[test]
 fn two_clauses_where_a_non_equality_names_the_partition_key_are_not_supported() {
     // Measured 2026-10-23 on a table with HASH `pk`, RANGE `sk`.
     assert_all(

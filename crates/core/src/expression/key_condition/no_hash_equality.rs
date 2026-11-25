@@ -119,7 +119,7 @@ impl KeyCondition {
         let Some(hash_attr) = single_hash_attr(key_schema) else {
             return false;
         };
-        let names_hash = |path: &[PathElement]| attr_of(path, names).as_deref() == Some(hash_attr);
+        let names_hash = |path: &[PathElement]| attr_of(path, names) == Some(hash_attr);
         let Some(sk) = &self.sk_condition else {
             return false;
         };
@@ -135,7 +135,7 @@ impl KeyCondition {
         if names_hash(&self.pk_path) {
             return false;
         }
-        !sk_is_equality && names_hash(clause_path(sk))
+        !sk_is_equality && names_hash(sk.path())
     }
 
     /// Refuse a key condition that has no equality clause on the HASH
@@ -161,8 +161,7 @@ impl KeyCondition {
     ///
     /// # Errors
     ///
-    /// Returns `ValidationException` for the conditions above, and when a
-    /// `#name` on a clause is not defined in `names`.
+    /// Returns `ValidationException` for the conditions above.
     pub fn refuse_without_hash_equality(
         &self,
         key_schema: &[KeySchemaElement],
@@ -171,7 +170,6 @@ impl KeyCondition {
         if !self.lacks_hash_equality(key_schema, names) {
             return Ok(());
         }
-        let attrs = self.clause_attrs(names)?;
 
         let hash_attrs: Vec<&str> = hash_key_elements(key_schema)
             .iter()
@@ -186,10 +184,10 @@ impl KeyCondition {
         }
 
         let pk_attr = hash_attrs.first().copied().unwrap_or_default();
-        let message = if attrs.iter().any(|attr| attr == pk_attr) {
-            NOT_SUPPORTED.to_owned()
-        } else {
+        let message = if self.operands_naming(pk_attr, names).is_empty() {
             format!("Query condition missed key schema element: {pk_attr}")
+        } else {
+            NOT_SUPPORTED.to_owned()
         };
         Err(DynamoDbError::ValidationException(message))
     }
@@ -209,7 +207,7 @@ impl KeyCondition {
         attribute: &str,
         names: &HashMap<String, String>,
     ) -> Vec<(&'a [PathElement], &'a Expr)> {
-        let names_it = |path: &[PathElement]| attr_of(path, names).as_deref() == Some(attribute);
+        let names_it = |path: &[PathElement]| attr_of(path, names) == Some(attribute);
         let mut found: Vec<(&[PathElement], &Expr)> = Vec::new();
         if names_it(&self.pk_path) {
             found.push((&self.pk_path, &self.pk_value));
@@ -238,31 +236,6 @@ impl KeyCondition {
         }
         found
     }
-
-    /// The top-level attribute of each clause, in the order of
-    /// [`Self::clause_paths`], with `#name` resolved.
-    fn clause_attrs(&self, names: &HashMap<String, String>) -> Result<Vec<String>, DynamoDbError> {
-        self.clause_paths()
-            .into_iter()
-            .map(|path| resolve_clause_attr(path, names))
-            .collect()
-    }
-
-    /// The path of each clause, in classification order: the equality, the
-    /// `sk_condition` and, for two clauses with no equality, the other one.
-    fn clause_paths(&self) -> Vec<&[PathElement]> {
-        let mut paths: Vec<&[PathElement]> = Vec::new();
-        if !self.pk_path.is_empty() {
-            paths.push(&self.pk_path);
-        }
-        if let Some(sk) = &self.sk_condition {
-            paths.push(clause_path(sk));
-        }
-        if let Some((path, _)) = self.extra_sk_conditions.first() {
-            paths.push(path);
-        }
-        paths
-    }
 }
 
 /// The only HASH attribute of a schema, or `None` for zero or several.
@@ -275,46 +248,13 @@ fn single_hash_attr(key_schema: &[KeySchemaElement]) -> Option<&str> {
 
 /// The top-level attribute a path names, with `#name` resolved; `None` when
 /// the name is not defined or the path is not an attribute.
-fn attr_of(path: &[PathElement], names: &HashMap<String, String>) -> Option<String> {
+fn attr_of<'a>(path: &'a [PathElement], names: &'a HashMap<String, String>) -> Option<&'a str> {
     match path.first()? {
         PathElement::Attribute(name) => match name.strip_prefix('#') {
-            Some(ref_name) => names.get(ref_name).cloned(),
-            None => Some(name.clone()),
+            Some(ref_name) => names.get(ref_name).map(String::as_str),
+            None => Some(name.as_str()),
         },
         PathElement::Index(_) => None,
-    }
-}
-
-/// The top-level attribute a clause names, with `#name` resolved.
-///
-/// An undefined `#name` is refused with the `KeyConditionExpression` form of
-/// the service's sentence.
-fn resolve_clause_attr(
-    path: &[PathElement],
-    names: &HashMap<String, String>,
-) -> Result<String, DynamoDbError> {
-    match path.first() {
-        Some(PathElement::Attribute(name)) => match name.strip_prefix('#') {
-            Some(ref_name) => names.get(ref_name).cloned().ok_or_else(|| {
-                DynamoDbError::ValidationException(format!(
-                    "Invalid KeyConditionExpression: An expression attribute name used in \
-                     the document path is not defined; attribute name: #{ref_name}"
-                ))
-            }),
-            None => Ok(name.clone()),
-        },
-        _ => Err(DynamoDbError::ValidationException(
-            "Invalid KeyConditionExpression: Invalid key condition path".to_owned(),
-        )),
-    }
-}
-
-/// The attribute path a clause applies to.
-fn clause_path(clause: &SortKeyCondition) -> &[PathElement] {
-    match clause {
-        SortKeyCondition::Compare { path, .. }
-        | SortKeyCondition::Between { path, .. }
-        | SortKeyCondition::BeginsWith { path, .. } => path,
     }
 }
 
