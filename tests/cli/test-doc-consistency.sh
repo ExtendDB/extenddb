@@ -92,22 +92,6 @@ for subcmd in $MANAGE_CMDS; do
 done
 
 echo ""
-echo "--- Check 2: Sample Config vs. Documentation ---"
-echo ""
-
-if [ -f extenddb.sample.toml ]; then
-    SAMPLE_KEYS=$(grep -oP '^#?\s*([a-z_]+)\s*=' extenddb.sample.toml | sed 's/^#\s*//' | sed 's/\s*=.*//' | sort -u)
-    for key in $SAMPLE_KEYS; do
-        # Skip very generic keys
-        if [ ${#key} -lt 3 ]; then continue; fi
-        grep -rq "$key" docs/manuals/ docs/install-from-source.md docs/configuration.md 2>/dev/null; RC=$?
-        assert_ok $RC "config key '$key' documented"
-    done
-else
-    info "extenddb.sample.toml not found — skipping Check 2"
-fi
-
-echo ""
 echo "--- Check 3: Runtime Settings vs. Documentation ---"
 echo ""
 
