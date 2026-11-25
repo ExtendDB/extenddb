@@ -83,6 +83,21 @@ The node now listens on `127.0.0.1:9042` with password authentication enabled.
 ExtendDB creates its keyspaces under the configured `keyspace_prefix`, so one
 cluster can host more than one deployment by giving each a different prefix.
 
+`extenddb destroy` drops only the deployment's own keyspaces: the catalog
+keyspace and the account keyspaces (`<keyspace_prefix>_account_` followed by a
+12-digit account id). A keyspace that starts with `<keyspace_prefix>_` but is
+not one of these, such as the keyspaces of a second deployment whose prefix
+begins with this one (`extenddb_test` beside `extenddb`), stays in place.
+`destroy` prints its name. `destroy` decides by name only: a keyspace that
+another program made with the name `<keyspace_prefix>_catalog`, or with
+`<keyspace_prefix>_account_` and 12 digits, is dropped.
+`destroy` returns only after the nodes agree on the schema. It waits up to 30
+seconds, or longer when a node is slow to answer. The wait compares the schema version of
+the whole cluster, so schema changes by another deployment on the same cluster
+can delay it. If the nodes do not agree, `destroy` returns an error. When it had
+dropped keyspaces, the error says so, and `destroy` can be run again to wait
+again.
+
 ## Building with Cassandra Support
 
 The Cassandra backend is behind a feature flag. Backends are mutually exclusive
@@ -98,7 +113,7 @@ side, build one binary per backend.
 
 ## Container Image
 
-Starting with ExtendDB 1.0, the `extenddb/extenddb-cassandra` image is
+From release 0.1.15 on, the `extenddb/extenddb-cassandra` image is
 published to Docker Hub, GHCR and ECR Public. It contains this build of
 ExtendDB and no Cassandra server, client or Java runtime; Cassandra stays a
 separate service. [`docker/README-cassandra.md`](../docker/README-cassandra.md) covers
@@ -176,8 +191,8 @@ contact_points = ["127.0.0.1:9042"]
 username = <extenddb-user>      # From extenddb init args
 password = <extenddb-pass>      # From extenddb init args
 keyspace_prefix = "extenddb"
-replication_factor = 1           # Single node (use 3 or more for production)
-datacenter = "datacenter1"
+replication_factor = 1           # From --replication-factor (default 1)
+datacenter = "datacenter1"       # From --datacenter (default datacenter1)
 max_connections = 10
 ```
 
@@ -188,16 +203,24 @@ Fields:
 - `username` / `password` — the application credentials ExtendDB uses at serve
   time. Required against any authenticated node (which `init` requires anyway).
 - `keyspace_prefix` — prefix for this deployment's keyspaces (default
-  `extenddb`).
-- `replication_factor` — keyspace replication factor. `init` always writes `1`
-  and creates its own keyspaces with it; see [Keyspace replication](#keyspace-replication)
-  for a multi-node cluster.
-- `datacenter` — the local datacenter name for `NetworkTopologyStrategy`. Currently,
-  `init` always writes `datacenter1` and has no flag to change it, and the keyspaces
-  it creates reference `datacenter1`, so the cluster's local datacenter must be
-  named `datacenter1`. A node started with a different datacenter name (for
-  example `CASSANDRA_DC=dc1`) fails keyspace creation with
-  `Unrecognized strategy option {datacenter1} ... for keyspace extenddb_catalog`.
+  `extenddb`). It may hold ASCII letters, digits and `_`, and must start with a
+  letter (ExtendDB does not check this). It may hold at most 27 characters, so
+  that `<keyspace_prefix>_account_` and a 12-digit id stay within Cassandra's
+  48-character keyspace name limit. `init` refuses a longer prefix before it
+  creates the role or any keyspace. Cassandra stores a
+  keyspace name written without quotes in lower case, so ExtendDB lower-cases
+  the prefix in this file, in a connection string and in
+  `init --keyspace-prefix`. `Acme` and `acme` are the same prefix.
+- `replication_factor` — keyspace replication factor. `init` creates its own
+  keyspaces with `--replication-factor` (default `1`), or with this file's value
+  for `init --overwrite`, and writes the same value here; see
+  [Keyspace replication](#keyspace-replication) for a multi-node cluster.
+- `datacenter` — the local datacenter name for `NetworkTopologyStrategy`. `init`
+  creates its keyspaces in `--datacenter` (default `datacenter1`), or in this
+  file's value for `init --overwrite`, and writes the same value here. It must name a datacenter the cluster has: a node started
+  with another name (for example `CASSANDRA_DC=dc1`) fails keyspace creation
+  with `Unrecognized strategy option {datacenter1} ... for keyspace
+  extenddb_catalog` until you pass `--datacenter dc1`.
 - `max_connections` — maximum connections per host.
 
 Edit these values in `extenddb.toml` after `init`. Unlike the PostgreSQL and
@@ -262,23 +285,52 @@ section covers only what is specific to Cassandra.
 
 ### Keyspace replication
 
-Set `replication_factor` to 3 or more for a multi-node cluster. `init` has no
-flag for it: it creates the catalog keyspace and the default account's
-keyspace with replication factor 1 and writes `replication_factor = 1` to the
-config. Keyspaces created later (one per new account) take the value from the
-config when `serve` starts, except an account keyspace that `migrate --yes`
-creates for an account whose CreateAccount stopped before its keyspace, which
-takes the catalog keyspace's replication. On a multi-node cluster, after
-`init`:
+Use a replication factor of 3 or more for a multi-node cluster. Pass it to
+`init`, which creates the catalog keyspace and the default account's keyspace
+with it and writes it to the config:
 
-1. Set `replication_factor = 3` in `extenddb.toml` (example below), before you
+```bash
+./target/release/extenddb init --backend cassandra \
+    --cassandra-contact-points cass-1:9042 \
+    --replication-factor 3 --datacenter datacenter1 \
+    --config extenddb.toml
+```
+
+Keyspaces created later (one per new account) take the value from the config
+when `serve` starts, except an account keyspace that `migrate --yes` creates
+for an account whose CreateAccount stopped before its keyspace, which takes
+the catalog keyspace's replication. Cassandra keeps a keyspace's replication
+until an `ALTER KEYSPACE` changes it, so editing the config later changes only
+the account keyspaces created afterwards. At start-up, `serve` logs a warning
+for each of the deployment's keyspaces whose replication differs from the
+config's `replication_factor` and `datacenter`. Either can be wrong. If the
+keyspace is right, set `replication_factor` and `datacenter` in the config to
+match it. If the config is right, change the keyspace in the order below for
+its change. If the config's `datacenter` is not one of the cluster's, the
+config is wrong: fix it, and do not alter the keyspaces.
+
+The order of `ALTER KEYSPACE` and `nodetool repair` depends on the change. The
+wrong order can lose writes that Cassandra acknowledged. Stop every ExtendDB
+server of the deployment before the first step, and start them again after the
+last.
+
+| Change | Order |
+|---|---|
+| Raise the replication factor, same datacenter | `ALTER KEYSPACE`, then `nodetool repair -full` on each node (steps below) |
+| Lower the replication factor, same datacenter | `nodetool repair -full` on each node, then `ALTER KEYSPACE`, then `nodetool cleanup` on each node |
+| Change the strategy (for example `SimpleStrategy`) or the datacenter | Follow [Changing keyspace replication strategy](https://docs.datastax.com/en/cassandra-oss/3.0/cassandra/operations/opsChangeKSStrategy.html) in the Cassandra documentation. Do not move the replicas with one `ALTER KEYSPACE`. |
+
+Cassandra's own `system_auth` keyspace, which holds the roles ExtendDB logs in
+with, starts at `SimpleStrategy` with replication factor 1 whatever `init` is
+given. To raise replication on a cluster — `system_auth` after any `init`, or
+the deployment's keyspaces after an `init` at replication factor 1:
+
+1. Set `replication_factor` in `extenddb.toml` (example below), before you
    start `serve` or, if it is already running, restart it before you create
    accounts.
-2. Raise the replication of the keyspaces that already exist: Cassandra's own
-   `system_auth` keyspace, which holds the roles ExtendDB logs in with and
-   starts at `SimpleStrategy` with replication factor 1, and every keyspace
-   whose name starts with the keyspace prefix (`DESCRIBE KEYSPACES` lists
-   them):
+2. Raise the replication of the keyspaces that already exist: `system_auth`
+   and every keyspace whose name starts with the keyspace prefix
+   (`DESCRIBE KEYSPACES` lists them):
 
    ```sql
    ALTER KEYSPACE system_auth
@@ -290,16 +342,49 @@ takes the catalog keyspace's replication. On a multi-node cluster, after
 
 3. Run `nodetool repair -full` on each node.
 
-Use a replication factor no larger than the number of nodes in `datacenter1`.
+Use a replication factor no larger than the number of nodes in the datacenter.
+`init` does not check this. With fewer nodes, `init` stops after it creates
+the catalog keyspace, because its reads and writes need a quorum of replicas:
+it prints `No nodes available in query plan!`. A second `init` with the same
+`--replication-factor` stops the same way. A second `init` with another
+`--replication-factor` is refused, because the catalog keyspace already has
+the first one. To recover, lower the catalog keyspace's replication factor with
+`ALTER KEYSPACE` (as above, with a value no larger than the node count), or
+remove the keyspace with `DROP KEYSPACE`, but only when it holds no data: no
+table, or for the catalog keyspace no table but `settings`. Then run `init`
+again.
 Logins read `system_auth` at `QUORUM` for the default superuser, so a
 `system_auth` replication factor above the node count makes those logins fail
 with `Cannot achieve consistency level QUORUM`.
 
-The `datacenter` must be `datacenter1`:
-`init` hardcodes that name into the keyspace definitions and provides no flag to
-change it, so your cluster's local datacenter has to be named `datacenter1`
-until that is configurable. ExtendDB creates its keyspaces with
-`NetworkTopologyStrategy` using these values.
+ExtendDB runs each read and write at `LOCAL_QUORUM` or `LOCAL_SERIAL`, so a
+request needs a quorum of its keyspace's replicas in the datacenter to be up.
+When fewer replicas are up, the request fails with HTTP 500 (`InternalServerError`).
+A replication factor of 3 keeps serving while one replica is down; a replication
+factor of 2 or 1, requests will fail when any replica is down. Use a replication
+factor of 3 on at least three nodes for any production deployment. For how Cassandra
+counts a quorum, see
+[Tunable Consistency](https://cassandra.apache.org/doc/4.1/cassandra/architecture/dynamo.html#tunable-consistency)
+in the Cassandra documentation.
+
+Run `extenddb backup migrate-legacy` only when every replica of every account
+keyspace is up. It reads the backup data that older versions wrote at `ALL`, so
+it fails when any replica is down, even with a replication factor of 3. See
+[Migrating legacy backups into the store](manuals/14-backup-and-restore.md#migrating-legacy-backups-into-the-store).
+
+Run the `extenddb encryption-key` commands only when every replica of the
+catalog keyspace is up. They read the key rows at `ALL`, and they write the key
+ring and the stored secrets at `ALL`. So they fail when any replica is down,
+even with a replication factor of 3.
+
+ExtendDB creates its keyspaces with `NetworkTopologyStrategy`, with
+`replication_factor` replicas in `datacenter`. Use the name your cluster's
+nodes report (`nodetool status` prints it); in the `ALTER KEYSPACE` statements
+above, replace `datacenter1` with it.
+
+ExtendDB supports one Cassandra datacenter. A keyspace that also replicates to
+a second datacenter still works, but `serve` logs the start-up warning for it
+at every start.
 
 With a replication factor of 1, the catalog has one replica, so a restart of
 that node stops every request to it. A running server renews its serving
@@ -309,6 +394,7 @@ through an outage of 25 to 30 s, depending on when the outage starts. After
 that, 30 to 35 s after its last successful renewal, it answers new requests
 with `ServiceUnavailable`, stops its background workers, and tries to register
 again every second for up to 30 s.
+
 It registers again, starts its workers again and serves on only when the
 Cassandra driver has reconnected to the node within that time, which after a
 restart of 30 s or more it often has not; otherwise it stops with exit 1. Run
@@ -322,7 +408,7 @@ username = "extenddb"
 password = "<application-password>"
 keyspace_prefix = "extenddb"
 replication_factor = 3
-datacenter = "datacenter1"   # must be datacenter1 (hardcoded by init)
+datacenter = "datacenter1"   # the name nodetool status prints
 max_connections = 10
 ```
 
@@ -364,8 +450,9 @@ backend is experimental rather than production-ready.
   are known (observed as intermittent integration-test failures) and are being
   worked. Under concurrent load, outcomes may occasionally diverge from
   DynamoDB semantics.
-- **Single-datacenter writes per table.** Transaction and TTL lifecycle
-  operations use `LOCAL_QUORUM` / `LOCAL_SERIAL`, which are linearizable only
+- **Single-datacenter writes per table.** Reads and writes use `LOCAL_QUORUM`,
+  so a read sees each write that its datacenter acknowledged before the read
+  started. Lightweight transactions use `LOCAL_SERIAL`, and are linearizable
   within one datacenter. Serve writes for a given table from one Cassandra
   datacenter.
 - **Multi-node ExtendDB needs node-id configuration.** Running more than one
