@@ -131,7 +131,9 @@ jobs:
         # writes the cargo-fuzz and libFuzzer output to a file, prints only the
         # final statistics of a clean run, and uploads nothing. Any file under
         # fuzz/artifacts fails the job, a slow input too, because no log shows
-        # it.
+        # it. A dictionary line libFuzzer refuses, or another error that stops
+        # it before it runs, also ends with this message. The same command run
+        # locally shows that error at once.
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "pull_request" ]; then
@@ -154,7 +156,7 @@ jobs:
             -timeout=25 \
             -print_final_stats=1 > "$log" 2>&1 || status=$?
           if [ "$status" -ne 0 ] || [ -n "$(find fuzz/artifacts -type f -print -quit 2>/dev/null)" ]; then
-            echo "::error::The ${{ matrix.target }} fuzz run failed: an input crashed, timed out, ran out of memory or ran slowly, or libFuzzer stopped. This job does not publish the libFuzzer log or the input. Run cargo fuzz run ${{ matrix.target }} locally to reproduce it, and report a security defect privately, as SECURITY.md describes."
+            echo "::error::The ${{ matrix.target }} fuzz run failed: an input crashed, timed out, ran out of memory or ran slowly, or libFuzzer stopped. This job does not publish the libFuzzer log or the input, and it used a random libFuzzer seed, so a local run cannot replay it. To search for the input, run from the repository root: cargo fuzz run ${{ matrix.target }} <empty directory> fuzz/seeds/${{ matrix.target }} -- ${dict:+$dict }-max_total_time=${seconds} -rss_limit_mb=4096 -timeout=25. This job searched for up to ${seconds} seconds, and a local search can take longer or find a different input. Report a security defect privately, as SECURITY.md describes."
             exit 1
           fi
           grep -E '^(Done |stat::)' "$log" || true
