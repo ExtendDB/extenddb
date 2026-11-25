@@ -267,10 +267,18 @@ fn numbers_are_checked_before_the_operator_checks() {
     assert_eq!(msg("EQ", &[n("1")]), None);
     assert_eq!(msg("EQ", &[n("-1.5e3")]), None);
     // The service reads a Unicode decimal digit of the Basic Multilingual
-    // Plane as the digit it stands for, and names a refused value with those
-    // digits read. It refuses the other characters outside ASCII here
-    // (measured 2026-11-24 for U+FF11 and 2026-11-25 for the rest).
-    assert_eq!(msg("EQ", &[n("\u{ff11}")]), None);
+    // Plane as the digit it stands for, inside a set, a list and a map too,
+    // and names a refused value with those digits read. It refuses the other
+    // characters outside ASCII here (measured 2026-11-24 for a top-level
+    // U+FF11 and 2026-11-25 for the rest).
+    for digits in [
+        n("\u{ff11}"),
+        AttributeValue::NS(["\u{ff11}".to_owned()].into()),
+        AttributeValue::L(vec![n("\u{ff11}")]),
+        AttributeValue::M([("k".to_owned(), n("\u{ff11}"))].into()),
+    ] {
+        assert_eq!(msg("EQ", std::slice::from_ref(&digits)), None, "{digits:?}");
+    }
     assert_eq!(msg("EQ", &[n("a\u{ff11}")]), bad("a1"));
     for raw in [
         "\u{e9}",

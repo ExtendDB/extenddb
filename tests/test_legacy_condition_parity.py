@@ -58,10 +58,10 @@ def _in_each_legacy_map(label, value, error):
     ]
 
 
-# Measured 2026-11-24: the service reads a Unicode decimal digit of the Basic
-# Multilingual Plane as the digit it stands for (#565), so these requests
-# reach the table lookup.
-DIGITS_READ = [("ff11", _n(FF11))]
+# Measured 2026-11-24 (ff11) and 2026-11-25 (inside an NS, an L and an M):
+# the service reads a Unicode decimal digit of the Basic Multilingual Plane as
+# the digit it stands for (#565), so these requests reach the table lookup.
+DIGITS_READ = [("ff11", _n(FF11)), ("ns_ff11", {"NS": [FF11]}), ("l_ff11", {"L": [_n(FF11)]}), ("m_ff11", {"M": {"k": _n(FF11)}})]
 # Measured 2026-11-25: the service refuses the other characters outside ASCII
 # here before the table lookup, and names the value with its decimal digits
 # read. (id, N text, the text the message names)
