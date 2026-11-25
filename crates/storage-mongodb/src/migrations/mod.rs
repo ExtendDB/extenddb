@@ -60,6 +60,8 @@ use extenddb_storage::migrations::{
 };
 
 pub use backend::{MongoMigrations, MongoStores};
+#[cfg(feature = "test-util")]
+pub use commands::held_lock_for_tests;
 pub(crate) use commands::lease_of;
 pub use commands::{MongoCatalogMigrations, lock};
 pub use foreign::foreign_contents;

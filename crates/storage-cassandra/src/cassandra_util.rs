@@ -35,15 +35,25 @@ pub enum Stmt {
     Lwt,
     /// A read at `LOCAL_SERIAL`, which sees every committed Paxos round.
     SerialRead,
-    /// A read at `ALL`. Use it only to read rows that an earlier version of
-    /// ExtendDB wrote at `ONE`: the in-catalog backup payload that
-    /// `backup migrate-legacy` reads. A quorum read can miss a row that only
-    /// one replica holds. At `ALL`, every replica answers, so a replica that
-    /// is down fails the read instead of shortening it. The restore of an
-    /// in-catalog backup reads the same rows as [`Stmt::Read`]: a row that
-    /// read misses fails the restore with an item count mismatch. Remove
-    /// this kind when `backup migrate-legacy` is removed.
+    /// A read at `ALL`, for two kinds of read. The first reads rows that an
+    /// earlier version of ExtendDB wrote at `ONE`: the in-catalog backup
+    /// payload that `backup migrate-legacy` reads. A quorum read can miss a
+    /// row that only one replica holds. At `ALL`, every replica answers, so a
+    /// replica that is down fails the read instead of shortening it. The
+    /// restore of an in-catalog backup reads the same rows as [`Stmt::Read`]:
+    /// a row that read misses fails the restore with an item count mismatch.
+    /// The second is the encryption-key commands' reads of the key rows and
+    /// of the stored secrets ([`Stmt::WriteAll`]).
     ReadAll,
+    /// A write without a condition at `ALL`. The encryption-key commands
+    /// (RFC-0000 section 8.4) write the key ring row, and rewrite and delete
+    /// the stored secrets, at `ALL`, so every replica holds the new
+    /// ciphertexts and the new ring before the old key goes. A replica that
+    /// is down fails the write.
+    WriteAll,
+    /// A conditional write (LWT) of the encryption-key commands: Paxos at
+    /// `LOCAL_SERIAL`, commit at `ALL` ([`Stmt::WriteAll`]).
+    LwtAll,
     /// `CREATE`, `ALTER`, `DROP`, `GRANT` or `REVOKE`: `ONE`. Cassandra does
     /// not use the client's consistency level for these statements.
     Ddl,
@@ -77,8 +87,9 @@ fn levels(
     match kind {
         Stmt::Read | Stmt::Write => (Consistency::LocalQuorum, None),
         Stmt::Lwt => (Consistency::LocalQuorum, Some(Consistency::LocalSerial)),
+        Stmt::LwtAll => (Consistency::All, Some(Consistency::LocalSerial)),
         Stmt::SerialRead => (Consistency::LocalSerial, None),
-        Stmt::ReadAll => (Consistency::All, None),
+        Stmt::ReadAll | Stmt::WriteAll => (Consistency::All, None),
         Stmt::Ddl | Stmt::SystemRead => (Consistency::One, None),
     }
 }
@@ -241,9 +252,10 @@ impl PolicySession for CassandraSession {
 /// - [`Stmt::Read`], [`Stmt::SerialRead`] and [`Stmt::ReadAll`]: a `SELECT` that does not read
 ///   `system.*` or `system_schema.*`.
 /// - [`Stmt::SystemRead`]: a `SELECT` from `system.*` or `system_schema.*`.
-/// - [`Stmt::Write`]: an `INSERT`, `UPDATE`, `DELETE` or `BEGIN BATCH` with
-///   no `IF` condition.
-/// - [`Stmt::Lwt`]: an `INSERT`, `UPDATE` or `DELETE` with an `IF` condition.
+/// - [`Stmt::Write`] and [`Stmt::WriteAll`]: an `INSERT`, `UPDATE`, `DELETE`
+///   or `BEGIN BATCH` with no `IF` condition.
+/// - [`Stmt::Lwt`] and [`Stmt::LwtAll`]: an `INSERT`, `UPDATE` or `DELETE`
+///   with an `IF` condition.
 /// - [`Stmt::Ddl`]: a `CREATE`, `ALTER`, `DROP`, `GRANT` or `REVOKE`.
 ///
 /// Quoted literals and identifiers are removed before the check, so an `IF`
@@ -278,16 +290,16 @@ pub fn shape_error(kind: Stmt, query: &str) -> Option<&'static str> {
                 Some("a system read must read system.* or system_schema.*")
             }
         }
-        Stmt::Write => {
+        Stmt::Write | Stmt::WriteAll => {
             if !matches!(first, "INSERT" | "UPDATE" | "DELETE" | "BEGIN") {
                 Some("a write must be an INSERT, UPDATE, DELETE or BEGIN BATCH")
             } else if conditional {
-                Some("a write with an IF condition must use Stmt::Lwt")
+                Some("a write with an IF condition must use Stmt::Lwt or Stmt::LwtAll")
             } else {
                 None
             }
         }
-        Stmt::Lwt => {
+        Stmt::Lwt | Stmt::LwtAll => {
             if !matches!(first, "INSERT" | "UPDATE" | "DELETE") {
                 Some("an LWT must be an INSERT, UPDATE or DELETE")
             } else if conditional {
@@ -391,7 +403,11 @@ pub async fn system_read<E: FromDbError>(
 }
 
 /// Run `query` with `values` as a statement of `kind` and return its rows.
-async fn rows_at<E: FromDbError>(
+/// The error keeps the driver's message.
+///
+/// # Errors
+/// Returns an error if the Cassandra query fails or the response cannot be parsed.
+pub(crate) async fn rows_at<E: FromDbError>(
     session: &Arc<CassandraSession>,
     query: &str,
     kind: Stmt,
@@ -528,6 +544,29 @@ pub async fn execute<E: FromDbError>(
         E::db_error("Database error".to_owned())
     })?;
 
+    Ok(())
+}
+
+/// Execute a non-query statement of `kind`, at the level [`params`] gives
+/// that kind. Unlike [`execute`], the error keeps the driver's message.
+///
+/// Name the kind for writes that are prerequisites for a later read at that
+/// level, or whose loss would make an absence decision unsafe.
+///
+/// # Errors
+/// Returns an error if Cassandra does not acknowledge the statement at the
+/// level of `kind`.
+pub(crate) async fn execute_at<E: FromDbError>(
+    session: &Arc<CassandraSession>,
+    query: &str,
+    values: QueryValues,
+    kind: Stmt,
+    context: &str,
+) -> Result<(), E> {
+    session.run(kind, query, values).await.map_err(|error| {
+        tracing::error!("{context} {kind:?} execute failed: {error}");
+        E::db_error(format!("{context}: {error}"))
+    })?;
     Ok(())
 }
 
@@ -674,7 +713,24 @@ pub async fn apply_lwt<E: FromDbError>(
     values: QueryValues,
     context: &str,
 ) -> Result<bool, E> {
-    let result = session.run(Stmt::Lwt, query, values).await.map_err(|e| {
+    apply_lwt_at(session, query, values, Stmt::Lwt, context).await
+}
+
+/// [`apply_lwt`] as a statement of `kind`: [`Stmt::Lwt`], or
+/// [`Stmt::LwtAll`] for the commit phase at `ALL`. The serial phase runs at
+/// `LOCAL_SERIAL` for both.
+///
+/// # Errors
+/// Returns an error if Cassandra does not acknowledge the statement at the
+/// level of `kind` or the response cannot be parsed.
+pub(crate) async fn apply_lwt_at<E: FromDbError>(
+    session: &Arc<CassandraSession>,
+    query: &str,
+    values: QueryValues,
+    kind: Stmt,
+    context: &str,
+) -> Result<bool, E> {
+    let result = session.run(kind, query, values).await.map_err(|e| {
         tracing::error!("{context} lwt failed: {e}");
         E::db_error("Database error".to_owned())
     })?;
@@ -880,8 +936,23 @@ mod tests {
     }
 
     #[test]
-    fn a_read_all_runs_at_all() {
+    fn the_all_kinds_run_at_all() {
         assert_eq!(levels(Stmt::ReadAll), (Consistency::All, None));
+        assert_eq!(levels(Stmt::WriteAll), (Consistency::All, None));
+        assert_eq!(
+            levels(Stmt::LwtAll),
+            (Consistency::All, Some(Consistency::LocalSerial))
+        );
+    }
+
+    #[test]
+    fn a_write_all_has_no_condition_and_an_lwt_all_has_one() {
+        let plain = "UPDATE ks.t SET a = ? WHERE pk = ?";
+        let conditional = "UPDATE ks.t SET a = ? WHERE pk = ? IF a = ?";
+        assert_eq!(shape_error(Stmt::WriteAll, plain), None);
+        assert!(shape_error(Stmt::WriteAll, conditional).is_some());
+        assert_eq!(shape_error(Stmt::LwtAll, conditional), None);
+        assert!(shape_error(Stmt::LwtAll, plain).is_some());
     }
 
     #[test]
@@ -940,7 +1011,13 @@ mod tests {
         ] {
             assert!(kind.is_read(), "{kind:?}");
         }
-        for kind in [Stmt::Write, Stmt::Lwt, Stmt::Ddl] {
+        for kind in [
+            Stmt::Write,
+            Stmt::Lwt,
+            Stmt::WriteAll,
+            Stmt::LwtAll,
+            Stmt::Ddl,
+        ] {
             assert!(!kind.is_read(), "{kind:?}");
         }
     }
