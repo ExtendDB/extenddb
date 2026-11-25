@@ -20,7 +20,7 @@ use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::{
-    build_expression_maps, parse_optional_filter, prefix_expression_error,
+    build_expression_maps, check_expression_size, parse_optional_filter, prefix_expression_error,
 };
 use crate::index_helpers::{
     VectorIndexReadRefusal, classify_unresolved_index_read, combined_lek_key_schema,
@@ -56,14 +56,17 @@ pub async fn handle_query(
 
     // P118: Fetch key_info first so we can use table_id for index lookup.
     // Amazon DynamoDB reads the key condition before it looks up the table:
-    // on a table that does not exist, `_g = :v` answers the syntax error and
-    // an empty key condition the empty-expression error (measured 2026-11-14
-    // and 2026-11-18). Only the tokenizer runs here, and only when the lookup
-    // fails, so every check below keeps its order on a table that exists.
+    // on a table that does not exist, `_g = :v` answers the syntax error, an
+    // empty key condition the empty-expression error, and a key condition
+    // over the size limit the size error (measured 2026-11-14, 2026-11-18
+    // and 2026-11-25). Only the size check and the tokenizer run here, and
+    // only when the lookup fails, so every check below keeps its order on a
+    // table that exists.
     let key_info = match ctx.table_key_info(&input.table_name).await {
         Ok(key_info) => key_info,
         Err(err) => {
             if let Some(kce) = input.key_condition_expression.as_deref() {
+                check_expression_size(kce, ExpressionKind::KeyCondition, &ctx.limits)?;
                 tokenize_for(
                     kce,
                     ctx.limits.max_expression_tokens,
