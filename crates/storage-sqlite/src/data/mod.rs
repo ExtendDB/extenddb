@@ -41,10 +41,10 @@ mod tx_helpers;
 mod update_item;
 pub(crate) mod vector_index;
 
-pub(crate) use index::{
-    PendingApplyContext, apply_pending_context, insert_index_row_multi, item_has_index_keys,
-    project_item_for_index,
-};
+pub(crate) use index::{insert_index_row_multi, item_has_index_keys, project_item_for_index};
+// The GSI propagation worker's entry point; no worker runs in the browser build.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use index::{PendingApplyContext, apply_pending_context};
 
 /// Quoted SQL identifier for a virtual DynamoDB table's data table.
 pub(crate) fn data_table_name(table_id: &str) -> String {

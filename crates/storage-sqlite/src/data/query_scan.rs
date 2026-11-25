@@ -570,8 +570,11 @@ fn finalize(
     limit: Option<i64>,
     key_schema: &[extenddb_core::types::KeySchemaElement],
 ) -> Result<(Vec<Item>, Option<Item>), StorageError> {
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    let actual_limit = limit.map_or(1_000_000_usize, |l| l.max(0) as usize);
+    // A limit below 1 keeps no row. A limit too large for `usize`, which is
+    // 32 bits on wasm32, keeps every row, as it does where `usize` is 64 bits.
+    let actual_limit = limit.map_or(1_000_000_usize, |l| {
+        usize::try_from(l.max(0)).unwrap_or(usize::MAX)
+    });
     let has_more = rows.len() > actual_limit;
     let items: Vec<Item> = rows
         .into_iter()
@@ -903,6 +906,35 @@ mod tests {
             assert_eq!(binds[2], "x");
             assert_eq!(binds[3], "p");
             assert_eq!(binds[4], "s");
+        }
+    }
+
+    /// `finalize` keeps `Limit` rows of the over-fetched page: none for a
+    /// limit below 1 (the engine refuses such a request before it reaches
+    /// storage, so only a direct caller passes one), every row for a limit
+    /// larger than the page, and a `LastEvaluatedKey` only when rows were
+    /// left out.
+    #[test]
+    fn finalize_keeps_limit_rows_and_none_below_one() {
+        let ki = key_info(None);
+        let rows = || {
+            vec![
+                serde_json::json!({"bpk": {"S": "a"}}),
+                serde_json::json!({"bpk": {"S": "b"}}),
+            ]
+        };
+        for limit in [i64::MIN, -1, 0] {
+            let (items, last) = finalize(rows(), Some(limit), &ki.key_schema).expect("rows decode");
+            assert!(items.is_empty(), "Limit {limit} kept {} rows", items.len());
+            assert_eq!(last, None, "Limit {limit}");
+        }
+        let (items, last) = finalize(rows(), Some(1), &ki.key_schema).expect("rows decode");
+        assert_eq!(items, vec![start_key(&[("bpk", "a")])]);
+        assert_eq!(last, Some(start_key(&[("bpk", "a")])));
+        for limit in [Some(2), Some(i64::MAX), None] {
+            let (items, last) = finalize(rows(), limit, &ki.key_schema).expect("rows decode");
+            assert_eq!(items.len(), 2, "Limit {limit:?}");
+            assert_eq!(last, None, "Limit {limit:?}");
         }
     }
 }
