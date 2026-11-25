@@ -430,12 +430,6 @@ pub trait DataEngine: Send + Sync {
     /// with another segment's key would otherwise return a silently wrong
     /// (truncated or fabricated) page.
     ///
-    /// `Ok(true)` means "cannot be proven foreign" rather than "proven local":
-    /// a backend whose assignment depends on storage identity rather than key
-    /// content MUST return `true` for a key it cannot resolve, because
-    /// DynamoDB permits an `ExclusiveStartKey` that no longer exists and
-    /// refusing it would reject legitimate resumptions after a delete.
-    ///
     /// Required, not defaulted: a new backend must decide its answer
     /// explicitly, since returning a constant `true` silently disables the
     /// engine's cross-segment refusal for that backend.
