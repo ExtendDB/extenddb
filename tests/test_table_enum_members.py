@@ -12,7 +12,8 @@ The TableClass and SSESpecification rows were measured on 13, 14 and 18 Nov
   path and the set in its own order.
 - A member of the wrong JSON type answers ``SerializationException`` first.
   Its text there, such as "Unexpected field type", is not the text ExtendDB
-  sends, so these rows check the exception only.
+  sends, so these rows check the exception only. The UpdateTable
+  SSESpecification rows check the text too.
 - A TableClass outside its set gets the service's own sentence. A member of
   the wrong JSON type and a table name of a bad length answer ahead of it.
   It answers ahead of every member fault.
@@ -22,9 +23,11 @@ The TableClass and SSESpecification rows were measured on 13, 14 and 18 Nov
 - On a table created without an SSESpecification or with KMS, UpdateTable
   refuses the SSESpecification rows below with the sentences CreateTable
   uses. A specification without Enabled that names SSEType or
-  KMSMasterKeyId is read as one with Enabled true. Enabled false on a table
-  created without an SSESpecification gets a sentence of its own, after the
-  table lookup. The table keeps its SSEDescription.
+  KMSMasterKeyId is read as one with Enabled true. An Enabled written as a
+  string is read as false when it is "false" and as true otherwise.
+  Enabled false on a table created without an SSESpecification gets a
+  sentence of its own, after the table lookup. The table keeps its
+  SSEDescription.
 - UpdateTable refuses before it looks up the table. After a refused
   CreateTable no table exists. After a refused UpdateTable the table has no
   stream, and the same UpdateTable with ``NEW_IMAGE`` enables one.
@@ -45,6 +48,7 @@ from raw_signed_request import signed_post
 
 REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 SERIALIZATION = "SerializationException"
+NOT_FOUND = "ResourceNotFoundException"
 PROJECTION_SET = "[ALL, INCLUDE, KEYS_ONLY]"
 VIEW_SET = "[OLD_IMAGE, KEYS_ONLY, NEW_AND_OLD_IMAGES, NEW_IMAGE]"
 SSE_SET = "[AES256, KMS]"
@@ -248,6 +252,13 @@ ROWS += [
      {"TableClass": "BOGUS", "AttributeDefinitions": "x"}, SERIALIZATION),
 ]
 
+ROWS += [
+    # An Enabled of "yes" reads as true, so the table lookup answers
+    # (measured 2026-11-25).
+    ("ut-sse-enabled-yes-kms", "UpdateTable",
+     {"SSESpecification": {"Enabled": "yes", "SSEType": "KMS"}}, NOT_FOUND),
+]
+
 # UpdateTable of an existing table keyed on pk alone, created without an
 # SSESpecification or with KMS: (id, the table's SSESpecification, the
 # request's, the answer's message). <account> is the table's account.
@@ -273,6 +284,17 @@ SSE_UPDATE_ROWS = [
     ("kms-key-without-enabled", KMS, {"KMSMasterKeyId": "alias/no-such-key"}, KMS_REQUIRED),
     ("default-disabled", None, {"Enabled": False},
      _invalid("Table is already encrypted by default")),
+    # Measured on a table that does not exist on 2026-11-25. Each answer
+    # comes before the table lookup.
+    ("enabled-true-string", None, {"Enabled": "true", "SSEType": "AES256"},
+     _invalid("SSEType AES256 is not supported")),
+    ("enabled-yes-string", None, {"Enabled": "yes", "SSEType": "AES256"},
+     _invalid("SSEType AES256 is not supported")),
+    ("kms-enabled-false-string", KMS, {"Enabled": "false", "SSEType": "KMS"},
+     _invalid("SSEType can not be specified if Enabled is false")),
+    ("kms-specification-string", KMS, "x", (SERIALIZATION, "Unexpected field type")),
+    ("sse-type-number", None, {"Enabled": True, "SSEType": 5},
+     (SERIALIZATION, "NUMBER_VALUE cannot be converted to String")),
 ]
 
 # KMS beside a stream change and a billing change, on a table created without
@@ -303,15 +325,20 @@ def post(endpoint_url):
     return _post
 
 
-def _assert_answer(resp, expected: str) -> None:
+def _assert_answer(resp, expected) -> None:
+    """``expected`` is the text of a ValidationException, SERIALIZATION or
+    NOT_FOUND for that exception with any text, or a pair of an exception and
+    its text."""
     assert resp.status_code == 400, resp.text
     payload = resp.json()
     kind = payload.get("__type", "").rsplit("#", 1)[-1]
-    if expected == SERIALIZATION:
-        assert kind == SERIALIZATION, payload
+    if expected in (SERIALIZATION, NOT_FOUND):
+        assert kind == expected, payload
         return
-    assert kind == "ValidationException", payload
-    assert payload.get("message", payload.get("Message")) == expected
+    if not isinstance(expected, tuple):
+        expected = ("ValidationException", expected)
+    assert kind == expected[0], payload
+    assert payload.get("message", payload.get("Message")) == expected[1]
 
 
 def _streams(endpoint_url, name: str) -> list:
@@ -346,8 +373,9 @@ def test_refused_sse_update_keeps_the_table(create_and_cleanup_table, dynamodb_c
                                             unique_table_name, post, created, spec, expected):
     table = create_and_cleanup_table(**({"SSESpecification": created} if created else {}))
     account = table["TableDescription"]["TableArn"].split(":")[4]
-    spec = {k: v.replace("<account>", account) if isinstance(v, str) else v
-            for k, v in spec.items()}
+    if isinstance(spec, dict):
+        spec = {k: v.replace("<account>", account) if isinstance(v, str) else v
+                for k, v in spec.items()}
     before = dynamodb_client.describe_table(TableName=unique_table_name)["Table"]
     resp = post("UpdateTable", {"TableName": unique_table_name, "SSESpecification": spec})
     _assert_answer(resp, expected)

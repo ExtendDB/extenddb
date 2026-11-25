@@ -370,6 +370,23 @@ fn rows() -> Vec<((&'static str, Value), Option<String>)> {
             json!({"KMSMasterKeyId": "alias/no-such-key"}),
             invalid("SSEType KMS is required if KMSMasterKeyId is specified"),
         ),
+        // An Enabled written as a string reads as false when it is "false",
+        // and as true otherwise (measured 2026-11-25).
+        (
+            json!({"Enabled": "true", "SSEType": "AES256"}),
+            invalid("SSEType AES256 is not supported"),
+        ),
+        (
+            json!({"Enabled": "yes", "SSEType": "AES256"}),
+            invalid("SSEType AES256 is not supported"),
+        ),
+        (
+            json!({"Enabled": "false", "SSEType": "KMS"}),
+            invalid("SSEType can not be specified if Enabled is false"),
+        ),
+        // A specification of the wrong JSON type (measured 2026-11-25).
+        (json!("x"), None),
+        (json!({"Enabled": true, "SSEType": 5}), None),
     ] {
         rows.push((update(json!({"SSESpecification": spec})), expected));
     }

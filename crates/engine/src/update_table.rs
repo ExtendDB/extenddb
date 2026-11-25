@@ -52,6 +52,9 @@ pub async fn handle_update_table(
     let enum_faults = crate::nested_enums::EnumFaults::update_table(&mut body);
     let mut input: UpdateTableInput =
         serde_json::from_value(body).map_err(crate::deserialize_error)?;
+    if let Some(spec) = &input.sse_specification {
+        check_sse_member_types(spec)?;
+    }
     if let Some(fault) = table_class {
         return Err(fault);
     }
@@ -163,17 +166,18 @@ pub async fn handle_update_table(
             ));
     }
 
-    // The service reads a specification without Enabled that names SSEType
-    // or KMSMasterKeyId as one with Enabled true (measured 2026-11-18), and
-    // the backends report a specification by its Enabled.
-    if let Some(spec) = input
-        .sse_specification
-        .as_mut()
-        .and_then(Value::as_object_mut)
-        && !spec.contains_key("Enabled")
-        && (spec.contains_key("SSEType") || spec.contains_key("KMSMasterKeyId"))
-    {
-        spec.insert("Enabled".to_owned(), Value::Bool(true));
+    // The service reads an Enabled written as a string as the check below
+    // reads it (measured 2026-11-25), and a specification without Enabled
+    // that names SSEType or KMSMasterKeyId as one with Enabled true
+    // (measured 2026-11-18). The backends read Enabled as a boolean.
+    if let Some(spec) = input.sse_specification.as_mut() {
+        let named = |k: &str| spec.get(k).is_some_and(|v| !v.is_null());
+        let implied =
+            spec.get("Enabled").is_none() && (named("SSEType") || named("KMSMasterKeyId"));
+        let enabled = crate::create_table::sse_enabled(spec).or(implied.then_some(true));
+        if let (Some(enabled), Some(members)) = (enabled, spec.as_object_mut()) {
+            members.insert("Enabled".to_owned(), Value::Bool(enabled));
+        }
     }
     // The service answers these after a BillingMode of PROVISIONED without
     // ProvisionedThroughput, and before the table lookup (measured
@@ -409,6 +413,24 @@ fn projected_after_gsi_updates(
                     .filter_map(|u| u.create.as_ref())
                     .map(|c| &c.projection),
             ),
+    )
+}
+
+/// Refuses an `SSESpecification` that is not a JSON object, or whose
+/// `SSEType` or `KMSMasterKeyId` is not a string, as the service refuses it
+/// while it reads the body (measured 2026-11-25: `"x"` gets `Unexpected
+/// field type` and an `SSEType` of 5 gets `NUMBER_VALUE cannot be converted
+/// to String`). The other texts are those of
+/// [`crate::streams_iterator_params::check_member_types`].
+fn check_sse_member_types(spec: &Value) -> Result<(), DynamoDbError> {
+    if !spec.is_object() {
+        return Err(DynamoDbError::SerializationException(
+            "Unexpected field type".to_owned(),
+        ));
+    }
+    crate::streams_iterator_params::check_member_types(
+        spec,
+        &[("SSEType", "String"), ("KMSMasterKeyId", "String")],
     )
 }
 
