@@ -117,6 +117,31 @@ pub fn validate_create_table(
     input: &CreateTableInput,
     limits: &LimitsConfig,
 ) -> Result<(), DynamoDbError> {
+    validate_table(input, limits, false)
+}
+
+/// Validate the table definition a backup records, before a restore creates
+/// the table from it. Every check of [`validate_create_table`] runs except two:
+/// a name defined twice in `AttributeDefinitions`, and a key schema with more
+/// keys than there are definitions. Earlier releases accepted both at
+/// `CreateTable` and stored them, so a backup can record them. Every key of
+/// each key schema still needs a definition.
+///
+/// # Errors
+///
+/// The `ValidationException` of the first check that fails.
+pub fn validate_recorded_table(
+    input: &CreateTableInput,
+    limits: &LimitsConfig,
+) -> Result<(), DynamoDbError> {
+    validate_table(input, limits, true)
+}
+
+fn validate_table(
+    input: &CreateTableInput,
+    limits: &LimitsConfig,
+    recorded: bool,
+) -> Result<(), DynamoDbError> {
     // The request's member constraints come first. The service answers the
     // keySchema length before the definition count and the key schema shape,
     // and an index name before the billing rules and a name defined twice
@@ -133,13 +158,17 @@ pub fn validate_create_table(
     // definitions and a name defined twice, all before the key schema shape
     // checks (measured 2026-10-26 and 2026-11-25; see key_definitions.rs).
     validate_provisioned_throughput(input)?;
-    validate_definition_count(&input.key_schema, &input.attribute_definitions)?;
+    if !recorded {
+        validate_definition_count(&input.key_schema, &input.attribute_definitions)?;
+    }
     validate_hash_and_range_differ(&input.key_schema)?;
-    validate_unique_attribute_definitions(&input.attribute_definitions)?;
+    if !recorded {
+        validate_unique_attribute_definitions(&input.attribute_definitions)?;
+    }
     validate_key_schema(input, limits.allow_multipart_table_keys)?;
     validate_gsi_key_schemas(input)?;
     validate_lsi_key_schemas(input)?;
-    validate_attribute_definitions(input)?;
+    validate_attribute_definitions(input, recorded)?;
     validate_gsi_provisioned_throughput(input)?;
     validate_gsi_throughput_minimum(input)?;
     validate_gsi_count(input, limits)?;
@@ -910,7 +939,10 @@ fn validate_lsi_key_schemas(input: &CreateTableInput) -> Result<(), DynamoDbErro
     Ok(())
 }
 
-fn validate_attribute_definitions(input: &CreateTableInput) -> Result<(), DynamoDbError> {
+fn validate_attribute_definitions(
+    input: &CreateTableInput,
+    recorded: bool,
+) -> Result<(), DynamoDbError> {
     // A vector attribute must NOT be declared in AttributeDefinitions, and this is
     // checked before anything else here because the attribute may simultaneously be
     // a legitimate key attribute: without this, naming the table's own partition key
@@ -997,7 +1029,8 @@ fn validate_attribute_definitions(input: &CreateTableInput) -> Result<(), Dynamo
 
     // Every key attribute must have a definition: the table's key schema, then
     // each LSI's, then each GSI's (measured order, see key_definitions.rs). The
-    // table's definition count came first, in `validate_create_table`.
+    // table's definition count came first, in `validate_table`. A recorded
+    // table keeps only the rule that each key has a definition.
     let defs = &input.attribute_definitions;
     validate_keys_defined(&input.key_schema, defs)?;
     let index_schemas = input
@@ -1013,7 +1046,9 @@ fn validate_attribute_definitions(input: &CreateTableInput) -> Result<(), Dynamo
                 .map(|gsi| &gsi.key_schema),
         );
     for schema in index_schemas {
-        validate_definition_count(schema, defs)?;
+        if !recorded {
+            validate_definition_count(schema, defs)?;
+        }
         validate_keys_defined(schema, defs)?;
     }
 
@@ -2959,7 +2994,7 @@ mod tests {
             ],
         );
         input.vector_indexes = Some(vec![vi_spec("vidx")]);
-        let err = validate_attribute_definitions(&input)
+        let err = validate_attribute_definitions(&input, false)
             .expect_err("a declared vector attribute must be refused");
         assert_eq!(format!("{err}"), expected);
 
@@ -2972,7 +3007,7 @@ mod tests {
         let mut spec = vi_spec("vidx");
         spec.vector_attribute.attribute_name = "pk".to_owned();
         input.vector_indexes = Some(vec![spec]);
-        let err = validate_attribute_definitions(&input)
+        let err = validate_attribute_definitions(&input, false)
             .expect_err("the partition key must not double as the vector attribute");
         assert!(
             format!("{err}").contains("Conflicting attribute definition for 'pk'"),
@@ -3034,7 +3069,7 @@ mod tests {
             element_type: crate::types::SearchSchemaElementType::Hash,
         }]);
         input.vector_indexes = Some(vec![spec]);
-        let err = validate_attribute_definitions(&input)
+        let err = validate_attribute_definitions(&input, false)
             .expect_err("an undefined SearchSchema attribute must be refused");
         assert_eq!(
             format!("{err}"),

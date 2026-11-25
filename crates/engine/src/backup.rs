@@ -1349,9 +1349,12 @@ where
 
     // 8. A stored definition the service would refuse at CreateTable is
     // refused here too (the service re-validates on restore): a backup row
-    // is data, and data can be wrong. Only CreateTable's rules apply, so a
-    // table CreateTable or UpdateTable accepted restores.
-    extenddb_core::validation::validate_create_table(&input, limits)?;
+    // is data, and data can be wrong. The rules are CreateTable's but two:
+    // a name defined twice in AttributeDefinitions and a key schema with
+    // more keys than definitions, which earlier releases accepted at
+    // CreateTable (`validate_recorded_table`). So a table CreateTable or
+    // UpdateTable accepted restores.
+    extenddb_core::validation::validate_recorded_table(&input, limits)?;
     let on_demand = input.billing_mode == Some(BillingMode::PayPerRequest);
 
     // 9. The maintenance claim, then the permit last: every refusal above

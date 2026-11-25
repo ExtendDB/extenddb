@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Checks that a key schema's attributes are defined in `AttributeDefinitions`,
-//! shared by `CreateTable` and an `UpdateTable` GSI `Create`.
+//! shared by `CreateTable`, an `UpdateTable` GSI `Create` and a restore.
 //!
 //! The service's rules, measured on 2026-10-25, 2026-10-26 and 2026-11-25
 //! (us-east-1), in the order the service checks them:
@@ -24,7 +24,9 @@
 //! runs rule 4 on the table's key schema, then rules 1 and 4 on each LSI's and
 //! each GSI's in turn. The service checks each index's definitions before that
 //! index's shape (measured 2026-11-25), so a request with both faults in one
-//! index gets the shape sentence here.
+//! index gets the shape sentence here. A restore runs `CreateTable`'s checks
+//! without rules 1 and 3, which earlier releases did not apply
+//! (`validate_recorded_table`).
 
 use std::collections::HashSet;
 

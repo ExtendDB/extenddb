@@ -6095,6 +6095,56 @@ async fn a_table_create_table_accepted_restores() {
     }
 }
 
+/// An on-demand table with key pk and a GSI on gpk, with the given recorded
+/// definitions and GSI key schema.
+fn source_with_gsi_keys(
+    attribute_definitions: Vec<AttributeDefinition>,
+    gsi_keys: Vec<KeySchemaElement>,
+) -> BackupRestoreSource {
+    let mut src = source(Some(definition("PAY_PER_REQUEST")));
+    src.key_schema = vec![key("pk", KeyType::Hash)];
+    src.attribute_definitions = attribute_definitions;
+    let def = src.definition.as_mut().unwrap();
+    def.local_secondary_indexes = Vec::new();
+    def.global_secondary_indexes[0].key_schema = gsi_keys;
+    src
+}
+
+/// Earlier releases accepted a name defined twice in `AttributeDefinitions` at
+/// `CreateTable` and stored both definitions. A backup of such a table restores
+/// on both paths and keeps the recorded definitions.
+#[tokio::test]
+async fn a_backup_that_records_a_name_defined_twice_restores() {
+    let numeric = AttributeDefinition {
+        attribute_name: "gpk".to_owned(),
+        attribute_type: ScalarAttributeType::N,
+    };
+    let defs = vec![attr("pk"), numeric, attr("gpk")];
+    let src = source_with_gsi_keys(defs.clone(), vec![key("gpk", KeyType::Hash)]);
+    let input = restored_input(src, json!({})).await.unwrap();
+    assert_eq!(input.attribute_definitions, defs);
+}
+
+/// Earlier releases accepted a GSI key schema with more keys than there are
+/// definitions when the keys repeat a name. A backup of such a table restores
+/// on both paths and keeps the recorded definitions and keys.
+#[tokio::test]
+async fn a_backup_that_records_more_index_keys_than_definitions_restores() {
+    let defs = vec![attr("pk"), attr("gpk")];
+    let gsi_keys = vec![
+        key("gpk", KeyType::Hash),
+        key("gpk", KeyType::Hash),
+        key("gpk", KeyType::Range),
+    ];
+    let src = source_with_gsi_keys(defs.clone(), gsi_keys.clone());
+    let input = restored_input(src, json!({})).await.unwrap();
+    assert_eq!(input.attribute_definitions, defs);
+    assert_eq!(
+        input.global_secondary_indexes.unwrap()[0].key_schema,
+        gsi_keys
+    );
+}
+
 #[tokio::test]
 async fn a_missing_backup_is_backup_not_found() {
     let fake = Arc::new(Fake::default());
