@@ -1186,7 +1186,7 @@ curl --cacert ~/.extenddb/tls/cert.pem -u admin:<pw> https://127.0.0.1:18443/met
 
 JSON metrics endpoint with DynamoDB CloudWatch-style metric names and dimensions. The response shape is `{ metrics, buckets, segments, source }`. See `docs/design/06-component-server.md` §7.2 for the full schema and metric list.
 
-### Health Check
+### Health Check Endpoint
 
 ```bash
 curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
