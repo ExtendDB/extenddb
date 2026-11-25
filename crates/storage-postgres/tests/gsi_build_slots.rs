@@ -21,6 +21,13 @@
 //! server whose role may create and drop databases. Without it every test here
 //! reports a skip and passes, the same convention the wire suites use.
 
+// `base_conn` comes from the fixture that the stream tests share. It fails a
+// test under `EXTENDDB_TEST_PG_REQUIRED`. Nothing else in the fixture is used
+// here.
+#[path = "common/stream_disable_fixture.rs"]
+#[allow(unused_imports)]
+mod fixture;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
@@ -35,6 +42,7 @@ use extenddb_storage_postgres::{
     GSI_BUILD_SLOTS, PostgresConfig, PostgresEngine, hold_gsi_backfill_for_tests,
     reconcile_creating_gsis,
 };
+use fixture::base_conn;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 
@@ -71,11 +79,6 @@ impl Scratch {
         .expect("drop the scratch database");
         admin.close().await;
     }
-}
-
-fn base_conn() -> Option<String> {
-    let conn = std::env::var("EXTENDDB_TEST_PG_CONNECTION_STRING").ok()?;
-    (!conn.trim().is_empty()).then(|| conn.trim_end_matches('/').to_owned())
 }
 
 fn shipped_migrations() -> Vec<String> {

@@ -20,6 +20,13 @@
 //! server whose role may create and drop databases. Without it every test here
 //! reports a skip and passes, the same convention the wire suites use.
 
+// `base_conn` comes from the fixture that the stream tests share. It fails a
+// test under `EXTENDDB_TEST_PG_REQUIRED`. Nothing else in the fixture is used
+// here.
+#[path = "common/stream_disable_fixture.rs"]
+#[allow(unused_imports)]
+mod fixture;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
@@ -30,6 +37,7 @@ use extenddb_core::types::{
 };
 use extenddb_storage::{DataEngine, TableEngine};
 use extenddb_storage_postgres::{PostgresConfig, PostgresEngine};
+use fixture::base_conn;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 
@@ -62,24 +70,6 @@ impl Scratch {
         .expect("drop the scratch database");
         admin.close().await;
     }
-}
-
-/// The server's base URL, or `None` to skip. With `EXTENDDB_TEST_PG_REQUIRED`
-/// set to any value but `0`, a job that must reach a server fails here
-/// instead.
-fn base_conn() -> Option<String> {
-    let conn = std::env::var("EXTENDDB_TEST_PG_CONNECTION_STRING").unwrap_or_default();
-    if conn.trim().is_empty() {
-        let required =
-            std::env::var("EXTENDDB_TEST_PG_REQUIRED").is_ok_and(|v| !v.is_empty() && v != "0");
-        assert!(
-            !required,
-            "EXTENDDB_TEST_PG_CONNECTION_STRING is not set, and EXTENDDB_TEST_PG_REQUIRED says \
-             this job must reach a PostgreSQL server"
-        );
-        return None;
-    }
-    Some(conn.trim_end_matches('/').to_owned())
 }
 
 fn shipped_migrations() -> Vec<String> {
