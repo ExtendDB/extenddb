@@ -63,6 +63,11 @@ const ROWS: &[Row] = &[
     Row { name: "deleted principal", holder: Holder::IamUser, stored: StoredHash::Missing, method: "GET", csrf: Csrf::Absent, status: StatusCode::SEE_OTHER, location: LOGIN, body: "" },
     Row { name: "password changed", holder: Holder::Admin, stored: StoredHash::Changed, method: "GET", csrf: Csrf::Absent, status: StatusCode::SEE_OTHER, location: LOGIN, body: "" },
     Row { name: "catalog unreadable", holder: Holder::Admin, stored: StoredHash::Unreadable, method: "GET", csrf: Csrf::Absent, status: StatusCode::SERVICE_UNAVAILABLE, location: None, body: "The catalog is unavailable. Try again." },
+    // HEAD, OPTIONS and TRACE pass without the token, as GET does. The router
+    // drops the body of a HEAD answer.
+    Row { name: "HEAD without a token", holder: Holder::Admin, stored: StoredHash::LoginHash, method: "HEAD", csrf: Csrf::Absent, status: StatusCode::OK, location: None, body: "" },
+    Row { name: "OPTIONS without a token", holder: Holder::Admin, stored: StoredHash::LoginHash, method: "OPTIONS", csrf: Csrf::Absent, status: StatusCode::OK, location: None, body: "admin=true x=true" },
+    Row { name: "TRACE without a token", holder: Holder::Admin, stored: StoredHash::LoginHash, method: "TRACE", csrf: Csrf::Absent, status: StatusCode::OK, location: None, body: "admin=true x=true" },
     Row { name: "POST with the session's token", holder: Holder::IamUser, stored: StoredHash::LoginHash, method: "POST", csrf: Csrf::SessionToken, status: StatusCode::OK, location: None, body: "admin=false x=true" },
     Row { name: "POST without a token", holder: Holder::Admin, stored: StoredHash::LoginHash, method: "POST", csrf: Csrf::Absent, status: StatusCode::FORBIDDEN, location: None, body: "CSRF token mismatch" },
     Row { name: "POST with another token", holder: Holder::Admin, stored: StoredHash::LoginHash, method: "POST", csrf: Csrf::OtherToken, status: StatusCode::FORBIDDEN, location: None, body: "CSRF token mismatch" },
