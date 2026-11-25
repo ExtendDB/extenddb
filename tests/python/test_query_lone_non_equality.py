@@ -175,15 +175,6 @@ def _refused_prefix(client, prefix: str, **request) -> None:
     assert err["Error"]["Message"].startswith(prefix), err["Error"]["Message"]
 
 
-def _refused_suffix(client, suffix: str, **request) -> None:
-    """Like ``_refused_request`` for a refusal whose leading text ExtendDB words differently."""
-    with pytest.raises(ClientError) as exc_info:
-        client.query(**request)
-    err = exc_info.value.response
-    assert err["Error"]["Code"] == "ValidationException", err["Error"]["Message"]
-    assert err["Error"]["Message"].endswith(suffix), err["Error"]["Message"]
-
-
 def _values(expression: str) -> dict:
     """Those of ``:x``, ``:y`` (strings), ``:n`` and ``:m`` (numbers) the expression uses."""
     values = {":x": {"S": "a"}, ":y": {"S": "b"}, ":n": {"N": "1"}, ":m": {"N": "2"}}
@@ -526,11 +517,10 @@ class TestOrderAmongOtherRefusals:
     def test_all_projected_attributes_without_an_index_is_reported_first(
         self, dynamodb_client, table
     ):
-        # The service's text starts with "1 validation error detected: ";
-        # ExtendDB's does not (the Select check is shared with Scan).
-        _refused_suffix(
+        _refused_request(
             dynamodb_client,
-            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName",
+            "1 validation error detected: ALL_PROJECTED_ATTRIBUTES can be used only when "
+            "Querying using an IndexName",
             TableName=table,
             KeyConditionExpression="pk > :x",
             Select="ALL_PROJECTED_ATTRIBUTES",
