@@ -136,11 +136,14 @@ This is the minimal mechanism needed to honor DynamoDB's consistency model. It w
 [Frontend B] ─┘     └→ [Cassandra Node 3]
 ```
 
-- Storage layer maps DynamoDB consistency to native consistency levels.
-  - `ConsistentRead = true` → `QUORUM` or `LOCAL_QUORUM`
-  - `ConsistentRead = false` → `ONE` or `LOCAL_ONE`
+- The Cassandra backend performs every read and write at `LOCAL_QUORUM`, and
+  every lightweight transaction at `LOCAL_SERIAL`. Table reads are therefore
+  strongly consistent, for both DynamoDB consistent and eventually consistent
+  reads, when the clocks of the Cassandra nodes and the ExtendDB hosts are in
+  sync (see "Clock synchronization" in `docs/cassandra-setup.md`).
 - No separate primary/replica distinction — the storage adapter handles it.
-- Suitable for: large-scale deployments, multi-datacenter.
+- Suitable for: large-scale deployments in one datacenter. Multi-datacenter
+  deployments are not supported.
 
 ### Model 5: Multi-Region (Future)
 

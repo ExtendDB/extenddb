@@ -420,8 +420,8 @@ jobs:
           devtools/check-cassandra-catalog-lock ./target/release/extenddb
           ${{ job.services.cassandra.id }} 127.0.0.1:9042 18454
 
-      # No released image carries the Cassandra backend, so the job builds
-      # the last 0.1.x release from its tag, on a cache miss only.
+      # No 0.1.14 image carries the Cassandra backend, so the job builds
+      # 0.1.14 from its tag, on a cache miss only.
       - name: Build the v0.1.14 release (cassandra backend)
         if: steps.cache-v0-1-14.outputs.cache-hit != 'true'
         run: |
@@ -440,7 +440,7 @@ jobs:
           path: ${{ runner.temp }}/target-v0.1.14/release/extenddb
           key: extenddb-v0.1.14-no-default-features-${{ env.V0114_FEATURES }}-${{ runner.os }}-${{ runner.arch }}
 
-      - name: Check the last 0.1.x release against migrated catalogs
+      - name: Check the 0.1.14 release against migrated catalogs
         run: >-
           devtools/check-cassandra-older-binary ./target/release/extenddb
           ${{ runner.temp }}/target-v0.1.14/release/extenddb

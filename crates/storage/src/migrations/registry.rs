@@ -45,10 +45,10 @@ macro_rules! migration_ids {
 }
 
 migration_ids! {
-    /// Creates the v1.0 schema on an empty store and brings every released
+    /// Creates the catalog schema on an empty store and brings every released
     /// catalog to it.
     Baseline = 1, "baseline",
-        "create the v1.0 catalog schema, or bring a released catalog to it";
+        "create the catalog schema, or bring a released catalog to it";
     /// Rewrites stored policies from `dynamodb:ResourceTag/<key>` to
     /// `aws:ResourceTag/<key>`.
     ResourceTagConditionKeys = 2, "resource_tag_condition_keys",
@@ -116,8 +116,9 @@ migration_ids! {
 
 /// Highest id that has shipped in a release. Bodies at or below it are frozen:
 /// each backend pins their checksums, kinds and convergent flags, and
-/// `forget` refuses them. The v1.0 release PR raises it to 12.
-pub const RELEASED_THROUGH: u32 = 0;
+/// `forget` refuses them. Each release PR raises it to the last id
+/// (CONTRIBUTING.md, "Adding a catalog migration", step 7).
+pub const RELEASED_THROUGH: u32 = 12;
 
 impl MigrationId {
     /// The highest id this binary carries.

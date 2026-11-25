@@ -139,7 +139,7 @@ pub fn compare(expected: &Definitions, actual: &Definitions) -> Vec<String> {
     };
     for key in actual.columns.keys() {
         if named(key) && !expected.columns.contains_key(key) {
-            differences.push(format!("column {key} is not part of the v1.0 schema"));
+            differences.push(format!("column {key} is not part of migration 1's schema"));
         }
     }
     for (name, want) in &expected.indexes {
@@ -204,7 +204,8 @@ pub(crate) async fn check(
         return Ok(());
     }
     Err(MigrationError::Store(format!(
-        "migration 1 left {keyspace} different from the v1.0 schema, so it was not recorded: {}",
+        "migration 1 left {keyspace} different from migration 1's schema, so it was not \
+         recorded: {}",
         differences.join("; ")
     )))
 }
