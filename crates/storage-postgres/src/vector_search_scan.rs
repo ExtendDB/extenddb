@@ -133,10 +133,19 @@ mod tests {
 
     use super::{ScanConnection, XACT_OF_THIS_BACKEND, cancel_if_in_transaction};
 
-    /// A pool on the server's maintenance database, or `None` to skip.
+    /// A pool on the server's maintenance database, or `None` to skip. With
+    /// `EXTENDDB_TEST_PG_REQUIRED` set to any value but `0`, a job that must
+    /// reach a server fails here instead.
     async fn pool(max: u32) -> Option<sqlx::PgPool> {
         let base = std::env::var("EXTENDDB_TEST_PG_CONNECTION_STRING").unwrap_or_default();
         if base.trim().is_empty() {
+            let required =
+                std::env::var("EXTENDDB_TEST_PG_REQUIRED").is_ok_and(|v| !v.is_empty() && v != "0");
+            assert!(
+                !required,
+                "EXTENDDB_TEST_PG_CONNECTION_STRING is not set, and EXTENDDB_TEST_PG_REQUIRED \
+                 says this job must reach a PostgreSQL server"
+            );
             eprintln!("SKIP: EXTENDDB_TEST_PG_CONNECTION_STRING is not set");
             return None;
         }
