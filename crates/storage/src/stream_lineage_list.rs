@@ -50,7 +50,7 @@ pub fn list_streams(
     if let Some(start) = exclusive_start {
         listed.retain(|entry| *entry < start);
     }
-    let limit = usize::try_from(limit).unwrap_or(0).max(1);
+    let limit = extenddb_core::limits::page_size(limit);
     let last = (listed.len() >= limit).then(|| {
         let (t, l) = &listed[limit - 1];
         arn(t, l)

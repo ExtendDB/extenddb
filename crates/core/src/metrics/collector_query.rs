@@ -7,17 +7,14 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::time::{Duration, Instant, SystemTime};
+use web_time::{Duration, Instant, SystemTime};
 
 use super::accumulator::{Accumulator, DataPoint};
-use super::collector::{MetricKey, MetricsCollector, window_cutoff};
+use super::collector::{MetricKey, MetricsCollector};
 use super::types::{
     Dimension, FlushBucket, MetricName, MetricSnapshot, MetricsQuery, OperationSegments,
     Percentiles, TimeWindow,
 };
-
-/// Accumulator for per-operation segment sums: (auth, authz, throttle, dispatch, response, total, count).
-type SegmentAccum = (f64, f64, f64, f64, f64, f64, u64);
 
 impl MetricsCollector {
     /// Query metrics and return snapshots.
@@ -152,61 +149,34 @@ impl MetricsCollector {
 
     /// Query average latency segments for the console deep-dive.
     ///
-    /// Returns per-operation averages over the given time window, of the
-    /// requests of `account_id` only when it is given (an empty string is no
-    /// filter).
+    /// Returns per-operation averages over the given time window, sorted by
+    /// operation name, of the requests of `account_id` only when it is given
+    /// (an empty string is no filter); without it, every account's requests
+    /// are summed per operation. `LastMinute` and `Last5Minutes` read
+    /// 1-second buckets, the longer windows read 1-minute buckets: a window of
+    /// `W` seconds covers at least the last `W` seconds and at most the last
+    /// `W` plus one bucket width. `AllTime` is the whole 24-hour ring.
     #[must_use]
     pub fn query_segments(
         &self,
         window: TimeWindow,
         account_id: Option<&str>,
     ) -> Vec<OperationSegments> {
-        let account_id = account_id.filter(|a| !a.is_empty());
-        let now = Instant::now();
-        let cutoff = window_cutoff(window, now);
-        let Ok(vec) = self.segments.read() else {
+        self.query_segments_with(window, account_id, Instant::now)
+    }
+
+    /// `query_segments` with the clock it reads, under the lock, paired with
+    /// `record_segments`.
+    pub(super) fn query_segments_with(
+        &self,
+        window: TimeWindow,
+        account_id: Option<&str>,
+        clock: impl FnOnce() -> Instant,
+    ) -> Vec<OperationSegments> {
+        let Ok(store) = self.segments.read() else {
             return Vec::new();
         };
-        let mut by_op: HashMap<String, SegmentAccum> = HashMap::new();
-        for p in vec.iter() {
-            if let Some(c) = cutoff
-                && p.timestamp < c
-            {
-                continue;
-            }
-            if account_id.is_some_and(|a| a != p.account_id) {
-                continue;
-            }
-            let e = by_op.entry(p.operation.clone()).or_default();
-            e.0 += p.segments.auth_us;
-            e.1 += p.segments.authz_us;
-            e.2 += p.segments.throttle_us;
-            e.3 += p.segments.dispatch_us;
-            e.4 += p.segments.response_us;
-            e.5 += p.segments.total_us;
-            e.6 += 1;
-        }
-        by_op
-            .into_iter()
-            .map(
-                |(op, (auth, authz, throttle, dispatch, response, total, count))| {
-                    #[allow(clippy::cast_precision_loss)]
-                    let c = count as f64;
-                    OperationSegments {
-                        operation: op,
-                        count,
-                        avg: super::types::LatencySegments {
-                            auth_us: auth / c,
-                            authz_us: authz / c,
-                            throttle_us: throttle / c,
-                            dispatch_us: dispatch / c,
-                            response_us: response / c,
-                            total_us: total / c,
-                        },
-                    }
-                },
-            )
-            .collect()
+        store.query(window, account_id, clock())
     }
 }
 
