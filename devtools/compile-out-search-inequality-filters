@@ -38,6 +38,7 @@ FEATURE = "search-inequality-filters"
 CRATES = 7
 BROWSER = "extenddb-wasm-adapter"
 BROWSER_CRATES = ("extenddb-core", "extenddb-engine", "extenddb-storage-sqlite")
+WASM = "wasm32-unknown-unknown"
 
 
 def feature_tree(root: Path, *args: str) -> str:
@@ -50,13 +51,22 @@ def feature_tree(root: Path, *args: str) -> str:
     ).stdout
 
 
+def host_target() -> str:
+    """The host's target triple, for which `cargo tree` resolves by default."""
+    info = subprocess.run(["rustc", "-vV"], check=True, capture_output=True, text=True).stdout
+    return next(line.split(": ", 1)[1] for line in info.splitlines() if line.startswith("host: "))
+
+
 def check_browser(root: Path, want: bool) -> list[str]:
-    """The crates of the browser build whose feature state is not `want`."""
+    """The crates of the browser build whose feature state is not `want`,
+    built for the host or for wasm32, so a dependency that only one of the
+    two targets has is counted."""
     wrong = []
     for crate in BROWSER_CRATES:
-        tree = feature_tree(root, "-p", BROWSER, "-i", crate)
-        if (f'{crate} feature "{FEATURE}"' in tree) != want:
-            wrong.append(crate)
+        for target in (host_target(), WASM):
+            tree = feature_tree(root, "-p", BROWSER, "--target", target, "-i", crate)
+            if (f'{crate} feature "{FEATURE}"' in tree) != want:
+                wrong.append(f"{crate} ({target})")
     return wrong
 
 
@@ -80,7 +90,7 @@ def compile_out(root: Path) -> int:
         return 1
     for manifest, text in edits:
         manifest.write_text(text)
-    tree = feature_tree(root, "--workspace", "-i", "extenddb-core")
+    tree = feature_tree(root, "--workspace", "--target", "all", "-i", "extenddb-core")
     if f'feature "{FEATURE}"' in tree:
         print(f"error: the workspace still enables {FEATURE}:\n{tree}", file=sys.stderr)
         return 1
