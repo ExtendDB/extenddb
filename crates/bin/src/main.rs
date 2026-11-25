@@ -17,6 +17,13 @@
 //! installs one backend per process, so a build with more than one would be ambiguous
 //! and is rejected at compile time.
 
+// The `mimalloc` feature replaces the system allocator with mimalloc. The
+// request path allocates for each JSON value, attribute and string that it
+// builds, on many tokio worker threads. See ADR-0030 for the measurements.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 // Exactly one backend feature must be enabled.
 #[cfg(any(
     all(feature = "postgres", feature = "cassandra"),

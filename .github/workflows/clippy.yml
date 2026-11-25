@@ -34,8 +34,9 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # With the Cassandra and MongoDB crates' `test-hooks` features, so the
       # hook modules (`src/test_hooks.rs`) and their call sites, which only
-      # the integration test binaries build otherwise, are linted too.
-      - run: cargo clippy --all-targets --features extenddb-storage-cassandra/test-hooks,extenddb-storage-mongodb/test-hooks -- -D warnings
+      # the integration test binaries build otherwise, are linted too. With the
+      # bin crate's `mimalloc` feature as well, which no other job builds.
+      - run: cargo clippy --all-targets --features extenddb-storage-cassandra/test-hooks,extenddb-storage-mongodb/test-hooks,extenddb/mimalloc -- -D warnings
       # The backup job's kill-point pauses (`EXTENDDB_BACKUP_PAUSE`), which
       # `devtools/backup-kill-points.sh` runs by hand on a build with the
       # feature; no other job builds it.

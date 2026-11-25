@@ -68,6 +68,9 @@ extenddb-auth = { path = "crates/auth", version = "=1.0.0" }
 extenddb-server = { path = "crates/server", version = "=1.0.0" }
 extenddb-app = { path = "crates/app", version = "=1.0.0" }
 
+# Memory allocator, opt-in through the `mimalloc` feature of the bin crate
+mimalloc = { version = "0.1", default-features = false }
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
