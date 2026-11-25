@@ -14,19 +14,19 @@
 //! any corrupted value. An empty AAD is refused, because AES-GCM treats an
 //! empty AAD and no AAD the same way.
 //!
-//! The cipher is AWS-LC through `aws-lc-rs`, which draws a fresh random 96-bit
-//! nonce for each encryption.
+//! The cipher is AES-256-GCM through [`extenddb_core::crypto`], which draws a
+//! fresh random 96-bit nonce for each encryption. That module holds the one
+//! target-specific backend choice: AWS-LC on the server, a pure-Rust backend
+//! where AWS-LC's C and assembly do not build. This module keeps the
+//! base64 key decoding, the AAD rules, and the exact error messages.
 
-use aws_lc_rs::aead::{AES_256_GCM, Aad, NONCE_LEN, Nonce, RandomizedNonceKey};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use extenddb_core::crypto;
 use zeroize::Zeroizing;
 
 /// Length of the decoded encryption key.
-pub const KEY_LEN: usize = 32;
-
-/// Length of the GCM authentication tag that follows the ciphertext.
-const TAG_LEN: usize = 16;
+pub const KEY_LEN: usize = crypto::KEY_LEN;
 
 /// Encrypt `plaintext` under the base64 key `key_b64`, binding `aad`.
 ///
@@ -52,8 +52,12 @@ pub fn encrypt_secret(plaintext: &str, key_b64: &str, aad: &str) -> Result<Vec<u
 /// UTF-8.
 pub fn decrypt_secret(encrypted: &[u8], key_b64: &str, aad: &str) -> Result<String, String> {
     require_aad(aad)?;
-    split_sealed(encrypted)?;
-    let mut plaintext = open_text(&*decode_key(key_b64)?, encrypted, aad)?;
+    // The length is checked before the key is decoded, so a short value is
+    // reported as short whatever the key; `open` is not called here, since it
+    // would check the length again.
+    require_length(encrypted)?;
+    let opened = crypto::open(&*decode_key(key_b64)?, encrypted, aad.as_bytes())?;
+    let mut plaintext = into_text(opened)?;
     Ok(std::mem::take(&mut *plaintext))
 }
 
@@ -61,42 +65,19 @@ pub fn decrypt_secret(encrypted: &[u8], key_b64: &str, aad: &str) -> Result<Stri
 /// `nonce(12) || ciphertext || tag(16)`.
 pub(crate) fn seal(key: &[u8; KEY_LEN], plaintext: &[u8], aad: &str) -> Result<Vec<u8>, String> {
     require_aad(aad)?;
-    let key = aead_key(key)?;
-
-    // Zeroizing, so the plaintext copy is wiped if the seal fails. The
-    // capacity is exact, so the buffer never reallocates.
-    let mut sealed = Zeroizing::new(Vec::with_capacity(NONCE_LEN + plaintext.len() + TAG_LEN));
-    sealed.extend_from_slice(&[0; NONCE_LEN]);
-    sealed.extend_from_slice(plaintext);
-    let (nonce, tag) = key
-        .seal_in_place_separate_tag(Aad::from(aad.as_bytes()), &mut sealed[NONCE_LEN..])
-        .map_err(|_| "encrypt: AES-256-GCM seal failed".to_owned())?;
-    sealed[..NONCE_LEN].copy_from_slice(nonce.as_ref());
-    sealed.extend_from_slice(tag.as_ref());
-    Ok(std::mem::take(&mut *sealed))
+    crypto::seal(key, plaintext, aad.as_bytes())
 }
 
 /// Decrypt `nonce(12) || ciphertext || tag(16)` under the 32 key bytes `key`,
-/// authenticating `aad`. The plaintext is wiped when the result drops.
+/// authenticating `aad`. The returned buffer is wiped when it drops.
 pub(crate) fn open(
     key: &[u8; KEY_LEN],
     encrypted: &[u8],
     aad: &str,
 ) -> Result<Zeroizing<Vec<u8>>, String> {
     require_aad(aad)?;
-    let (nonce, sealed) = split_sealed(encrypted)?;
-    let key = aead_key(key)?;
-    let mut in_out = Zeroizing::new(sealed.to_vec());
-    let len = key
-        .open_in_place(
-            Nonce::from(nonce),
-            Aad::from(aad.as_bytes()),
-            &mut in_out[..],
-        )
-        .map_err(|_| "decrypt: authentication failed".to_owned())?
-        .len();
-    in_out.truncate(len);
-    Ok(in_out)
+    require_length(encrypted)?;
+    crypto::open(key, encrypted, aad.as_bytes())
 }
 
 /// [`open`], for a plaintext that must be UTF-8 text.
@@ -105,7 +86,12 @@ pub(crate) fn open_text(
     encrypted: &[u8],
     aad: &str,
 ) -> Result<Zeroizing<String>, String> {
-    let mut plaintext = open(key, encrypted, aad)?;
+    into_text(open(key, encrypted, aad)?)
+}
+
+/// The UTF-8 text of an opened secret, in a wrapper that wipes it on drop.
+/// Bytes that are not UTF-8 are wiped before the error returns.
+fn into_text(mut plaintext: Zeroizing<Vec<u8>>) -> Result<Zeroizing<String>, String> {
     match String::from_utf8(std::mem::take(&mut *plaintext)) {
         Ok(text) => Ok(Zeroizing::new(text)),
         Err(e) => {
@@ -116,11 +102,15 @@ pub(crate) fn open_text(
     }
 }
 
-/// Split `nonce(12) || sealed` and refuse input too short to hold a tag.
-fn split_sealed(encrypted: &[u8]) -> Result<(&[u8; NONCE_LEN], &[u8]), String> {
-    match encrypted.split_first_chunk::<NONCE_LEN>() {
-        Some((nonce, sealed)) if sealed.len() >= TAG_LEN => Ok((nonce, sealed)),
-        _ => Err(format!(
+/// Refuse input too short to hold a nonce and a tag, with a message that names
+/// its length. The length rule is `crypto::split_nonce`, the check
+/// `crypto::open` applies; this only words the refusal. Each path through this
+/// module calls it once: `decrypt_secret` before it decodes the key, `open`
+/// before it opens.
+fn require_length(encrypted: &[u8]) -> Result<(), String> {
+    match crypto::split_nonce(encrypted) {
+        Some(_) => Ok(()),
+        None => Err(format!(
             "ciphertext too short: {} bytes (need at least 12-byte nonce + 16-byte auth tag)",
             encrypted.len()
         )),
@@ -174,15 +164,10 @@ pub(crate) fn decode_key_into(key_b64: &str, key: &mut [u8; KEY_LEN]) -> Result<
     Ok(())
 }
 
-/// Load 32 key bytes into an AES-256-GCM key.
-fn aead_key(key: &[u8; KEY_LEN]) -> Result<RandomizedNonceKey, String> {
-    RandomizedNonceKey::new(&AES_256_GCM, key)
-        .map_err(|_| "load encryption key: AES-256-GCM key setup failed".to_owned())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use extenddb_core::crypto::{NONCE_LEN, TAG_LEN};
 
     const KEY_B64: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
     const AAD: &str = "AKIAEXTENDDBCOMPAT01";
@@ -301,6 +286,44 @@ mod tests {
         }
     }
 
+    /// A value too short for a nonce and a tag is refused before the key is
+    /// decoded, so under a key that does not decode the refusal still names
+    /// the value's length.
+    #[test]
+    fn a_short_value_is_refused_before_the_key_is_decoded() {
+        for key in ["not base64!", ""] {
+            assert_eq!(
+                decrypt_secret(&[0; NONCE_LEN], key, AAD).unwrap_err(),
+                "ciphertext too short: 12 bytes (need at least 12-byte nonce + 16-byte auth tag)",
+                "key {key:?}"
+            );
+        }
+    }
+
+    /// `open` and `open_text`, which the key ring and the secret-key rows
+    /// call with the decoded key, refuse a short value with the same message
+    /// as `decrypt_secret`.
+    #[test]
+    fn open_refuses_a_short_value_with_its_length() {
+        let key = decode_key(KEY_B64).expect("key");
+        for len in [0, 1, NONCE_LEN, NONCE_LEN + TAG_LEN - 1] {
+            let short = vec![0u8; len];
+            let expected = format!(
+                "ciphertext too short: {len} bytes (need at least 12-byte nonce + 16-byte auth tag)"
+            );
+            assert_eq!(
+                open(&key, &short, AAD).err(),
+                Some(expected.clone()),
+                "open, length {len}"
+            );
+            assert_eq!(
+                open_text(&key, &short, AAD).err(),
+                Some(expected),
+                "open_text, length {len}"
+            );
+        }
+    }
+
     #[test]
     fn key_that_is_not_32_bytes_is_rejected() {
         let sealed = encrypt_secret(PLAINTEXT, KEY_B64, AAD).expect("encrypt");
@@ -333,14 +356,8 @@ mod tests {
 
     #[test]
     fn non_utf8_plaintext_is_rejected() {
-        let key = aead_key(&decode_key(KEY_B64).expect("key")).expect("key");
-        let mut in_out = vec![0xff, 0xfe];
-        let (nonce, tag) = key
-            .seal_in_place_separate_tag(Aad::from(AAD.as_bytes()), &mut in_out)
-            .expect("seal");
-        let mut sealed = nonce.as_ref().to_vec();
-        sealed.extend_from_slice(&in_out);
-        sealed.extend_from_slice(tag.as_ref());
+        let key = decode_key(KEY_B64).expect("key");
+        let sealed = crypto::seal(&key, &[0xff, 0xfe], AAD.as_bytes()).expect("seal");
         let err = decrypt_secret(&sealed, KEY_B64, AAD).unwrap_err();
         assert!(
             err.starts_with("decrypted secret is not valid UTF-8: "),
@@ -399,12 +416,8 @@ mod tests {
         // which AES-GCM treats as no AAD, it yields the plaintext. The
         // rejections above come from the access key id binding, not from
         // damaged bytes.
-        let key = aead_key(&decode_key(KEY_B64).expect("key")).expect("key");
-        let (nonce, sealed) = stored.split_first_chunk::<NONCE_LEN>().expect("nonce");
-        let mut in_out = sealed.to_vec();
-        let opened = key
-            .open_in_place(Nonce::from(nonce), Aad::empty(), &mut in_out[..])
-            .expect("open without AAD");
-        assert_eq!(opened, PLAINTEXT.as_bytes());
+        let key = decode_key(KEY_B64).expect("key");
+        let opened = crypto::open(&key, &stored, b"").expect("open without AAD");
+        assert_eq!(&*opened, PLAINTEXT.as_bytes());
     }
 }

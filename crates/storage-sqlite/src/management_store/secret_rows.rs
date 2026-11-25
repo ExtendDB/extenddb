@@ -336,7 +336,9 @@ mod tests {
         crate::migrations::migrate(&location, "test", Duration::from_secs(5))
             .await
             .expect("a current catalog");
-        let pool = crate::catalog_pool(&location).await.expect("pool");
+        let pool = crate::server_backend::catalog_pool(&location)
+            .await
+            .expect("pool");
         let catalog_key = extenddb_storage::bootstrapper::helpers::generate_encryption_key()
             .expect("a catalog key");
         let catalog = Arc::new(SecretKeys::catalog_key(&catalog_key).expect("key holder"));
@@ -533,7 +535,9 @@ mod conformance {
         crate::migrations::migrate(&location, "test", Duration::from_secs(5))
             .await
             .expect("a current catalog");
-        let pool = crate::catalog_pool(&location).await.expect("pool");
+        let pool = crate::server_backend::catalog_pool(&location)
+            .await
+            .expect("pool");
         let catalog_key = extenddb_storage::bootstrapper::helpers::generate_encryption_key()
             .expect("a catalog key");
         SqliteCatalogStore::new(pool.clone())
