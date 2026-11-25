@@ -955,12 +955,21 @@ async fn update_table_creates_a_vector_index_and_backfills_what_is_already_there
         1,
         "the pre-existing item must be backfilled"
     );
-    let holds: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM vector_index_holds WHERE table_id = $1")
+    // `mark_active` commits the ACTIVE flip on the catalog first and releases the hold
+    // afterwards, in a second statement on the data database. The poll above can see
+    // ACTIVE between the two, so wait for the release instead of reading the count once.
+    let mut holds: i64 = -1;
+    for _ in 0..100 {
+        holds = sqlx::query_scalar("SELECT COUNT(*) FROM vector_index_holds WHERE table_id = $1")
             .bind(&id)
             .fetch_one(s.engine.data_pool())
             .await
             .expect("count the holds");
+        if holds == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     assert_eq!(holds, 0, "the hold must be released after the ACTIVE flip");
     let (backfilling, owner): (Option<bool>, Option<String>) =
         sqlx::query_as("SELECT backfilling, build_owner FROM vector_indexes WHERE table_id = $1")
