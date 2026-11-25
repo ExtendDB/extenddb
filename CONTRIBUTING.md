@@ -69,6 +69,11 @@ for its MongoDB and Cassandra cells) and runs nightly from
 (`docs/manuals/06-developer-test-guide.md`, "Test Runner Script") has a
 paragraph on each.
 
+The WebAssembly workflow (`.github/workflows/wasm.yml`) builds, lints and
+tests the code for `wasm32-unknown-unknown`. `devtools/run-wasm-step <step>`
+runs one of its steps locally, as the script's header describes. The README's
+"Experimental: WebAssembly build" says what that build is.
+
 ### Code Style
 
 All contributions must pass:
@@ -196,7 +201,12 @@ SQLite, PostgreSQL, Cassandra and MongoDB migrate through this framework.
    transaction. Put it in its own module, `src/migrations/mNNNN_<name>.rs` in
    the backend's crate, and declare the module with `#[rustfmt::skip]` and
    `#[allow(clippy::all, deprecated)]`, so that neither tool can require an
-   edit to a released body. The module defines:
+   edit to a released body. That allow also switches off, for the body, the
+   lists in `devtools/wasm-clippy/clippy.toml` of what the WebAssembly clippy
+   step refuses (the file's header says what that step does not see).
+   The WebAssembly build opens only in-memory databases, and each runs every
+   migration when it opens, so in a crate of that build, review checks that a
+   body calls none of the methods or types listed there. The module defines:
 
    - `SOURCE`, the module's own text through `include_str!`, followed by the
      text of any SQL file the body executes. The checksum test pins its

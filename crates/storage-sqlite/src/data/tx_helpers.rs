@@ -244,8 +244,8 @@ pub(super) async fn write_stream_record_in_tx(
     // One wall-clock read feeds both the record's ApproximateCreationDateTime
     // and the created_at column, so the two never disagree.
     let created_at_ms = i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis(),
     )
