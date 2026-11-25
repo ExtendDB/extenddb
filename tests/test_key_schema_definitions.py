@@ -23,9 +23,9 @@ Create:
   definition. The service checks an index's definitions before its shape, and
   ExtendDB checks every shape first. No row here has both faults in one index.
 
-The service orders both lists in a way that follows neither the request nor
-the alphabet, and ExtendDB lists them in request order, so these tests compare
-the lists as sets.
+The service lists both in the order of a Java HashMap, which
+crates/core/src/validation/key_definitions.rs models, so the rows compare the
+whole message.
 
 On UpdateTable a definition that redefines the table's own key with another
 type is accepted beside a valid Create, and the table keeps its type
@@ -36,7 +36,6 @@ Dual-target against Amazon DynamoDB and extenddb.
 
 from __future__ import annotations
 
-import re
 import time
 
 import pytest
@@ -47,10 +46,11 @@ from conftest import scoped_table
 NEVER_CREATED = "never-created-key-definitions"
 INVALID = "Invalid KeySchema: Some index key attribute have no definition"
 SAME_NAME = "Both the Hash Key and the Range Key element in the KeySchema have the same name"
-LISTED = re.compile(
-    r"^One or more parameter values were invalid: Some index key attributes are not defined in "
-    r"AttributeDefinitions\. Keys: \[([^\]]*)\], AttributeDefinitions: \[([^\]]*)\]$"
-)
+
+
+def listed(keys: str, names: str) -> str:
+    return ("One or more parameter values were invalid: Some index key attributes are not defined in "
+            f"AttributeDefinitions. Keys: [{keys}], AttributeDefinitions: [{names}]")
 
 
 def defs(spec: str) -> list[dict]:
@@ -75,12 +75,6 @@ def _message(call) -> str:
     err = exc_info.value.response["Error"]
     assert err["Code"] == "ValidationException", err
     return err["Message"]
-
-
-def _listed(message: str) -> tuple[set[str], set[str]]:
-    m = LISTED.match(message)
-    assert m, message
-    return set(m.group(1).split(", ")), set(m.group(2).split(", "))
 
 
 @pytest.fixture(scope="module")
@@ -121,22 +115,22 @@ def _create(client, spec, table_keys, gsis=(), lsis=()):
     return lambda: client.create_table(**kwargs)
 
 
-# UpdateTable GSI Create: (definitions, index hash, index range, keys listed, definitions listed)
+# UpdateTable GSI Create: (definitions, index hash, index range, message)
 UPDATE_LISTED = [
-    ("range_missing", "pk:S g:S", "g", "r", {"g", "r"}, {"pk", "g"}),
-    ("hash_missing", "pk:S r:S", "g", "r", {"g", "r"}, {"pk", "r"}),
-    ("both_missing_two_defs", "pk:S z:S", "g", "r", {"g", "r"}, {"pk", "z"}),
-    ("both_missing_three_defs", "pk:S y:S z:S", "g", "r", {"g", "r"}, {"pk", "y", "z"}),
-    ("hash_only_missing", "pk:S", "g", None, {"g"}, {"pk"}),
-    ("other_types", "pk:S n:N b:B", "n", "x", {"n", "x"}, {"pk", "n", "b"}),
+    ("range_missing", "pk:S g:S", "g", "r", listed("r, g", "pk, g")),
+    ("hash_missing", "pk:S r:S", "g", "r", listed("r, g", "r, pk")),
+    ("both_missing_two_defs", "pk:S z:S", "g", "r", listed("r, g", "z, pk")),
+    ("both_missing_three_defs", "pk:S y:S z:S", "g", "r", listed("r, g", "y, z, pk")),
+    ("hash_only_missing", "pk:S", "g", None, listed("g", "pk")),
+    ("other_types", "pk:S n:N b:B", "n", "x", listed("x, n", "n, b, pk")),
+    ("service_order", "pk:S x:S", "g", "r", listed("r, g", "x, pk")),
 ]
 
 
-@pytest.mark.parametrize(("case", "spec", "h", "r", "keys", "names"), UPDATE_LISTED,
+@pytest.mark.parametrize(("case", "spec", "h", "r", "expected"), UPDATE_LISTED,
                          ids=[c[0] for c in UPDATE_LISTED])
-def test_update_table_lists_every_key_and_definition(dynamodb_client, table, case, spec, h, r, keys, names):
-    message = _message(_update(dynamodb_client, table, spec, ks(h, r)))
-    assert _listed(message) == (keys, names)
+def test_update_table_lists_every_key_and_definition(dynamodb_client, table, case, spec, h, r, expected):
+    assert _message(_update(dynamodb_client, table, spec, ks(h, r))) == expected
 
 
 @pytest.mark.parametrize(("spec", "h", "r"), [("pk:S", "g", "r"), ("pk:S", "pk", "r")],
@@ -174,33 +168,28 @@ def test_update_table_checks_in_the_service_order(dynamodb_client, case, spec, k
     assert _message(_update(dynamodb_client, NEVER_CREATED, spec, keys(key_spec))) == expected
 
 
-# CreateTable: (definitions, table keys, GSIs, LSIs, keys listed or None for the
-# key schema sentence, definitions listed)
+# CreateTable: (definitions, table keys, GSIs, LSIs, message)
 CREATE = [
-    ("gsi_range_missing", "pk:S g:S", ks("pk"), [ks("g", "r")], [], {"g", "r"}, {"pk", "g"}),
-    ("gsi_both_missing", "pk:S", ks("pk"), [ks("g", "r")], [], None, None),
-    ("table_sort_missing_one_def", "pk:S", ks("pk", "sk"), [], [], None, None),
-    ("table_sort_missing", "pk:S x:S", ks("pk", "sk"), [], [], {"pk", "sk"}, {"pk", "x"}),
-    ("table_pk_missing", "x:S", ks("pk"), [], [], {"pk"}, {"x"}),
-    ("table_before_gsi", "pk:S g:S", ks("pk", "sk"), [ks("g", "r")], [], {"pk", "sk"}, {"pk", "g"}),
-    ("table_before_lsi", "pk:S x:S", ks("pk", "sk"), [], [ks("pk", "l")], {"pk", "sk"}, {"pk", "x"}),
-    ("lsi_missing", "pk:S sk:S", ks("pk", "sk"), [], [ks("pk", "l")], {"pk", "l"}, {"pk", "sk"}),
+    ("gsi_range_missing", "pk:S g:S", ks("pk"), [ks("g", "r")], [], listed("r, g", "pk, g")),
+    ("gsi_both_missing", "pk:S", ks("pk"), [ks("g", "r")], [], INVALID),
+    ("table_sort_missing_one_def", "pk:S", ks("pk", "sk"), [], [], INVALID),
+    ("table_sort_missing", "pk:S x:S", ks("pk", "sk"), [], [], listed("sk, pk", "x, pk")),
+    ("table_pk_missing", "x:S", ks("pk"), [], [], listed("pk", "x")),
+    ("table_before_gsi", "pk:S g:S", ks("pk", "sk"), [ks("g", "r")], [], listed("sk, pk", "pk, g")),
+    ("table_before_lsi", "pk:S x:S", ks("pk", "sk"), [], [ks("pk", "l")], listed("sk, pk", "x, pk")),
+    ("lsi_missing", "pk:S sk:S", ks("pk", "sk"), [], [ks("pk", "l")], listed("l, pk", "sk, pk")),
     ("lsi_before_gsi", "pk:S sk:S g:S", ks("pk", "sk"), [ks("g", "r")], [ks("pk", "l")],
-     {"pk", "l"}, {"pk", "sk", "g"}),
+     listed("l, pk", "sk, pk, g")),
     ("first_gsi_first", "pk:S g:S h:S", ks("pk"), [ks("g", "r"), ks("h", "q")], [],
-     {"g", "r"}, {"pk", "g", "h"}),
+     listed("r, g", "h, pk, g")),
 ]
 
 
-@pytest.mark.parametrize(("case", "spec", "table_keys", "gsis", "lsis", "keys", "names"), CREATE,
+@pytest.mark.parametrize(("case", "spec", "table_keys", "gsis", "lsis", "expected"), CREATE,
                          ids=[c[0] for c in CREATE])
 def test_create_table_checks_each_key_schema_in_turn(dynamodb_client, case, spec, table_keys, gsis, lsis,
-                                                     keys, names):
-    message = _message(_create(dynamodb_client, spec, table_keys, gsis, lsis))
-    if keys is None:
-        assert message == INVALID
-    else:
-        assert _listed(message) == (keys, names)
+                                                     expected):
+    assert _message(_create(dynamodb_client, spec, table_keys, gsis, lsis)) == expected
 
 
 KEY_SCHEMA_LENGTH = ("1 validation error detected: Value '[KeySchemaElement(attributeName=a, keyType={}), "

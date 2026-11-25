@@ -549,7 +549,7 @@ mod tests {
                               AttributeDefinitions: [r, pk]";
         const LISTED_PK_G: &str = "One or more parameter values were invalid: Some index key \
                                    attributes are not defined in AttributeDefinitions. Keys: \
-                                   [g, r], AttributeDefinitions: [pk, g]";
+                                   [r, g], AttributeDefinitions: [pk, g]";
         const ABSENT: &str = "One or more parameter values were invalid: AttributeDefinitions \
                               is not specified for index: gix";
         let input = |keys: [&str; 2], defs: Option<&str>| -> UpdateTableInput {

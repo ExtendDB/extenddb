@@ -16,7 +16,7 @@
 //!    naming the name whose second definition comes first in the list.
 //! 4. A key with no definition answers `Some index key attributes are not
 //!    defined in AttributeDefinitions`, listing every key of the schema and
-//!    every definition.
+//!    every definition, each list in the order of [`listed`].
 //!
 //! An `UpdateTable` GSI `Create` runs the four in that order. `CreateTable`
 //! runs the first three on the table's key schema, after the table billing
@@ -25,9 +25,6 @@
 //! each GSI's in turn. The service checks each index's definitions before that
 //! index's shape (measured 2026-11-25), so a request with both faults in one
 //! index gets the shape sentence here.
-//!
-//! The service lists the keys and definitions in an order that follows neither
-//! the request nor the alphabet; ExtendDB lists them in request order.
 
 use std::collections::HashSet;
 
@@ -115,17 +112,59 @@ pub fn validate_keys_defined(
     {
         return Ok(());
     }
-    let keys: Vec<&str> = key_schema
-        .iter()
-        .map(|k| k.attribute_name.as_str())
-        .collect();
-    let names: Vec<&str> = defs.iter().map(|d| d.attribute_name.as_str()).collect();
+    let keys = listed(key_schema.iter().map(|k| k.attribute_name.as_str()));
+    let names = listed(defs.iter().map(|d| d.attribute_name.as_str()));
     Err(DynamoDbError::ValidationException(format!(
         "One or more parameter values were invalid: Some index key attributes are not defined in \
          AttributeDefinitions. Keys: [{}], AttributeDefinitions: [{}]",
         keys.join(", "),
         names.join(", ")
     )))
+}
+
+/// The order in which the service lists the names of a key schema or of
+/// `AttributeDefinitions`: the iteration order of a `java.util.HashMap`
+/// created with 4 buckets and load factor 0.75, into which the names go in
+/// request order. A name's bucket is `spread & (buckets - 1)`, where `spread`
+/// is the Java `String.hashCode` of the name over its UTF-16 code units,
+/// combined by XOR with itself shifted right by 16 bits. The table doubles
+/// when it holds more names than three quarters of its buckets, and when a
+/// bucket that holds eight names takes a ninth while the table has fewer than
+/// 64 buckets. The names come out bucket by bucket, in insertion order within a
+/// bucket (measured 2026-11-25, with lists of up to nine names in one bucket).
+/// A repeated name keeps its first position, as `HashMap::put` does. No
+/// measured list repeats a name.
+///
+/// Not modelled: a bucket that takes its ninth name in a table of 64 or more
+/// buckets. `HashMap` turns that bucket into a tree, which it iterates in
+/// another order. That needs at least 11 names, nine or more of them in one
+/// bucket.
+fn listed<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut seen = HashSet::new();
+    let mut entries: Vec<(&str, u32)> = Vec::new();
+    let mut buckets: u32 = 4;
+    for name in names {
+        if !seen.insert(name) {
+            continue;
+        }
+        let hash = name.encode_utf16().fold(0_u32, |h, unit| {
+            h.wrapping_mul(31).wrapping_add(u32::from(unit))
+        });
+        let spread = hash ^ (hash >> 16);
+        let mask = buckets - 1;
+        let crowded = buckets < 64
+            && entries
+                .iter()
+                .filter(|&&(_, s)| s & mask == spread & mask)
+                .count()
+                >= 8;
+        entries.push((name, spread));
+        if crowded || entries.len() > (buckets / 4 * 3) as usize {
+            buckets *= 2;
+        }
+    }
+    entries.sort_by_key(|&(_, s)| s & (buckets - 1));
+    entries.into_iter().map(|(name, _)| name).collect()
 }
 
 #[cfg(test)]
@@ -196,25 +235,63 @@ mod tests {
         assert!(validate_hash_and_range_differ(&ks("g", None)).is_ok());
     }
 
+    /// The lists of measured answers (2026-10-25 and 2026-11-25).
     #[test]
-    fn a_missing_key_lists_every_key_and_every_definition() {
-        assert_eq!(
-            message(validate_keys_defined(
-                &ks("g", Some("r")),
-                &defs(&["pk", "g"])
-            )),
-            "One or more parameter values were invalid: Some index key attributes are not defined \
-             in AttributeDefinitions. Keys: [g, r], AttributeDefinitions: [pk, g]"
-        );
-        // As many definitions as keys, none of them a key.
-        assert_eq!(
-            message(validate_keys_defined(
-                &ks("g", Some("r")),
-                &defs(&["pk", "z"])
-            )),
-            "One or more parameter values were invalid: Some index key attributes are not defined \
-             in AttributeDefinitions. Keys: [g, r], AttributeDefinitions: [pk, z]"
-        );
+    fn a_missing_key_lists_every_key_and_every_definition_in_the_service_order() {
+        for (schema, names, expected) in [
+            (
+                ks("g", Some("r")),
+                &["pk", "g"][..],
+                "Keys: [r, g], AttributeDefinitions: [pk, g]",
+            ),
+            (
+                ks("g", Some("r")),
+                &["pk", "z"][..],
+                "Keys: [r, g], AttributeDefinitions: [z, pk]",
+            ),
+            (
+                ks("pk", Some("sk")),
+                &["pk", "x"][..],
+                "Keys: [sk, pk], AttributeDefinitions: [x, pk]",
+            ),
+        ] {
+            assert_eq!(
+                message(validate_keys_defined(&schema, &defs(names))),
+                format!(
+                    "One or more parameter values were invalid: Some index key attributes are \
+                     not defined in AttributeDefinitions. {expected}"
+                )
+            );
+        }
         assert!(validate_keys_defined(&ks("g", Some("r")), &defs(&["r", "g"])).is_ok());
+    }
+
+    /// Request order in, the service's order out (measured 2026-11-25). The
+    /// last two lists put nine and eight names in one bucket of a 16-bucket
+    /// table: the ninth makes the table double, the eighth does not.
+    #[test]
+    fn lists_follow_the_measured_order() {
+        for (request, service) in [
+            (
+                "alpha beta gamma delta epsilon zeta eta theta",
+                "epsilon zeta eta alpha delta theta beta gamma",
+            ),
+            ("Zed apple Mango kiwi Ünï", "Zed Mango apple kiwi Ünï"),
+            ("pk id userId createdAt", "createdAt pk id userId"),
+            ("gsiPk gsiSk", "gsiSk gsiPk"),
+            ("pk sk g", "sk pk g"),
+            ("pk g h", "h pk g"),
+            ("pk n b", "n b pk"),
+            (
+                "kaaa kaaq kabb kabr kacc kacs kadd kadt kaee",
+                "kaaa kabb kacc kadd kaee kaaq kabr kacs kadt",
+            ),
+            (
+                "kaaa kaaq kabb kabr kacc kacs kadd kadt",
+                "kaaa kaaq kabb kabr kacc kacs kadd kadt",
+            ),
+        ] {
+            assert_eq!(listed(request.split(' ')).join(" "), service, "{request}");
+        }
     }
 }
