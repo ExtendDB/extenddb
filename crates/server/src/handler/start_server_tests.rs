@@ -141,6 +141,7 @@ async fn serve(
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let installed = observer.map(|o| o as Arc<dyn RequestObserver>);
     let (state, _) = build_state_with(
+        None,
         move |account_id| {
             Arc::new(SlowAuth {
                 account_id,

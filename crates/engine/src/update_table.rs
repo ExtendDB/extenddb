@@ -391,10 +391,7 @@ pub(crate) fn update_table_err_to_dynamo(
         // request. The backend supplies the whole message because only it knows
         // the state.
         StorageError::IndexesInUse(msg) => DynamoDbError::ResourceInUseException(msg),
-        // The backend already classified this failure into the service error
-        // vocabulary and chose the client-facing message. Pass it through
-        // unchanged; it is not a storage fault, so it is not logged as one.
-        StorageError::Service(e) => e,
+        StorageError::Service(e) => crate::create_table::service_err_to_dynamo(e),
         other => {
             log_storage_fault!(other, "storage internal error");
             DynamoDbError::InternalServerError("Internal server error".to_owned())

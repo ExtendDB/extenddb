@@ -147,6 +147,11 @@ pub async fn handle_update_time_to_live(
             let account_id = ctx.account_id.clone();
             let table_name = input.table_name.clone();
             let attr = input.time_to_live_specification.attribute_name.clone();
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "reached only when the backend reports Enabling; the SQLite backend, \
+                          the only one in the wasm build, reports Enabled or Disabled"
+            )]
             tokio::spawn(async move {
                 if let Err(e) = storage
                     .create_ttl_index(&account_id, &table_name, &attr)
@@ -226,10 +231,7 @@ pub(crate) fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
         StorageError::TableNotActive(name) => {
             DynamoDbError::ResourceInUseException(format!("Table {name} is not in ACTIVE state"))
         }
-        // The backend already classified this failure into the service error
-        // vocabulary and chose the client-facing message. Pass it through
-        // unchanged; it is not a storage fault, so it is not logged as one.
-        StorageError::Service(e) => e,
+        StorageError::Service(e) => crate::create_table::service_err_to_dynamo(e),
         other => {
             log_storage_fault!(other, "storage internal error");
             DynamoDbError::InternalServerError("Internal server error".to_owned())
@@ -240,53 +242,6 @@ pub(crate) fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // A backend-classified error reaches the client unchanged through the TTL
-    // mapper, keeping both its variant and its message.
-
-    #[test]
-    fn service_internal_server_error_passes_through() {
-        let err = storage_to_dynamo(StorageError::Service(DynamoDbError::InternalServerError(
-            "backend internal".to_owned(),
-        )));
-        match err {
-            DynamoDbError::InternalServerError(msg) => assert_eq!(msg, "backend internal"),
-            other => panic!("expected InternalServerError, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn service_service_unavailable_passes_through() {
-        let err = storage_to_dynamo(StorageError::Service(DynamoDbError::ServiceUnavailable(
-            "retry shortly".to_owned(),
-        )));
-        match err {
-            DynamoDbError::ServiceUnavailable(msg) => assert_eq!(msg, "retry shortly"),
-            other => panic!("expected ServiceUnavailable, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn service_limit_exceeded_passes_through() {
-        let err = storage_to_dynamo(StorageError::Service(
-            DynamoDbError::LimitExceededException("limit reached".to_owned()),
-        ));
-        match err {
-            DynamoDbError::LimitExceededException(msg) => assert_eq!(msg, "limit reached"),
-            other => panic!("expected LimitExceededException, got {other:?}"),
-        }
-    }
-
-    // Control: an unclassified driver error is still redacted behind the fixed
-    // string, with the driver text absent from the client message.
-    #[test]
-    fn internal_driver_text_is_redacted() {
-        let err = storage_to_dynamo(StorageError::Internal("driver text".to_owned()));
-        match err {
-            DynamoDbError::InternalServerError(msg) => assert_eq!(msg, "Internal server error"),
-            other => panic!("expected InternalServerError, got {other:?}"),
-        }
-    }
 
     #[test]
     fn valid_ttl_attribute_names() {

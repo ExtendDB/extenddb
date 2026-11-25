@@ -4,7 +4,7 @@
 //! Unit tests for `BuiltinAuthProvider::authenticate`.
 
 use super::*;
-use axum::http::{HeaderMap, HeaderValue};
+use http::{HeaderMap, HeaderValue};
 
 /// In-memory credential store for unit tests.
 struct MockCredentialStore {
@@ -75,7 +75,7 @@ async fn expired_session_returns_expired_token_exception() {
         credential: None,
         error: Some("The security token included in the request is expired"),
     };
-    let provider = BuiltinAuthProvider::new(store, "us-east-1");
+    let provider = provider_over(store);
     let headers = make_headers_with_auth("ASIAEXTENDDB00000000", Some("test-token-value"));
 
     let result = provider.authenticate(&headers, b"{}").await;
@@ -96,7 +96,7 @@ async fn nonexistent_key_returns_unrecognized_client() {
         credential: None,
         error: None,
     };
-    let provider = BuiltinAuthProvider::new(store, "us-east-1");
+    let provider = provider_over(store);
     let headers = make_headers_with_auth("AKIAXXXXXXXXXXXXXXXX", None);
 
     let result = provider.authenticate(&headers, b"{}").await;
@@ -150,14 +150,22 @@ fn signed_headers(access_key: &str, region: &str, token: Option<&str>, body: &[u
     headers
 }
 
-fn provider(is_session: bool) -> BuiltinAuthProvider<MockCredentialStore> {
-    BuiltinAuthProvider::new(
-        MockCredentialStore {
-            credential: Some(credential(is_session)),
-            error: None,
-        },
+fn provider(is_session: bool) -> BuiltinAuthProvider {
+    provider_over(MockCredentialStore {
+        credential: Some(credential(is_session)),
+        error: None,
+    })
+}
+
+/// A provider for a server in `us-east-1` whose credential cache passes every
+/// lookup through to `store`.
+fn provider_over(store: MockCredentialStore) -> BuiltinAuthProvider {
+    BuiltinAuthProvider::new(CachedCredentialStore::pass_through(
+        store,
+        extenddb_cache::SwrCacheConfig::default(),
         "us-east-1",
-    )
+        1,
+    ))
 }
 
 #[tokio::test]
@@ -320,14 +328,11 @@ async fn scope_wrong_in_region_and_service_reports_both() {
 }
 
 /// A provider whose store holds no credential at all.
-fn provider_without_credentials() -> BuiltinAuthProvider<MockCredentialStore> {
-    BuiltinAuthProvider::new(
-        MockCredentialStore {
-            credential: None,
-            error: None,
-        },
-        "us-east-1",
-    )
+fn provider_without_credentials() -> BuiltinAuthProvider {
+    provider_over(MockCredentialStore {
+        credential: None,
+        error: None,
+    })
 }
 
 /// Move the request date one hour into the past, re-signing the scope

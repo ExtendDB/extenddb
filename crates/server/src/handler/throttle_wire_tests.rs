@@ -3,6 +3,8 @@
 //! The server's own throttle refusal, driven through `handle_request` against
 //! an in-memory engine: the error class, the reasons field and its casing, the
 //! reason text and the table ARN the body carries for each bucket that refuses.
+//! Also the metrics `handle_request` records for a batch a backend throttled,
+//! against the engine tests' storage double.
 
 use std::sync::Arc;
 
@@ -55,13 +57,22 @@ fn cache_cfg(name: &'static str) -> extenddb_cache::SwrCacheConfig {
 /// `dev_mode` on. Returns the state and the account id the stub answers with,
 /// so the expected ARN can be formed.
 pub(super) async fn build_state() -> (Arc<AppState>, String) {
-    build_state_with(|account_id| Arc::new(StubAuth { account_id }), None).await
+    build_state_with(None, stub_auth, None).await
 }
 
-/// `build_state` with the auth provider built by `auth` from the bootstrapped
-/// default account id and an optional request observer, for a test that needs
-/// its own.
+/// The stub auth provider bound to `account_id`: `build_state`'s provider,
+/// and the one for a test that replaces the storage but not the auth.
+pub(super) fn stub_auth(account_id: String) -> Arc<dyn AuthProvider> {
+    Arc::new(StubAuth { account_id })
+}
+
+/// `build_state` with `storage`, when given, in place of the SQLite engine
+/// for the table and item calls (the catalog and the authorization stores
+/// stay on SQLite), with the auth provider built by `auth` from the
+/// bootstrapped default account id, and with an optional request observer,
+/// for a test that needs its own provider or observer.
 pub(super) async fn build_state_with(
+    storage: Option<Arc<dyn extenddb_storage::StorageEngine>>,
     auth: impl FnOnce(String) -> Arc<dyn AuthProvider>,
     request_observer: Option<Arc<dyn crate::extensions::RequestObserver>>,
 ) -> (Arc<AppState>, String) {
@@ -94,8 +105,9 @@ pub(super) async fn build_state_with(
             session_data: cache_cfg("session_data"),
         },
     ));
+    let engine = storage.unwrap_or_else(|| components.engine.clone());
     let table_key_info_cache = Arc::new(crate::CachedTableKeyInfoStore::pass_through(
-        components.engine.clone(),
+        engine.clone(),
         cache_cfg("table_key_info"),
     ));
     let limits = Arc::new(extenddb_core::limits::LimitsConfig::default());
@@ -107,7 +119,7 @@ pub(super) async fn build_state_with(
     ));
 
     let state = Arc::new(AppState {
-        storage: components.engine,
+        storage: engine,
         backup_runtime: Arc::new(extenddb_engine::BackupRuntime::new(1)),
         auth: auth(account_id.clone()),
         throttle,
@@ -208,9 +220,9 @@ async fn provisioned_write_throttle_names_the_table_arn() {
         json!({"ProvisionedThroughput": {"ReadCapacityUnits": 1, "WriteCapacityUnits": 1}}),
     )
     .await;
-    // The first write consumes the burst; the manager is drained directly
-    // rather than by many writes so the test does not depend on timing.
-    state.throttle.consume(&account_id, table, 0.0, 2.0);
+    // The manager is drained directly, far past the one second of burst,
+    // rather than by many writes, so the test does not depend on timing.
+    state.throttle.consume(&account_id, table, 0.0, 1.0e9);
     let (status, body) = call(
         &state,
         "PutItem",
@@ -242,7 +254,7 @@ async fn provisioned_read_throttle_names_the_read_reason() {
         json!({"ProvisionedThroughput": {"ReadCapacityUnits": 1, "WriteCapacityUnits": 1}}),
     )
     .await;
-    state.throttle.consume(&account_id, table, 2.0, 0.0);
+    state.throttle.consume(&account_id, table, 1.0e9, 0.0);
     let (status, body) = call(
         &state,
         "GetItem",
@@ -270,12 +282,14 @@ async fn on_demand_hot_key_write_names_the_key_range_and_read_carries_no_reasons
     let (state, account_id) = build_state().await;
     let table = "hot-key";
     create_table(&state, table, json!({"BillingMode": "PAY_PER_REQUEST"})).await;
-    // Drain the partition bucket for key "k" in both directions (its limits
-    // are 3,000 RCU and 1,000 WCU per second with one second of burst),
-    // leaving the table bucket at the default on-demand ceilings full.
+    // Drain the partition bucket for key "k" in both directions and leave
+    // the table bucket full: the drain runs while the table is not
+    // registered, and the request registers it again from DescribeTable, as
+    // after a restart.
+    state.throttle.remove_table(&account_id, table);
     state
         .throttle
-        .consume_with_partition(&account_id, table, 6_000.0, 2_000.0, Some("k"));
+        .consume_with_partition(&account_id, table, 1.0e9, 1.0e9, Some("k"));
     let (status, body) = call(
         &state,
         "PutItem",
@@ -325,7 +339,7 @@ async fn on_demand_caps_throttle_names_the_max_on_demand_limit() {
         }),
     )
     .await;
-    state.throttle.consume(&account_id, table, 2.0, 2.0);
+    state.throttle.consume(&account_id, table, 1.0e9, 1.0e9);
     for (operation, body, reason) in [
         (
             "Query",
@@ -375,7 +389,7 @@ async fn half_capped_table_reports_the_cap_for_its_direction_only() {
     )
     .await;
     // Drain the write cap of 1 and the default read ceiling of 12,000.
-    state.throttle.consume(&account_id, table, 24_000.0, 2.0);
+    state.throttle.consume(&account_id, table, 1.0e9, 1.0e9);
     let (status, body) = call(
         &state,
         "PutItem",
@@ -403,19 +417,17 @@ async fn half_capped_table_reports_the_cap_for_its_direction_only() {
 }
 
 /// The account bucket can refuse a request whose table the engine has never
-/// seen. An ARN naming a table in this account is reduced to the bare name
-/// before the resource is formed. A name outside the table name pattern is
-/// refused before the throttle, so it never carries a reasons list.
+/// seen. A `TableName` that is the ARN of a table in this account and Region
+/// names that table in the reasons list.
 #[tokio::test]
-async fn account_throttle_reduces_an_arn_name_and_omits_an_invalid_one() {
+async fn account_throttle_reason_names_the_table_of_an_arn() {
     let (state, account_id) = build_state().await;
     // Drain the account aggregate (its limits are the per-account maxima).
     state.throttle.consume(&account_id, "any", 1.0e9, 1.0e9);
-    let key = json!({"pk": {"S": "k"}});
     let (status, body) = call(
         &state,
         "GetItem",
-        json!({"TableName": arn(&account_id, "absent"), "Key": key}),
+        json!({"TableName": arn(&account_id, "absent"), "Key": {"pk": {"S": "k"}}}),
     )
     .await;
     assert_eq!(status, 400, "{body}");
@@ -427,19 +439,35 @@ async fn account_throttle_reduces_an_arn_name_and_omits_an_invalid_one() {
         body["ThrottlingReasons"],
         json!([{"reason": "TableReadAccountLimitExceeded", "resource": arn(&account_id, "absent")}])
     );
-    let (status, body) = call(
-        &state,
-        "GetItem",
-        json!({"TableName": "bad name!", "Key": key}),
-    )
-    .await;
-    assert_eq!(status, 400, "{body}");
-    // The table name check refuses this name before the throttle segment.
-    assert_eq!(
-        body["__type"],
-        "com.amazon.coral.validate#ValidationException"
-    );
-    assert!(body.get("ThrottlingReasons").is_none(), "{body}");
+}
+
+/// A `TableName` outside the table name rules is not throttled: with the
+/// account bucket drained, the server answers it as it did with capacity
+/// left, and with no reasons list. The service refuses such a name before
+/// any throttle (measured 2026-11-25 with GetItem and PutItem, twice each).
+#[tokio::test]
+async fn names_outside_the_table_name_rules_are_not_throttled() {
+    let (state, account_id) = build_state().await;
+    let long = "a".repeat(256);
+    let other_region = format!("arn:aws:dynamodb:eu-west-1:{account_id}:table/absent");
+    let mut requests = Vec::new();
+    for name in ["ab", "", long.as_str(), other_region.as_str()] {
+        requests.push((
+            "GetItem",
+            json!({"TableName": name, "Key": {"pk": {"S": "k"}}}),
+        ));
+        requests.push(("PutItem", json!({"TableName": name, "Item": item(16)})));
+    }
+    let mut with_capacity = Vec::new();
+    for (operation, request) in &requests {
+        with_capacity.push(call(&state, operation, request.clone()).await);
+    }
+    state.throttle.consume(&account_id, "any", 1.0e9, 1.0e9);
+    for ((operation, request), before) in requests.iter().zip(&with_capacity) {
+        let drained = call(&state, operation, request.clone()).await;
+        assert_eq!(&drained, before, "{operation} {request}");
+        assert_eq!(drained.0, 400, "{operation} {request}");
+    }
 }
 
 /// With capacity available the same requests succeed, so the refusals above
@@ -469,4 +497,65 @@ async fn requests_with_capacity_are_served() {
     .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["Item"]["pk"], json!({"S": "k"}));
+}
+
+#[path = "../../../engine/tests/batch_partial/failing_store.rs"]
+#[allow(dead_code)]
+mod failing_store;
+
+/// The metrics of a batch a backend throttled, read from the collector after
+/// `handle_request`. On a 200, one read or write throttle event per throttled
+/// entry, one data point per table, and no `ThrottledRequests`. When every
+/// entry was throttled, the same events, `ThrottledRequests` and no
+/// `UserErrors`. Each row: the operation, the request, the status, and the
+/// (sum, data points) expected for each metric.
+#[tokio::test]
+async fn a_batch_a_backend_throttled_records_the_throttle_metrics() {
+    use extenddb_core::metrics::MetricName;
+    let puts = |pks: &[&str]| -> Value {
+        pks.iter()
+            .map(|pk| json!({"PutRequest": {"Item": {"pk": {"S": pk}}}}))
+            .collect()
+    };
+    let keys = |pks: &[&str]| -> Value { pks.iter().map(|pk| json!({"pk": {"S": pk}})).collect() };
+    let rows = [
+        (
+            "BatchGetItem",
+            json!({"RequestItems": {"T": {"Keys": keys(&["k1", "k2", "k3"])}}}),
+            200,
+            [(2.0, 1), (0.0, 0), (0.0, 0), (0.0, 0)],
+        ),
+        (
+            "BatchWriteItem",
+            json!({"RequestItems": {"T": puts(&["p1", "k2"])}}),
+            200,
+            [(0.0, 0), (1.0, 1), (0.0, 0), (0.0, 0)],
+        ),
+        (
+            "BatchGetItem",
+            json!({"RequestItems": {"T": {"Keys": keys(&["k2", "k3"])}}}),
+            400,
+            [(2.0, 1), (0.0, 0), (1.0, 1), (0.0, 0)],
+        ),
+    ];
+    for (operation, request, status, expected) in rows {
+        let store = failing_store::FailingStore::throttling()
+            .with_items(&["k1", "k2", "k3"])
+            .failing_on(&["k2", "k3"]);
+        let (state, account_id) = build_state_with(Some(Arc::new(store)), stub_auth, None).await;
+        let (got, body) = call(&state, operation, request).await;
+        assert_eq!(got, status, "{operation}: {body}");
+        for (metric, want) in [
+            MetricName::ReadThrottleEvents,
+            MetricName::WriteThrottleEvents,
+            MetricName::ThrottledRequests,
+            MetricName::UserErrors,
+        ]
+        .into_iter()
+        .zip(expected)
+        {
+            let got = crate::throttle_helpers::points(&state.metrics, &account_id, metric, None);
+            assert_eq!(got, want, "{operation} {status}: {metric:?}");
+        }
+    }
 }

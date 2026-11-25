@@ -256,6 +256,18 @@ pub(super) fn rejected(result: Result<DispatchResult, DynamoDbError>) -> DynamoD
     }
 }
 
+/// A batch of two puts whose first write fails with a connection error, so
+/// nothing is applied and the batch is rejected: the client's error and the
+/// `table/pk` of the writes the double received.
+pub(crate) async fn batch_that_applies_nothing_after_a_connection_error()
+-> (DynamoDbError, Vec<String>) {
+    let down = StorageError::Connection("refused".to_owned());
+    let data = Scripted::new(vec![Err(down)]);
+    let items = json!({"t": [put("a"), put("b")]});
+    let err = rejected(run(&data, items, &["t"], found(&["t"])).await);
+    (err, data.writes())
+}
+
 /// The body of a batch that must have been answered with a 200.
 pub(super) fn answered(result: Result<DispatchResult, DynamoDbError>) -> DispatchResult {
     result.unwrap_or_else(|e| panic!("the batch must answer 200: {e:?}"))

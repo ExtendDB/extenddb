@@ -67,6 +67,7 @@ async fn observed_state(refuse_auth: bool) -> (Arc<AppState>, String, Arc<Record
     let observer = Arc::new(Recording::default());
     let installed: Arc<dyn RequestObserver> = Arc::clone(&observer) as Arc<dyn RequestObserver>;
     let (state, account_id) = build_state_with(
+        None,
         move |account_id| {
             Arc::new(SwitchAuth {
                 account_id,
@@ -287,6 +288,7 @@ async fn an_abandoned_request_is_recorded_with_status_zero() {
 #[tokio::test]
 async fn without_an_observer_the_request_is_served_as_before() {
     let (state, _) = build_state_with(
+        None,
         |account_id| {
             Arc::new(SwitchAuth {
                 account_id,
