@@ -310,3 +310,21 @@ fn a_token_without_a_stream_arn_gets_the_answer_the_authorization_layer_gives() 
         );
     }
 }
+
+// The shard lookup delegates a shard id within the length bound to
+// `storage_to_dynamo`, so a backend-classified error reaches the client as that
+// mapping gives it (`service_error_log_tests`).
+#[test]
+fn a_service_error_reaches_the_client_as_classified_through_the_shard_lookup() {
+    for (error, body) in crate::service_error_log_tests::rows() {
+        let got = super::shard_lookup_error(
+            65,
+            extenddb_storage::error::StorageError::Service(error.clone()),
+        );
+        assert_eq!(
+            extenddb_core::error::error_document(&got),
+            body,
+            "{error:?}"
+        );
+    }
+}

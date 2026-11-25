@@ -69,6 +69,8 @@ pub mod stream_capture;
 mod streams;
 mod streams_iterator_params;
 mod tagging;
+#[cfg(test)]
+mod test_tracing;
 mod transact_get_items;
 mod transact_write_helpers;
 mod transact_write_items;
@@ -203,10 +205,11 @@ pub(crate) fn serialize_output(
 /// Use this for storage calls that don't go through `storage_err_to_dynamo`
 /// (e.g., tagging, metadata operations that return `StorageError` directly).
 /// A [`StorageError::Service`] error is the backend's own classification of
-/// the failure and reaches the client unchanged, without the fault log line.
+/// the failure and reaches the client through
+/// [`create_table::service_err_to_dynamo`], without the fault log line.
 pub(crate) fn sanitize_storage_error(e: extenddb_storage::error::StorageError) -> DynamoDbError {
     if let extenddb_storage::error::StorageError::Service(e) = e {
-        return e;
+        return create_table::service_err_to_dynamo(e);
     }
     tracing::error!(internal_error = %e, "storage internal error");
     DynamoDbError::InternalServerError("Internal server error".to_owned())
@@ -657,19 +660,6 @@ mod sanitize_storage_error_tests {
     use super::sanitize_storage_error;
     use extenddb_core::error::DynamoDbError;
     use extenddb_storage::error::StorageError;
-
-    // The metadata and tagging paths map through this function; a
-    // backend-classified error keeps its variant and message there too.
-    #[test]
-    fn service_error_passes_through() {
-        let err = sanitize_storage_error(StorageError::Service(DynamoDbError::ServiceUnavailable(
-            "retry shortly".to_owned(),
-        )));
-        match err {
-            DynamoDbError::ServiceUnavailable(msg) => assert_eq!(msg, "retry shortly"),
-            other => panic!("expected ServiceUnavailable, got {other:?}"),
-        }
-    }
 
     // Control: every other variant is still redacted behind the fixed string.
     #[test]
