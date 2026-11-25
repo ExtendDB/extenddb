@@ -502,7 +502,7 @@ mod failing_store;
 /// (sum, data points) expected for each metric.
 #[tokio::test]
 async fn a_batch_a_backend_throttled_records_the_throttle_metrics() {
-    use extenddb_core::metrics::{MetricName, MetricsQuery, TimeWindow};
+    use extenddb_core::metrics::MetricName;
     let puts = |pks: &[&str]| -> Value {
         pks.iter()
             .map(|pk| json!({"PutRequest": {"Item": {"pk": {"S": pk}}}}))
@@ -545,16 +545,8 @@ async fn a_batch_a_backend_throttled_records_the_throttle_metrics() {
         .into_iter()
         .zip(expected)
         {
-            let points = state.metrics.query(&MetricsQuery {
-                account_id: Some(account_id.clone()),
-                metric: Some(metric),
-                window: Some(TimeWindow::AllTime),
-                ..Default::default()
-            });
-            let sum_and_count = points
-                .iter()
-                .fold((0.0, 0), |(sum, n), p| (sum + p.sum, n + p.count));
-            assert_eq!(sum_and_count, want, "{operation} {status}: {metric:?}");
+            let got = crate::throttle_helpers::points(&state.metrics, &account_id, metric, None);
+            assert_eq!(got, want, "{operation} {status}: {metric:?}");
         }
     }
 }

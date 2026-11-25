@@ -501,31 +501,37 @@ mod throttle_error_tests {
     }
 }
 
+/// The sum and the number of data points of `metric` for `account_id` and
+/// `table`, or for every table of the account with `None`.
+#[cfg(test)]
+pub(crate) fn points(
+    c: &extenddb_core::metrics::MetricsCollector,
+    account_id: &str,
+    metric: extenddb_core::metrics::MetricName,
+    table: Option<&str>,
+) -> (f64, u64) {
+    c.query(&extenddb_core::metrics::MetricsQuery {
+        account_id: Some(account_id.to_owned()),
+        table_name: table.map(str::to_owned),
+        metric: Some(metric),
+        window: Some(extenddb_core::metrics::TimeWindow::AllTime),
+        ..Default::default()
+    })
+    .iter()
+    .fold((0.0, 0), |(sum, count), s| (sum + s.sum, count + s.count))
+}
+
 #[cfg(test)]
 mod partial_batch_throttle_tests {
     use std::collections::BTreeMap;
 
-    use extenddb_core::metrics::{MetricName, MetricsCollector, MetricsQuery, TimeWindow};
+    use extenddb_core::metrics::{MetricName, MetricsCollector};
 
     use serde_json::json;
 
-    use super::{batch_entry_counts, record_partial_batch_throttle};
+    use super::{batch_entry_counts, points, record_partial_batch_throttle};
 
     const ACCOUNT: &str = "111111111111";
-
-    /// The sum and the number of data points of `metric` for `table`, or for
-    /// every table with `None`.
-    fn points(c: &MetricsCollector, metric: MetricName, table: Option<&str>) -> (f64, u64) {
-        c.query(&MetricsQuery {
-            account_id: Some(ACCOUNT.to_owned()),
-            table_name: table.map(str::to_owned),
-            metric: Some(metric),
-            window: Some(TimeWindow::AllTime),
-            ..Default::default()
-        })
-        .iter()
-        .fold((0.0, 0), |(sum, count), s| (sum + s.sum, count + s.count))
-    }
 
     /// CloudWatch counts each throttled entry of a batch as a read or write
     /// throttle event and leaves a partly served batch out of
@@ -556,7 +562,7 @@ mod partial_batch_throttle_tests {
             record_partial_batch_throttle(&c, ACCOUNT, operation, &throttled);
             let row = format!("{operation} {throttled:?}");
             assert_eq!(
-                points(&c, MetricName::ThrottledRequests, None),
+                points(&c, ACCOUNT, MetricName::ThrottledRequests, None),
                 (0.0, 0),
                 "{row}"
             );
@@ -567,10 +573,10 @@ mod partial_batch_throttle_tests {
                 let total = expected
                     .iter()
                     .fold((0.0, 0), |(sum, count), (_, (s, n))| (sum + s, count + n));
-                assert_eq!(points(&c, metric, None), total, "{row} {metric:?}");
+                assert_eq!(points(&c, ACCOUNT, metric, None), total, "{row} {metric:?}");
                 for (table, sum_and_points) in expected {
                     assert_eq!(
-                        points(&c, metric, Some(table)),
+                        points(&c, ACCOUNT, metric, Some(table)),
                         *sum_and_points,
                         "{row} {metric:?} {table}"
                     );
