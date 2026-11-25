@@ -85,8 +85,10 @@ const NAME_BOUNDS: (usize, usize) = (3, 255);
 
 /// The operations that count a table name in UTF-16 code units when they
 /// choose its length clause, so a character above U+FFFF counts twice
-/// (measured 2026-11-14 and 2026-11-18). The item operations count
-/// characters, as the gate does for every operation not listed here.
+/// (measured 2026-11-14 and 2026-11-18). The gate counts characters for every
+/// other operation. The service counts characters on GetItem and PutItem with
+/// their `Key` or `Item`, Query, Scan and TransactWriteItems (measured
+/// 2026-11-18), and on ListTables (measured 2026-11-25).
 const UTF16_LENGTH: [&str; 4] = ["CreateTable", "DeleteTable", "DescribeTable", "UpdateTable"];
 
 /// Refuse a table name outside the service's character pattern, in any field
