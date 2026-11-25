@@ -17,14 +17,17 @@ use crate::CassandraEngine;
 /// The control-plane sweep (`process_control_plane_transitions`) selects a
 /// `DELETING` row only once that deadline has passed, and takes it with
 /// [`CassandraEngine::renew_delete_lease`] from the deadline it read. Until
-/// then the row is left to the call that claimed it. A call that stops after
-/// the claim, because its process dies or a statement after the claim fails,
-/// leaves the row to the sweep, which removes the table after the deadline;
-/// with no deadline the sweep would never select the row, and the name would
-/// stay taken. A removal that stops part way, the call's or the sweep's,
-/// keeps the catalog row, since the row delete is its last statement, and a
-/// later pass takes the row over once the deadline written by the last
-/// claim or renewal has passed.
+/// then the row is left to the call that claimed it. When a statement of the
+/// removal fails after the claim or the take, the actor moves the deadline to
+/// the current time (`release_delete_lease`), so the sweep's next pass takes
+/// the row. A call that stops after the claim without an error, because its
+/// process stops or its request is dropped, leaves the row to the sweep,
+/// which removes the table after the deadline; with no deadline the sweep
+/// would never select the row, and the name would stay taken. A removal that
+/// stops part way, the call's or the sweep's, keeps the catalog row, since
+/// the row delete is its last statement, and a later pass takes the row over
+/// once the deadline written by the last claim, renewal or release has
+/// passed.
 ///
 /// The length decides how long a stopped call keeps the name refused, and
 /// how slow a call can be before the sweep takes the row over and runs the
@@ -146,6 +149,52 @@ impl CassandraEngine {
         held_ms: i64,
     ) -> Result<Option<i64>, StorageError> {
         let lease_until = lease_deadline_ms();
+        Ok(self
+            .swap_delete_deadline(account_id, table_name, table_id, held_ms, lease_until)
+            .await?
+            .then_some(lease_until))
+    }
+
+    /// Hands a row this actor holds back to the control-plane sweep after a
+    /// statement of its removal failed: moves the deadline `held_ms` that the
+    /// actor's claim, take or last renewal wrote to the current time, with the
+    /// compare-and-set the renewal uses, so the sweep's next pass selects the
+    /// row and takes it. The swap does not apply when the row was taken over
+    /// or removed since, and then there is nothing to hand back. A swap that
+    /// fails is logged, and the row waits for `held_ms` as it does when the
+    /// actor's process stops; so does a row whose renewal applied but whose
+    /// answer was lost, since its deadline is then not `held_ms`.
+    async fn release_delete_lease(
+        &self,
+        account_id: &str,
+        table_name: &str,
+        table_id: &str,
+        held_ms: i64,
+    ) {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if let Err(error) = self
+            .swap_delete_deadline(account_id, table_name, table_id, held_ms, now_ms)
+            .await
+        {
+            tracing::warn!(
+                "Removing table {table_name} (account {account_id}): handing the row to the \
+                 control-plane sweep failed: {error}; the sweep takes it after its deadline"
+            );
+        }
+    }
+
+    /// The compare-and-set of [`Self::renew_delete_lease`] and
+    /// [`Self::release_delete_lease`]: sets the row's deadline to `until_ms`
+    /// if the row still holds `table_id`, still reads `DELETING` and still
+    /// carries `held_ms`. Returns whether it applied.
+    async fn swap_delete_deadline(
+        &self,
+        account_id: &str,
+        table_name: &str,
+        table_id: &str,
+        held_ms: i64,
+        until_ms: i64,
+    ) -> Result<bool, StorageError> {
         let swap = format!(
             "UPDATE {}.tables SET status_transition_at = ? \
              WHERE account_id = ? AND table_name = ? \
@@ -155,10 +204,10 @@ impl CassandraEngine {
         let result = crate::cassandra_util::query_lwt(
             &self.session,
             &swap,
-            cdrs_tokio::query_values!(lease_until, account_id, table_name, table_id, held_ms),
+            cdrs_tokio::query_values!(until_ms, account_id, table_name, table_id, held_ms),
         )
         .await?;
-        Ok(crate::cassandra_util::lwt_applied(&result)?.then_some(lease_until))
+        crate::cassandra_util::lwt_applied(&result)
     }
 
     pub(crate) async fn delete_table_as(
@@ -283,14 +332,25 @@ impl CassandraEngine {
         // When the renewal inside does not apply, this call outlived its lease
         // and the control-plane sweep took the row over; the sweep finishes
         // the removal and the call answers with the description all the same.
-        self.remove_claimed_table(
-            account_id,
-            &input.table_name,
-            &table_id,
-            &description.table_arn,
-            lease,
-        )
-        .await?;
+        let removed = self
+            .remove_claimed_table(
+                account_id,
+                &input.table_name,
+                &table_id,
+                &description.table_arn,
+                lease,
+            )
+            .await;
+        if removed.is_err() && lease.is_some() {
+            // The failed removal handed the row back to the sweep. The wake
+            // has the poller start its next pass at once, and that pass
+            // takes the row and finishes the removal. A failure inside the
+            // sweep does not wake the poller: the poller runs that pass, and
+            // a wake from inside it would keep it polling every second for as
+            // long as the failure lasts.
+            self.control_plane_notify.notify_one();
+        }
+        removed?;
         Ok(description)
     }
 
@@ -312,6 +372,10 @@ impl CassandraEngine {
     /// actor whose lease was taken over, or whose row was removed or created
     /// again under the name, stops before that delete. It holds while the two
     /// statements after the renewal finish within the lease it wrote.
+    ///
+    /// When a statement fails, the actor hands the row back to the sweep
+    /// (`release_delete_lease`) before it returns the error, so the sweep's
+    /// next pass runs the removal again without waiting for the lease.
     pub(crate) async fn remove_claimed_table(
         &self,
         account_id: &str,
@@ -319,6 +383,29 @@ impl CassandraEngine {
         table_id: &str,
         table_arn: &str,
         lease: Option<i64>,
+    ) -> Result<bool, StorageError> {
+        let mut held = lease;
+        let removal = self
+            .run_removal(account_id, table_name, table_id, table_arn, &mut held)
+            .await;
+        if removal.is_err()
+            && let Some(held) = held
+        {
+            self.release_delete_lease(account_id, table_name, table_id, held)
+                .await;
+        }
+        removal
+    }
+
+    /// The statements of [`Self::remove_claimed_table`]. `held` is the
+    /// deadline the actor holds, which the renewal moves.
+    async fn run_removal(
+        &self,
+        account_id: &str,
+        table_name: &str,
+        table_id: &str,
+        table_arn: &str,
+        held: &mut Option<i64>,
     ) -> Result<bool, StorageError> {
         let catalog_keyspace = self.catalog_keyspace();
         // Catalog metadata and user data intentionally live in different
@@ -340,13 +427,14 @@ impl CassandraEngine {
         )
         .await?;
 
-        if let Some(held) = lease
-            && self
-                .renew_delete_lease(account_id, table_name, table_id, held)
+        if let Some(lease) = *held {
+            let Some(renewed) = self
+                .renew_delete_lease(account_id, table_name, table_id, lease)
                 .await?
-                .is_none()
-        {
-            return Ok(false);
+            else {
+                return Ok(false);
+            };
+            *held = Some(renewed);
         }
 
         // Delete tags for this table so they don't survive recreation under the same name.

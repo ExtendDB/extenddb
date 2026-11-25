@@ -406,3 +406,103 @@ async fn tag_rows(engine: &CassandraEngine, arn: &str) -> usize {
     )
     .await
 }
+
+/// A `DeleteTable` of a table with two indexes whose first index table drop
+/// fails, after the claim. The call answers that error and hands the row back
+/// to the sweep: the row's deadline is no later than the current time, so the
+/// sweep's next pass takes the row rather than waiting five minutes for the
+/// lease. The index tables go before their metadata, so the metadata outlives
+/// the failed drop, and that pass drops both index tables.
+#[cfg(feature = "test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delete_that_fails_after_its_claim_is_finished_by_the_next_sweep() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, &test_config().keyspace_prefix).await;
+    let id = account.account_id.clone();
+    let test = {
+        let (engine, id) = (engine.clone(), id.clone());
+        async move {
+            let name = "FailsAfterTheClaim";
+            let table = engine
+                .create_table(&id, gsi_input(name, 2))
+                .await
+                .expect("create the table");
+            activate(&engine, &id, name).await;
+            let index_tables = index_table_names(&engine, &table.table_id).await;
+            assert_eq!(tables_left(&engine, &id, &index_tables).await, 2);
+            let keyspace = engine.account_keyspace(&id);
+            extenddb_storage_cassandra::test_hooks::fail_next_index_table_drop(&keyspace);
+            match engine.delete_table(&id, delete_input(name)).await {
+                Err(extenddb_storage::error::StorageError::Internal(message)) => assert_eq!(
+                    message,
+                    format!("test hook: the drop of an index data table in {keyspace} failed")
+                ),
+                other => panic!("expected the failed drop's error, got {other:?}"),
+            }
+            assert_eq!(
+                row_status(&engine, &id, name).await.as_deref(),
+                Some("DELETING")
+            );
+            let deadline = row_deadline_ms(&engine, &id, name)
+                .await
+                .expect("the row keeps a deadline");
+            assert!(
+                deadline <= chrono::Utc::now().timestamp_millis(),
+                "the call hands the row to the sweep, but its deadline is {deadline}"
+            );
+
+            engine
+                .process_control_plane_transitions()
+                .await
+                .expect("the sweep");
+            // Another test's sweep may take the row first.
+            wait_for_row_gone(&engine, &id, name).await;
+            assert!(!data_table_exists(&engine, &id, &table.table_id).await);
+            assert_eq!(
+                tables_left(&engine, &id, &index_tables).await,
+                0,
+                "the sweep drops both index tables"
+            );
+        }
+    };
+    removing_rows_after(&engine, &id, test).await;
+}
+
+/// How many of `names` are tables in the account's keyspace.
+#[cfg(feature = "test-hooks")]
+async fn tables_left(engine: &CassandraEngine, account_id: &str, names: &[String]) -> usize {
+    let mut left = 0;
+    for name in names {
+        if crate::backup_engine::data_table_exists(engine, account_id, name).await {
+            left += 1;
+        }
+    }
+    left
+}
+
+/// The names of the index data tables of `table_id`, read from its index
+/// metadata.
+#[cfg(feature = "test-hooks")]
+async fn index_table_names(engine: &CassandraEngine, table_id: &str) -> Vec<String> {
+    use cdrs_tokio::types::IntoRustByName as _;
+    extenddb_storage_cassandra::cassandra_util::query_rows::<extenddb_storage::error::StorageError>(
+        &engine.session_arc(),
+        &format!(
+            "SELECT index_id FROM {}.indexes WHERE table_id = ?",
+            engine.catalog_keyspace()
+        ),
+        cdrs_tokio::query_values!(table_id),
+        "index ids",
+    )
+    .await
+    .expect("read the index metadata")
+    .iter()
+    .map(|row| {
+        let index_id: String = row.get_r_by_name("index_id").expect("index_id");
+        extenddb_storage_cassandra::data::ddl::index_table_name(&index_id)
+    })
+    .collect()
+}

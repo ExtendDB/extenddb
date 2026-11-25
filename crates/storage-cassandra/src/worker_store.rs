@@ -40,8 +40,8 @@ impl CassandraEngine {
     /// # Errors
     ///
     /// Returns [`StorageError`] if the catalog cannot be read or a row cannot
-    /// be parsed; a failure to remove one `DELETING` table is logged and the
-    /// table is left for a later pass.
+    /// be parsed; a failure to remove one `DELETING` table is logged, and the
+    /// removal hands the row to the next pass.
     pub async fn process_control_plane_transitions(
         &self,
     ) -> Result<Vec<(String, &'static str)>, StorageError> {
@@ -89,10 +89,11 @@ impl CassandraEngine {
             transitions.push((table_name, "CREATING → active"));
         }
 
-        // DELETING → removed. Only a DeleteTable claim and the renewals of it
-        // give a DELETING row a deadline, so a row here is a claim whose call
-        // stopped, a call still running past its lease, or a removal by an
-        // earlier pass that stopped part way.
+        // DELETING → removed. Only a DeleteTable claim, its renewals and the
+        // release of a failed removal give a DELETING row a deadline, so a row
+        // here is a claim whose call stopped, a call still running past its
+        // lease, or a removal by a call or an earlier pass that failed or
+        // stopped part way.
         let query = format!(
             "SELECT account_id, table_name, table_arn, table_id, \
              toUnixTimestamp(status_transition_at) AS deadline_ms \
@@ -152,9 +153,9 @@ impl CassandraEngine {
             match removal.await {
                 Ok(true) => transitions.push((table_name, "DELETING → deleted")),
                 Ok(false) => {}
-                // Logged and left, so one row that cannot be removed does not
-                // stop the rows after it. A later pass takes it again once this
-                // pass's lease has passed.
+                // Logged, so one row that cannot be removed does not stop the
+                // rows after it. A removal that fails hands the row back first,
+                // so the next pass takes it again.
                 Err(error) => tracing::warn!(
                     "Control-plane sweep: removing table {table_name} (account {account_id}): \
                      {error}; retrying on a later pass"

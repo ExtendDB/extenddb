@@ -281,6 +281,7 @@ impl CassandraEngine {
         account_keyspace: &str,
         index_id: &str,
     ) -> Result<(), StorageError> {
+        crate::test_hooks::index_table_drop_failure(account_keyspace)?;
         let idx_table = index_table_name(index_id);
         let ddl = format!("DROP TABLE IF EXISTS {account_keyspace}.{idx_table}");
 

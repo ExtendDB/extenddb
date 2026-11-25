@@ -62,7 +62,11 @@
 //!   serial re-read after it;
 //! * a pause in `set_backup_deleted` between its read of the row and its
 //!   lightweight transaction, so a test can move the row in that gap and see
-//!   the transaction's store condition send it under the root it names.
+//!   the transaction's store condition send it under the root it names;
+//! * an error on the next drop of an index data table in one account
+//!   keyspace, so a test can see a `DeleteTable` that fails after its claim
+//!   hand the row to the sweep, and the sweep drop the index tables the
+//!   failed call left.
 
 use std::time::Duration;
 
@@ -163,6 +167,7 @@ mod armed {
         pub(super) before_legacy_registration: HashMap<String, Arc<Pause>>,
         pub(super) convert_refusals: HashMap<String, usize>,
         pub(super) legacy_keys_page: Option<i32>,
+        pub(super) index_table_drop_failures: std::collections::HashSet<String>,
     }
 
     pub(super) static HOOKS: LazyLock<Mutex<Hooks>> = LazyLock::new(Mutex::default);
@@ -1020,4 +1025,30 @@ pub(crate) fn progress_write_fault(account_id: &str) -> Option<ProgressWriteFaul
         let _ = account_id;
         None
     }
+}
+
+/// Make the next drop of an index data table in `account_keyspace` fail with
+/// an error before it reaches Cassandra. Taken once, then disarmed.
+#[cfg(feature = "test-hooks")]
+pub fn fail_next_index_table_drop(account_keyspace: &str) {
+    armed::with_hooks(|hooks| {
+        hooks
+            .index_table_drop_failures
+            .insert(account_keyspace.to_owned());
+    });
+}
+
+/// The error the next index data table drop in `account_keyspace` fails
+/// with, if a test armed [`fail_next_index_table_drop`].
+pub(crate) fn index_table_drop_failure(account_keyspace: &str) -> Result<(), StorageError> {
+    #[cfg(feature = "test-hooks")]
+    {
+        if armed::with_hooks(|hooks| hooks.index_table_drop_failures.remove(account_keyspace)) {
+            return Err(StorageError::Internal(format!(
+                "test hook: the drop of an index data table in {account_keyspace} failed"
+            )));
+        }
+    }
+    let _ = account_keyspace;
+    Ok(())
 }
