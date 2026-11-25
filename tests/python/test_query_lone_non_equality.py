@@ -5,7 +5,7 @@
 
 Every row below is one measured on the service in us-east-1: the issue table
 rows on 2026-10-21, the rows of ``TestValueTypes`` and the two-clause
-``begins_with`` rows on 2026-11-01, the rest on 2026-10-23. Rows 427-8c, 5a
+``begins_with`` rows on 2026-11-01, the rest on 2026-10-23. Rows M8c, 5a
 and 5b were measured again on 2026-10-31 with the same answers. The table has
 HASH ``pk`` and RANGE ``sk``, an LSI ``lsi`` on RANGE ``ls``, an index
 ``single-idx`` with HASH ``g`` and RANGE ``s``, an index ``multi-idx`` with
@@ -36,7 +36,7 @@ On a schema with one HASH attribute, two conditions on one attribute are
 reported first. Then a wrong-typed value in the clause on the HASH attribute,
 and ``begins_with`` on a number HASH attribute in either clause, are reported
 before the key schema wording and after an unused value and an invalid
-``FilterExpression`` (rows 427-8c, 5a, 5b and 6, and ``TestValueTypes``). No
+``FilterExpression`` (rows M8c, 5a, 5b and 6, and ``TestValueTypes``). No
 other value is checked. On an index with several key attributes the HASH
 wording comes first (row 4, ``h > :n``).
 """
@@ -273,7 +273,7 @@ class TestMultiAttributeIndex:
 
 
 class TestMeasuredShapes:
-    """Rows 427-1 to 427-9, measured 2026-10-23: shapes the issue table did not cover."""
+    """Rows M1 to M9, measured 2026-10-23: shapes the issue table did not cover."""
 
     def test_table_partition_key_between(self, dynamodb_client, table):
         _refused(dynamodb_client, table, NOT_SUPPORTED, "pk BETWEEN :x AND :y")
@@ -298,7 +298,7 @@ class TestMeasuredShapes:
         _refused(dynamodb_client, request.getfixturevalue(fixture), message, expression)
 
     def test_number_value_on_a_string_key_reports_the_type(self, dynamodb_client, table):
-        # Row 427-8c: the type check comes before the key schema wording.
+        # Row M8c: the type check comes before the key schema wording.
         _refused_request(
             dynamodb_client,
             TYPE_MISMATCH,

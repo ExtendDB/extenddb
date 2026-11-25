@@ -101,7 +101,7 @@ fn string_index() -> (Vec<KeySchemaElement>, Vec<AttributeDefinition>) {
 
 #[test]
 fn single_attribute_schema_reports_a_wrong_typed_value_before_the_wording() {
-    // Row 427-8c.
+    // Row M8c.
     let (schema, definitions) = string_table();
     assert_refusals(
         &[("pk > :n", TYPE_MISMATCH), ("pk > :x", NOT_SUPPORTED)],
