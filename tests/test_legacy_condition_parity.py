@@ -4,7 +4,7 @@
 key schema, the number check on legacy values, and BatchGetItem capacity for
 absent keys. Every expected response was measured against Amazon DynamoDB in
 us-east-1 on 2026-10-24 (issue #477), and the cases marked 2026-10-31,
-2026-11-12 and 2026-11-24 on those dates.
+2026-11-12, 2026-11-24 and 2026-11-25 on those dates.
 """
 
 from __future__ import annotations
@@ -45,6 +45,37 @@ def _n(v):
 
 
 PK_X = {"pk": _cond("EQ", [_s("x")])}
+FF11 = "\uff11"
+
+
+def _in_each_legacy_map(label, value, error):
+    """`value` as the only value of an EQ condition in ScanFilter, QueryFilter
+    and KeyConditions: one row each for the missing table test."""
+    return [
+        pytest.param("scan", {"ScanFilter": {"x": _cond("EQ", [value])}}, error, id=f"scan_filter_{label}"),
+        pytest.param("query", {"KeyConditions": {"pk": _cond("EQ", [_s("a")])}, "QueryFilter": {"x": _cond("EQ", [value])}}, error, id=f"query_filter_{label}"),
+        pytest.param("query", {"KeyConditions": {"n": _cond("EQ", [value])}}, error, id=f"key_conditions_{label}"),
+    ]
+
+
+# Measured 2026-11-24: the service reads a Unicode decimal digit of the Basic
+# Multilingual Plane as the digit it stands for (#565), so these requests
+# reach the table lookup.
+DIGITS_READ = [("ff11", _n(FF11))]
+# Measured 2026-11-25: the service refuses the other characters outside ASCII
+# here before the table lookup, and names the value with its decimal digits
+# read. (id, N text, the text the message names)
+NOT_READ = [
+    ("e_acute", "\u00e9", "\u00e9"),
+    ("1_e_acute", "1\u00e9", "1\u00e9"),
+    ("a_ff11", "a" + FF11, "a1"),
+    ("superscript_two", "\u00b2", "\u00b2"),
+    ("vulgar_half", "\u00bd", "\u00bd"),
+    ("roman_one", "\u2160", "\u2160"),
+    ("fullwidth_minus_1", "\uff0d1", "\uff0d1"),
+    ("1_fullwidth_full_stop_5", "1\uff0e5", "1\uff0e5"),
+    ("bold_one_u1d7cf", "\U0001d7cf", "\U0001d7cf"),
+]
 
 
 def _validation_error(call):
@@ -206,11 +237,8 @@ class TestLegacyNumberValues:
         [
             pytest.param("scan", {"ScanFilter": {"a": _cond("EQ", [_n("abc")])}}, ("ValidationException", NOT_A_NUMBER.format("abc")), id="scan_filter_abc"),
             pytest.param("scan", {"ScanFilter": {"a": _cond("EQ", [_n("abc")])}, "IndexName": "nope"}, ("ValidationException", NOT_A_NUMBER.format("abc")), id="scan_filter_abc_on_an_index"),
-            # Measured 2026-11-24: the service reads U+FF11 as the digit one
-            # (#565), so the request reaches the table lookup.
-            pytest.param("query", {"KeyConditions": {"n": _cond("EQ", [_n("\uff11")])}}, TABLE_NOT_FOUND, id="key_conditions_ff11"),
-            pytest.param("query", {"KeyConditions": {"pk": _cond("EQ", [_s("a")])}, "QueryFilter": {"x": _cond("EQ", [_n("\uff11")])}}, TABLE_NOT_FOUND, id="query_filter_ff11"),
-            pytest.param("scan", {"ScanFilter": {"x": _cond("EQ", [_n("\uff11")])}}, TABLE_NOT_FOUND, id="scan_filter_ff11"),
+            *[row for label, value in DIGITS_READ for row in _in_each_legacy_map(label, value, TABLE_NOT_FOUND)],
+            *[row for label, raw, named in NOT_READ for row in _in_each_legacy_map(label, _n(raw), ("ValidationException", NOT_A_NUMBER.format(named)))],
         ],
     )
     def test_number_check_on_a_table_that_does_not_exist(self, dynamodb_client_no_validation, missing_table, operation, args, error):

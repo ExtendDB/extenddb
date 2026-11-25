@@ -523,9 +523,11 @@ const INVALID_PARAMS: &str = "One or more parameter values were invalid: ";
 /// (measured 2026-10-23 and 2026-10-24 on empty tables). In order:
 ///
 /// 1. every `N` in the value list, including inside `NS`, `L` and `M`, is a
-///    valid number (`The parameter cannot be converted to a numeric value:
-///    <raw>`, or the overflow, underflow and 38-digit messages; no prefix),
-///    or holds a character outside ASCII (see `condition_values`);
+///    valid number once each Unicode decimal digit of the Basic Multilingual
+///    Plane is read as the digit it stands for (`The parameter cannot be
+///    converted to a numeric value: <value>`, with those digits read, or the
+///    overflow, underflow and 38-digit messages; no prefix; see
+///    `condition_values`);
 /// 2. the operator is one of the thirteen (`Invalid comparison operator`);
 /// 3. the value count fits the operator: none for `NULL` and `NOT_NULL`, two
 ///    for `BETWEEN`, one or more for `IN`, one otherwise (`Invalid number of
@@ -554,7 +556,10 @@ pub fn validate_legacy_condition(
     operator: &str,
     values: &[AttributeValue],
 ) -> Result<(), DynamoDbError> {
-    extenddb_core::validation::number::operations::condition_values(values)?;
+    extenddb_core::validation::number::operations::condition_values(
+        values,
+        crate::decimal_digits::fold_decimal_digits,
+    )?;
     let refuse = |text: String| {
         Err(DynamoDbError::ValidationException(format!(
             "{INVALID_PARAMS}{text}"

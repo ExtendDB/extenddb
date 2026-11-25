@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Tests for the legacy condition validator; every expected message was
-//! measured against Amazon DynamoDB on 2026-10-23, 2026-10-24 and 2026-11-12.
+//! measured against Amazon DynamoDB on 2026-10-23, 2026-10-24, 2026-11-12,
+//! 2026-11-24 and 2026-11-25.
 
 use std::collections::BTreeMap;
 
@@ -265,9 +266,24 @@ fn numbers_are_checked_before_the_operator_checks() {
     );
     assert_eq!(msg("EQ", &[n("1")]), None);
     assert_eq!(msg("EQ", &[n("-1.5e3")]), None);
-    // A number holding a character outside ASCII is left to the later checks:
-    // the service reads U+FF11 as 1 (measured 2026-11-24).
+    // The service reads a Unicode decimal digit of the Basic Multilingual
+    // Plane as the digit it stands for, and names a refused value with those
+    // digits read. It refuses the other characters outside ASCII here
+    // (measured 2026-11-24 for U+FF11 and 2026-11-25 for the rest).
     assert_eq!(msg("EQ", &[n("\u{ff11}")]), None);
+    assert_eq!(msg("EQ", &[n("a\u{ff11}")]), bad("a1"));
+    for raw in [
+        "\u{e9}",
+        "1\u{e9}",
+        "\u{b2}",
+        "\u{bd}",
+        "\u{2160}",
+        "\u{ff0d}1",
+        "1\u{ff0e}5",
+        "\u{1d7cf}",
+    ] {
+        assert_eq!(msg("EQ", &[n(raw)]), bad(raw), "{raw:?}");
+    }
 }
 
 #[path = "legacy_filter_key_schema_tests.rs"]
