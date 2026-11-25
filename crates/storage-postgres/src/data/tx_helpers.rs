@@ -10,9 +10,9 @@ use extenddb_core::types::{
     AttributeValue, Item, StreamEventName, StreamRecord, StreamRecordData, StreamViewType,
     TableKeyInfo, item_size_bytes,
 };
-use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{SortKeyValue, parse_sk, pk_to_text, sk_column, sk_info};
+use extenddb_storage::{StoredToken, StreamCapture, cancelled_token_fingerprint};
 
 use super::index::db_error;
 use super::{data_table_name, json_to_item};
@@ -473,25 +473,77 @@ pub(super) async fn write_stream_record_to_shard_in_tx(
     Ok(())
 }
 
-/// Check an idempotency token within an existing transaction.
+/// Check an idempotency token within an existing transaction. The token is
+/// scoped to `account_id`. Returns `Ok(())` for a new token (inserted, or a
+/// stored row taken for this run), `Err(IdempotentReplay)` for a replay and
+/// `Err(IdempotentMismatch)` for another request's token.
 ///
-/// The token is scoped to `account_id`: the same token value from different
-/// accounts is stored and matched independently. Returns `Ok(())` for new
-/// tokens (inserted), `Err(IdempotentReplay)` for matching replays,
-/// `Err(IdempotentMismatch)` for fingerprint conflicts.
+/// Two sends of one request can reach this check at once (#851). The insert
+/// of the second send waits for the first send to commit and then locks the
+/// committed row, but the select of the same statement reads the snapshot
+/// from before that commit: no row, or the `cancelled:` row that the commit
+/// replaced ([`stale_read`]). The statement then runs once more. It does not
+/// wait, because this transaction holds the lock, and at READ COMMITTED it
+/// takes a new snapshot, which holds the locked row. At REPEATABLE READ or
+/// SERIALIZABLE, which a role, the database or the connection string can set
+/// (#570), the first statement fails with SQLSTATE 40001 instead, because the
+/// committed row is not in the transaction's snapshot, and the request is
+/// cancelled with `TransactionConflict` on every member. A second stale
+/// result is not expected at any level. If one comes, it answers
+/// `Err(TransactionInProgress)`, so that the request does not run twice.
 pub(super) async fn check_idempotency_token_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: &str,
     token: &str,
     fingerprint: &str,
 ) -> Result<(), StorageError> {
-    let row: Option<(String, bool)> = sqlx::query_as(
+    let mut row = run_token_statement(tx, account_id, token, fingerprint).await?;
+    if stale_read(row.as_ref(), fingerprint) {
+        row = run_token_statement(tx, account_id, token, fingerprint).await?;
+        if stale_read(row.as_ref(), fingerprint) {
+            return Err(StorageError::TransactionInProgress);
+        }
+    }
+
+    match row {
+        Some((_, true)) | None => Ok(()),
+        Some((stored, false)) => match StoredToken::of(&stored, fingerprint) {
+            StoredToken::Replay => Err(StorageError::IdempotentReplay),
+            StoredToken::Rerun | StoredToken::Mismatch => Err(StorageError::IdempotentMismatch),
+        },
+    }
+}
+
+/// A result of [`run_token_statement`] that a snapshot from before another
+/// send's commit gives: no row, or this request's `cancelled:` row that the
+/// statement did not take.
+fn stale_read(row: Option<&(String, bool)>, fingerprint: &str) -> bool {
+    match row {
+        None => true,
+        Some((stored, false)) => StoredToken::of(stored, fingerprint) == StoredToken::Rerun,
+        Some((_, true)) => false,
+    }
+}
+
+/// One statement of [`check_idempotency_token_in_tx`]: insert the token row,
+/// or take a stored row that is older than 10 minutes or that this request
+/// left cancelled (see `StoredToken::of`), and return it with `true`.
+/// Otherwise return the stored row with `false`, read with the statement's
+/// snapshot, or no row when that snapshot holds none less than 10 minutes old.
+async fn run_token_statement(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: &str,
+    token: &str,
+    fingerprint: &str,
+) -> Result<Option<(String, bool)>, StorageError> {
+    sqlx::query_as(
         r"WITH ins AS (
             INSERT INTO idempotency_tokens (account_id, token, fingerprint)
             VALUES ($1, $2, $3)
             ON CONFLICT (account_id, token) DO UPDATE
                 SET fingerprint = $3, created_at = NOW()
                 WHERE idempotency_tokens.created_at <= NOW() - INTERVAL '10 minutes'
+                   OR idempotency_tokens.fingerprint = $4
             RETURNING fingerprint, TRUE AS inserted
           )
           SELECT fingerprint, inserted FROM ins
@@ -507,13 +559,36 @@ pub(super) async fn check_idempotency_token_in_tx(
     .bind(account_id)
     .bind(token)
     .bind(fingerprint)
+    .bind(cancelled_token_fingerprint(fingerprint))
     .fetch_optional(&mut **tx)
     .await
-    .map_err(db_error)?;
+    .map_err(db_error)
+}
 
-    match row {
-        Some((_, true)) | None => Ok(()),
-        Some((stored, false)) if stored == fingerprint => Err(StorageError::IdempotentReplay),
-        Some((_, false)) => Err(StorageError::IdempotentMismatch),
-    }
+/// Keep a token used after its request was cancelled past the request-level
+/// key checks, once the request's transaction has rolled back: store it with
+/// [`cancelled_token_fingerprint`] and the time now, so the token stays used
+/// for 10 minutes from the last cancellation (measured 2026-11-05). A row
+/// another request or another send stored less than 10 minutes ago is kept.
+pub(super) async fn record_cancelled_token(
+    pool: &sqlx::PgPool,
+    account_id: &str,
+    token: &str,
+    fingerprint: &str,
+) -> Result<(), StorageError> {
+    sqlx::query(
+        r"INSERT INTO idempotency_tokens (account_id, token, fingerprint)
+          VALUES ($1, $2, $3)
+          ON CONFLICT (account_id, token) DO UPDATE
+              SET fingerprint = $3, created_at = NOW()
+              WHERE idempotency_tokens.created_at <= NOW() - INTERVAL '10 minutes'
+                 OR idempotency_tokens.fingerprint = $3",
+    )
+    .bind(account_id)
+    .bind(token)
+    .bind(cancelled_token_fingerprint(fingerprint))
+    .execute(pool)
+    .await
+    .map_err(db_error)?;
+    Ok(())
 }

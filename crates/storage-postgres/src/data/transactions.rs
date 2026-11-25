@@ -13,15 +13,19 @@ use extenddb_core::types::{
 use extenddb_core::validation;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::pk_to_text;
-use extenddb_storage::{IdempotencyKey, StreamCapture, TransactGetOp, TransactWriteOp};
+use extenddb_storage::{
+    IdempotencyKey, StreamCapture, TransactGetOp, TransactWriteOp, transact_first_empty_literal,
+    transact_key_check_pass, transact_op_empty_literal_checks, transact_op_key_checks,
+};
 
 use super::index::{
-    IndexMeta, db_error, enqueue_async_indexes, fetch_write_path_indexes, sync_indexes,
+    IndexMeta, db_error, enqueue_async_indexes, fetch_write_path_indexes, fresh_attr_defs,
+    sync_indexes,
 };
 use super::tx_helpers::{
     check_idempotency_token_in_tx, delete_item_in_tx, fetch_item_for_update, fetch_item_in_tx,
-    insert_item_if_absent_in_tx, stream_record_shard_in_tx, upsert_item_in_tx,
-    write_stream_record_to_shard_in_tx,
+    insert_item_if_absent_in_tx, record_cancelled_token, stream_record_shard_in_tx,
+    upsert_item_in_tx, write_stream_record_to_shard_in_tx,
 };
 use crate::PostgresEngine;
 use crate::pg_util::is_conflict_abort;
@@ -128,23 +132,54 @@ impl PostgresEngine {
         // applies to this transaction rather than up to 30 s later.
         let sys_delay = self.index_propagation_delay().await;
 
+        // Key checks first, for every member, before the token is checked and
+        // before any row is locked. They need only the request and the table
+        // metadata, and a fault among them decides the request under the
+        // service's precedence (the first such fault in request order) and
+        // leaves the token unused, so a request that is already decided never
+        // waits on a row another transaction holds.
+        transact_key_check_pass(ops.iter().map(|op| {
+            let indexes = &table_indexes[transact_op_table_name(op)];
+            transact_op_key_checks(
+                op,
+                &index_key_refs(indexes),
+                fresh_attr_defs(indexes, &transact_op_key_info(op).attribute_definitions),
+            )
+        }))?;
+        // The first Update member with an empty index-key literal. Only the
+        // members before it run: an empty value one of them writes from the
+        // item answers ahead of the literal, and no member after it is locked.
+        // A member before it waits on a row another transaction holds as any
+        // member does.
+        let empty_literal = transact_first_empty_literal(ops.iter().map(|op| {
+            transact_op_empty_literal_checks(
+                op,
+                &index_key_refs(&table_indexes[transact_op_table_name(op)]),
+            )
+        }));
+        let run = empty_literal.as_ref().map_or(ops.len(), |(p, _)| *p);
+
         let mut tx = self
             .data_pool
             .begin()
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        // A conflict abort outside the per-op loop cannot be tied to one item.
+        // A conflict abort outside the per-op loop cannot be tied to one item:
+        // `after_token_error` cancels every member and keeps the token used.
         // Unreachable at READ COMMITTED, where the ops already hold every row
         // lock; a stricter operator isolation can raise 40001 at commit.
-        let cancel_all = |e: StorageError| conflict_cancels_all(e, ops.len());
 
         // Check the idempotency token within the transaction so token storage
         // and data writes commit together. The token is scoped to its account.
-        if let Some(key) = idempotency {
-            check_idempotency_token_in_tx(&mut tx, key.account_id, key.token, key.fingerprint)
-                .await
-                .map_err(cancel_all)?;
+        if let Some(key) = idempotency
+            && let Err(e) =
+                check_idempotency_token_in_tx(&mut tx, key.account_id, key.token, key.fingerprint)
+                    .await
+        {
+            return Err(
+                after_token_error(&self.data_pool, Some(tx), idempotency, e, ops.len()).await,
+            );
         }
 
         let mut reasons: Vec<CancellationReason> = vec![CancellationReason::none(); ops.len()];
@@ -152,36 +187,15 @@ impl PostgresEngine {
         let mut op_items: Vec<(Option<Item>, Option<Item>)> = vec![(None, None); ops.len()];
         let mut any_failed = false;
         let mut failed_op: Option<(usize, StorageError)> = None;
-
-        // Key checks first, for every member, before any row is locked. They
-        // need only the request and the table metadata, and a fault among them
-        // decides the request under the service's precedence (a wrong-typed
-        // key on any member, else an empty index key on any member), so a
-        // request that is already decided never waits on a row another
-        // transaction holds.
-        {
-            let mut key_reasons: Vec<CancellationReason> =
-                vec![CancellationReason::none(); ops.len()];
-            let mut any_key_fault = false;
-            for (i, op) in ops.iter().enumerate() {
-                let indexes = &table_indexes[transact_op_table_name(op)];
-                if let Err(r) = transact_op_key_checks(op, indexes) {
-                    any_key_fault = true;
-                    key_reasons[i] = r;
-                }
-            }
-            if any_key_fault {
-                return Err(match CancellationReason::resolve_key_faults(key_reasons) {
-                    Ok(reasons) => StorageError::TransactionCanceled(reasons),
-                    Err(message) => StorageError::Validation(message),
-                });
-            }
+        if let Some((p, reason)) = &empty_literal {
+            any_failed = true;
+            reasons[*p] = reason.clone();
         }
 
         // Run the ops in key order, not request order, so every transaction
         // locks its items in one global order and two cannot deadlock on each
         // other. Results keep their request positions.
-        for i in execution_order(ops) {
+        for i in execution_order(ops).into_iter().filter(|&i| i < run) {
             let op = &ops[i];
             let indexes = &table_indexes[transact_op_table_name(op)];
             let reason = execute_transact_write_op(
@@ -211,8 +225,20 @@ impl PostgresEngine {
             if is_conflict_abort(&e) {
                 // PostgreSQL broke a lock conflict by aborting this transaction.
                 // Cancel it with the contended item named, as the service does.
+                // A member that ran earlier in execution order may have left an
+                // internal key fault (an Update's empty index key); the shared
+                // resolver ranks it as it does without the conflict, so no
+                // internal code reaches the client. The request passed the
+                // key checks, so its token stays used.
                 reasons[i] = CancellationReason::transaction_conflict();
-                return Err(StorageError::TransactionCanceled(reasons));
+                // End the aborted transaction first: its uncommitted token row
+                // would block the record below.
+                tx.rollback().await.map_err(db_error)?;
+                keep_cancelled_token(&self.data_pool, idempotency).await;
+                return Err(match CancellationReason::resolve_key_faults(reasons) {
+                    Ok(reasons) => StorageError::TransactionCanceled(reasons),
+                    Err(message) => StorageError::Validation(message),
+                });
             }
             // Infrastructure error: abort without leaking internal details
             // into cancellation reasons.
@@ -223,8 +249,11 @@ impl PostgresEngine {
             // Key faults left the members as internal reasons; the shared
             // resolver applies the service's cross-member precedence and
             // decides between a cancellation and a top-level
-            // ValidationException. Every member has run, so the first
-            // wrong-typed key in request order is the one named.
+            // ValidationException. The request passed the key checks, so
+            // its token stays used, as the service keeps it: roll back the
+            // writes, then record the token as cancelled.
+            tx.rollback().await.map_err(db_error)?;
+            keep_cancelled_token(&self.data_pool, idempotency).await;
             return Err(match CancellationReason::resolve_key_faults(reasons) {
                 Ok(reasons) => StorageError::TransactionCanceled(reasons),
                 Err(message) => StorageError::Validation(message),
@@ -245,14 +274,26 @@ impl PostgresEngine {
             if transact_op_stream(op).is_none() {
                 continue;
             }
-            let shard = stream_record_shard_in_tx(
+            let shard = match stream_record_shard_in_tx(
                 &mut tx,
                 transact_op_key_info(op),
                 old_item.as_ref(),
                 new_item.as_ref(),
             )
             .await
-            .map_err(cancel_all)?;
+            {
+                Ok(shard) => shard,
+                Err(e) => {
+                    return Err(after_token_error(
+                        &self.data_pool,
+                        Some(tx),
+                        idempotency,
+                        e,
+                        ops.len(),
+                    )
+                    .await);
+                }
+            };
             if let Some(shard) = shard {
                 records.push((shard, i));
             }
@@ -261,8 +302,8 @@ impl PostgresEngine {
         for (shard, i) in &records {
             let op = &ops[*i];
             let (old_item, new_item) = &op_items[*i];
-            if let Some(capture) = transact_op_stream(op) {
-                write_stream_record_to_shard_in_tx(
+            if let Some(capture) = transact_op_stream(op)
+                && let Err(e) = write_stream_record_to_shard_in_tx(
                     &mut tx,
                     transact_op_key_info(op),
                     capture,
@@ -271,7 +312,15 @@ impl PostgresEngine {
                     shard,
                 )
                 .await
-                .map_err(cancel_all)?;
+            {
+                return Err(after_token_error(
+                    &self.data_pool,
+                    Some(tx),
+                    idempotency,
+                    e,
+                    ops.len(),
+                )
+                .await);
             }
         }
 
@@ -282,13 +331,25 @@ impl PostgresEngine {
             for op in ops {
                 let name = transact_op_table_name(op);
                 if !missed.contains_key(name) {
-                    let found = super::gsi_build::missed_gsis(
+                    let found = match super::gsi_build::missed_gsis(
                         &self.pool,
                         transact_op_table_id(op),
                         &table_indexes[name],
                     )
                     .await
-                    .map_err(cancel_all)?;
+                    {
+                        Ok(found) => found,
+                        Err(e) => {
+                            return Err(after_token_error(
+                                &self.data_pool,
+                                Some(tx),
+                                idempotency,
+                                e,
+                                ops.len(),
+                            )
+                            .await);
+                        }
+                    };
                     missed.insert(name.to_owned(), found);
                 }
             }
@@ -309,7 +370,7 @@ impl PostgresEngine {
                 | TransactWriteOp::ConditionCheck { key_info, .. } => key_info,
             };
             // One row per async index, each honoring its own propagation delay.
-            let n = enqueue_async_indexes(
+            let n = match enqueue_async_indexes(
                 &mut tx,
                 key_info,
                 indexes,
@@ -318,14 +379,26 @@ impl PostgresEngine {
                 sys_delay,
             )
             .await
-            .map_err(cancel_all)?;
+            {
+                Ok(n) => n,
+                Err(e) => {
+                    return Err(after_token_error(
+                        &self.data_pool,
+                        Some(tx),
+                        idempotency,
+                        e,
+                        ops.len(),
+                    )
+                    .await);
+                }
+            };
 
             // Vector maintenance for all three write kinds in one place, rather
             // than in each branch above: this loop already visits exactly the ops
             // that changed an item, with both images in hand, and it runs inside
             // the same transaction. Three call sites would have been three chances
             // to diverge on which image is passed.
-            let vector_n = crate::data::vector_index::maintain_vector_indexes(
+            let vector_n = match crate::data::vector_index::maintain_vector_indexes(
                 &mut tx,
                 &table_vector_metas[transact_op_table_name(op)],
                 &key_info.table_id,
@@ -336,15 +409,37 @@ impl PostgresEngine {
                 sys_delay,
             )
             .await
-            .map_err(cancel_all)?;
+            {
+                Ok(n) => n,
+                Err(e) => {
+                    return Err(after_token_error(
+                        &self.data_pool,
+                        Some(tx),
+                        idempotency,
+                        e,
+                        ops.len(),
+                    )
+                    .await);
+                }
+            };
             let repair_n = match (
                 missed.get(transact_op_table_name(op)),
                 new_item.as_ref().or(old_item.as_ref()),
             ) {
                 (Some(m), Some(item)) if !m.is_empty() => {
-                    super::gsi_build::queue_repairs(&mut tx, key_info, m, item)
-                        .await
-                        .map_err(cancel_all)?
+                    match super::gsi_build::queue_repairs(&mut tx, key_info, m, item).await {
+                        Ok(n) => n,
+                        Err(e) => {
+                            return Err(after_token_error(
+                                &self.data_pool,
+                                Some(tx),
+                                idempotency,
+                                e,
+                                ops.len(),
+                            )
+                            .await);
+                        }
+                    }
                 }
                 _ => 0,
             };
@@ -353,7 +448,17 @@ impl PostgresEngine {
             }
         }
 
-        tx.commit().await.map_err(db_error).map_err(cancel_all)?;
+        if let Err(e) = tx.commit().await {
+            // A failed commit has ended the transaction already.
+            return Err(after_token_error(
+                &self.data_pool,
+                None,
+                idempotency,
+                db_error(e),
+                ops.len(),
+            )
+            .await);
+        }
 
         if needs_notify && let Some(ref q) = self.gsi_queue {
             q.notify_workers();
@@ -389,6 +494,45 @@ fn conflict_cancels_all(e: StorageError, n_ops: usize) -> StorageError {
     } else {
         e
     }
+}
+
+/// Keep the token of a request cancelled after the request-level key checks
+/// used, once its transaction has ended (`record_cancelled_token`). A failed
+/// write is logged: nothing was applied, so the request still answers its
+/// cancellation, and the token is left unused.
+async fn keep_cancelled_token(pool: &sqlx::PgPool, idempotency: Option<IdempotencyKey<'_>>) {
+    if let Some(key) = idempotency
+        && let Err(e) =
+            record_cancelled_token(pool, key.account_id, key.token, key.fingerprint).await
+    {
+        tracing::warn!("record_cancelled_token failed (the token stays unused): {e}");
+    }
+}
+
+/// An error after the token check, outside the member loop. A conflict abort
+/// cancels the request with `TransactionConflict` on every member and keeps
+/// its token used, as every cancellation after the key checks does (the
+/// service keeps a token used after `TransactionConflict`, measured
+/// 2026-11-05). `tx`, when the transaction has not ended yet, is rolled back
+/// first: its uncommitted token row would make the record wait. Any other
+/// error passes through, and `tx` rolls back when it is dropped.
+async fn after_token_error(
+    pool: &sqlx::PgPool,
+    tx: Option<sqlx::Transaction<'_, sqlx::Postgres>>,
+    idempotency: Option<IdempotencyKey<'_>>,
+    e: StorageError,
+    n_ops: usize,
+) -> StorageError {
+    if !is_conflict_abort(&e) {
+        return e;
+    }
+    if let Some(tx) = tx
+        && let Err(rollback) = tx.rollback().await
+    {
+        tracing::warn!("rollback after a conflict abort failed: {rollback}");
+    }
+    keep_cancelled_token(pool, idempotency).await;
+    conflict_cancels_all(e, n_ops)
 }
 
 /// Request positions of `ops`, sorted by table and primary key.
@@ -477,71 +621,6 @@ pub(super) fn index_key_refs(indexes: &[IndexMeta]) -> Vec<validation::IndexKeyR
         .collect()
 }
 
-/// The key checks a transaction member can fail before any row is read or
-/// locked: the table key's shape and types, and the secondary-index keys the
-/// member supplies in the request itself (a Put item's attributes, an Update
-/// statement's literal operands). Faults carry the internal reasons that
-/// `CancellationReason::resolve_key_faults` ranks. Values computed from the
-/// existing item are checked later, once the row is read.
-fn transact_op_key_checks(
-    op: &TransactWriteOp<'_>,
-    indexes: &[IndexMeta],
-) -> Result<(), CancellationReason> {
-    match op {
-        TransactWriteOp::Put { key_info, item, .. } => {
-            validation::validate_item_keys(
-                item,
-                &key_info.key_schema,
-                &key_info.attribute_definitions,
-            )
-            .map_err(|e| CancellationReason::key_type_mismatch(e.to_string()))?;
-            let idx_refs = index_key_refs(indexes);
-            validation::validate_index_key_types(
-                item,
-                &idx_refs,
-                super::index::fresh_attr_defs(indexes, &key_info.attribute_definitions),
-            )
-            .map_err(|e| CancellationReason::key_type_mismatch(e.to_string()))?;
-            validation::validate_index_key_not_empty(
-                item,
-                &idx_refs,
-                validation::SecondaryIndexEmptyContext::Item,
-            )
-            .map_err(|e| CancellationReason::index_key_empty_abort(e.to_string()))
-        }
-        TransactWriteOp::Update {
-            key_info,
-            key,
-            actions,
-            maps,
-            ..
-        } => {
-            validation::validate_batch_key_only(
-                key,
-                &key_info.key_schema,
-                &key_info.attribute_definitions,
-            )
-            .map_err(|e| CancellationReason::key_type_mismatch(e.to_string()))?;
-            validation::validate_index_key_literal_operands(
-                actions,
-                &index_key_refs(indexes),
-                super::index::fresh_attr_defs(indexes, &key_info.attribute_definitions),
-                maps,
-            )
-            .map_err(|e| CancellationReason::key_type_mismatch(e.to_string()))
-        }
-        TransactWriteOp::Delete { key_info, key, .. }
-        | TransactWriteOp::ConditionCheck { key_info, key, .. } => {
-            validation::validate_batch_key_only(
-                key,
-                &key_info.key_schema,
-                &key_info.attribute_definitions,
-            )
-            .map_err(|e| CancellationReason::key_type_mismatch(e.to_string()))
-        }
-    }
-}
-
 enum TxnOpError {
     /// User-driven failure — becomes a per-item cancellation reason.
     Cancel(CancellationReason),
@@ -582,7 +661,12 @@ async fn execute_transact_write_op(
             // reasons, matching real DynamoDB behavior.
             // Key checks ran in the pre-pass; repeated so the arm stays
             // correct if called on its own.
-            transact_op_key_checks(op, indexes).map_err(TxnOpError::Cancel)?;
+            transact_op_key_checks(
+                op,
+                &index_key_refs(indexes),
+                fresh_attr_defs(indexes, &key_info.attribute_definitions),
+            )
+            .map_err(TxnOpError::Cancel)?;
             let mut existing = fetch_item_for_update(tx, key_info, item)
                 .await
                 .map_err(TxnOpError::Storage)?;
@@ -727,8 +811,9 @@ async fn execute_transact_write_op(
             return_values_on_ccf,
             ..
         } => {
-            transact_op_key_checks(op, indexes).map_err(TxnOpError::Cancel)?;
             let idx_refs = index_key_refs(indexes);
+            let attr_defs = fresh_attr_defs(indexes, &key_info.attribute_definitions);
+            transact_op_key_checks(op, &idx_refs, attr_defs).map_err(TxnOpError::Cancel)?;
             let mut existing = fetch_item_for_update(tx, key_info, key)
                 .await
                 .map_err(TxnOpError::Storage)?;
@@ -764,18 +849,21 @@ async fn execute_transact_write_op(
                     .map_err(|e| {
                         TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
                     })?;
-                // Secondary-index keys on the written item: a value computed from
-                // the existing item (an attribute reference, the fallback of
-                // if_not_exists) of the wrong type, reported with the service's
-                // computed-value wording, and a key left empty.
-                validation::validate_index_key_types_after_update(
-                    &item,
-                    &idx_refs,
-                    super::index::fresh_attr_defs(indexes, &key_info.attribute_definitions),
-                )
-                .map_err(|e| {
-                    TxnOpError::Cancel(CancellationReason::key_type_mismatch(e.to_string()))
-                })?;
+                // Secondary-index keys on the written item: a wrong-typed value
+                // the statement wrote from an attribute reference or from
+                // if_not_exists, reported with the service's computed-value
+                // wording, and a key such a value leaves empty (an empty
+                // literal was found before any member ran). With the path
+                // absent the if_not_exists fallback is a literal from the
+                // request, which the service ranks with the values taken from
+                // the item. The type fault is a plain positional reason: the
+                // service leaves the other members' outcomes in place beside
+                // it, where a wrong type supplied in the request (the
+                // pre-pass) masks them.
+                validation::validate_index_key_types_after_update(&item, &idx_refs, attr_defs)
+                    .map_err(|e| {
+                        TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
+                    })?;
                 validation::validate_index_key_not_empty(
                     &item,
                     &idx_refs,

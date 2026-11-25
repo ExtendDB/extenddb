@@ -100,6 +100,8 @@ mod transact_write_stream_sequence;
 mod transact_write_stream_size_sweep;
 #[path = "direct/transact_write_stream_tables.rs"]
 mod transact_write_stream_tables;
+#[path = "direct/transact_write_tokens.rs"]
+mod transact_write_tokens;
 #[path = "direct/transaction_ledger.rs"]
 mod transaction_ledger;
 #[path = "direct/users.rs"]

@@ -1282,8 +1282,11 @@ second server refuses to start while another process holds the lock on
 `<database>.lock`. On Windows the server takes no lock (#642). PostgreSQL,
 SQLite and MongoDB keep a token for 10 minutes. On those backends every token
 that the release you upgrade or downgrade from stored expires at most 10
-minutes after its last server stops. The Cassandra backend does not expire
-tokens, so there a later retry with such a token gets these answers at any time.
+minutes after its last server stops. On Cassandra, this release writes each
+token row with a TTL of 600 seconds, so after a downgrade its tokens expire in
+the same way. Earlier releases wrote the token rows with no TTL, and those rows
+do not expire. So after an upgrade on Cassandra, a later retry with such a
+token gets these answers at any time.
 No catalog migration is required.
 
 ---

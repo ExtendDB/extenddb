@@ -293,7 +293,8 @@ pub(crate) const IDEMPOTENT_MISMATCH_MESSAGE: &str = "Specified idempotent token
 ///   without the field.
 ///
 /// PostgreSQL, SQLite and MongoDB keep a token for 10 minutes. Cassandra
-/// keeps it with no expiry.
+/// writes each token row with a TTL of 600 seconds. A Cassandra token row
+/// that an earlier version wrote has no TTL and does not expire.
 ///
 /// The keyed hash prevents an attacker from crafting a
 /// different request body that produces the same fingerprint for a given token.
