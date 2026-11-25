@@ -23,8 +23,10 @@
 //!   characters the message lists both clauses, the length first, joined by
 //!   `; ` under `2 validation errors detected:` (measured at `tableName`;
 //!   derived for the other locations). Locations: `tableName` for `TableName`,
-//!   `targetTableName`, `sourceTableName`, `tableCreationParameters.tableName`,
-//!   `exclusiveStartTableName`, `indexName` for `Query`, `Scan` and `SearchVectors`, and
+//!   `targetTableName` and `sourceTableName` of RestoreTableToPointInTime (a
+//!   RestoreTableFromBackup `TargetTableName` is described below),
+//!   `tableCreationParameters.tableName`, `exclusiveStartTableName`,
+//!   `indexName` for `Query`, `Scan` and `SearchVectors`, and
 //!   `transactItems.<n>.member.<op>.tableName` (1-based, `put`, `get`,
 //!   `delete`, `update`, `conditionCheck`). A name inside the pattern but of a
 //!   bad length is left to the engine handlers, whose answer the service's

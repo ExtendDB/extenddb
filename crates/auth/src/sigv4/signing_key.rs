@@ -11,16 +11,22 @@
 //! kSigning = HMAC(kService, "aws4_request")
 //! ```
 
-use aws_lc_rs::hmac;
 use zeroize::Zeroizing;
 
 /// Derive the `SigV4` signing key of `secret` into `out`.
 ///
 /// The prefixed secret and the three intermediate keys live in `Zeroizing`
-/// buffers and are wiped before this returns, so the only copy of key
-/// material left behind is in `out`. The caller passes a slot of the locked
-/// key store, or a `Zeroizing` buffer. (The tag that `hmac::sign` returns is
-/// a stack value this function cannot wipe.)
+/// buffers and are wiped before this returns. The caller passes `out` as a
+/// slot of the locked key store, or a `Zeroizing` buffer. Copies of key
+/// material this function cannot wipe are also left behind:
+///
+/// - the 32-byte array that `extenddb_core::crypto::hmac_sha256` returns for
+///   each step, and the tag its backend computes, on the stack;
+/// - copies of the key-derived state that the HMAC of each step can leave on
+///   the stack, with either backend, and on `wasm32` copies of its key as well
+///   (the README at the root of the repository this crate's manifest names,
+///   in its section "What it does not do", says what the `wasm32` backend can
+///   leave).
 ///
 /// # Arguments
 /// * `secret` - The plaintext secret access key.
@@ -70,11 +76,10 @@ pub fn compute_signature(signing_key: &[u8; 32], string_to_sign: &str) -> String
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8], out: &mut [u8; 32]) {
-    // HMAC-SHA256 accepts a key of any length (RFC 2104). `Key::new` panics
-    // only if AWS-LC cannot set up the HMAC context, which does not depend on
-    // the key. AWS-LC cleanses its copy of the key when `key` drops.
-    let key = hmac::Key::new(hmac::HMAC_SHA256, key);
-    out.copy_from_slice(hmac::sign(&key, data).as_ref());
+    // HMAC-SHA256 accepts a key of any length (RFC 2104). The shared crypto
+    // module chooses the backend (AWS-LC on the server, pure-Rust on wasm);
+    // what each can leave on the stack is listed on `derive_signing_key_into`.
+    out.copy_from_slice(&extenddb_core::crypto::hmac_sha256(key, data));
 }
 
 #[cfg(test)]
