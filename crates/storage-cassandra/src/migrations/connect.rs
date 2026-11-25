@@ -582,22 +582,26 @@ fn change_to(
     }
 }
 
+/// Whether `keyspace` is one of this deployment's account keyspaces:
+/// `<keyspace_prefix>_account_` and an account id. An account id is 12 ASCII
+/// digits (`generate_account_id`). Any other text after `account_` belongs to
+/// another deployment whose prefix starts with this one, such as
+/// `acme_account` for `acme`.
+pub(crate) fn is_account_keyspace(keyspace: &str, keyspace_prefix: &str) -> bool {
+    keyspace
+        .strip_prefix(keyspace_prefix)
+        .and_then(|r| r.strip_prefix("_account_"))
+        .is_some_and(extenddb_core::arn::is_account_id)
+}
+
 /// Whether `keyspace` is this deployment's catalog or one of its account
 /// keyspaces.
-fn is_deployment_keyspace(keyspace: &str, keyspace_prefix: &str) -> bool {
-    let Some(rest) = keyspace
-        .strip_prefix(keyspace_prefix)
-        .and_then(|r| r.strip_prefix('_'))
-    else {
-        return false;
-    };
-    // An account id is 12 ASCII digits (`generate_account_id`). Any other
-    // text after `account_` belongs to another deployment whose prefix
-    // starts with this one, such as `acme_account` for `acme`.
-    rest == "catalog"
-        || rest
-            .strip_prefix("account_")
-            .is_some_and(|id| id.len() == 12 && id.bytes().all(|b| b.is_ascii_digit()))
+pub(crate) fn is_deployment_keyspace(keyspace: &str, keyspace_prefix: &str) -> bool {
+    is_account_keyspace(keyspace, keyspace_prefix)
+        || keyspace
+            .strip_prefix(keyspace_prefix)
+            .and_then(|r| r.strip_prefix('_'))
+            == Some("catalog")
 }
 
 /// Whether a `system_schema` replication map is `NetworkTopologyStrategy`
@@ -632,8 +636,8 @@ mod tests {
     use extenddb_storage::migrations::{AdminRole, MigrationError, Target};
 
     use super::{
-        Deployment, ReplicationChange, TRANSIENT_CODES, change_to, is_deployment_keyspace,
-        replicates_as, replication_literal, retryable,
+        Deployment, ReplicationChange, TRANSIENT_CODES, change_to, is_account_keyspace,
+        is_deployment_keyspace, replicates_as, replication_literal, retryable,
     };
 
     /// A keyspace in the config's datacenter only is a raise or a lower. A
@@ -799,24 +803,70 @@ mod tests {
         }
     }
 
+    /// `migrate`, `verify` and `settings` reach the prefix through
+    /// `Deployment::from_target`: a prefix with an upper-case letter in the
+    /// connection string is the lower-case one Cassandra stores.
+    #[test]
+    fn a_deployment_takes_the_prefix_in_lower_case() {
+        let target = Target {
+            location: "user:pw@h1:9042/Acme_Prod".to_owned(),
+            ..Target::default()
+        };
+        let deployment = Deployment::from_target(&target).expect("a deployment");
+        assert_eq!(deployment.keyspace_prefix, "acme_prod");
+    }
+
+    /// Which keyspaces of a cluster belong to a deployment. Each row is
+    /// `(keyspace, is_account_keyspace, is_deployment_keyspace)`. The
+    /// `destroy` command and the workers use these two functions, so this
+    /// table is the test of the name rule.
     #[test]
     fn only_the_catalog_and_account_keyspaces_are_the_deployments() {
-        for keyspace in ["acme_catalog", "acme_account_123456789012"] {
-            assert!(is_deployment_keyspace(keyspace, "acme"), "{keyspace}");
-        }
-        for keyspace in [
-            "acme",
-            "acme_account_",
-            "acme_account_12345",
+        let acme = [
+            ("acme_catalog", false, true),
+            ("acme_account_123456789012", true, true),
+            ("acme_account_999999999999", true, true),
+            ("acme", false, false),
+            ("acme_account_", false, false),
+            ("acme_account_12345", false, false),
+            ("acme_account_1234567890123", false, false),
+            ("acme_account_12345678901a", false, false),
             // The deployment of prefix `acme_account`, not of `acme`.
-            "acme_account_catalog",
-            "acme_account_account_123456789012",
-            "acme_other",
-            "acmex_catalog",
-            "other_catalog",
-            "system_auth",
-        ] {
-            assert!(!is_deployment_keyspace(keyspace, "acme"), "{keyspace}");
+            ("acme_account_catalog", false, false),
+            ("acme_account_account_123456789012", false, false),
+            // The deployment of prefix `acme_test`, not of `acme`.
+            ("acme_test_catalog", false, false),
+            ("acme_test_account_123456789012", false, false),
+            // A keyspace that an operator made by hand.
+            ("acme_reports", false, false),
+            ("acme_other", false, false),
+            ("acmex_catalog", false, false),
+            ("other_catalog", false, false),
+            ("other_account_123456789012", false, false),
+            ("system", false, false),
+            ("system_auth", false, false),
+            ("system_schema", false, false),
+        ];
+        // A prefix that ends in `_catalog` is taken whole: the catalog
+        // keyspace of the prefix `a_catalog` is `a_catalog_catalog`.
+        let ends_in_catalog = [
+            ("a_catalog_catalog", false, true),
+            ("a_catalog_account_123456789012", true, true),
+            ("a_users", false, false),
+        ];
+        for (prefix, rows) in [("acme", acme.as_slice()), ("a_catalog", &ends_in_catalog)] {
+            for &(keyspace, account, deployment) in rows {
+                assert_eq!(
+                    is_account_keyspace(keyspace, prefix),
+                    account,
+                    "is_account_keyspace({keyspace}, {prefix})"
+                );
+                assert_eq!(
+                    is_deployment_keyspace(keyspace, prefix),
+                    deployment,
+                    "is_deployment_keyspace({keyspace}, {prefix})"
+                );
+            }
         }
     }
 }

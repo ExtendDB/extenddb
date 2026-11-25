@@ -49,12 +49,6 @@ enum PaginationBinds {
     BasePkAndSk { pk_text: String, sk: SortKeyValue },
 }
 
-/// Compute upper bound for `begins_with` on strings.
-/// Appends the maximum Unicode codepoint to create an exclusive upper bound.
-pub(super) fn string_upper_bound(prefix: &str) -> String {
-    format!("{prefix}\u{10FFFF}")
-}
-
 /// Compute upper bound for `begins_with` on binary data.
 /// Returns `None` when the prefix is empty or all-0xFF (no finite upper bound).
 pub(super) fn binary_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
