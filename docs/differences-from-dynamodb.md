@@ -121,7 +121,7 @@ from a request sent to that service or backend.
 
 ## Backup and Restore
 
-Measured against ExtendDB 0.1.14 with each backend (PostgreSQL, SQLite, MongoDB, Cassandra) on one host, database on loopback; timings compare the backends and do not predict a networked deployment. Two markers qualify entries: *(earlier build)* is a number measured on a pre-release build and not repeated on 0.1.14, and *(from the code)* is a statement from reading the code and storage-level tests rather than a running server. <!-- version-literal-ok: names the release the measurements were taken on -->
+Behaviour stated as measured, and every number below, was observed with release builds for each backend (PostgreSQL, SQLite, MongoDB, Cassandra) on one host with the database on loopback, except where a row says otherwise, so timings say how the backends compare, not what a networked deployment will see. Numbers marked *(earlier build)* were measured on an earlier build and not repeated on the final one. Sentences marked *(from the code)* rest on reading the code and on storage-level tests, not on a running server.
 
 | Area | DynamoDB | ExtendDB |
 |------|----------|------|
