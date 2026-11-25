@@ -12,12 +12,13 @@ use aws_sigv4::http_request::{
     PayloadChecksumKind, SignableBody, SignableRequest, SigningSettings, sign as sdk_sign,
 };
 use aws_sigv4::sign::v4;
-use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use extenddb_auth::sigv4::{canonical, parse};
 use extenddb_auth::{
-    AuthIdentity, AuthProvider, BuiltinAuthProvider, CredentialStore, StoredCredential,
+    AuthIdentity, AuthProvider, BuiltinAuthProvider, CachedCredentialStore, CredentialStore,
+    StoredCredential,
 };
 use extenddb_core::error::DynamoDbError;
+use http::{HeaderMap, HeaderName, HeaderValue};
 
 use crate::capture;
 
@@ -433,7 +434,12 @@ impl Authorization {
 /// The authentication call the HTTP layer makes for a DynamoDB request, on a
 /// server deployed as `SERVER_REGION`.
 pub fn authenticate(wire: &Wire) -> Result<AuthIdentity, DynamoDbError> {
-    let provider = BuiltinAuthProvider::new(MemoryStore, SERVER_REGION);
+    let provider = BuiltinAuthProvider::new(CachedCredentialStore::pass_through(
+        MemoryStore,
+        extenddb_cache::SwrCacheConfig::default(),
+        SERVER_REGION,
+        1,
+    ));
     futures::executor::block_on(provider.authenticate(&wire.header_map(), &wire.body))
 }
 

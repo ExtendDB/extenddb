@@ -65,7 +65,7 @@ default, `init` grants nothing, because every login role, including the
 application role, can then read and drop any keyspace and change any role's
 password, the superuser's included; use such a cluster for ExtendDB alone.
 Anyone who can read `extenddb.toml` holds the application role's password.
-A deployment created before 1.0 under `CassandraAuthorizer` needs the GRANT
+A deployment created before 0.1.15 under `CassandraAuthorizer` needs the GRANT
 statements in `docs/manuals/07-upgrade-manual.md` before it is upgraded.
 
 Run `extenddb init` once against a writable state volume. It connects as a

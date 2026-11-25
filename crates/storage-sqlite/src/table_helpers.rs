@@ -21,8 +21,8 @@ use crate::data;
 use crate::sqlite_util::parse_timestamp;
 use crate::store::SqliteEngine;
 
+sqlite_row_struct! {
 /// Catalog `tables` row (JSON columns as TEXT, timestamp as RFC 3339 TEXT).
-#[derive(sqlx::FromRow)]
 pub(crate) struct TableRow {
     pub table_name: String,
     pub key_schema: String,
@@ -44,9 +44,10 @@ pub(crate) struct TableRow {
     pub warm_throughput: Option<String>,
     pub status_transition_at: Option<String>,
 }
+}
 
+sqlite_row_struct! {
 /// Catalog `indexes` row.
-#[derive(sqlx::FromRow)]
 pub(crate) struct IndexRow {
     pub index_name: String,
     #[allow(dead_code)]
@@ -58,13 +59,14 @@ pub(crate) struct IndexRow {
     pub provisioned_throughput: Option<String>,
     pub warm_throughput: Option<String>,
 }
+}
 
+sqlite_row_struct! {
 /// A `vector_indexes` catalog row, in `FromRow` field order.
 ///
 /// Decoding stops at this struct: the rules that turn it into a wire shape are
 /// shared with the other backends in `extenddb_storage::vector_catalog`. The JSON
 /// columns are text here, so the conversion parses them into values.
-#[derive(sqlx::FromRow)]
 pub(crate) struct VectorIndexRow {
     pub index_name: String,
     #[allow(dead_code)]
@@ -76,6 +78,7 @@ pub(crate) struct VectorIndexRow {
     pub projection: String,
     pub index_status: String,
     pub backfilling: Option<i64>,
+}
 }
 
 impl VectorIndexRow {
@@ -285,11 +288,15 @@ impl SqliteEngine {
                 )));
             }
         };
+        let transition_at = row
+            .status_transition_at
+            .as_deref()
+            .map(parse_timestamp)
+            .transpose()
+            .map_err(|e| StorageError::Internal(format!("Parse status_transition_at: {e}")))?;
         let table_status = reported_status(
             stored_status,
-            row.status_transition_at
-                .as_deref()
-                .and_then(|at| parse_timestamp(at).ok()),
+            transition_at,
             time::OffsetDateTime::now_utc(),
         );
 
@@ -465,5 +472,78 @@ impl SqliteEngine {
                 restore_in_progress: *status == extenddb_core::types::TableStatus::Creating,
             },
         ))
+    }
+}
+
+#[cfg(test)]
+mod stored_value_tests {
+    use crate::SqliteEngine;
+    use extenddb_core::types::DescribeTableInput;
+    use extenddb_storage::TableEngine;
+    use extenddb_storage::error::StorageError;
+    use serde_json::json;
+
+    const ACCOUNT: &str = "000000000000";
+
+    /// An engine with table `t`, PROVISIONED 5/5 and ACTIVE, whose catalog
+    /// row then holds `value` in `column`.
+    async fn table_with(column: &str, value: &str) -> SqliteEngine {
+        let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
+            .await
+            .expect("engine");
+        crate::migrations::apply_for_tests(&engine.pool).await;
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0') \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .execute(&engine.pool)
+        .await
+        .expect("delay");
+        sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
+            .bind(ACCOUNT)
+            .execute(&engine.pool)
+            .await
+            .expect("account");
+        let input = serde_json::from_value(json!({
+            "TableName": "t",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PROVISIONED",
+            "ProvisionedThroughput": {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5}
+        }))
+        .expect("input");
+        engine
+            .create_table_impl(ACCOUNT, input, false)
+            .await
+            .expect("create table");
+        sqlx::query(&format!(
+            "UPDATE tables SET {column} = ? WHERE table_name = 't'"
+        ))
+        .bind(value)
+        .execute(&engine.pool)
+        .await
+        .expect("rewrite the row");
+        engine
+    }
+
+    /// A `status_transition_at` that does not parse is an error, as an
+    /// unknown `table_status` is, and not a table outside an UPDATING window.
+    #[tokio::test]
+    async fn a_status_transition_at_that_does_not_parse_is_an_error() {
+        let engine = table_with("status_transition_at", "soon").await;
+        let err = engine
+            .describe_table(
+                ACCOUNT,
+                DescribeTableInput {
+                    table_name: "t".to_owned(),
+                },
+            )
+            .await
+            .expect_err("the row is reported");
+        assert!(
+            matches!(&err, StorageError::Internal(m)
+                if m == "Parse status_transition_at: the 'year' component could not be parsed"),
+            "{err:?}"
+        );
     }
 }

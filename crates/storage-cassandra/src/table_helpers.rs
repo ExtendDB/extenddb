@@ -3,6 +3,8 @@
 
 //! Helper methods for `TableEngine` operations.
 
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use cdrs_tokio::types::{IntoRustByName, rows::Row};
 use extenddb_core::types::{
     BillingMode, BillingModeSummary, GsiDescription, LsiDescription,
@@ -37,7 +39,8 @@ impl CassandraEngine {
 
         let table_result = self
             .session
-            .query_with_values(
+            .run(
+                Stmt::Read,
                 &table_query,
                 cdrs_tokio::query_values!(account_id, table_name),
             )
@@ -66,7 +69,11 @@ impl CassandraEngine {
 
         let index_result = self
             .session
-            .query_with_values(&index_query, cdrs_tokio::query_values!(table_id.as_str()))
+            .run(
+                Stmt::Read,
+                &index_query,
+                cdrs_tokio::query_values!(table_id.as_str()),
+            )
             .await
             .map_err(|e| StorageError::Internal(format!("Query indexes failed: {e}")))?;
 
@@ -134,8 +141,9 @@ impl CassandraEngine {
                 )));
             }
         };
-        let transition_at: Option<i64> =
-            table_row.get_by_name("status_transition_at").ok().flatten();
+        let transition_at: Option<i64> = table_row
+            .get_by_name("status_transition_at")
+            .map_err(|e| StorageError::Internal(format!("Parse status_transition_at: {e}")))?;
         let table_status = reported_status(
             stored_status,
             transition_at,

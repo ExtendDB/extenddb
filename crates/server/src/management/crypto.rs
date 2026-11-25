@@ -1,17 +1,12 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared cryptographic helpers for the management API.
-//!
-//! Provides secret key generation for the temporary session credentials that
-//! `assume_role` issues, and re-exports the AES-256-GCM secret encryption that
-//! every storage backend uses, from `extenddb_storage::secret_cipher`.
+//! Shared cryptographic helpers for the management API: the secret key,
+//! session key ID and session token that `assume_role` issues. The secret is
+//! encrypted through the catalog store's key holder
+//! (`extenddb_storage::secret_keys::SecretKeys`).
 
 use rand::Rng;
-
-/// Encrypt a secret key under the base64 catalog encryption key, with the
-/// access key id as the AAD. Returns `nonce || ciphertext || tag`.
-pub use extenddb_storage::secret_cipher::encrypt_secret;
 
 /// Generate a 40-character secret access key branded with `extenddb` prefix.
 ///
