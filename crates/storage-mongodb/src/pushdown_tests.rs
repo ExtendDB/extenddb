@@ -232,34 +232,33 @@ fn or_chain(terms: usize) -> Expr {
 #[test]
 fn logical_nesting_past_the_limit_is_not_pushable() {
     let maps = maps_with(&[(":s", AttributeValue::S("x".into()))]);
+    // 65 terms nest 64 levels and are pushed down; 66 terms nest 65 levels
+    // and are not. Literal values, so a change of `MAX_LOGICAL_DEPTH` fails
+    // here.
+    assert_eq!(is_pushable(&or_chain(65), &maps), Pushable::Yes);
     assert_eq!(
-        is_pushable(&or_chain(MAX_LOGICAL_DEPTH + 1), &maps),
-        Pushable::Yes
-    );
-    assert_eq!(
-        is_pushable(&or_chain(MAX_LOGICAL_DEPTH + 2), &maps),
+        is_pushable(&or_chain(66), &maps),
         Pushable::No("AND, OR and NOT nest deeper than a MongoDB filter allows")
     );
     // A 150-term chain, which nested 149 `$or` levels in one filter.
     assert!(!is_pushable(&or_chain(150), &maps).is_yes());
-    // Depth 97, the first depth at which a chain of `contains` leaves fails
-    // on MongoDB, is refused whatever the limit is set to.
-    assert!(!is_pushable(&or_chain(98), &maps).is_yes());
-    // Depth is the deeper side's: the NOT on the left adds one level to a
-    // depth-1 side, the chain on the right sets the depth.
+    // 99 terms nest 98 levels. Depth 98 is the first at which MongoDB refuses
+    // a chain of `contains` leaves (a chain of equality leaves runs at depth
+    // 98 and is refused at 99), so it is refused whatever the limit is set to.
+    assert!(!is_pushable(&or_chain(99), &maps).is_yes());
+    // Depth is the deeper side's: the NOT on the left makes a depth-1 side,
+    // the 64-term chain on the right nests 63 levels, and the AND above it
+    // makes 64.
     let not_wrapped = Expr::And(
         Box::new(Expr::Not(Box::new(Expr::Function {
             name: "attribute_exists".into(),
             args: vec![path("a")],
         }))),
-        Box::new(or_chain(MAX_LOGICAL_DEPTH)),
+        Box::new(or_chain(64)),
     );
-    assert_eq!(logical_depth(&not_wrapped), MAX_LOGICAL_DEPTH);
-    // NOT counts as a level.
-    assert_eq!(
-        logical_depth(&Expr::Not(Box::new(or_chain(MAX_LOGICAL_DEPTH + 1)))),
-        MAX_LOGICAL_DEPTH + 1
-    );
+    assert_eq!(logical_depth(&not_wrapped), 64);
+    // NOT counts as a level: 65 terms nest 64 levels, and the NOT makes 65.
+    assert_eq!(logical_depth(&Expr::Not(Box::new(or_chain(65)))), 65);
 }
 
 #[test]
