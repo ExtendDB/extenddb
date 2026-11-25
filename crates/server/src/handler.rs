@@ -137,11 +137,15 @@ pub(crate) async fn handle_request(
     // the table name passes `check_table_name_chars`; a table name outside
     // its pattern answers first, from `authorize_request`, and no length
     // check applies to the table name here (#1462). The checked request goes
-    // to the engine at dispatch, so the checks run once.
+    // to the engine at dispatch, so the checks run once. A failure is recorded
+    // in the request metrics as an engine error is: the error, the request
+    // count and the latency segments, the checks' time as the dispatch
+    // segment.
     let mut checked_search = None;
     if operation == "SearchVectors"
         && crate::table_name_gate::check_table_name_chars(&operation, &input, &account_id).is_ok()
     {
+        let check_start = std::time::Instant::now();
         match extenddb_engine::check_search_vectors_request(
             &input,
             &state.storage,
@@ -152,6 +156,8 @@ pub(crate) async fn handle_request(
         {
             Ok(checked) => checked_search = Some(checked),
             Err(e) => {
+                #[allow(clippy::cast_precision_loss)]
+                let dispatch_us = check_start.elapsed().as_micros() as f64;
                 let metric_table = metric_table_name(&operation, &input, &state.limits);
                 record_error_metrics(
                     &state.metrics,
@@ -160,8 +166,27 @@ pub(crate) async fn handle_request(
                     metric_table.as_deref(),
                     &operation,
                 );
+                let response_start = std::time::Instant::now();
+                let response = error_response(&e, &request_id);
+                #[allow(clippy::cast_precision_loss)]
+                let response_us = response_start.elapsed().as_micros() as f64;
+                #[allow(clippy::cast_precision_loss)]
+                let total_us = handler_start.elapsed().as_micros() as f64;
                 state.metrics.record_request_count(&account_id, &operation);
-                return error_response(&e, &request_id);
+                state.metrics.record_segments(
+                    &account_id,
+                    &operation,
+                    metric_table.as_deref(),
+                    extenddb_core::metrics::LatencySegments {
+                        auth_us,
+                        authz_us: 0.0,
+                        throttle_us: 0.0,
+                        dispatch_us,
+                        response_us,
+                        total_us,
+                    },
+                );
+                return response;
             }
         }
     }
