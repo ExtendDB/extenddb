@@ -399,6 +399,18 @@ deployment, even when no catalog migration is required.
 
 No catalog migration or configuration change is required.
 
+### v1.1.0: PostgreSQL connections read `PGHOSTADDR`, `hostaddr=` and `.pgpass` as libpq does, and a source build needs Rust 1.94.0
+
+**What changed** (#1166). ExtendDB moves from sqlx 0.8.6 to 0.9.1, so the SQLite builds bundle SQLite 3.54.1 in place of 3.46.0. RUSTSEC-2026-0459 covers SQLite before 3.54.0. Five things change:
+
+- A build from source needs Rust 1.94.0 or later. 1.0.0 needed 1.91.1.
+- When the environment of the ExtendDB process sets `PGHOSTADDR` to an IP address, every PostgreSQL TCP connection goes to that address. This holds also when the connection string names a host. 1.0.0 read `PGHOSTADDR` only when the connection string named no host, and then used it as the host name.
+- A connection string with `hostaddr=` connects to that address and keeps its host name for TLS. 1.0.0 used the address as the host. One connection differs: the migration runner opens an admin connection to create the pgvector extension. That connection goes to the host name. When the string names no host, it goes to the host in `PGHOST`, or to the default host (#1165).
+- ExtendDB reads a password in `.pgpass` with libpq's escapes. A `.pgpass` password that contains `\` now reaches the server as another password. Write a literal backslash in `.pgpass` as `\\`.
+- The text of an error that PostgreSQL returns now ends with ` at line <n>` in the ExtendDB log and in command output. `<n>` is a line in the PostgreSQL source code. 1.0.0 showed the text without it.
+
+**Before upgrading** a PostgreSQL deployment, check that the environment of the ExtendDB process does not set `PGHOSTADDR`, unless every connection is to go to that address. Check that no `.pgpass` entry that ExtendDB reads has a `\` in its password. Check any log alert that matches the whole text of a PostgreSQL error. SQLite deployments get SQLite 3.54.1. MongoDB and Cassandra deployments see only the Rust version change, and only in a build from source. The upgrade needs no catalog migration and no configuration change.
+
 ### v1.0.0: Cassandra reads and writes at `LOCAL_QUORUM`
 
 **What changed.** The Cassandra backend runs its reads and writes at `LOCAL_QUORUM`. 0.1.15 ran many of them at `ONE`, the driver's default, in each area: items (the reads of GetItem, Query and Scan among them), transactions, TTL, streams, the catalog, IAM and `init`. A read with `ConsistentRead` `false` also runs at `LOCAL_QUORUM`. A lightweight transaction runs Paxos at `LOCAL_SERIAL` and commits at `LOCAL_QUORUM`. 0.1.15 ran many of its lightweight transactions at those levels already, and others, among them the admin user creation and most IAM writes, at the driver's defaults, `SERIAL` and `ONE`. Batches ran at `LOCAL_QUORUM` before and still do. No setting changes these levels (#945).
