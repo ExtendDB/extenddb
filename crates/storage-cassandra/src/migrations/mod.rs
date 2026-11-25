@@ -47,6 +47,7 @@ use extenddb_storage::migrations::{
 };
 
 pub use agreement::AGREEMENT_TIMEOUT;
+pub(crate) use agreement::wait_for_agreement;
 #[cfg(any(test, feature = "test-util"))]
 pub(crate) use backend::stopped;
 pub use backend::{CassandraMigrations, CassandraStores};
@@ -54,8 +55,8 @@ pub use commands::CassandraCatalogMigrations;
 pub(crate) use commands::lease_of;
 pub use connect::Deployment;
 pub(crate) use connect::{
-    LOCKED_DDL_TIMEOUT, REQUEST_TIMEOUT, alter_steps, cluster_datacenters, replication_differs,
-    tables_of,
+    LOCKED_DDL_TIMEOUT, REQUEST_TIMEOUT, alter_steps, cluster_datacenters, is_account_keyspace,
+    is_deployment_keyspace, replication_differs, tables_of,
 };
 // Public for the integration tests only.
 #[cfg(any(test, feature = "test-util"))]

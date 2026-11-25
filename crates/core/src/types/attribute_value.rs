@@ -68,9 +68,11 @@ impl<'de> Deserialize<'de> for AttributeValue {
 
 struct AttributeValueVisitor;
 
-const EMPTY_ATTRIBUTE_VALUE: &str =
+/// The deserializer's text for a value with no type descriptor.
+pub const EMPTY_ATTRIBUTE_VALUE: &str =
     "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes";
-const MULTI_ATTRIBUTE_VALUE: &str = "Supplied AttributeValue has more than one datatypes set, must contain exactly one of the supported datatypes";
+/// The deserializer's text for a value with more than one type descriptor.
+pub const MULTI_ATTRIBUTE_VALUE: &str = "Supplied AttributeValue has more than one datatypes set, must contain exactly one of the supported datatypes";
 
 impl<'de> Visitor<'de> for AttributeValueVisitor {
     type Value = AttributeValue;

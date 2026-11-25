@@ -388,6 +388,17 @@ Catalog upgrades change the schema; behavior changes alter how the running serve
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
 
+### v1.1.0: latency `segments` are summed into time buckets
+
+**What changed** (#398). The latency `segments` that `/metrics` and the console's `/console/metrics-data` return come from time buckets per account and operation. 1.0.0 kept one record per request for 24 hours. Each operation's count and means are still exact over the requests that the window covers. Four things change:
+
+- A window of `W` seconds returns at least the last `W` seconds and at most one bucket width more: up to 1 second more for `LastMinute` and `Last5Minutes`, and up to 60 seconds more for `LastHour` and `LastDay`. 1.0.0 cut each window exactly `W` seconds before the query.
+- `AllTime` returns the same as `LastDay`. 1.0.0 returned every record it held, 24 hours to 24 hours and 5 minutes of requests.
+- The operations are sorted by name. 1.0.0 returned them in no fixed order.
+- The segment memory is bounded: at most 111,488 bytes of buckets for each operation of each account that sent it in the last day, about 4.46 MB for an account that sends all 40 operations every second. 1.0.0 kept about 250 bytes for each request that reached dispatch in the last 24 hours, so the sizing rule in the deployment guide's [Process Memory](11-deployment-guide.md#process-memory) section stops applying after the upgrade.
+
+No catalog migration or configuration change is required.
+
 ### v1.1.0: a request refused in the authorization step counts in `UserErrors` and `RequestCount`
 
 **What changed.** A request the server refuses in its authorization step, before the IAM decision or by it, now records `UserErrors` and `RequestCount` under the account and the operation, as a request the engine refuses does. The refusals in that step are a `TableName`, index name or ARN that breaks the naming rules, a batch or transaction outside its count limits, a malformed stream, backup, export or tag ARN, a shard iterator the server cannot read, a resource in another account, and the IAM denial itself (`AccessDeniedException`). 1.0.0 answered each of them with the same HTTP 400 and recorded no metric for it. A storage fault during the key lookup of that step records `SystemErrors` and `RequestCount`. The DynamoDB metrics documentation counts every request answered with an HTTP 400 in `UserErrors`.
@@ -1235,6 +1246,51 @@ DescribeStream and GetShardIterator now refuse a client-built `StreamArn` with t
 - Expression nesting depth (#1000). Each parenthesis and each `if_not_exists` or `list_append` call in an `UpdateExpression`, and each nested `size` call in a condition or filter, counts one level against `max_expression_depth` under `[limits]` (default 150). Past it the request gets `ValidationException` "Invalid UpdateExpression: expression nesting depth exceeded" (or "Invalid ConditionExpression: ..." or "Invalid FilterExpression: ..."), and nothing is written. Earlier releases had no limit there, and a debug build of the server stopped with a stack overflow on 681 nested parentheses in a `SET` value. PartiQL, new in this release, applies the same limit: at the default, a PartiQL `UPDATE` with 76 or more nested `if_not_exists(a, a + ...)` steps gets `ValidationException` "expression nesting depth exceeded".
 
 **Who is affected.** A client that sends malformed numbers, names or ARNs, or deeply nested expressions, and relied on the earlier answer: it now gets `ValidationException`, and its batch or transaction writes nothing. A client that matches error text changes for the messages above. An item stored under an invalid number key before the upgrade can be read only by Scan or Query, which do not check the number yet, and removed only with its table. No catalog migration is required.
+
+---
+
+### v1.1.0: a `ClientRequestToken` retry compares `ReturnConsumedCapacity` and `ReturnItemCollectionMetrics`
+
+**What changed.** `TransactWriteItems` decides whether a request with a known
+`ClientRequestToken` is a replay. It compares a fingerprint of the request with
+the fingerprint stored for the token. Before this release the fingerprint
+covered `TransactItems` only. It now also covers `ReturnConsumedCapacity` when
+the value is `TOTAL` or `INDEXES`, and `ReturnItemCollectionMetrics` when the
+value is `SIZE`. A retry that keeps the token and the items but changes either
+field now answers `IdempotentParameterMismatchException`, as Amazon DynamoDB
+does (measured 2026-10-24). Earlier releases served it as a replay. A request
+with neither field, or with both set to `NONE`, has the same fingerprint as in
+earlier releases. An `ExecuteTransaction` write uses the same fingerprint with
+the request's `ReturnConsumedCapacity`, and the service answers its retries the
+same way (measured 2026-11-10).
+
+**Who is affected.** Clients that retry a `TransactWriteItems` or
+`ExecuteTransaction` request with the same token across an upgrade or a
+downgrade. The change affects requests that set `ReturnConsumedCapacity` to
+`TOTAL` or `INDEXES`, or `ReturnItemCollectionMetrics` to `SIZE`. 0.1.15 and
+1.0.0 serve `ExecuteTransaction` with the earlier fingerprint. A token that
+either release stored for an `ExecuteTransaction` write therefore gets the same
+answers as one stored for a `TransactWriteItems` request.
+
+**Impact.** After an upgrade, a token that the earlier release stored for such
+a request answers `IdempotentParameterMismatchException` to an identical retry.
+The server replays a retry without the field. After a downgrade, a token that
+this release stored for such a request answers
+`IdempotentParameterMismatchException` to every retry. This includes an
+identical retry and a retry without the field. A token for a request with
+neither field, or with both set to `NONE`, replays in both directions. On
+PostgreSQL, MongoDB and Cassandra nothing stops servers of both releases from
+sharing one database during a rolling upgrade (see the deployment guide's
+[Multi-Instance Considerations](11-deployment-guide.md#multi-instance-considerations)).
+A retry that reaches a server of the other release then gets the same answers.
+On SQLite, run the two releases one after the other. On Linux and macOS a
+second server refuses to start while another process holds the lock on
+`<database>.lock`. On Windows the server takes no lock (#642). PostgreSQL,
+SQLite and MongoDB keep a token for 10 minutes. On those backends every token
+that the release you upgrade or downgrade from stored expires at most 10
+minutes after its last server stops. The Cassandra backend does not expire
+tokens, so there a later retry with such a token gets these answers at any time.
+No catalog migration is required.
 
 ---
 
