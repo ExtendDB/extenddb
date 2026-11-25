@@ -187,14 +187,12 @@ pub struct VectorSearch<'a> {
     /// on every search against such an index. Backends may therefore treat
     /// `Some` as a mandatory predicate rather than a hint.
     pub hash_key: Option<(&'a str, &'a AttributeValue)>,
-    /// Equality filters over the index's inline-filter attributes, combined
-    /// with logical AND. Empty means no additional filtering.
+    /// Equalities on String and Binary values over the index's inline-filter
+    /// attributes, combined with logical AND, which the backend applies in
+    /// its own query. Empty means no additional filtering.
     ///
-    /// Equality only, deliberately. The wire surface accepts a filter
-    /// expression, which the engine parses and lowers to these pairs; that is
-    /// lossless today because only exact-match conditions are supported, and
-    /// range or function conditions are rejected before reaching a backend. If
-    /// the service ever admits range conditions this type must widen.
+    /// Every other condition of a search condition, a range, `IN`, `OR`,
+    /// `NOT`, a function or a Number equality, arrives as `item_filter`.
     pub filters: &'a [(&'a str, &'a AttributeValue)],
     /// A condition each candidate must satisfy before it is ranked, for a
     /// search condition that `filters` cannot express. `None` means no

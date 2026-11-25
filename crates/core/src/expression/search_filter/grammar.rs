@@ -79,7 +79,11 @@ pub(super) enum Node {
 
 // A tree can be as deep as the expression is long, and the drop glue of a
 // `Box` chain recurses once per level. These drops move the children onto a
-// heap stack instead, so dropping never recurses.
+// heap stack instead, so dropping a `Node` never recurses. The steps after
+// the checks still recurse: `rules::lower`, the evaluator that
+// `SearchFilter::matches` calls and the drop of the lowered `Expr` take one
+// frame per level. The operator limit bounds that depth: an accepted
+// condition has at most 300 operators, so at most 300 levels.
 
 impl Drop for Node {
     fn drop(&mut self) {
