@@ -1135,6 +1135,31 @@ fn parse_restore_table_overrides(body: &Value) -> Result<RestoreTableOverrides, 
     })
 }
 
+/// The `SerializationException` the overrides' parse gives a top-level override
+/// member whose JSON kind is not the model's. The parse reads a
+/// `ProvisionedThroughputOverride` list of two integers and a
+/// `BillingModeOverride` object of one key with no error (#1106). Reads no
+/// storage.
+pub fn check_restore_override_kinds(body: &Value) -> Result<(), DynamoDbError> {
+    let wrong_kinds: serde_json::Map<String, Value> = body
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(member, value)| match member.as_str() {
+            "BillingModeOverride" => !value.is_string(),
+            "GlobalSecondaryIndexOverride" | "LocalSecondaryIndexOverride" => !value.is_array(),
+            "ProvisionedThroughputOverride"
+            | "OnDemandThroughputOverride"
+            | "SSESpecificationOverride" => !value.is_object(),
+            _ => false,
+        })
+        .map(|(member, value)| (member.clone(), value.clone()))
+        .collect();
+    let wrong_kinds = Value::Object(wrong_kinds);
+    parse_restore_table_overrides(&wrong_kinds)?;
+    overrides::IndexOverrides::parse(&wrong_kinds).map(drop)
+}
+
 /// Handle `RestoreTableFromBackup`.
 pub(crate) async fn handle_restore_table_from_backup(
     body: Value,

@@ -55,7 +55,14 @@
 //!   answer of `extenddb_engine::check_restore_table_name`: `TableName must
 //!   be at least 3 characters long and at most 255 characters long` when its
 //!   length in UTF-16 code units is outside 3 to 255, and the clauses at
-//!   `targetTableName` otherwise (measured 2026-11-20).
+//!   `targetTableName` otherwise. An override member of another JSON kind
+//!   that the overrides' parse refuses
+//!   (`extenddb_engine::check_restore_override_kinds`) and a `BackupArn` of
+//!   another account (the cross-account refusal) are answered before it
+//!   (measured 2026-11-20). The parse accepts a
+//!   `ProvisionedThroughputOverride` list of two integers and a
+//!   `BillingModeOverride` object of one key, which the service refuses
+//!   before the name (#1106).
 //! - A RestoreTableFromBackup `TargetTableName` that is neither a string nor
 //!   null: `SerializationException`, before the checks of the value of
 //!   `BackupArn` and of the overrides (measured 2026-11-20). A member of
@@ -81,6 +88,7 @@ use extenddb_core::error::DynamoDbError;
 use serde_json::Value;
 
 use crate::arn_gate::{self, PATTERN, in_pattern};
+use crate::authz_resource::cross_account;
 
 const MAP_KEYS_NAME: &str = "Map keys must satisfy constraint: \
     [Member must have length less than or equal to 255, \
@@ -128,6 +136,12 @@ pub(crate) fn check_table_name_chars(
             // length text before the member constraints, with the model's
             // bounds (measured on DynamoDB on 20 Nov 2026).
             check_name_member(target, "targetTableName").or_else(|_| {
+                extenddb_engine::check_restore_override_kinds(input)?;
+                // The cross-account refusal answers it, and `authorize_request`
+                // looks no table up before that refusal.
+                if cross_account::find(operation, input, account_id).is_some() {
+                    return Ok(());
+                }
                 let name = target.and_then(Value::as_str).unwrap_or_default();
                 extenddb_engine::check_restore_table_name(name, "targetTableName", (3, 255))
             })
@@ -675,6 +689,83 @@ mod tests {
         }
         let null = json!({ "BackupArn": own, "TargetTableName": null });
         assert!(message("RestoreTableFromBackup", null).is_none());
+    }
+
+    /// Measured on DynamoDB on 20, 21 and 25 Nov 2026: with a target name the
+    /// gate refuses, an override member of another JSON kind is answered first,
+    /// and a `BackupArn` of another account is passed on to the cross-account
+    /// refusal. Any other override fault keeps the name's answer. Each body has
+    /// the caller's `BackupArn` unless the row gives one. Only the type of a
+    /// `SerializationException` is checked (#1012).
+    #[test]
+    fn a_refused_restore_target_name_is_answered_after_the_types_and_the_account() {
+        let own =
+            "arn:aws:dynamodb:us-east-1:123456789012:table/t367name/backup/01700000000000-abcdef12";
+        let other = own.replace("123456789012", "111122223333");
+        let gsi = "GlobalSecondaryIndexOverride";
+        let pt = "ProvisionedThroughputOverride";
+        let sse = "SSESpecificationOverride";
+        let bm = "BillingModeOverride";
+        let ser = "SerializationException";
+        let len = "TableName must be at least 3 characters long and at most 255 characters long";
+        let rows = [
+            (json!({ "BackupArn": other }), "a*", "passed"),
+            (json!({ "BackupArn": other }), "a b", "passed"),
+            (json!({ "BackupArn": other }), "t\u{0}x", "passed"),
+            (json!({ "BackupArn": other, gsi: [{}] }), "a*", "passed"),
+            (json!({ "BackupArn": other, gsi: {} }), "a*", ser),
+            (json!({ gsi: {} }), "a*", ser),
+            (json!({ gsi: {} }), "a b", ser),
+            (json!({ "LocalSecondaryIndexOverride": {} }), "a*", ser),
+            (json!({ sse: 5 }), "a*", ser),
+            (json!({ pt: "x" }), "a*", ser),
+            (json!({ "OnDemandThroughputOverride": 5 }), "a*", ser),
+            (json!({ bm: 5 }), "a*", ser),
+            (json!({ bm: "PAY", sse: 5 }), "a*", ser),
+            (json!({ bm: "PAY" }), "a*", len),
+            (json!({ bm: "PROVISIONED" }), "a*", len),
+            (
+                json!({ pt: { "ReadCapacityUnits": 0, "WriteCapacityUnits": 1 } }),
+                "a*",
+                len,
+            ),
+            (json!({ pt: {} }), "a*", len),
+            (
+                json!({ pt: { "ReadCapacityUnits": 1.5, "WriteCapacityUnits": 1 } }),
+                "a*",
+                len,
+            ),
+            (json!({ gsi: [{}] }), "a*", len),
+            (
+                json!({ gsi: [{ "IndexName": "gi", "Projection": { "ProjectionType": "FOO" },
+                    "KeySchema": [{ "AttributeName": "k", "KeyType": "HASH" }] }] }),
+                "a*",
+                len,
+            ),
+            (json!({}), "a*", len),
+            (
+                json!({ bm: null, gsi: null, "LocalSecondaryIndexOverride": null, pt: null,
+                    "OnDemandThroughputOverride": null, sse: null }),
+                "a*",
+                len,
+            ),
+            // A name inside the pattern is passed on to the later checks.
+            (json!({ gsi: {} }), "ab", "passed"),
+        ];
+        for (members, name, expected) in rows {
+            let mut input = json!({ "BackupArn": own, "TargetTableName": name });
+            for (member, value) in members.as_object().unwrap() {
+                input[member] = value.clone();
+            }
+            let answer =
+                match check_table_name_chars("RestoreTableFromBackup", &input, "123456789012") {
+                    Ok(()) => "passed".to_owned(),
+                    Err(DynamoDbError::SerializationException(_)) => ser.to_owned(),
+                    Err(DynamoDbError::ValidationException(m)) => m,
+                    Err(other) => panic!("unexpected error {other:?}"),
+                };
+            assert_eq!(answer, expected, "{input}");
+        }
     }
 
     #[test]
