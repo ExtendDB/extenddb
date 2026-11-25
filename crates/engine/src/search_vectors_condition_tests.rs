@@ -101,16 +101,12 @@ type Routed = (
 
 async fn routed(setting: &str, hash: bool, expr: &str, item: &Item) -> Routed {
     let storage = server(setting).await;
-    let served = storage
-        .as_vector_search()
-        .expect("SQLite serves vector search");
     let values: HashMap<String, AttributeValue> = values()
         .into_iter()
         .filter(|(k, _)| expr.contains(k.as_str()))
         .collect();
     let parsed = parse(
         &storage,
-        served,
         "111111111111",
         Some(expr),
         None,
@@ -268,9 +264,6 @@ async fn without_the_setting(
     let storage = crate::test_context::memory_engine().await;
     let store = Arc::new(Failing::default());
     crate::install_search_filter_settings(&storage, store.clone());
-    let served = storage
-        .as_vector_search()
-        .expect("SQLite serves vector search");
     let values: HashMap<String, AttributeValue> = values()
         .into_iter()
         .filter(|(k, _)| expr.contains(k.as_str()))
@@ -279,7 +272,6 @@ async fn without_the_setting(
     let answer = async {
         let parsed = parse(
             &storage,
-            served,
             "111111111111",
             Some(expr),
             names,

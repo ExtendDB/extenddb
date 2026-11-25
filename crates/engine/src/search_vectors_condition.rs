@@ -27,7 +27,7 @@ use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{
     AttributeDefinition, AttributeValue, SearchSchemaElement, SearchSchemaElementType,
 };
-use extenddb_storage::{StorageEngine, VectorItemFilter, VectorSearchEngine};
+use extenddb_storage::{StorageEngine, VectorItemFilter};
 
 #[cfg(feature = "search-inequality-filters")]
 use crate::search_vectors_extended::Extended;
@@ -54,11 +54,8 @@ pub(crate) type Scope<'a> = (
 );
 
 /// Structural validation of the filter expression (schema-independent),
-/// with each grammar that may serve the caller.
-///
-/// Taking the backend's vector search engine means the grammar is only
-/// parsed once the backend has been found to serve vector search: a backend
-/// without it refuses the request before this runs.
+/// with each grammar that may serve the caller. The caller has already
+/// found that the backend serves vector search.
 ///
 /// # Errors
 ///
@@ -67,7 +64,6 @@ pub(crate) type Scope<'a> = (
 /// the setting cannot be read.
 pub(crate) async fn parse(
     storage: &Arc<dyn StorageEngine>,
-    _served_by: &dyn VectorSearchEngine,
     account_id: &str,
     expr: Option<&str>,
     names: Option<&HashMap<String, String>>,

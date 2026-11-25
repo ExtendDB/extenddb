@@ -110,7 +110,6 @@ pub(super) async fn check<'s>(
 
     let parsed = condition::parse(
         storage,
-        vector_search,
         account_id,
         input.search_condition_expression.as_deref(),
         input.expression_attribute_names.as_ref(),
