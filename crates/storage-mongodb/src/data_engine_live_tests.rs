@@ -38,6 +38,9 @@ mod txn_create;
 #[path = "data_engine_live_tests_repair_pass.rs"]
 mod repair_pass;
 
+#[path = "data_engine_live_tests_delete_table.rs"]
+mod delete_table;
+
 fn uri() -> String {
     std::env::var("EXTENDDB_TEST_MONGODB_URI").expect(
         "set EXTENDDB_TEST_MONGODB_URI to a MongoDB replica set, e.g. \

@@ -735,15 +735,6 @@ impl MongoEngine {
         self.drop_index_collections_for_table(&desc.table_id)
             .await?;
 
-        // Tags are keyed by the table ARN rather than table_id. Remove them
-        // before deleting the table metadata so a table recreated with the
-        // same name cannot inherit the previous table's tags.
-        self.catalog_db
-            .collection::<Document>("tags")
-            .delete_many(doc! { "resource_arn": &desc.table_arn })
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-
         self.gsi_cache_invalidate(&desc.table_id);
 
         // Delete stream_shards, stream_records, and their sequence counters
@@ -752,18 +743,73 @@ impl MongoEngine {
         // table's stream history. RFC-0003 §8.2 (table-name reuse).
         self.cleanup_stream_state_for_table(&desc.table_id).await?;
 
-        // Delete the table metadata
-        tables_coll
-            .delete_one(
-                doc! { "_id": { "account_id": account_id, "table_name": &input.table_name } },
-            )
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        // Tags are keyed by the table ARN rather than table_id, so a table
+        // recreated with the same name would inherit any left behind. They
+        // go in one transaction with the table metadata: ListTagsOfResource
+        // returns them for as long as the table reads DELETING (#604), as
+        // DynamoDB does.
+        self.delete_tags_and_table_doc(account_id, &input.table_name, &desc.table_arn)
+            .await?;
 
         Ok(TableDescription {
             table_status: TableStatus::Deleting,
             ..desc
         })
+    }
+
+    /// DeleteTable's last step: the table's tags and its catalog document,
+    /// removed in one session transaction. A transaction that lost a write
+    /// conflict is re-run.
+    async fn delete_tags_and_table_doc(
+        &self,
+        account_id: &str,
+        table_name: &str,
+        table_arn: &str,
+    ) -> Result<(), StorageError> {
+        use crate::data_engine::{CommitOutcome, TRANSIENT_RETRY_ATTEMPTS, TxErr, backoff_sleep};
+        let internal = |e: mongodb::error::Error| StorageError::Internal(e.to_string());
+        let tags = self.catalog_db.collection::<Document>("tags");
+        let tables = self.catalog_db.collection::<Document>("tables");
+        let mut session = self.client.start_session().await.map_err(internal)?;
+        let tx_options = self.write_transaction_options();
+        for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+            session
+                .start_transaction()
+                .with_options(tx_options.clone())
+                .await
+                .map_err(internal)?;
+            let body: Result<(), TxErr> = async {
+                tags.delete_many(doc! { "resource_arn": table_arn })
+                    .session(&mut session)
+                    .await?;
+                tables
+                    .delete_one(
+                        doc! { "_id": { "account_id": account_id, "table_name": table_name } },
+                    )
+                    .session(&mut session)
+                    .await?;
+                Ok(())
+            }
+            .await;
+            match body {
+                Ok(()) => match self.commit_write_transaction(&mut session, None).await? {
+                    CommitOutcome::Committed => return Ok(()),
+                    CommitOutcome::RerunBody(_) => backoff_sleep(attempt).await,
+                },
+                Err(TxErr::Transient(_)) => {
+                    let _ = session.abort_transaction().await;
+                    backoff_sleep(attempt).await;
+                }
+                Err(TxErr::Fatal(e)) => {
+                    let _ = session.abort_transaction().await;
+                    return Err(e);
+                }
+            }
+        }
+        Err(StorageError::Internal(format!(
+            "DeleteTable of {table_name} did not commit after {TRANSIENT_RETRY_ATTEMPTS} \
+             conflicting attempts"
+        )))
     }
 
     pub(crate) async fn describe_table_impl(
