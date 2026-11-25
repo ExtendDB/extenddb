@@ -144,8 +144,10 @@ pub async fn handle_query(
     // Parse KeyConditionExpression or desugar legacy KeyConditions
     let (mut key_condition, legacy_kc_maps) = if let Some(parsed) = key_condition_expression {
         // Parsed and checked above. A fault in its shape answers here, after
-        // the table checks (measured 2026-11-23: `pk > :a` on a table that does
-        // not exist answers ResourceNotFoundException).
+        // the table checks. A key condition with no equality on the HASH
+        // attribute is refused below, also after the table checks (measured
+        // 2026-11-23: `pk > :a` on a table that does not exist answers
+        // ResourceNotFoundException).
         (parsed?, None)
     } else if let Some(ref kc) = input.key_conditions {
         let key_schema_pairs: Vec<(String, bool)> = query_key_info

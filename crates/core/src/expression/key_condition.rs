@@ -638,9 +638,10 @@ pub fn has_duplicate_key_condition(
 /// # Errors
 ///
 /// As [`parse_key_condition`], plus `ValidationException` for each of the
-/// faults above. A fault in the key condition's shape, such as no equality
-/// on the partition key, is the `Err` inside `Ok`: the engine answers it
-/// after the table checks, where the service does.
+/// faults above. A fault in the key condition's shape, such as two
+/// non-equality clauses beside an equality, is the `Err` inside `Ok`, for the
+/// engine to answer after the table checks. A key condition with no equality
+/// clause parses, and the engine refuses it once it knows the key schema.
 pub fn parse_key_condition_with_maps(
     tokens: &[Token],
     maps: &ExpressionMaps,
@@ -2383,27 +2384,16 @@ mod tests {
     /// table checks.
     #[test]
     fn the_shape_is_refused_after_the_checks() {
-        for (expr, want) in [
-            ("pk > :a", "partition key condition must use equality (=)"),
-            (
-                "pk > :a AND sk > :b",
-                "one condition must be an equality on the partition key",
-            ),
-            (
-                "pk = :a AND sk > :b AND zz < :c",
-                "at most one non-equality condition is allowed",
-            ),
-        ] {
-            let tokens = tokenize(expr).unwrap();
-            let maps = ExpressionMaps::new(HashMap::new(), values_of(expr));
-            let shape = parse_key_condition_with_maps(&tokens, &maps)
-                .unwrap_or_else(|err| panic!("expr {expr} should pass the checks: {err:?}"));
-            assert_refused(
-                shape,
-                &format!("Invalid KeyConditionExpression: {want}"),
-                expr,
-            );
-        }
+        let expr = "pk = :a AND sk > :b AND zz < :c";
+        let tokens = tokenize(expr).unwrap();
+        let maps = ExpressionMaps::new(HashMap::new(), values_of(expr));
+        let shape = parse_key_condition_with_maps(&tokens, &maps)
+            .unwrap_or_else(|err| panic!("expr {expr} should pass the checks: {err:?}"));
+        assert_refused(
+            shape,
+            "Invalid KeyConditionExpression: at most one non-equality condition is allowed",
+            expr,
+        );
     }
 
     #[test]
