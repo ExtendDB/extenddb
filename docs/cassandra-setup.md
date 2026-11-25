@@ -83,6 +83,21 @@ The node now listens on `127.0.0.1:9042` with password authentication enabled.
 ExtendDB creates its keyspaces under the configured `keyspace_prefix`, so one
 cluster can host more than one deployment by giving each a different prefix.
 
+`extenddb destroy` drops only the deployment's own keyspaces: the catalog
+keyspace and the account keyspaces (`<keyspace_prefix>_account_` followed by a
+12-digit account id). A keyspace that starts with `<keyspace_prefix>_` but is
+not one of these, such as the keyspaces of a second deployment whose prefix
+begins with this one (`extenddb_test` beside `extenddb`), stays in place.
+`destroy` prints its name. `destroy` decides by name only: a keyspace that
+another program made with the name `<keyspace_prefix>_catalog`, or with
+`<keyspace_prefix>_account_` and 12 digits, is dropped.
+`destroy` returns only after the nodes agree on the schema. It waits up to 30
+seconds, or longer when a node is slow to answer. The wait compares the schema version of
+the whole cluster, so schema changes by another deployment on the same cluster
+can delay it. If the nodes do not agree, `destroy` returns an error. When it had
+dropped keyspaces, the error says so, and `destroy` can be run again to wait
+again.
+
 ## Building with Cassandra Support
 
 The Cassandra backend is behind a feature flag. Backends are mutually exclusive
@@ -188,7 +203,14 @@ Fields:
 - `username` / `password` — the application credentials ExtendDB uses at serve
   time. Required against any authenticated node (which `init` requires anyway).
 - `keyspace_prefix` — prefix for this deployment's keyspaces (default
-  `extenddb`).
+  `extenddb`). It may hold ASCII letters, digits and `_`, and must start with a
+  letter (ExtendDB does not check this). It may hold at most 27 characters, so
+  that `<keyspace_prefix>_account_` and a 12-digit id stay within Cassandra's
+  48-character keyspace name limit. `init` refuses a longer prefix before it
+  creates the role or any keyspace. Cassandra stores a
+  keyspace name written without quotes in lower case, so ExtendDB lower-cases
+  the prefix in this file, in a connection string and in
+  `init --keyspace-prefix`. `Acme` and `acme` are the same prefix.
 - `replication_factor` — keyspace replication factor. `init` creates its own
   keyspaces with `--replication-factor` (default `1`), or with this file's value
   for `init --overwrite`, and writes the same value here; see

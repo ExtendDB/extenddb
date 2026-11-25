@@ -127,6 +127,12 @@ pub async fn hash_password(password: String, cost: u32) -> OpResult<String> {
 /// slot became free within [`VERIFY_WAIT`], and `OpError::Internal` when the
 /// blocking task failed. Callers treat both as a server error, not as a
 /// failed login.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "its callers are the admin and IAM-user password checks of the console and the \
+              management API; the WebAssembly adapter answers only DynamoDB operations, none \
+              of which checks a password"
+)]
 pub async fn verify_password(password: String, hash: String) -> OpResult<bool> {
     let Ok(acquired) = tokio::time::timeout(VERIFY_WAIT, BCRYPT_SEMAPHORE.acquire()).await else {
         tracing::warn!(
@@ -180,6 +186,12 @@ pub async fn verify_stored_password(
 /// blocking closure and is dropped there after the call returns, so the slot
 /// stays taken for the whole call even if the caller's future is dropped
 /// while it waits for the result.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "runs the bcrypt calls of hash_password and verify_password, whose callers the \
+              WebAssembly adapter never reaches: it answers only DynamoDB operations, none \
+              of which hashes or checks a password"
+)]
 async fn run_bcrypt<T: Send + 'static>(
     permit: SemaphorePermit<'static>,
     work: impl FnOnce() -> T + Send + 'static,
