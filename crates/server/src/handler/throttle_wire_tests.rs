@@ -199,9 +199,9 @@ async fn provisioned_write_throttle_names_the_table_arn() {
         json!({"ProvisionedThroughput": {"ReadCapacityUnits": 1, "WriteCapacityUnits": 1}}),
     )
     .await;
-    // The first write consumes the burst; the manager is drained directly
-    // rather than by many writes so the test does not depend on timing.
-    state.throttle.consume(&account_id, table, 0.0, 2.0);
+    // The manager is drained directly, far past the one second of burst,
+    // rather than by many writes, so the test does not depend on timing.
+    state.throttle.consume(&account_id, table, 0.0, 1.0e9);
     let (status, body) = call(
         &state,
         "PutItem",
@@ -233,7 +233,7 @@ async fn provisioned_read_throttle_names_the_read_reason() {
         json!({"ProvisionedThroughput": {"ReadCapacityUnits": 1, "WriteCapacityUnits": 1}}),
     )
     .await;
-    state.throttle.consume(&account_id, table, 2.0, 0.0);
+    state.throttle.consume(&account_id, table, 1.0e9, 0.0);
     let (status, body) = call(
         &state,
         "GetItem",
@@ -261,12 +261,14 @@ async fn on_demand_hot_key_write_names_the_key_range_and_read_carries_no_reasons
     let (state, account_id) = build_state().await;
     let table = "hot-key";
     create_table(&state, table, json!({"BillingMode": "PAY_PER_REQUEST"})).await;
-    // Drain the partition bucket for key "k" in both directions (its limits
-    // are 3,000 RCU and 1,000 WCU per second with one second of burst),
-    // leaving the table bucket at the default on-demand ceilings full.
+    // Drain the partition bucket for key "k" in both directions and leave
+    // the table bucket full: the drain runs while the table is not
+    // registered, and the request registers it again from DescribeTable, as
+    // after a restart.
+    state.throttle.remove_table(&account_id, table);
     state
         .throttle
-        .consume_with_partition(&account_id, table, 6_000.0, 2_000.0, Some("k"));
+        .consume_with_partition(&account_id, table, 1.0e9, 1.0e9, Some("k"));
     let (status, body) = call(
         &state,
         "PutItem",
@@ -316,7 +318,7 @@ async fn on_demand_caps_throttle_names_the_max_on_demand_limit() {
         }),
     )
     .await;
-    state.throttle.consume(&account_id, table, 2.0, 2.0);
+    state.throttle.consume(&account_id, table, 1.0e9, 1.0e9);
     for (operation, body, reason) in [
         (
             "Query",
@@ -366,7 +368,7 @@ async fn half_capped_table_reports_the_cap_for_its_direction_only() {
     )
     .await;
     // Drain the write cap of 1 and the default read ceiling of 12,000.
-    state.throttle.consume(&account_id, table, 24_000.0, 2.0);
+    state.throttle.consume(&account_id, table, 1.0e9, 1.0e9);
     let (status, body) = call(
         &state,
         "PutItem",
