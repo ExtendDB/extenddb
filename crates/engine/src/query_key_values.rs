@@ -190,9 +190,7 @@ pub(crate) fn shape_fault_first<T: DeserializeOwned>(
         .filter(|(name, _)| present(body, name))
         .find_map(|(name, value)| match (name.as_str(), value) {
             ("ConsistentRead" | "ScanIndexForward", Value::String(text))
-                if BOOLEAN_TEXTS
-                    .iter()
-                    .any(|word| word.eq_ignore_ascii_case(text)) =>
+                if reads_as_boolean(text) =>
             {
                 None
             }
@@ -228,6 +226,14 @@ pub(crate) fn shape_fault_first<T: DeserializeOwned>(
 /// `ScanIndexForward`, and 2026-11-23 on `Query` for `"T"`, `"0"` and the
 /// refused `"on"`.
 const BOOLEAN_TEXTS: [&str; 10] = ["true", "t", "yes", "y", "1", "false", "f", "no", "n", "0"];
+
+/// Whether the service reads the string `text` as a boolean, one of
+/// [`BOOLEAN_TEXTS`] in any ASCII case.
+pub(crate) fn reads_as_boolean(text: &str) -> bool {
+    BOOLEAN_TEXTS
+        .iter()
+        .any(|word| word.eq_ignore_ascii_case(text))
+}
 
 /// The deserializer's `SerializationException` for `body` as a `T`, unless it
 /// is the one for an AttributeValue with an unknown type descriptor.
