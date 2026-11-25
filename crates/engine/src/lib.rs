@@ -28,6 +28,7 @@ mod batch_get_item;
 mod batch_write_item;
 pub mod capacity_helpers;
 mod create_table;
+mod decimal_digits;
 mod delete_item;
 mod delete_table;
 mod describe_endpoints;
@@ -60,6 +61,7 @@ mod put_item;
 mod query;
 #[cfg(test)]
 mod query_key_size_tests;
+pub mod query_key_values;
 mod read_helpers;
 mod request_limits;
 mod scan;
