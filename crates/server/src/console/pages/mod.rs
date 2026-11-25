@@ -43,6 +43,9 @@ pub use user_pages::{create_user, delete_user, new_user_form, user_detail};
 
 use std::sync::Arc;
 
+use axum::Form;
+use axum::body::{Body, Bytes};
+use axum::extract::{FromRequest, Request};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 
@@ -113,7 +116,7 @@ fn session_response(
 
 /// Validate a CSRF token from a form submission against the session's token.
 /// Uses constant-time comparison to prevent timing attacks.
-pub(super) fn validate_csrf(submitted: &str, expected: &str) -> bool {
+fn validate_csrf(submitted: &str, expected: &str) -> bool {
     if submitted.len() != expected.len() {
         return false;
     }
@@ -133,6 +136,28 @@ fn require_csrf(csrf_field: &str, session: &SessionData) -> Result<(), Response>
     } else {
         Err((axum::http::StatusCode::FORBIDDEN, "CSRF token mismatch").into_response())
     }
+}
+
+/// Check the `_csrf` field of a request's form body as [`require_csrf`]
+/// checks a built-in page's form, and hand the request on with its body. The
+/// body is read up to axum's 2 MB default; a longer one gets axum's 413. A
+/// body that is not an `application/x-www-form-urlencoded` form has no
+/// `_csrf` field, so it gets the 403.
+#[allow(clippy::result_large_err)]
+pub(super) async fn require_form_csrf(
+    req: Request,
+    session: &SessionData,
+) -> Result<Request, Response> {
+    let (parts, body) = req.into_parts();
+    let bytes = Bytes::from_request(Request::from_parts(parts.clone(), body), &())
+        .await
+        .map_err(IntoResponse::into_response)?;
+    let form = Request::from_parts(parts.clone(), Body::from(bytes.clone()));
+    let csrf = Form::<CsrfOnly>::from_request(form, &())
+        .await
+        .map_or_else(|_| String::new(), |Form(form)| form.csrf);
+    require_csrf(&csrf, session)?;
+    Ok(Request::from_parts(parts, Body::from(bytes)))
 }
 
 /// Form struct for POST handlers that only need CSRF validation (e.g. delete).

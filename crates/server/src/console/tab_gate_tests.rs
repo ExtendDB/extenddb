@@ -36,6 +36,8 @@ enum Holder {
 enum Csrf {
     Absent,
     SessionToken,
+    /// A token of the same length that is not the session's.
+    OtherToken,
 }
 
 struct Row {
@@ -60,6 +62,9 @@ const ROWS: &[Row] = &[
     Row { name: "password changed", holder: Holder::Admin, stored: StoredHash::Changed, method: "GET", csrf: Csrf::Absent, status: StatusCode::SEE_OTHER, location: LOGIN, body: "" },
     Row { name: "catalog unreadable", holder: Holder::Admin, stored: StoredHash::Unreadable, method: "GET", csrf: Csrf::Absent, status: StatusCode::SERVICE_UNAVAILABLE, location: None, body: "The catalog is unavailable. Try again." },
     Row { name: "POST with the session's token", holder: Holder::IamUser, stored: StoredHash::LoginHash, method: "POST", csrf: Csrf::SessionToken, status: StatusCode::OK, location: None, body: "admin=false x=true" },
+    Row { name: "POST without a token", holder: Holder::Admin, stored: StoredHash::LoginHash, method: "POST", csrf: Csrf::Absent, status: StatusCode::FORBIDDEN, location: None, body: "CSRF token mismatch" },
+    Row { name: "POST with another token", holder: Holder::Admin, stored: StoredHash::LoginHash, method: "POST", csrf: Csrf::OtherToken, status: StatusCode::FORBIDDEN, location: None, body: "CSRF token mismatch" },
+    Row { name: "DELETE without a token", holder: Holder::Admin, stored: StoredHash::LoginHash, method: "DELETE", csrf: Csrf::Absent, status: StatusCode::FORBIDDEN, location: None, body: "CSRF token mismatch" },
     Row { name: "POST with no cookie", holder: Holder::Nobody, stored: StoredHash::LoginHash, method: "POST", csrf: Csrf::Absent, status: StatusCode::SEE_OTHER, location: LOGIN, body: "" },
     Row { name: "POST for a deleted principal", holder: Holder::Admin, stored: StoredHash::Missing, method: "POST", csrf: Csrf::SessionToken, status: StatusCode::SEE_OTHER, location: LOGIN, body: "" },
 ];
@@ -87,6 +92,7 @@ async fn the_tab_session_check_answers_for_each_session_state() {
         let csrf = match (row.csrf, &session) {
             (Csrf::Absent, _) => None,
             (Csrf::SessionToken, Some((_, token))) => Some(token.clone()),
+            (Csrf::OtherToken, Some((_, token))) => Some("0".repeat(token.len())),
             (_, None) => Some("0".repeat(64)),
         };
         let form = match csrf {

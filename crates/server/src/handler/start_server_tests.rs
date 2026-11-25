@@ -332,12 +332,12 @@ async fn a_client_that_goes_away_mid_request_is_recorded_once_with_status_zero()
 
 /// A tab page that renders the console layout from the identity the session
 /// check inserted, so the test can read the navigation bar, plus a POST route
-/// that acts only when the form's `_csrf` field is the session's token.
+/// that answers with a field of its form. The session check refuses a POST
+/// without the session's CSRF token before the route runs.
 fn tab_router() -> Router {
     #[derive(serde::Deserialize)]
     struct Act {
-        #[serde(rename = "_csrf", default)]
-        csrf: String,
+        x: String,
     }
     Router::new()
         .route(
@@ -367,16 +367,7 @@ fn tab_router() -> Router {
         )
         .route(
             "/act",
-            post(
-                |identity: axum::Extension<crate::console::ConsoleIdentity>,
-                 axum::Form(form): axum::Form<Act>| async move {
-                    if identity.csrf_matches(&form.csrf) {
-                        (axum::http::StatusCode::OK, "acted")
-                    } else {
-                        (axum::http::StatusCode::FORBIDDEN, "CSRF token mismatch")
-                    }
-                },
-            ),
+            post(|axum::Form(form): axum::Form<Act>| async move { format!("acted x={}", form.x) }),
         )
 }
 
@@ -465,7 +456,8 @@ async fn a_console_tab_is_behind_the_session_check_and_listed_in_the_nav_bar() {
     );
 
     // The page's meta tag carries the session's CSRF token; a POST with it
-    // acts, a POST without it is refused as the built-in pages refuse.
+    // reaches the route with its form, a POST without it is refused before
+    // the route as the built-in pages refuse it.
     let token = page
         .body
         .split(r#"name="csrf-token" content=""#)
@@ -483,12 +475,14 @@ async fn a_console_tab_is_behind_the_session_check_and_listed_in_the_nav_bar() {
     )
     .await;
     assert_eq!(act.status, 200, "{}", act.body);
+    assert_eq!(act.body, "acted x=1");
     let refused = raw(
         addr,
         &post_req_with_cookie("/console/chaos/act", &cookie, b"x=1"),
     )
     .await;
     assert_eq!(refused.status, 403, "{}", refused.body);
+    assert_eq!(refused.body, "CSRF token mismatch");
     let no_session = raw(addr, &post_req("/console/chaos/act", "", b"x=1")).await;
     assert_eq!(no_session.status, 303, "{}", no_session.body);
     assert_eq!(no_session.header("location"), Some("/console/login"));

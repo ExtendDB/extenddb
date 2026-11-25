@@ -85,8 +85,10 @@ impl Extensions {
 ///
 /// The router is nested at `/console/<slug>` inside the console and wrapped in
 /// the console's session check: a request without a live session is redirected
-/// to the login page before it reaches the router, and one with a session
-/// carries a [`crate::console::ConsoleIdentity`] request extension, so the
+/// to the login page before it reaches the router, a request that may change
+/// state needs the session's CSRF token in its `_csrf` form field (see
+/// [`crate::console::require_console_session`]), and one that passes carries
+/// a [`crate::console::ConsoleIdentity`] request extension, so the
 /// page can render the console's navigation bar and layout through
 /// [`crate::console::html`]. Every path under the slug meets the session
 /// check, including paths the router has no route for: the server installs a
