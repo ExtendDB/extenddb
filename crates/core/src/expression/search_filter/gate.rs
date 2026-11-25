@@ -3,7 +3,8 @@
 
 //! Which accounts get the extended grammar.
 //!
-//! The service serves the grammar to every account. The setting names the
+//! DynamoDB accepts the grammar on the accounts and regions measured
+//! (us-east-1, eu-north-1, ap-southeast-2). The setting names the
 //! accounts ExtendDB serves it to: `all` (the default), `off`, or a
 //! comma-separated list of 12-digit account IDs, in which case a request
 //! gets the grammar when the caller is listed. A request on a table of

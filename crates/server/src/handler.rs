@@ -131,11 +131,12 @@ pub(crate) async fn handle_request(
         }
     };
 
-    // The service checks a SearchVectors request before it authorizes it, as
-    // far as the checks need no table: the body, IndexName, SearchVector,
-    // TopK, the expression maps, the projection and the search condition. A
-    // table name the service refuses still answers first, from
-    // `authorize_request`.
+    // A SearchVectors request is checked before it is authorized, as far as
+    // the checks need no table: the body, IndexName, SearchVector, TopK, the
+    // expression maps, the projection and the search condition. They run once
+    // the table name passes `check_table_name_chars`; a table name outside
+    // its pattern answers first, from `authorize_request`, and no length
+    // check applies to the table name here (#1462).
     if operation == "SearchVectors"
         && crate::table_name_gate::check_table_name_chars(&operation, &input, &account_id).is_ok()
         && let Err(e) = extenddb_engine::check_search_vectors_request(

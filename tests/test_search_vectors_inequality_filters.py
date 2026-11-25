@@ -6,7 +6,8 @@
 Under the extended grammar, a search condition takes ``<>``, ``<``, ``<=``,
 ``>``, ``>=``, BETWEEN, IN, OR, NOT, parentheses, ``attribute_exists`` and
 ``attribute_not_exists``, and more than one condition on an attribute, up to
-50 conditions. The service serves it to every account; ExtendDB serves it to
+50 conditions. The service accepts it on the accounts and regions measured
+(us-east-1, eu-north-1, ap-southeast-2); ExtendDB serves it to
 the accounts the ``search_inequality_filters`` setting names, every account
 when the setting is absent.
 
