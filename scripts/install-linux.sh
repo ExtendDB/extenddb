@@ -143,4 +143,4 @@ echo "  2. Initialize: extenddb init --catalog-db extenddb_catalog --pg-user pos
 echo "  3. Verify:     extenddb verify --config extenddb.toml"
 echo "  4. Start:      extenddb serve --config extenddb.toml"
 echo
-echo "See docs/manuals/08-install-linux.md for the full guide."
+echo "See docs/install-from-source.md for the full guide."

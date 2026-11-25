@@ -65,7 +65,7 @@ psql -U $(id -nu) -d postgres -c "CREATE USER extenddb WITH PASSWORD 'extenddb-l
 psql -U $(id -nu) -d postgres -c "CREATE DATABASE extenddb OWNER extenddb;"
 ```
 
-See [Local PostgreSQL setup](local-postgres-setup.md) for full setup instructions.
+See [Install from source](install-from-source.md#install-postgresql) for the PostgreSQL setup.
 
 ### `migration failed: ...`
 
@@ -83,13 +83,13 @@ See [Local PostgreSQL setup](local-postgres-setup.md) for full setup instruction
 
 **Cause:** The database holds no catalog: no migration ledger and no `catalog_version` row. `serve`, `migrate` and `verify` exit 1 and change nothing.
 
-**Fix:** Check that the config names the right database. For a new deployment, run `extenddb init` to create the catalog and data databases. See the [full walkthrough](getting-started.md).
+**Fix:** Check that the config names the right database. For a new deployment, run `extenddb init` to create the catalog and data databases. See [Install from source](install-from-source.md#3-initialize-the-deployment).
 
 ### `Database '<name>' already exists. Run 'extenddb destroy --config <config>' first, then re-run 'extenddb init'.`
 
 **Cause:** `extenddb init` detected that the catalog or data database already exists in PostgreSQL. To prevent accidental data loss, `extenddb init` refuses to proceed when either database is present.
 
-**Fix:** If you want to re-initialize from scratch, run `extenddb destroy --config extenddb.toml` first to drop both databases, then run `extenddb init` again. If you want to keep the existing data and just apply migrations, use `extenddb migrate` instead.
+**Fix:** If you want to re-initialize from scratch, run `extenddb destroy --config extenddb.toml --yes` first to drop both databases, then run `extenddb init` again. If you want to keep the existing data and just apply migrations, use `extenddb migrate` instead.
 
 ### `Failed to bind <addr>: Address already in use`
 
@@ -150,7 +150,7 @@ What the server did depends on the rest of the message:
 - **`was accepted but did not take effect`**: the filesystem keeps no file modes (vfat, some SMB and 9p mounts). Keep the key on a filesystem that does, or mount it with an owner-only mode.
 - **`setting it to 0600 failed: <error>`**: run `chmod 600` on the file as its owner.
 
-**Rotate the key if it may have been copied.** While its mode was wider, any local user could read the key. In the four cases where the server could not narrow it, the key stays readable until its mode is fixed, so fix the mode first: a key replaced before that lands at the same mode. Then, if a copy matters, replace the key and certificate by generating a new pair as in [Generating a self-signed certificate manually](getting-started.md#generating-a-self-signed-certificate-manually), with the key at the mode above, and restart the server. Do not rely on `extenddb init` for this: on a deployment that already has a config file, `init` stops at the config check before it reaches the certificate step. Clients that pinned the old certificate through `AWS_CA_BUNDLE` need the new `cert.pem`.
+**Rotate the key if it may have been copied.** While its mode was wider, any local user could read the key. In the four cases where the server could not narrow it, the key stays readable until its mode is fixed, so fix the mode first: a key replaced before that lands at the same mode. Then, if a copy matters, replace the key and certificate by generating a new pair as in [Install from source: Options](install-from-source.md#options), with the key at the mode above, and restart the server. Do not rely on `extenddb init` for this: on a deployment that already has a config file, `init` stops at the config check before it reaches the certificate step. Clients that pinned the old certificate through `AWS_CA_BUNDLE` need the new `cert.pem`.
 
 ### `Config file <path> has permissions <mode>, which is too open.`
 

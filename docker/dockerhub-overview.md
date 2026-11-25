@@ -16,7 +16,7 @@ For local development, the Compose stack in the repository starts PostgreSQL alo
 
 For a real deployment the image serves three explicit operations: `extenddb init` once to bootstrap the database, `extenddb migrate` when upgrading, and `extenddb serve` in steady state, which is the default command. It listens on port 18443 over TLS, keeps configuration and certificates under `/var/lib/extenddb`, runs as a non-root user, and supports a read-only root filesystem.
 
-To learn how to configure and operate it, see [getting started](https://github.com/ExtendDB/extenddb/blob/main/docs/getting-started.md) and the [container notes](https://github.com/ExtendDB/extenddb/blob/main/docker/README.md).
+To learn how to configure and operate it, see [getting started](https://github.com/ExtendDB/extenddb/blob/main/docs/start.md) and the [container notes](https://github.com/ExtendDB/extenddb/blob/main/docker/README.md).
 
 ## Tags and verification
 

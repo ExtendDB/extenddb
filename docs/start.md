@@ -8,11 +8,11 @@ slug: /start
 
 ExtendDB speaks the DynamoDB wire protocol. The AWS CLI and every AWS SDK talk to it the same way they talk to the DynamoDB service, with one change: the endpoint URL points at your server.
 
-This page gets a server running in one command and sends the first requests to it. The Install pages cover the other ways to run ExtendDB: [Docker Compose with PostgreSQL](local-dev-docker-compose.md), and builds from source on [Linux](manuals/08-install-linux.md) and [macOS](manuals/09-install-macos.md).
+This page gets a server running in one command and sends the first requests to it. The install pages cover the other ways to run ExtendDB: [Docker Compose with PostgreSQL](local-dev-docker-compose.md), and a [build from source](install-from-source.md) on Linux or macOS.
 
 ## 1. Start a server
 
-The development image is one container over SQLite, plain HTTP, with a seeded example credential. It needs no database, no initialisation step and no certificate to trust. Data persists in the named volume.
+The development image is one container over SQLite, plain HTTP, with a seeded example credential. It needs no database, no initialization step and no certificate to trust. Data persists in the named volume.
 
 ```bash
 docker run -d --name extenddb -p 127.0.0.1:18080:18080 \
@@ -125,9 +125,10 @@ docker volume rm extenddb
 
 ## Next
 
-- [Docker Compose with PostgreSQL](local-dev-docker-compose.md) and TLS, or a build from source on [Linux](manuals/08-install-linux.md) or [macOS](manuals/09-install-macos.md).
+- [First requests](first-requests.md): tables, items, batches, transactions and streams from the AWS CLI against the server you have.
+- [Docker Compose with PostgreSQL](local-dev-docker-compose.md) and TLS, or a [build from source](install-from-source.md).
 - [Using ExtendDB](manuals/03-usage-guide.md): the operations, expressions, transactions and streams, with examples.
-- [Differences from DynamoDB](differences-from-dynamodb.md): every behaviour that is measured to differ from the service.
+- [Differences from DynamoDB](differences-from-dynamodb.md): every behavior that is measured to differ from the service.
 - [Deployment](manuals/11-deployment-guide.md): running ExtendDB on your own servers.
 
 ---

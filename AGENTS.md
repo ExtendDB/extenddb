@@ -107,9 +107,9 @@ extenddb-wasm-adapter (experimental WebAssembly build; publish = false)
 
 - Rust 1.91.1+ (`rustup update`)
 - Storage backend (one of):
-  - PostgreSQL 14+ running locally (see `docs/local-postgres-setup.md`)
+  - PostgreSQL 14+ running locally (see `docs/install-from-source.md`)
   - SQLite (embedded; nothing to install)
-  - MongoDB 7.0+ with replica set (see `docs/local-mongodb-setup.md`)
+  - MongoDB 7.0+ with replica set (see `docs/install-from-source.md`)
   - Cassandra 4.1+ (experimental; see `docs/cassandra-setup.md`)
 - Python 3.10+ for tests (`python3 -m venv ~/venvs/extenddb-venv && source ~/venvs/extenddb-venv/bin/activate && pip install -r requirements.txt`)
 
@@ -152,14 +152,17 @@ cargo clippy --all-targets -- -D warnings
 ./target/release/extenddb init --config extenddb.toml
 
 # MongoDB
-./target/release/extenddb init --backend mongodb --config extenddb.toml
+./target/release/extenddb init --backend mongodb --config extenddb.toml --overwrite   # the seed file carries [storage.mongodb].connection_string
 
 # Cassandra (experimental)
-./target/release/extenddb init --backend cassandra --config extenddb.toml
+export EXTENDDB_CASSANDRA_PASSWORD=cassandra
+./target/release/extenddb init --backend cassandra \
+    --cassandra-contact-points 127.0.0.1:9042 \
+    --cassandra-user cassandra --config extenddb.toml
 ```
 
 This creates:
-- Databases (`extenddb_catalog` and `extenddb` on PostgreSQL; `extenddb_catalog` and `extenddb_data` on MongoDB)
+- Databases (`extenddb_catalog` and `extenddb` on PostgreSQL; `extenddb_catalog` and `extenddb_data` on MongoDB; on Cassandra, the `extenddb_catalog` keyspace and the default account's `extenddb_account_<account_id>` keyspace)
 - Admin user credentials (printed to stdout — save the password!)
 - Self-signed TLS certificate at `~/.extenddb/tls/cert.pem`
 - Config file `extenddb.toml`
@@ -412,7 +415,8 @@ Expression parsing lives in `crates/core/src/expression/`. This is pure sync Rus
 
 | Document | Path                                              | Description                            |
 |----------|---------------------------------------------------|----------------------------------------|
-| Getting Started | `docs/getting-started.md`                         | Full setup walkthrough                 |
+| Install from source | `docs/install-from-source.md`                     | Database, build, init, serve, smoke test |
+| First requests | `docs/first-requests.md`                          | AWS CLI operations against a server    |
 | Architecture Guide | `docs/manuals/01-architecture-guide.md`           | System design and crate structure      |
 | Admin Guide | `docs/manuals/05-admin-guide.md`                  | Server lifecycle, configuration, IAM   |
 | Security Model | `docs/manuals/10-security-model.md`               | Threat model, auth, authz              |
@@ -423,8 +427,6 @@ Expression parsing lives in `crates/core/src/expression/`. This is pure sync Rus
 | Storage Component Design | `docs/design/04-component-storage.md`             | Storage trait design                   |
 | MongoDB Design | `docs/design/13-storage-mongodb.md`               | MongoDB backend architecture           |
 | Cassandra Design (experimental) | `docs/adr/0010`–`0021`            | Cassandra backend design decisions (ADRs) |
-| Local PostgreSQL Setup | `docs/local-postgres-setup.md`                    | PostgreSQL installation and config     |
-| Local MongoDB Setup | `docs/local-mongodb-setup.md`                     | MongoDB installation and config        |
 | Cassandra Setup | `docs/cassandra-setup.md`                         | Cassandra install, config, and deployment (experimental) |
 | Testing Design | `docs/design/09-testing.md`                       | Test strategy and infrastructure       |
 | Extending Storage | `docs/manuals/12-extending-extenddb-storage.md` | Guide to implementing storage backends |

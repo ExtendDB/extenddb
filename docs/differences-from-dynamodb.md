@@ -221,7 +221,7 @@ alone, with the same wording. For PartiQL this holds in `ExecuteStatement`,
 | Provisioned throughput | Token bucket per table/partition | Token bucket per table/partition, matching DynamoDB's burst and refill behavior |
 | On-demand capacity | Automatic scaling | Fixed initial burst capacity (4000 WCU / 12000 RCU), no auto-scaling |
 | Warm throughput | Pre-provisions partitions to the requested read and write units; raising it is a long-running operation (`Status: UPDATING` for minutes, the previous values reported meanwhile); a request above the account's table maximum is `LimitExceededException` | Stored and reported with the same shape, defaults and validation so clients that read it (the Terraform AWS provider since 6.13.0) work: the previous values are reported with `Status: UPDATING` for `control_plane_delay_seconds` after a change, then the new values `ACTIVE`; a decrease is measured against the reported values, as on the service. Nothing acts on the values: no pre-warming and no scaling at the database level. The account maximum is not known to ExtendDB and is not enforced. A provisioned table whose warm throughput was never set, or was set on one side only, reports its new units at once after a capacity change, where the service reports the old units until the table is `ACTIVE`. Switching a table to `PAY_PER_REQUEST` stores 12000 read and 4000 write units where its warm throughput is lower, and the stored values stay after a switch back to `PROVISIONED`, as on the service; the response to the switch reads the new values with `Status: UPDATING` for `control_plane_delay_seconds`, where the service answers with the previous values and `Status: ACTIVE` |
-| Throttling | Always on; throttles requests that exceed provisioned/burst capacity. No setting to disable | Configurable via `throttling_enabled` runtime setting (default: `true`) |
+| Throttling | Always on; throttles requests that exceed provisioned/burst capacity. No setting to disable | Configurable via `throttling_enabled` runtime setting (default: `false`) |
 
 ## Transactions
 
@@ -276,7 +276,7 @@ ExtendDB exposes runtime settings that have no DynamoDB equivalent:
 |---------|---------|-------------|
 | `control_plane_delay_seconds` | 5 | Simulated delay for table state transitions (CREATING → ACTIVE, DELETING → removed) |
 | `index_propagation_delay_ms` | 10 | System-wide default propagation delay for asynchronous secondary-index maintenance (milliseconds), covering GSIs and vector indexes alike. Per-GSI overrides stored in catalog; vector indexes have no per-index override. 0 = synchronous. Accepts the pre-rename name `gsi_propagation_delay_ms` as a deprecated alias, and a catalog created before the rename keeps honouring a value stored under it. |
-| `throttling_enabled` | `true` | Enable provisioned capacity throttling (token bucket per table/partition) |
+| `throttling_enabled` | `false` | Enable provisioned capacity throttling (token bucket per table/partition) |
 | `limits.allow_multipart_table_keys` | `false` | Enable multi-part base table key extension |
 | `log_level` | `info` | Runtime log level (trace, debug, info, warn, error) |
 | `sqlx_log_level` | `warn` | Separate log level for sqlx query traces |

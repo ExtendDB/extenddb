@@ -1,5 +1,5 @@
 ---
-description: "Start the PostgreSQL image and a PostgreSQL container with one docker compose command, then create users, access keys and tables."
+description: "Start the extenddb/extenddb-postgres image and a PostgreSQL container with one docker compose command, then create users and access keys and make the first requests."
 ---
 
 # Docker Compose with PostgreSQL
@@ -115,13 +115,13 @@ docker compose exec extenddb extenddb manage \
   --policy-name full-access \
   --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"dynamodb:*","Resource":"*"}]}'
 
-# Create an access key (shown once — save it)
+# Create an access key (shown once; save it)
 docker compose exec extenddb extenddb manage \
   --user admin --password 'ExtendDBLocalAdmin123' \
   create-access-key --account-id <account-id> --user-name myuser
 ```
 
-For the full management API reference, see [Admin Guide](manuals/05-admin-guide.md).
+For the full management API reference, see [Administration](manuals/05-admin-guide.md).
 
 ## Configure AWS CLI
 
@@ -134,7 +134,7 @@ export AWS_CA_BUNDLE=/tmp/extenddb-cert.pem
 aws dynamodb list-tables --endpoint-url https://127.0.0.1:18443
 ```
 
-For more CLI examples, see [section 6 of the full walkthrough](getting-started.md#6-try-it-out); the table at the top of its section 5 lists the endpoint, certificate and credentials for a Compose server.
+For more CLI examples, see [First requests](first-requests.md); the table at the top of that page lists the endpoint, certificate and credentials for a Compose server.
 
 ## View logs
 
@@ -158,7 +158,7 @@ docker compose down -v
 
 ## ECR authentication
 
-The PostgreSQL image is pulled from Amazon ECR Public. If the pull fails with an
+The PostgreSQL server image is pulled from Amazon ECR Public. If the pull fails with an
 authorization error, reauthenticate:
 
 ```bash
