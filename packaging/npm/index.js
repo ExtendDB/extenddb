@@ -309,6 +309,9 @@ async function start(options = {}) {
     cwd,
     stdio: ["ignore", "ignore", "pipe"],
   });
+  // Best effort: do not outlive the caller.
+  const killOnExit = () => child.kill("SIGKILL");
+  process.once("exit", killOnExit);
   let stderrTail = "";
   child.stderr.on("data", (d) => {
     stderrTail = (stderrTail + d.toString()).slice(-4000);
@@ -327,9 +330,19 @@ async function start(options = {}) {
       reject(new Error(`extenddb exited during startup (code ${code}): ${stderrTail}`))
     );
   });
-  // The health wait gets the time the version check left.
-  await Promise.race([waitHealthy(endpoint, deadline, timeoutMs), spawned]);
+  // The health wait gets the time the version check left. A server that
+  // misses the deadline must not outlive the failed start.
+  await Promise.race([waitHealthy(endpoint, deadline, timeoutMs), spawned]).catch(async (err) => {
+    process.off("exit", killOnExit);
+    if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) {
+      const exited = new Promise((resolve) => child.once("exit", resolve));
+      child.kill("SIGKILL");
+      await exited;
+    }
+    throw err;
+  });
   child.removeAllListeners("exit");
+  child.once("exit", () => process.off("exit", killOnExit));
 
   let stopped = false;
   const stop = () =>
@@ -340,9 +353,6 @@ async function start(options = {}) {
       child.kill("SIGTERM");
       setTimeout(() => child.kill("SIGKILL"), 5000).unref();
     });
-  // Best effort: do not outlive the caller.
-  process.once("exit", () => child.kill("SIGKILL"));
-
   return {
     endpoint,
     port,
