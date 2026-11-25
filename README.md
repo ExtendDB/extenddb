@@ -535,7 +535,9 @@ arrive within the request timeout, its body must not stall for longer, and an
 HTTP/2 client must answer the keep-alive pings), the redirect of plain HTTP on
 a TLS port, the router's 404 and 405 answers to a path it has no route for or
 a method other than `POST` on `/`, the refusal of a repeated `host` or
-`authorization` header, and the checks of the `X-Amz-Target` header. Nor has
+`authorization` header, the developer-mode refusal of a browser request or a
+`/management` or `/metrics` request whose host the host check does not allow,
+and the checks of the `X-Amz-Target` header. Nor has
 this build the server's refusal of every request while a Cassandra, MongoDB or
 PostgreSQL backend registers again with its catalog, or the
 `AccessDeniedException` "User: is not authorized to perform this operation" it

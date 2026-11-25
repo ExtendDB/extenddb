@@ -23,7 +23,7 @@
 //! In developer mode a browser request is served only when its host is an IP
 //! address, `localhost`, a name ending in `.localhost`, or a name the operator
 //! lists in [`SETTING_KEY`]. Every other browser request is refused with 403
-//! before authentication. A call to the DynamoDB API and a console login are
+//! before authentication. A call to the `DynamoDB` API and a console login are
 //! `POST`s, which carry `Origin`, so a rebinding page can make neither.
 //!
 //! A same-origin `GET` or `HEAD` from a page served over plain HTTP from any
@@ -34,7 +34,7 @@
 //! another name, such as a Compose service name, needs that name listed. Any
 //! other request with no marker is served as before, whatever its host.
 //!
-//! Firefox before 70 and EdgeHTML send no `Origin` on a `POST` and no
+//! Firefox before 70 and `EdgeHTML` send no `Origin` on a `POST` and no
 //! `Sec-Fetch-*` headers, so outside the admin routes the guard serves their
 //! requests as it serves a non-browser client. The guard is installed only in
 //! developer mode; production serving is unchanged.
@@ -93,6 +93,7 @@ pub(crate) fn allowed_hosts(dev_mode: bool, raw: Option<&str>) -> Arc<[String]> 
 
 /// The note for an entry [`parse_dev_allowed_hosts`] dropped, saying what a
 /// kept entry looks like, for the startup banner and the log.
+#[must_use]
 pub fn dropped_entry_note(entry: &str) -> String {
     format!(
         "dev_allowed_hosts entry '{entry}' was ignored: list a bare host name with no port, \
@@ -111,6 +112,7 @@ fn rule() -> String {
 
 /// The host rule followed by the names kept from the setting, for the startup
 /// banner and the log.
+#[must_use]
 pub fn rule_line(kept: &[String]) -> String {
     let listed = if kept.is_empty() {
         "(none)".to_owned()
@@ -184,10 +186,11 @@ fn is_loopback_name(host: &str) -> bool {
 /// port, unwrap IPv6 brackets, and ignore a single trailing dot. The port is
 /// the text after the colon that follows the host, and it must be one or more
 /// ASCII digits. Returns `None` when the value has no host part or is
-/// structurally malformed: brackets around anything but an IPv6 address, or a
-/// colon followed by anything but digits, such as userinfo
-/// (`127.0.0.1:1@evil.com`), a port name, an empty port or an unbracketed IPv6
-/// address.
+/// structurally malformed: an opening bracket with no closing one, brackets
+/// around anything but an IPv6 address, text after the closing bracket other
+/// than a port, or a colon followed by anything but digits, such as userinfo
+/// (`127.0.0.1:1@evil.com`), a port name, an empty port or an unbracketed
+/// IPv6 address.
 fn host_label(raw: &str) -> Option<&str> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -354,6 +357,7 @@ fn reject_response(path: &str, reason: &RejectReason) -> Response {
 /// wildcard; any other entry is dropped, and the startup banner names it. Kept
 /// names are lowercased for a case-insensitive comparison against a request
 /// host.
+#[must_use]
 pub fn parse_dev_allowed_hosts(raw: &str) -> (Vec<String>, Vec<String>) {
     let mut kept = Vec::new();
     let mut dropped = Vec::new();
