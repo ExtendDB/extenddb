@@ -1,5 +1,7 @@
 /target
 /target-*
+# Generated wasm-bindgen module output that crates/wasm-adapter/parity/run.mjs loads.
+/crates/wasm-adapter/parity/pkg/
 extenddb.toml
 __pycache__/
 .coverage
