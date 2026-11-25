@@ -91,6 +91,32 @@ fn test_toml_deserialization() {
     assert_eq!(config.max_connections, 20);
 }
 
+/// Cassandra stores `Acme_catalog` as `acme_catalog`, so the prefix is
+/// lower case wherever the code reads it from.
+#[test]
+fn a_keyspace_prefix_is_lower_cased_in_every_form_it_is_given() {
+    let config: CassandraStorageConfig = toml::from_str(
+        r#"
+        contact_points = ["host1:9042"]
+        keyspace_prefix = "Acme_Prod"
+        "#,
+    )
+    .unwrap();
+    assert_eq!(config.keyspace_prefix, "acme_prod");
+
+    let (_, prefix) = CassandraStorageConfig::parse_connection_string("h1:9042,h2:9042/Acme_Prod");
+    assert_eq!(prefix, "acme_prod");
+    let parts = CassandraStorageConfig::connection_parts("user:pw@h1:9042/Acme_Prod");
+    assert_eq!(parts.keyspace_prefix, "acme_prod");
+
+    // A prefix that is already lower case, and the default, are unchanged.
+    let config: CassandraStorageConfig =
+        toml::from_str("contact_points = [\"h:9042\"]\nkeyspace_prefix = \"my_app_1\"").unwrap();
+    assert_eq!(config.keyspace_prefix, "my_app_1");
+    let config: CassandraStorageConfig = toml::from_str("contact_points = [\"h:9042\"]").unwrap();
+    assert_eq!(config.keyspace_prefix, "extenddb");
+}
+
 #[test]
 fn test_toml_deserialization_minimal() {
     let toml_str = r#"

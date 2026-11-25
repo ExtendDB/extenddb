@@ -3,7 +3,7 @@
 
 //! Cassandra storage backend configuration.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 /// Cassandra storage backend configuration.
 ///
@@ -25,8 +25,13 @@ pub struct CassandraStorageConfig {
     /// Password for authentication
     pub password: Option<String>,
 
-    /// Keyspace prefix (default: "extenddb")
-    #[serde(default = "default_keyspace_prefix")]
+    /// Keyspace prefix (default: "extenddb"), in lower case. A prefix with an
+    /// upper-case letter is lower-cased when the config is read: see
+    /// [`fold_keyspace_prefix`].
+    #[serde(
+        default = "default_keyspace_prefix",
+        deserialize_with = "deserialize_keyspace_prefix"
+    )]
     pub keyspace_prefix: String,
 
     /// Replication factor for keyspaces (default: 3, for a section with no
@@ -61,6 +66,29 @@ pub struct CassandraStorageConfig {
 
 fn default_keyspace_prefix() -> String {
     "extenddb".to_string()
+}
+
+/// The keyspace prefix in the form Cassandra stores it.
+///
+/// ExtendDB writes keyspace names into CQL without quotes, and Cassandra
+/// stores an unquoted name in lower case: `CREATE KEYSPACE Acme_catalog`
+/// makes `acme_catalog`. The code compares the names it builds with the
+/// names in `system_schema`, which are lower case, so a prefix with an
+/// upper-case letter would match none of them. The three places that read a
+/// prefix from outside (the config file, the connection string and `init
+/// --keyspace-prefix`) call this function, so the rest of the crate sees the
+/// lower-case form. Code that builds a [`CassandraStorageConfig`] itself must
+/// pass a lower-case prefix: `CassandraEngine::new` asserts it in debug
+/// builds.
+#[must_use]
+pub(crate) fn fold_keyspace_prefix(prefix: &str) -> String {
+    prefix.to_ascii_lowercase()
+}
+
+fn deserialize_keyspace_prefix<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
+    String::deserialize(deserializer).map(|prefix| fold_keyspace_prefix(&prefix))
 }
 
 fn default_replication_factor() -> u32 {
@@ -195,7 +223,7 @@ impl CassandraStorageConfig {
             None => (None, None),
         };
         let (hosts, keyspace_prefix) = match rest.split_once('/') {
-            Some((hosts, keyspace)) => (hosts, keyspace.trim().to_string()),
+            Some((hosts, keyspace)) => (hosts, fold_keyspace_prefix(keyspace.trim())),
             None => (rest, default_keyspace_prefix()),
         };
         ConnectionParts {
