@@ -398,21 +398,17 @@ fn binary_set(value: &serde_json::Value) -> Result<AttributeValue, String> {
             "One or more parameter values were invalid: Binary sets should not be empty".to_owned(),
         );
     }
-    let set: BTreeSet<Vec<u8>> = arr
+    let decoded: Vec<Vec<u8>> = arr
         .iter()
         .map(|v| {
             let b64 = v.as_str().ok_or_else(|| EMPTY_ATTRIBUTE_VALUE.to_owned())?;
             decode_base64(b64)
         })
         .collect::<Result<_, _>>()?;
-    if set.len() != arr.len() {
+    if decoded.iter().collect::<BTreeSet<_>>().len() != decoded.len() {
         // Each member as the base64 of its bytes (measured 2026-11-21:
         // `["Y=Q=", "//Q="]` prints `[//Q=, //Q=]`).
-        let values = arr
-            .iter()
-            .filter_map(|v| v.as_str())
-            .map(|text| decode_base64(text).map(|bytes| BASE64.encode(bytes)))
-            .collect::<Result<Vec<_>, _>>()?;
+        let values: Vec<String> = decoded.iter().map(|bytes| BASE64.encode(bytes)).collect();
         let repr = values.join(", ");
         // The binary form names the set type, with the service's
         // own missing space before 'of' ("...]of type BS...") --
@@ -422,7 +418,7 @@ fn binary_set(value: &serde_json::Value) -> Result<AttributeValue, String> {
             "One or more parameter values were invalid: Input collection [{repr}]of type BS contains duplicates."
         ));
     }
-    Ok(AttributeValue::BS(set))
+    Ok(AttributeValue::BS(decoded.into_iter().collect()))
 }
 
 #[cfg(test)]
