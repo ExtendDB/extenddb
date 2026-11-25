@@ -24,8 +24,9 @@
 //   - Markdown links and code spans in comments pass through to the page.
 //
 // Usage: node scripts/gen-config-reference.mjs [--check]
-//   --check  regenerate to a string and exit 1 with a unified diff when it
-//            differs from the committed docs/configuration.md.
+//   --check  regenerate to a string and exit 1 when it differs from the
+//            committed docs/configuration.md; `npm run gen:config` followed
+//            by `git diff docs/configuration.md` shows the change.
 
 import {readFileSync, writeFileSync} from 'node:fs';
 import {dirname, resolve} from 'node:path';
@@ -187,62 +188,6 @@ function render(sections) {
   return out.join('\n');
 }
 
-/** Unified diff of two texts (line based, longest common subsequence). */
-function unifiedDiff(oldText, newText, oldName, newName) {
-  const a = oldText.split('\n');
-  const b = newText.split('\n');
-  const n = a.length;
-  const m = b.length;
-  const lcs = Array.from({length: n + 1}, () => new Uint32Array(m + 1));
-  for (let i = n - 1; i >= 0; i--) {
-    for (let j = m - 1; j >= 0; j--) {
-      lcs[i][j] = a[i] === b[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
-    }
-  }
-  const ops = [];
-  let i = 0;
-  let j = 0;
-  while (i < n || j < m) {
-    if (i < n && j < m && a[i] === b[j]) {
-      ops.push([' ', a[i]]);
-      i++;
-      j++;
-    } else if (i < n && (j >= m || lcs[i + 1][j] >= lcs[i][j + 1])) {
-      ops.push(['-', a[i]]);
-      i++;
-    } else {
-      ops.push(['+', b[j]]);
-      j++;
-    }
-  }
-  const out = [`--- ${oldName}`, `+++ ${newName}`];
-  const context = 3;
-  let k = 0;
-  while (k < ops.length) {
-    if (ops[k][0] === ' ') {
-      k++;
-      continue;
-    }
-    const start = Math.max(0, k - context);
-    let end = k;
-    let lastChange = k;
-    while (end < ops.length && end - lastChange <= context * 2) {
-      if (ops[end][0] !== ' ') lastChange = end;
-      end++;
-    }
-    end = Math.min(ops.length, lastChange + context + 1);
-    const hunk = ops.slice(start, end);
-    const oldStart = ops.slice(0, start).filter((o) => o[0] !== '+').length + 1;
-    const newStart = ops.slice(0, start).filter((o) => o[0] !== '-').length + 1;
-    const oldLen = hunk.filter((o) => o[0] !== '+').length;
-    const newLen = hunk.filter((o) => o[0] !== '-').length;
-    out.push(`@@ -${oldStart},${oldLen} +${newStart},${newLen} @@`);
-    for (const [tag, text] of hunk) out.push(tag + text);
-    k = end;
-  }
-  return out.join('\n');
-}
-
 function main() {
   const check = process.argv.includes('--check');
   const generated = render(parseSample(readFileSync(samplePath, 'utf8')));
@@ -255,14 +200,13 @@ function main() {
   try {
     current = readFileSync(outputPath, 'utf8');
   } catch {
-    // Missing file: the diff below shows the whole page as added.
+    // Missing file: reported as out of date below.
   }
   if (current === generated) {
     console.log('docs/configuration.md matches extenddb.sample.toml');
     return;
   }
-  console.error('docs/configuration.md is out of date; run `npm run gen:config` in website/ and commit the result.\n');
-  console.error(unifiedDiff(current, generated, 'a/docs/configuration.md', 'b/docs/configuration.md'));
+  console.error('docs/configuration.md is out of date; run `npm run gen:config` in website/ and commit the result.');
   process.exitCode = 1;
 }
 
