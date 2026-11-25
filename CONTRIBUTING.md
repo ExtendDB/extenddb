@@ -360,14 +360,23 @@ SQLite, PostgreSQL, Cassandra and MongoDB migrate through this framework.
    raises `RELEASED_THROUGH` to the last id pastes the lines the test
    prints; the release workflows' gate jobs run
    `devtools/check-released-through` on the tagged commit and refuse a tag
-   whose bound is below the last id:
+   whose bound is below the last id. `devtools/freeze-migrations` makes both
+   edits. It runs the four tests below, takes the lines for the migrations
+   above the bound, raises the bound, inserts the lines, formats the four
+   crates and runs the four tests again. With `--release-version X.Y.Z` it
+   refuses to freeze a breaking migration in a patch release from 1.0 on:
 
    ```bash
-   cargo test -p extenddb-storage-sqlite --lib the_released_bodies -- --nocapture
-   cargo test -p extenddb-storage-postgres --lib the_released_bodies -- --nocapture
-   cargo test -p extenddb-storage-mongodb --lib the_released_bodies -- --nocapture
-   cargo test -p extenddb-storage-cassandra --lib the_released_bodies -- --nocapture
+   cargo test --locked -p extenddb-storage-sqlite --lib the_released_bodies_match_their_checksums -- --nocapture
+   cargo test --locked -p extenddb-storage-postgres --lib the_released_bodies_match_their_checksums -- --nocapture
+   cargo test --locked -p extenddb-storage-mongodb --lib the_released_bodies_match_their_checksums -- --nocapture
+   cargo test --locked -p extenddb-storage-cassandra --lib the_released_bodies_match_their_checksums -- --nocapture
    ```
+
+   To check the script on the real crates, remove the last migration's
+   entries from the four `RELEASED` tables, lower `RELEASED_THROUGH` by one,
+   run `devtools/freeze-migrations` and run `git diff`, which must show
+   nothing.
 
    A released body does not change. If one has to, for example because a
    dependency upgrade changes a code body's source, add a second `RELEASED`

@@ -116,7 +116,8 @@ deliberate second step):
    that ships a catalog migration, the release commit also raises
    `RELEASED_THROUGH` to the last migration. That commit holds the checksum
    lines that the checksum test prints (CONTRIBUTING.md, "Adding a catalog
-   migration"). The gate jobs of the release workflows run
+   migration"); `devtools/freeze-migrations --release-version X.Y.Z` makes
+   both edits. The gate jobs of the release workflows run
    `devtools/check-released-through` on the tag and refuse it otherwise.
 2. Rehearse first. Before the tag is pushed, run `devtools/release-dry-run`
    on the release commit: it runs the image workflows' gate and build steps
