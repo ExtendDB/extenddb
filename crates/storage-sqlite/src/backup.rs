@@ -570,6 +570,11 @@ impl SqliteEngine {
     /// which flips it ACTIVE and the record DONE in the copy's last batch, or
     /// mark the record FAILED and remove the target if the copy fails. Logs
     /// either outcome.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "runs in the task LegacyBackupReader::restore spawns; restore's only caller is \
+                  the engine's backup runtime, which the wasm build does not compile"
+    )]
     async fn finish_restore(
         &self,
         desc: &TableDescription,
@@ -988,6 +993,11 @@ impl SqliteEngine {
 }
 
 impl LegacyBackupReader for SqliteEngine {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "its only caller is the engine's backup runtime, which the wasm build does not \
+                  compile"
+    )]
     fn create(
         &self,
         account_id: &str,
@@ -1414,6 +1424,11 @@ impl LegacyBackupReader for SqliteEngine {
         })
     }
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "its only caller is the engine's backup runtime, which the wasm build does not \
+                  compile"
+    )]
     fn restore(
         &self,
         account_id: &str,
