@@ -171,7 +171,9 @@ impl Settings {
         let store = Arc::clone(&self.store);
         InFlight {
             changes: self.changes(),
-            task: tokio::spawn(async move { store.get_setting(SEARCH_INEQUALITY_FILTERS).await }),
+            task: tokio::spawn(async move {
+                store.get_setting_bounded(SEARCH_INEQUALITY_FILTERS).await
+            }),
         }
     }
 

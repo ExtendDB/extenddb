@@ -527,5 +527,36 @@ async fn a_request_does_not_wait_on_a_read_in_flight_after_a_change() {
     assert_eq!(store.reads(), 2);
 }
 
+/// A store whose plain read never ends and whose bounded read answers `off`.
+struct BoundedOnly;
+
+impl SettingsStore for BoundedOnly {
+    fn get_setting(&self, _key: &str) -> BoxFuture<'_, OpResult<Option<String>>> {
+        Box::pin(std::future::pending())
+    }
+
+    fn get_setting_bounded(&self, _key: &str) -> BoxFuture<'_, OpResult<Option<String>>> {
+        Box::pin(async { Ok(Some("off".to_owned())) })
+    }
+
+    fn set_setting(&self, _key: &str, _value: &str) -> BoxFuture<'_, OpResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn list_settings(&self) -> BoxFuture<'_, OpResult<Vec<(String, String)>>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+/// A request reads the setting with the store's bounded read.
+#[tokio::test(start_paused = true)]
+async fn a_request_reads_the_setting_with_the_bounded_read() {
+    let settings = Settings::new(Arc::new(BoundedOnly));
+    assert_eq!(
+        settings.enabled_accounts().await.unwrap(),
+        EnabledAccounts::Off
+    );
+}
+
 #[path = "search_vectors_settings_fault_tests.rs"]
 mod fault;

@@ -57,6 +57,14 @@ pub trait SettingsStore: Send + Sync {
     /// Get a single setting value. Returns `None` if the key does not exist.
     fn get_setting(&self, key: &str) -> BoxFuture<'_, OpResult<Option<String>>>;
 
+    /// Get a single setting value for a data-plane request, which must not
+    /// wait on the store without bound. The default is
+    /// [`SettingsStore::get_setting`]; a store whose read can wait on a lock
+    /// overrides it with a read bounded in the store.
+    fn get_setting_bounded(&self, key: &str) -> BoxFuture<'_, OpResult<Option<String>>> {
+        self.get_setting(key)
+    }
+
     /// Set a setting value (upsert).
     fn set_setting(&self, key: &str, value: &str) -> BoxFuture<'_, OpResult<()>>;
 
