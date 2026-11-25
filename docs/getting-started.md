@@ -34,8 +34,9 @@ software on your behalf. After the script completes, continue from
 ## Quick start with Docker Compose
 
 If you have Docker, the repository's `docker-compose.yml` starts the published
-PostgreSQL image together with a PostgreSQL container and runs the initialization
-for you, with no build step. See [Docker Compose with PostgreSQL](local-dev-docker-compose.md),
+PostgreSQL image (with `EXTENDDB_IMAGE=extenddb/extenddb-postgres:latest`; without
+the variable it builds the image from source) together with a PostgreSQL container
+and runs the initialization for you. See [Docker Compose with PostgreSQL](local-dev-docker-compose.md),
 then apply the Docker Compose row of the table in [section 5](#5-configure-aws-cli)
 and continue at [section 6](#6-try-it-out).
 
@@ -349,7 +350,7 @@ journalctl -t extenddb | grep sqlx
 
 ### Control Plane Delay
 
-By default, control plane operations (CreateTable, DeleteTable) emulate the service's asynchronous behavior: tables transition through CREATING → ACTIVE and DELETING → removed states over a configurable delay (default: 5 seconds). Adjust with:
+By default, control plane operations (CreateTable, DeleteTable) emulate the service's asynchronous behavior: tables transition through CREATING → ACTIVE and DELETING → removed states over a configurable delay (default: 0.25 seconds). Adjust with:
 
 ```bash
 # Set to 0 for instant transitions (useful for fast test cycles)
@@ -542,7 +543,7 @@ aws dynamodb create-table \
     --billing-mode PAY_PER_REQUEST
 ```
 
-The table is created in the `CREATING` state and becomes `ACTIVE` a few seconds later, as on the service. Wait for it before writing:
+The table is created in the `CREATING` state and becomes `ACTIVE` after the control-plane delay (0.25 s by default; the service takes several seconds). Wait for it before writing:
 
 ```bash
 aws dynamodb wait table-exists --table-name MyTable
@@ -810,12 +811,13 @@ curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
 # {"status":"healthy"}
 ```
 
-### Delete the table
+### Delete the tables
 
-When you are done with `MyTable`:
+When you are done with `MyTable` and `StreamTable`:
 
 ```bash
 aws dynamodb delete-table --table-name MyTable
+aws dynamodb delete-table --table-name StreamTable
 ```
 
 ## 7. Manage admin users and accounts

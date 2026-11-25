@@ -162,11 +162,16 @@ export EXTENDDB__STORAGE__MONGODB__CONNECTION_STRING="mongodb://localhost:27017/
 
 ## Verifying the Connection
 
+`list-tables` needs an access key: the server answers `UnrecognizedClientException` without one. Create it as in the [post-init workflow](getting-started.md#post-init-workflow) of the full walkthrough, then:
+
 ```bash
 # Health check
 curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
 
 # List tables (should return empty)
+export AWS_ACCESS_KEY_ID=<access-key-from-create-access-key>
+export AWS_SECRET_ACCESS_KEY=<secret-key-from-create-access-key>
+export AWS_REGION=us-east-1
 aws dynamodb list-tables \
     --endpoint-url https://127.0.0.1:18443 \
     --region us-east-1

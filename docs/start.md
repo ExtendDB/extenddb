@@ -26,19 +26,20 @@ curl -s http://127.0.0.1:18080/health
 ```
 
 ```json
-{"status":"healthy"}
+{"components":{"backup_store":{"kind":"filesystem","status":"healthy"}},"status":"healthy"}
 ```
 
 The image has no TLS and no access control, so it is bound to the loopback interface only. It is for development and CI; the [development image](dev-image.md) page explains what it does and does not protect. For a server with TLS and PostgreSQL, use [Docker Compose](local-dev-docker-compose.md).
 
 ## 2. Point the AWS CLI at it
 
-The image seeds the example key pair from the AWS documentation. Export it, the region, and the endpoint. The AWS CLI version 2 and the current SDKs read `AWS_ENDPOINT_URL_DYNAMODB`, so no `--endpoint-url` flag is needed on each call.
+The image seeds the example key pair from the AWS documentation. Export it, the region (both variables, so a region already set in your shell does not win), and the endpoint. The AWS CLI version 2 and the current SDKs read `AWS_ENDPOINT_URL_DYNAMODB`, so no `--endpoint-url` flag is needed on each call.
 
 ```bash
 export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
 export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 export AWS_DEFAULT_REGION=us-east-1
+export AWS_REGION=us-east-1
 export AWS_ENDPOINT_URL_DYNAMODB=http://127.0.0.1:18080
 ```
 
@@ -54,7 +55,7 @@ aws dynamodb list-tables
 
 ## 3. Create a table and write to it
 
-Tables are created in the `CREATING` state and become `ACTIVE` a few seconds later, as on the service, so wait for the table before writing.
+Tables are created in the `CREATING` state and become `ACTIVE` after the control-plane delay (0.25 s by default; the service takes several seconds), so wait for the table before writing.
 
 ```bash
 aws dynamodb create-table \
