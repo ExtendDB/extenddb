@@ -65,6 +65,8 @@ The steps run in this order; every rejection is HTTP 400.
 
 A request body's JSON syntax is checked before authentication at every nesting depth (the service does the same). A body that fails the check returns `SerializationException` whatever the signature. In a body nested deeper than 127 levels, the syntax check reads only the first JSON value. It follows the service in four places. It does not check UTF-8 or surrogate escapes in strings. It reads a number as `-` or a digit and any run of digits, `+`, `-`, `.`, `e` and `E` after it. It takes any byte from `0` to `g` (0x30 to 0x67) as one of the four after `\u`. It skips NUL, vertical tab and form feed between tokens. So bytes after that value, an invalid UTF-8 byte and a lone surrogate escape reach authentication. So do a number such as `01`, `1.`, `1e` or `-`, an escape such as `\u12G4`, and one of those three bytes between tokens. Only the parse after authentication refuses them. A body nested deeper than 127 levels is parsed only after authentication, so an unauthenticated request never makes a worker thread recurse past that depth. Headers not named in `SignedHeaders` do not take part in verification; the service behaves the same way, and clients sign every `x-amz-*` header they send.
 
+A body of zero bytes is the one exception to the check. It goes to authentication first, as on the service, and the parse refuses it after that.
+
 #### Credential Types
 
 | Prefix | Type | Lifetime |

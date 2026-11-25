@@ -22,7 +22,11 @@ import boto3
 import pytest
 
 from raw_signed_request import signed_post
-from test_request_nesting_depth import _raw_put_body
+from test_request_nesting_depth import (
+    _is_messageless_serialization_error,
+    _raw_put_body,
+    _unauthenticated_post,
+)
 
 MISSING = f"extenddb-test-{uuid.uuid4().hex[:12]}".encode()
 NAMED = b'{"TableName": "' + MISSING + b'"}'
@@ -76,3 +80,61 @@ def test_a_body_with_a_syntax_fault_gets_no_message(
         assert err == {
             "__type": "com.amazon.coral.service#SerializationException"
         }, resp.text
+
+
+# Rows: the body, and whether the service refuses it before authentication.
+# Each body went to DescribeTable twice with no signature and twice signed for
+# an access key that does not exist, in us-east-1 on 2026-11-20, with the same
+# answer each time. A body refused first gets the SerializationException with
+# no message. Every other body, the empty one included, gets the
+# authentication error.
+UNAUTHENTICATED_ROWS = {
+    "empty": (b"", False),
+    "one-space": (b" ", True),
+    "white-space": (b"   \n\t", True),
+    "newline": (b"\n", True),
+    "open-brace": (b"{", True),
+    "letter": (b"x", True),
+    "byte-order-mark-alone": (b"\xef\xbb\xbf", True),
+    "not-json": (b"{not json", True),
+    "nul-byte": (b"\x00", True),
+    "null": (b"null", False),
+    "empty-array": (b"[]", False),
+    "one-object": (NAMED, False),
+    "string": (b'"x"', False),
+    "number": (b"5", False),
+}
+
+# The authentication error for each signing: the start of its type after the
+# "#", and its message. For a missing signature, ExtendDB's type is
+# MissingAuthenticationToken and its message differs from the service's
+# (#1075). So the type is compared by its start, and that message is not
+# compared.
+AUTHENTICATION_ERRORS = {
+    "unsigned": ("MissingAuthenticationToken", None),
+    "unknown-key": (
+        "UnrecognizedClientException",
+        "The security token included in the request is invalid.",
+    ),
+}
+
+
+@pytest.mark.parametrize("signing", list(AUTHENTICATION_ERRORS))
+@pytest.mark.parametrize(
+    "body, refused", list(UNAUTHENTICATED_ROWS.values()), ids=list(UNAUTHENTICATED_ROWS)
+)
+def test_which_bodies_are_refused_before_authentication(
+    dynamodb_client, endpoint_url, body, refused, signing
+):
+    resp = _unauthenticated_post(
+        dynamodb_client, endpoint_url, body, signing, "DescribeTable"
+    )
+    assert resp.status_code == 400, resp.text
+    err = resp.json()
+    if refused:
+        assert _is_messageless_serialization_error(err), resp.text
+    else:
+        error_type, message = AUTHENTICATION_ERRORS[signing]
+        assert err["__type"].rpartition("#")[2].startswith(error_type), resp.text
+        if message is not None:
+            assert err["message"] == message, resp.text
