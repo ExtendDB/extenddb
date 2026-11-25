@@ -15,17 +15,38 @@
 //! which accounts get the grammar. It is read through the settings store the
 //! server installs with [`install_search_filter_settings`] (see
 //! `search_vectors_settings.rs`), so a change applies without a restart.
-//! Until a store is installed, every account gets the grammar.
+//! Until a store is installed, every account gets the grammar. The browser
+//! build (wasm32) has no catalog and installs no store, so it compiles the
+//! store reads out and gives every account the grammar.
 
 #[cfg(feature = "search-inequality-filters")]
 pub(crate) use imp::{Extended, enabled_for, parse, resolve_scope};
 
-#[cfg(feature = "search-inequality-filters")]
+#[cfg(all(feature = "search-inequality-filters", not(target_arch = "wasm32")))]
 #[path = "search_vectors_settings.rs"]
 mod settings;
 
-#[cfg(feature = "search-inequality-filters")]
+#[cfg(all(feature = "search-inequality-filters", not(target_arch = "wasm32")))]
 pub use settings::{install_search_filter_settings, search_filter_settings_changed};
+
+/// The setting in the browser build, which installs no settings store: every
+/// account, as on a server that has not installed one. The store reads use a
+/// tokio task and the clock, which wasm32-unknown-unknown does not have.
+#[cfg(all(feature = "search-inequality-filters", target_arch = "wasm32"))]
+mod settings {
+    use std::future::{Future, ready};
+    use std::sync::Arc;
+
+    use extenddb_core::error::DynamoDbError;
+    use extenddb_core::expression::search_filter::EnabledAccounts;
+    use extenddb_storage::StorageEngine;
+
+    pub(crate) fn enabled_accounts(
+        _storage: &Arc<dyn StorageEngine>,
+    ) -> impl Future<Output = Result<EnabledAccounts, DynamoDbError>> {
+        ready(Ok(EnabledAccounts::All))
+    }
+}
 
 #[cfg(feature = "search-inequality-filters")]
 mod imp {

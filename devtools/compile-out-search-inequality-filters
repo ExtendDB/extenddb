@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 
 FEATURE = "search-inequality-filters"
-CRATES = 7
+CRATES = 8
 
 
 def main() -> int:
