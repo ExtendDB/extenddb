@@ -6,8 +6,7 @@
 //! Builds the canonical request string from the HTTP method, URI path,
 //! query string, signed headers, and body hash per the AWS `SigV4` spec.
 
-use aws_lc_rs::digest;
-use axum::http::HeaderMap;
+use http::HeaderMap;
 
 /// Build the canonical request string.
 ///
@@ -112,13 +111,13 @@ fn build_canonical_headers(headers: &HeaderMap, signed_headers: &str) -> String 
 
 /// Lowercase hex-encoded SHA-256 hash.
 pub(crate) fn sha256_hex(data: &[u8]) -> String {
-    hex::encode(digest::digest(&digest::SHA256, data))
+    hex::encode(extenddb_core::crypto::sha256(data))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderMap;
+    use http::HeaderMap;
 
     #[test]
     fn canonical_request_basic() {
@@ -244,7 +243,7 @@ mod tests {
         let mut with_extra = plain.clone();
         with_extra.append(
             "x-amz-meta-dup",
-            axum::http::HeaderValue::from_bytes(b"\xff\xfe").unwrap(),
+            http::HeaderValue::from_bytes(b"\xff\xfe").unwrap(),
         );
         let a = canonical_request("POST", "/", "", &plain, "host;x-amz-meta-dup", b"{}");
         let b = canonical_request("POST", "/", "", &with_extra, "host;x-amz-meta-dup", b"{}");
