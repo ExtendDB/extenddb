@@ -10,8 +10,8 @@ Each request went out twice with the same answer.
 - The service answers ``ValidationException`` with the enum text, the member
   path and the set in its own order.
 - A member of the wrong JSON type answers ``SerializationException`` first.
-  Its text there is "Unexpected field type", which ExtendDB does not send,
-  so these rows check the exception only.
+  Its text there, such as "Unexpected field type", is not the text ExtendDB
+  sends, so these rows check the exception only.
 - UpdateTable refuses before it looks up the table. After a refused
   CreateTable no table exists. After a refused UpdateTable the table has no
   stream, and the same UpdateTable with ``NEW_IMAGE`` enables one.
@@ -148,6 +148,9 @@ ROWS = [
     ("ut-defs", "UpdateTable",
      {"AttributeDefinitions": "x", "GlobalSecondaryIndexUpdates": BAD_CREATE},
      SERIALIZATION),
+    # ReplicaUpdates holds objects (measured 25 Nov 2026). The service's text
+    # here is "Unexpected value type in payload".
+    ("ut-replica-update-string", "UpdateTable", {"ReplicaUpdates": ["x"]}, SERIALIZATION),
     ("ut-replica-updates", "UpdateTable",
      {"AttributeDefinitions": _defs("g"), "GlobalSecondaryIndexUpdates": BAD_CREATE,
       "ReplicaUpdates": "x"},

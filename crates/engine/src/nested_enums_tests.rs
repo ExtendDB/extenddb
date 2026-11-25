@@ -211,12 +211,14 @@ fn rows() -> Vec<((&'static str, Value), Option<String>)> {
             ),
         ),
     ]);
-    // A member of the wrong JSON type answers first.
+    // A member of the wrong JSON type answers first. `ReplicaUpdates` holds
+    // objects (measured 2026-11-25).
     for (operation, body) in [
         create(with(bad_gsi(), json!({"AttributeDefinitions": "x"}))),
         create(with(bad_gsi(), json!({"Tags": "x"}))),
         update(with(bad_create(), json!({"AttributeDefinitions": "x"}))),
         update(with(bad_create(), json!({"ReplicaUpdates": "x"}))),
+        update(json!({"ReplicaUpdates": ["x"]})),
     ] {
         rows.push(((operation, body), None));
     }

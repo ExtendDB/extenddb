@@ -1214,10 +1214,10 @@ pub struct UpdateTableInput {
     /// beside it is refused with the service's sentence.
     #[serde(rename = "SSESpecification", default)]
     pub sse_specification: Option<serde_json::Value>,
-    /// Read so that a value that is not a list is refused, as the service
-    /// refuses it. `UpdateTable` does not act on it.
+    /// Read so that a value that is not a list of objects is refused, as the
+    /// service refuses it. `UpdateTable` does not act on it.
     #[serde(rename = "ReplicaUpdates", default)]
-    pub replica_updates: Option<Vec<serde_json::Value>>,
+    pub replica_updates: Option<Vec<serde_json::Map<String, serde_json::Value>>>,
 }
 
 /// `UpdateTable` response body.
