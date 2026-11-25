@@ -12,6 +12,38 @@ from __future__ import annotations
 import pytest
 from botocore.exceptions import ClientError
 
+from helpers import unique_name
+
+# The clause of a table with more than 25 requests. DynamoDB gave each such
+# table this clause, two tables in either order, in every answer measured on
+# 2026-11-20. It quoted the request map instead in some answers of 2026-11-14
+# and 2026-11-16 and in every answer of 2026-11-25, in a message that holds
+# QUOTED_MAP, so the test accepts that from DynamoDB.
+OVER_LIMIT = (
+    "Value at 'RequestItems.{}.member' failed to satisfy constraint: "
+    "Member must have length less than or equal to 25"
+)
+QUOTED_MAP = (
+    "' at 'requestItems' failed to satisfy constraint: Map value must satisfy "
+    "constraint: [Member must have length less than or equal to 25, "
+    "Member must have length greater than or equal to 1]"
+)
+
+
+def _puts(n: int) -> list[dict]:
+    return [{"PutRequest": {"Item": {"pk": {"S": f"k{i}"}}}} for i in range(n)]
+
+
+NESTED_PUT = {
+    "PutRequest": {
+        "Item": {
+            "pk": {"S": "nested"},
+            "doc": {"M": {"inner": {"L": [{"S": "a"}, {"NULL": True}]}}},
+        }
+    }
+}
+DELETES = [{"DeleteRequest": {"Key": {"pk": {"S": f"d{i}"}}}} for i in range(26)]
+
 
 class TestBatchWriteItem:
     """BatchWriteItem API tests."""
@@ -89,15 +121,33 @@ class TestBatchWriteItem:
             dynamodb_client.batch_write_item(RequestItems={})
         assert exc.value.response["Error"]["Code"] == "ValidationException"
 
-    def test_batch_write_too_many_items(self, table_factory, dynamodb_client):
-        """More than 25 items is rejected."""
-        name = table_factory()
-        items = [
-            {"PutRequest": {"Item": {"pk": {"S": f"k{i}"}}}} for i in range(26)
-        ]
+    @pytest.mark.parametrize(
+        ("tables", "named"),
+        [
+            pytest.param([("tbl", _puts(25) + [NESTED_PUT])], [0], id="25_puts_and_a_nested_26th"),
+            pytest.param([("tbl", DELETES)], [0], id="26_deletes"),
+            pytest.param([("tbl", _puts(26)), ("tbl", _puts(26))], [0, 1], id="two_tables_of_26"),
+            pytest.param([("tbl", _puts(1)), ("tbl", _puts(26))], [1], id="1_and_26"),
+            pytest.param([("tbl.dot", _puts(26))], [0], id="a_dot_in_the_table_name"),
+        ],
+    )
+    def test_batch_write_too_many_items(
+        self, table_factory, dynamodb_client, is_extenddb, tables, named
+    ):
+        """More than 25 requests for a table is rejected, with each such table
+        named at its member path."""
+        names = [table_factory(unique_name(prefix)) for prefix, _ in tables]
         with pytest.raises(ClientError) as exc:
-            dynamodb_client.batch_write_item(RequestItems={name: items})
-        assert exc.value.response["Error"]["Code"] == "ValidationException"
+            dynamodb_client.batch_write_item(
+                RequestItems={name: reqs for name, (_, reqs) in zip(names, tables)}
+            )
+        error = exc.value.response["Error"]
+        assert error["Code"] == "ValidationException"
+        if not is_extenddb and QUOTED_MAP in error["Message"]:
+            return
+        clauses = [OVER_LIMIT.format(names[i]) for i in named]
+        detected = f"{len(clauses)} validation error{'s' if len(clauses) > 1 else ''} detected: "
+        assert error["Message"] in {detected + "; ".join(c) for c in (clauses, clauses[::-1])}
 
     def test_batch_write_unprocessed_empty(self, table_factory, dynamodb_client):
         """Small batch returns empty UnprocessedItems."""
