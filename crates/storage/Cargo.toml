@@ -36,6 +36,7 @@ futures = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_path_to_error = "0.1"
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }

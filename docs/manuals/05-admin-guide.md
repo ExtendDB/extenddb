@@ -313,7 +313,12 @@ Any config key can be overridden via environment variables using the `EXTENDDB__
 EXTENDDB__SERVER__PORT=9000
 EXTENDDB__STORAGE__POSTGRES__CONNECTION_STRING="postgresql://..."
 EXTENDDB__AUTH__PROVIDER=builtin
+EXTENDDB__IMPORT__PATHS="/data/in,/data/shared"
 ```
+
+A list key (`import.paths`, `export.paths`, `storage.cassandra.contact_points`) takes one comma-delimited string; items are trimmed and empty items dropped, so an empty variable is an empty list. An item that itself contains a comma can only be written as an array in the config file.
+
+Every `[section]` and the installed backend's `[storage.<backend>]` table refuse to start the server on a key they do not know, with `unknown field` and the key named, so a misspelled key is a startup error rather than a default silently in force. The `[storage]` table itself reads only `backend` and the installed backend's section: a misspelled key placed directly under `[storage]`, and a table for a backend this binary does not install (`[storage.postgres]` under the SQLite binary), are not read and raise no error.
 
 Precedence: CLI flags > environment variables > config file > defaults.
 

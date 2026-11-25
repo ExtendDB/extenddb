@@ -6,9 +6,17 @@
 use serde::{Deserialize, Deserializer};
 
 /// Cassandra storage backend configuration.
+///
+/// Unknown keys are refused like every other section (issue #540), so a
+/// misspelled key fails at startup instead of silently taking the default.
+/// Environment overrides (`EXTENDDB__STORAGE__CASSANDRA__<KEY>`) reach this
+/// deserializer as strings, so the numeric fields accept their string form and
+/// `contact_points` accepts one comma-delimited string (issue #539).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CassandraStorageConfig {
     /// Cassandra contact points (host:port)
+    #[serde(deserialize_with = "extenddb_storage::config::string_coerce::string_list")]
     pub contact_points: Vec<String>,
 
     /// Username for authentication
@@ -28,7 +36,10 @@ pub struct CassandraStorageConfig {
 
     /// Replication factor for keyspaces (default: 3, for a section with no
     /// `replication_factor` line; `init` always writes the line)
-    #[serde(default = "default_replication_factor")]
+    #[serde(
+        default = "default_replication_factor",
+        deserialize_with = "extenddb_storage::config::string_coerce::u32"
+    )]
     pub replication_factor: u32,
 
     /// Datacenter name for `NetworkTopologyStrategy` (default: "datacenter1")
@@ -36,7 +47,10 @@ pub struct CassandraStorageConfig {
     pub datacenter: String,
 
     /// Maximum connections per host (default: 10)
-    #[serde(default = "default_max_connections")]
+    #[serde(
+        default = "default_max_connections",
+        deserialize_with = "extenddb_storage::config::string_coerce::u32"
+    )]
     pub max_connections: u32,
 
     /// Cached connection string (JDBC-style: `host1,host2/keyspace_prefix`)
@@ -286,228 +300,23 @@ impl extenddb_storage::config::StorageConfig for CassandraStorageConfig {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use extenddb_storage::config::StorageConfig;
-
-    #[test]
-    fn test_config_defaults() {
-        let config = CassandraStorageConfig::new(vec!["localhost:9042".to_string()]);
-
-        assert_eq!(config.keyspace_prefix, "extenddb");
-        assert_eq!(config.replication_factor, 3);
-        assert_eq!(config.datacenter, "datacenter1");
-        assert_eq!(config.max_connections, 10);
-        assert_eq!(config.username, None);
-        assert_eq!(config.password, None);
-    }
-
-    #[test]
-    fn test_connection_config() {
-        let config =
-            CassandraStorageConfig::new(vec!["host1:9042".to_string(), "host2:9042".to_string()]);
-
-        // Should return JDBC-style connection string with keyspace
-        assert_eq!(config.connection_config(), "host1:9042,host2:9042/extenddb");
-    }
-
-    #[test]
-    fn test_connection_config_empty() {
-        let config = CassandraStorageConfig::new(vec![]);
-        // Empty contact points should still include keyspace
-        assert_eq!(config.connection_config(), "/extenddb");
-    }
-
-    #[test]
-    fn the_connection_string_carries_the_role_and_hides_the_password_when_shown() {
-        let mut config = CassandraStorageConfig::new(vec!["h1:9042".to_string()]);
-        config.username = Some("app:role".to_string());
-        config.password = Some("p@ss/w,rd%".to_string());
-        config.rebuild_cached_connection_string();
-        let conn = config.connection_config();
-        assert_eq!(conn, "app%3Arole:p%40ss%2Fw%2Crd%25@h1:9042/extenddb");
-        let parts = CassandraStorageConfig::connection_parts(conn);
-        assert_eq!(parts.username.as_deref(), Some("app:role"));
-        assert_eq!(parts.password.as_deref(), Some("p@ss/w,rd%"));
-        assert_eq!(parts.contact_points, ["h1:9042"]);
-        assert_eq!(parts.keyspace_prefix, "extenddb");
-        assert_eq!(
-            CassandraStorageConfig::parse_connection_string(conn),
-            (vec!["h1:9042".to_string()], "extenddb".to_string())
-        );
-        let shown = CassandraStorageConfig::redact_connection_string(conn);
-        assert_eq!(shown, "app%3Arole:***@h1:9042/extenddb");
-        assert!(!format!("{parts:?}").contains("p@ss"));
-        // Without a password nothing is hidden, and without a role nothing
-        // is added.
-        config.password = None;
-        config.rebuild_cached_connection_string();
-        assert_eq!(config.connection_config(), "app%3Arole@h1:9042/extenddb");
-        config.username = None;
-        config.rebuild_cached_connection_string();
-        assert_eq!(config.connection_config(), "h1:9042/extenddb");
-        assert_eq!(
-            CassandraStorageConfig::redact_connection_string("h1:9042/extenddb"),
-            "h1:9042/extenddb"
-        );
-    }
-
-    #[test]
-    fn test_toml_deserialization() {
-        let toml_str = r#"
-            contact_points = ["host1:9042", "host2:9042"]
-            username = "cassandra"
-            password = "secret"
-            keyspace_prefix = "myapp"
-            replication_factor = 5
-            datacenter = "dc1"
-            max_connections = 20
-        "#;
-
-        let config: CassandraStorageConfig = toml::from_str(toml_str).unwrap();
-
-        assert_eq!(config.contact_points, vec!["host1:9042", "host2:9042"]);
-        assert_eq!(config.username, Some("cassandra".to_string()));
-        assert_eq!(config.password, Some("secret".to_string()));
-        assert_eq!(config.keyspace_prefix, "myapp");
-        assert_eq!(config.replication_factor, 5);
-        assert_eq!(config.datacenter, "dc1");
-        assert_eq!(config.max_connections, 20);
-    }
-
-    /// Cassandra stores `Acme_catalog` as `acme_catalog`, so the prefix is
-    /// lower case wherever the code reads it from.
-    #[test]
-    fn a_keyspace_prefix_is_lower_cased_in_every_form_it_is_given() {
-        let config: CassandraStorageConfig = toml::from_str(
-            r#"
-            contact_points = ["host1:9042"]
-            keyspace_prefix = "Acme_Prod"
-            "#,
-        )
-        .unwrap();
-        assert_eq!(config.keyspace_prefix, "acme_prod");
-
-        let (_, prefix) =
-            CassandraStorageConfig::parse_connection_string("h1:9042,h2:9042/Acme_Prod");
-        assert_eq!(prefix, "acme_prod");
-        let parts = CassandraStorageConfig::connection_parts("user:pw@h1:9042/Acme_Prod");
-        assert_eq!(parts.keyspace_prefix, "acme_prod");
-
-        // A prefix that is already lower case, and the default, are unchanged.
-        let config: CassandraStorageConfig =
-            toml::from_str("contact_points = [\"h:9042\"]\nkeyspace_prefix = \"my_app_1\"")
-                .unwrap();
-        assert_eq!(config.keyspace_prefix, "my_app_1");
-        let config: CassandraStorageConfig =
-            toml::from_str("contact_points = [\"h:9042\"]").unwrap();
-        assert_eq!(config.keyspace_prefix, "extenddb");
-    }
-
-    #[test]
-    fn test_toml_deserialization_minimal() {
-        let toml_str = r#"
-            contact_points = ["localhost:9042"]
-        "#;
-
-        let config: CassandraStorageConfig = toml::from_str(toml_str).unwrap();
-
-        // Verify defaults are applied
-        assert_eq!(config.keyspace_prefix, "extenddb");
-        assert_eq!(config.replication_factor, 3);
-        assert_eq!(config.datacenter, "datacenter1");
-        assert_eq!(config.max_connections, 10);
-        assert_eq!(config.username, None);
-        assert_eq!(config.password, None);
-    }
-
-    #[test]
-    fn test_build_connection_string() {
-        let mut config = CassandraStorageConfig::new(vec![
-            "127.0.0.1:9042".to_string(),
-            "127.0.0.2:9042".to_string(),
-        ]);
-        config.keyspace_prefix = "my_keyspace".to_string();
-        config.rebuild_cached_connection_string();
-
-        assert_eq!(
-            config.cached_connection_string.as_ref().unwrap(),
-            "127.0.0.1:9042,127.0.0.2:9042/my_keyspace"
-        );
-    }
-
-    #[test]
-    fn test_build_connection_string_default_keyspace() {
-        let config = CassandraStorageConfig::new(vec!["localhost:9042".to_string()]);
-
-        assert_eq!(
-            config.cached_connection_string.as_ref().unwrap(),
-            "localhost:9042/extenddb"
-        );
-    }
-
-    #[test]
-    fn test_parse_connection_string_with_keyspace() {
-        let (contact_points, keyspace) = CassandraStorageConfig::parse_connection_string(
-            "127.0.0.1:9042,127.0.0.2:9042/my_keyspace",
-        );
-
-        assert_eq!(contact_points.len(), 2);
-        assert_eq!(contact_points[0], "127.0.0.1:9042");
-        assert_eq!(contact_points[1], "127.0.0.2:9042");
-        assert_eq!(keyspace, "my_keyspace");
-    }
-
-    #[test]
-    fn test_parse_connection_string_without_keyspace() {
-        let (contact_points, keyspace) =
-            CassandraStorageConfig::parse_connection_string("127.0.0.1:9042,127.0.0.2:9042");
-
-        assert_eq!(contact_points.len(), 2);
-        assert_eq!(contact_points[0], "127.0.0.1:9042");
-        assert_eq!(contact_points[1], "127.0.0.2:9042");
-        assert_eq!(keyspace, "extenddb"); // Default
-    }
-
-    #[test]
-    fn test_parse_connection_string_single_host() {
-        let (contact_points, keyspace) =
-            CassandraStorageConfig::parse_connection_string("localhost:9042/test_keyspace");
-
-        assert_eq!(contact_points.len(), 1);
-        assert_eq!(contact_points[0], "localhost:9042");
-        assert_eq!(keyspace, "test_keyspace");
-    }
-
-    #[test]
-    fn test_parse_connection_string_with_whitespace() {
-        let (contact_points, keyspace) = CassandraStorageConfig::parse_connection_string(
-            "  127.0.0.1:9042  ,  127.0.0.2:9042  /  my_keyspace  ",
-        );
-
-        assert_eq!(contact_points.len(), 2);
-        assert_eq!(contact_points[0], "127.0.0.1:9042");
-        assert_eq!(contact_points[1], "127.0.0.2:9042");
-        assert_eq!(keyspace, "my_keyspace");
-    }
-
-    #[test]
-    fn test_roundtrip_connection_string() {
-        // Build a connection string
-        let mut config =
-            CassandraStorageConfig::new(vec!["host1:9042".to_string(), "host2:9042".to_string()]);
-        config.keyspace_prefix = "test_ks".to_string();
-        config.rebuild_cached_connection_string();
-
-        let conn_str = config.cached_connection_string.unwrap();
-
-        // Parse it back
-        let (contact_points, keyspace) = CassandraStorageConfig::parse_connection_string(&conn_str);
-
-        assert_eq!(contact_points.len(), 2);
-        assert_eq!(contact_points[0], "host1:9042");
-        assert_eq!(contact_points[1], "host2:9042");
-        assert_eq!(keyspace, "test_ks");
-    }
+/// Deserialize a `[storage.cassandra]` TOML table into a boxed `StorageConfig`.
+///
+/// This is the entry point the installed backend hands to `extenddb-config`,
+/// so what it accepts is what `extenddb serve` accepts.
+///
+/// # Errors
+///
+/// Returns the deserialization error as text: an unknown key, a value of the
+/// wrong type, or a missing `contact_points`.
+pub fn deserialize_config(
+    table: &toml::Table,
+) -> Result<Box<dyn extenddb_storage::config::StorageConfig>, String> {
+    let mut config: CassandraStorageConfig =
+        extenddb_storage::config::parse_table(table, "cassandra")?;
+    config.ensure_cached_connection_string();
+    Ok(Box::new(config))
 }
+
+#[cfg(test)]
+mod tests;

@@ -271,10 +271,8 @@ pub fn backend() -> extenddb_storage::Backend {
             })
         },
         storage_config: |table| {
-            let config: MongoStorageConfig = table
-                .clone()
-                .try_into()
-                .map_err(|e: toml::de::Error| format!("Failed to parse mongodb config: {e}"))?;
+            let config: MongoStorageConfig =
+                extenddb_storage::config::parse_table(table, "mongodb")?;
             Ok(Box::new(config) as Box<dyn extenddb_storage::config::StorageConfig>)
         },
         operations: &operations::MongoOperationsEngine,

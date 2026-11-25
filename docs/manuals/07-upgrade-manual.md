@@ -399,6 +399,12 @@ deployment, even when no catalog migration is required.
 
 No catalog migration or configuration change is required.
 
+### v1.1.0: `[storage.cassandra]` refuses unknown keys; every key has an environment form
+
+**What changed.** `[storage.cassandra]` refuses a key the struct does not have, as every other section already did. A hand-edited key such as `replication_factr` or `pasword`, or a variable such as `EXTENDDB__STORAGE__CASSANDRA__KEYSPACE`, started v1.0.0 with the default in force; `serve`, `verify`, `migrate` and `init` now stop with `unknown field` and the key named. Files `init` wrote carry only known keys and are unaffected. `import.paths`, `export.paths` and `storage.cassandra.contact_points` accept one comma-delimited string as well as an array, and `storage.sqlite.pool_size`, `storage.cassandra.replication_factor` and `storage.cassandra.max_connections` accept their string form, so each has an environment override. A value of the wrong type in a `[storage.<backend>]` table is reported with its key in front, on one line: `Failed to parse sqlite config: pool_size: invalid u32 value "-1": invalid digit found in string`.
+
+**Rollback.** The previous binary refuses a file that writes a list key as one string (`expected a sequence`) or one of the three numeric keys as a quoted number (`invalid type: string "4", expected u32`). Before a rollback, write those keys as an array or a bare integer again, and unset the matching `EXTENDDB__` variables.
+
 ### v1.0.0: Cassandra reads and writes at `LOCAL_QUORUM`
 
 **What changed.** The Cassandra backend runs its reads and writes at `LOCAL_QUORUM`. 0.1.15 ran many of them at `ONE`, the driver's default, in each area: items (the reads of GetItem, Query and Scan among them), transactions, TTL, streams, the catalog, IAM and `init`. A read with `ConsistentRead` `false` also runs at `LOCAL_QUORUM`. A lightweight transaction runs Paxos at `LOCAL_SERIAL` and commits at `LOCAL_QUORUM`. 0.1.15 ran many of its lightweight transactions at those levels already, and others, among them the admin user creation and most IAM writes, at the driver's defaults, `SERIAL` and `ONE`. Batches ran at `LOCAL_QUORUM` before and still do. No setting changes these levels (#945).

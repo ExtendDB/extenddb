@@ -154,59 +154,7 @@ pub fn server_region_warning(region: &str) -> Option<StartupWarning> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::server_region_warning;
-
-    #[test]
-    fn a_region_the_backup_arn_parser_accepts_draws_no_warning() {
-        for region in ["us-east-1", "local", "eu-west-2", "a", "0-9"] {
-            assert!(server_region_warning(region).is_none(), "{region}");
-        }
-    }
-
-    #[test]
-    fn a_region_the_backup_arn_parser_refuses_is_warned_about_with_the_consequence() {
-        for region in [
-            "LOCAL",
-            "us_east_1",
-            "dev.local",
-            "",
-            "us east",
-            "Us-East-1",
-            "ü",
-        ] {
-            let warning = server_region_warning(region).unwrap_or_else(|| panic!("{region:?}"));
-            assert!(warning.title.contains("server.region"), "{region:?}");
-            assert!(warning.title.contains(&format!("{region:?}")), "{region:?}");
-            let text = warning.log_message();
-            assert!(
-                text.contains("Invalid Request: BackupArn is not valid"),
-                "{region:?}: {text}"
-            );
-            assert!(text.contains("DescribeBackup"), "{region:?}: {text}");
-            assert!(
-                text.contains("ListBackups refuses a cursor that is such an ARN"),
-                "{region:?}: {text}"
-            );
-            assert!(!text.contains("first page"), "{region:?}: {text}");
-            assert!(
-                text.contains("CreateBackup answers ValidationException naming server.region"),
-                "{region:?}: {text}"
-            );
-            // The warning agrees with the parser it speaks for.
-            let arn =
-                crate::util::backup_arn(region, "123456789012", "Music", "01489602797149-73d8d5bc");
-            assert!(crate::util::parse_backup_arn(&arn).is_none(), "{region:?}");
-        }
-        let arn = crate::util::backup_arn(
-            "us-east-1",
-            "123456789012",
-            "Music",
-            "01489602797149-73d8d5bc",
-        );
-        assert!(crate::util::parse_backup_arn(&arn).is_some());
-    }
-}
+mod tests;
 
 /// Serde helpers for typed backend-config fields that may arrive as strings.
 ///
@@ -216,32 +164,117 @@ mod tests {
 /// a raw `toml::Table`, which is strict about types (issue #222). These helpers
 /// accept either the native type or its string form, so
 /// `EXTENDDB__STORAGE__POSTGRES__POOL_SIZE=10` deserializes like
-/// `pool_size = 10`. String fields are untouched — coercion applies only where
-/// a backend explicitly opts a numeric or boolean field in with
+/// `pool_size = 10`, and a list key accepts one comma-delimited string, so
+/// `EXTENDDB__STORAGE__CASSANDRA__CONTACT_POINTS=a:9042,b:9042` deserializes
+/// like `contact_points = ["a:9042", "b:9042"]`. String fields are untouched:
+/// coercion applies only where a field explicitly opts in with
 /// `#[serde(deserialize_with = ...)]`, so a password of `"12345"` is never
 /// reinterpreted.
 pub mod string_coerce {
-    use serde::{Deserialize, Deserializer, de::Error};
+    use std::marker::PhantomData;
 
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum MaybeString<T> {
-        Native(T),
-        Text(String),
+    use serde::{Deserialize, Deserializer, de::Error, de::Unexpected, de::Visitor};
+
+    /// Parses one scalar from its string form; the error quotes the value and
+    /// names the type, and [`super::parse_table`] prefixes the key.
+    fn parse<T, E>(s: &str, what: &str) -> Result<T, E>
+    where
+        T: std::str::FromStr,
+        <T as std::str::FromStr>::Err: std::fmt::Display,
+        E: Error,
+    {
+        s.trim()
+            .parse()
+            .map_err(|e| E::custom(format!("invalid {what} value {s:?}: {e}")))
     }
 
-    fn coerce<'de, T, D>(deserializer: D, what: &str) -> Result<T, D::Error>
+    /// Accepts a scalar as its native type (integer or boolean) or as a string
+    /// that parses to it. A native value goes through `FromStr` as well, so
+    /// `bool` accepts a native boolean and `u32` a native integer; one that
+    /// does not fit fails with serde's own value or type error (``invalid
+    /// value: integer `-1`, expected a u32 or its string form``), and a bad
+    /// string with the value quoted (`invalid u32 value "four": ...`). A
+    /// float, array or table is a type error naming what was found and what
+    /// is accepted.
+    struct Scalar<T> {
+        what: &'static str,
+        _target: PhantomData<T>,
+    }
+
+    impl<T> Visitor<'_> for Scalar<T>
     where
-        T: Deserialize<'de> + std::str::FromStr,
+        T: std::str::FromStr,
+        <T as std::str::FromStr>::Err: std::fmt::Display,
+    {
+        type Value = T;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "a {} or its string form", self.what)
+        }
+
+        fn visit_str<E: Error>(self, s: &str) -> Result<T, E> {
+            parse(s, self.what)
+        }
+
+        fn visit_u64<E: Error>(self, v: u64) -> Result<T, E> {
+            v.to_string()
+                .parse()
+                .map_err(|_| E::invalid_value(Unexpected::Unsigned(v), &self))
+        }
+
+        fn visit_i64<E: Error>(self, v: i64) -> Result<T, E> {
+            v.to_string()
+                .parse()
+                .map_err(|_| E::invalid_value(Unexpected::Signed(v), &self))
+        }
+
+        fn visit_bool<E: Error>(self, v: bool) -> Result<T, E> {
+            v.to_string()
+                .parse()
+                .map_err(|_| E::invalid_type(Unexpected::Bool(v), &self))
+        }
+    }
+
+    fn coerce<'de, T, D>(deserializer: D, what: &'static str) -> Result<T, D::Error>
+    where
+        T: std::str::FromStr,
         <T as std::str::FromStr>::Err: std::fmt::Display,
         D: Deserializer<'de>,
     {
-        match MaybeString::<T>::deserialize(deserializer)? {
-            MaybeString::Native(v) => Ok(v),
-            MaybeString::Text(s) => s
-                .trim()
-                .parse()
-                .map_err(|e| D::Error::custom(format!("invalid {what} value \"{s}\": {e}"))),
+        deserializer.deserialize_any(Scalar {
+            what,
+            _target: PhantomData,
+        })
+    }
+
+    /// `Option` over [`Scalar`]: absent or null is `None`, anything present
+    /// is coerced.
+    struct OptScalar<T> {
+        what: &'static str,
+        _target: PhantomData<T>,
+    }
+
+    impl<'de, T> Visitor<'de> for OptScalar<T>
+    where
+        T: std::str::FromStr,
+        <T as std::str::FromStr>::Err: std::fmt::Display,
+    {
+        type Value = Option<T>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "a {} or its string form, or nothing", self.what)
+        }
+
+        fn visit_none<E: Error>(self) -> Result<Option<T>, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: Error>(self) -> Result<Option<T>, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Option<T>, D::Error> {
+            coerce(d, self.what).map(Some)
         }
     }
 
@@ -262,14 +295,10 @@ pub mod string_coerce {
     /// Returns an error when a present value is neither a `u32` nor a string
     /// that parses as one.
     pub fn opt_u32<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u32>, D::Error> {
-        Option::<MaybeString<u32>>::deserialize(deserializer)?
-            .map(|v| match v {
-                MaybeString::Native(n) => Ok(n),
-                MaybeString::Text(s) => s.trim().parse().map_err(|e| {
-                    serde::de::Error::custom(format!("invalid u32 value \"{s}\": {e}"))
-                }),
-            })
-            .transpose()
+        deserializer.deserialize_option(OptScalar {
+            what: "u32",
+            _target: PhantomData,
+        })
     }
 
     /// Deserialize an optional positive `u32` from a number, its string form,
@@ -304,6 +333,79 @@ pub mod string_coerce {
     pub fn u16<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u16, D::Error> {
         coerce(deserializer, "u16")
     }
+
+    /// Deserialize a `Vec<String>` from an array or from one comma-delimited
+    /// string, the only shape an environment variable can carry
+    /// (`EXTENDDB__IMPORT__PATHS="/data/in,/data/shared"`). Items in the
+    /// string form are trimmed and empty items are dropped, so an empty
+    /// variable is an empty list. An array is taken as written. The string
+    /// form has no escape, so an item that itself contains a comma can only
+    /// be written as an array in the file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming both accepted shapes when the value is neither
+    /// an array nor a string; an array element that is not a string fails
+    /// with serde's own type error.
+    pub fn string_list<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<String>, D::Error> {
+        struct ListVisitor;
+
+        impl<'de> Visitor<'de> for ListVisitor {
+            type Value = Vec<String>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an array of strings or one comma-delimited string")
+            }
+
+            fn visit_str<E: Error>(self, s: &str) -> Result<Self::Value, E> {
+                Ok(s.split(',')
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(str::to_owned)
+                    .collect())
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                Vec::<String>::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+            }
+        }
+
+        deserializer.deserialize_any(ListVisitor)
+    }
+}
+
+/// Deserialize a backend's `[storage.<backend>]` table into its config struct.
+///
+/// The table arrives as a `toml::Table`, whose deserializer has no source text
+/// to point at; its error puts the key on a second line (``in `pool_size` ``).
+/// This helper names the key in front of the message on one line instead:
+/// `Failed to parse sqlite config: pool_size: invalid u32 value "-1": invalid
+/// digit found in string`. An unknown-field or missing-field message already
+/// names its key and is passed through.
+///
+/// # Errors
+///
+/// Returns the deserialization error as text: an unknown key, a value of the
+/// wrong type, or a missing field.
+pub fn parse_table<T: serde::de::DeserializeOwned>(
+    table: &toml::Table,
+    backend: &str,
+) -> Result<T, String> {
+    serde_path_to_error::deserialize(toml::Value::Table(table.clone())).map_err(|e| {
+        let path = e.path().to_string();
+        let inner = e.into_inner();
+        let message = inner.message();
+        if path == "." || message.starts_with("unknown field") {
+            format!("Failed to parse {backend} config: {message}")
+        } else {
+            format!("Failed to parse {backend} config: {path}: {message}")
+        }
+    })
 }
 
 /// Deserializer function type for storage configurations.
@@ -323,105 +425,4 @@ pub fn deserialize_storage_config(table: &toml::Table) -> Result<Box<dyn Storage
 }
 
 #[cfg(test)]
-mod string_coerce_tests {
-    use serde::Deserialize;
-
-    #[derive(Debug, Deserialize)]
-    struct Sample {
-        #[serde(deserialize_with = "super::string_coerce::u32")]
-        count: u32,
-        #[serde(default, deserialize_with = "super::string_coerce::opt_u32")]
-        optional: Option<u32>,
-        #[serde(deserialize_with = "super::string_coerce::bool")]
-        flag: bool,
-        #[serde(deserialize_with = "super::string_coerce::u16")]
-        port: u16,
-        // Deliberately NOT coerced: a numeric-looking string field must stay a string.
-        password: String,
-    }
-
-    #[test]
-    fn native_types_deserialize_unchanged() {
-        let s: Sample = toml::from_str(
-            r#"count = 7
-optional = 9
-flag = true
-port = 8443
-password = "12345""#,
-        )
-        .expect("native types must deserialize");
-        assert_eq!(s.count, 7);
-        assert_eq!(s.optional, Some(9));
-        assert!(s.flag);
-        assert_eq!(s.port, 8443);
-        assert_eq!(s.password, "12345");
-    }
-
-    /// Issue #222: env-var overrides arrive as strings.
-    #[test]
-    fn string_forms_coerce_to_the_native_type() {
-        let s: Sample = toml::from_str(
-            r#"count = "7"
-optional = "9"
-flag = "true"
-port = " 8443 "
-password = "12345""#,
-        )
-        .expect("string forms must coerce");
-        assert_eq!(s.count, 7);
-        assert_eq!(s.optional, Some(9));
-        assert!(s.flag);
-        assert_eq!(s.port, 8443);
-        // The plain String field is never reinterpreted.
-        assert_eq!(s.password, "12345");
-    }
-
-    #[test]
-    fn absent_optional_stays_none() {
-        let s: Sample = toml::from_str(
-            r#"count = 1
-flag = false
-port = 1
-password = "x""#,
-        )
-        .expect("absent optional must deserialize");
-        assert_eq!(s.optional, None);
-    }
-
-    #[test]
-    fn garbage_strings_are_rejected_with_the_value_in_the_error() {
-        let err = toml::from_str::<Sample>(
-            r#"count = "seven"
-flag = false
-port = 1
-password = "x""#,
-        )
-        .expect_err("non-numeric string must be rejected");
-        assert!(
-            err.to_string().contains("seven"),
-            "error should quote the bad value, got: {err}"
-        );
-    }
-
-    #[test]
-    fn negative_and_overflow_values_are_rejected() {
-        assert!(
-            toml::from_str::<Sample>(
-                r#"count = "-1"
-flag = false
-port = 1
-password = "x""#
-            )
-            .is_err()
-        );
-        assert!(
-            toml::from_str::<Sample>(
-                r#"count = 1
-flag = false
-port = "70000"
-password = "x""#
-            )
-            .is_err()
-        );
-    }
-}
+mod string_coerce_tests;
