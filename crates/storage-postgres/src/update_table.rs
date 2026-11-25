@@ -138,18 +138,22 @@ impl PostgresEngine {
         // row lock and never queues behind one, so this read answers in the time
         // of one round trip.
         //
-        // It only shortens a refusal; it does not decide the request. A table it
-        // reads as ACTIVE falls through to the locked read, whose status check is
-        // the one the request acts on, so a status that changes between the two
-        // reads is still caught there. A missing row is left to the locked read
-        // as well: a CreateTable committing between the two reads has to be seen,
-        // and the locked read reports TableNotFound for a table still absent.
-        // Both reads are READ COMMITTED, so each takes its own snapshot and the
-        // second sees whatever committed after the first.
+        // It refuses early and never applies a request. A table it reads as
+        // ACTIVE falls through to the locked read, whose status check is the one
+        // the request acts on, so a status that changes between the two reads is
+        // still caught there. A missing row is left to the locked read as well:
+        // a CreateTable committing between the two reads has to be seen, and the
+        // locked read reports TableNotFound for a table still absent. Both reads
+        // are READ COMMITTED, so each takes its own snapshot and the second sees
+        // whatever committed after the first.
         //
-        // Both reads refuse through `refuse_unless_active`, so this read gives
-        // the same answer the locked read would have given; it exists to
-        // shorten the wait, not to change the answer.
+        // Both reads refuse through `refuse_unless_active`, so a status both
+        // reads see gets the same answer. The answer differs when the row
+        // changes after this read and before the locked read returns, as when
+        // this read runs while an uncommitted activation or delete holds the row
+        // lock. A CREATING row that becomes ACTIVE is refused here, where the
+        // locked read would apply the request. A DELETING row that is removed
+        // is refused here, where the locked read would report TableNotFound.
         let early_status: Option<String> = sqlx::query_scalar(
             "SELECT table_status FROM tables WHERE account_id = $1 AND table_name = $2",
         )
