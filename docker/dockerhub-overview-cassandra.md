@@ -10,8 +10,7 @@ before you rely on it; the setup guide below lists its known limitations.
 ## Quick start
 
 The Cassandra backend requires Apache Cassandra 4.1 or newer with
-`PasswordAuthenticator` enabled and a local datacenter named `datacenter1`.
-Read the
+`PasswordAuthenticator` enabled. Read the
 [Cassandra setup guide](https://github.com/ExtendDB/extenddb/blob/main/docs/cassandra-setup.md)
 first: it explains these requirements and the backend's known limitations.
 Run `CassandraAuthorizer`, under which `init` grants the application role only
@@ -49,14 +48,19 @@ docker run --rm \
   --config /var/lib/extenddb/extenddb.toml \
   --cassandra-contact-points cassandra.example.com:9042 \
   --cassandra-user <superuser> \
+  --replication-factor <1 for one node, 3 for three or more nodes> \
+  --datacenter <datacenter name from nodetool status> \
   --bind-addr 0.0.0.0 \
   --tls-san localhost \
   --tls-san 127.0.0.1
 ```
 
-`init` creates its keyspaces with replication factor 1. On a multi-node
-cluster, raise it afterwards as "Keyspace replication" in the setup guide
-describes.
+`init` creates its keyspaces with `--replication-factor` replicas in the
+`--datacenter` datacenter, and writes both to the configuration. Use a
+replication factor of 3 on a cluster of at least three nodes, and 1 on a
+single node. Use the datacenter name that `nodetool status` prints for your
+nodes. The defaults are replication factor 1 and `datacenter1`. To change the
+replication later, follow "Keyspace replication" in the setup guide.
 
 Start the server using the generated configuration:
 
@@ -96,18 +100,24 @@ Pin `X.Y.Z` or a digest for production; a version tag is never overwritten.
 `sha-<commit>` are unpromoted build candidates, not releases. Both
 `linux/amd64` and `linux/arm64` ship as one multi-architecture index.
 
-Every published image is signed with ExtendDB's release key, an elliptic-curve
-P-256 key held in the AWS Key Management Service. The public key is committed
-in the repository as
-[`extenddb-signing.pub.pem`](https://github.com/ExtendDB/extenddb/blob/main/extenddb-signing.pub.pem).
-Verify an image before deploying it:
+Every published image is signed keyless with Sigstore cosign, with a Rekor
+transparency-log entry: the certificate names the GitHub Actions workflow and
+ref that signed the image, and no public key is needed. Verify an image before
+deploying it:
 
 ```console
-cosign verify --key extenddb-signing.pub.pem \
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/ExtendDB/extenddb/\.github/workflows/(release-image|sign-image)\.yml@refs/heads/main$' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
   docker.io/extenddb/extenddb-cassandra:X.Y.Z
 ```
 
-The same images and their signatures are mirrored by digest to
+The signer identity separates tiers: routine backend releases are signed by
+`release-image.yml` and routine dev releases by `release-dev-image.yml`, so
+this pattern rejects a routinely-signed dev image. The break-glass signer
+`sign-image.yml` can sign any tier, so it is the one identity both patterns
+share; drop it to pin verification to the routine per-tier path. The same
+images and their signatures are mirrored by digest to
 `ghcr.io/extenddb/extenddb-cassandra` and
 `public.ecr.aws/extenddb/extenddb-cassandra`.
 

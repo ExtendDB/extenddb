@@ -532,65 +532,59 @@ mod tests {
 
     /// A created index whose key attribute is not in AttributeDefinitions is
     /// refused with the sentence the service picks by the member's shape
-    /// (measured 2026-10-25 and 2026-10-26): absent names the index; fewer
-    /// definitions than keys, including none, has the key schema sentence;
-    /// otherwise the sentence lists every key and every definition.
+    /// (measured 2026-10-25, 2026-10-26 and 2026-11-25): absent names the
+    /// index, fewer definitions than the index has keys has the key schema
+    /// sentence, a name defined twice is refused, and otherwise the sentence
+    /// lists every key of the index and every definition.
     #[test]
     fn a_created_gsi_on_an_undefined_key_attribute_is_refused_by_member_shape() {
-        let input = |defs: Option<Value>| -> UpdateTableInput {
+        const FEWER: &str = "Invalid KeySchema: Some index key attribute have no definition";
+        const LISTED: &str = "One or more parameter values were invalid: Some index key \
+                              attributes are not defined in AttributeDefinitions. Keys: [r, g], \
+                              AttributeDefinitions: [r, pk]";
+        const LISTED_PK_G: &str = "One or more parameter values were invalid: Some index key \
+                                   attributes are not defined in AttributeDefinitions. Keys: \
+                                   [g, r], AttributeDefinitions: [pk, g]";
+        const ABSENT: &str = "One or more parameter values were invalid: AttributeDefinitions \
+                              is not specified for index: gix";
+        let input = |keys: [&str; 2], defs: Option<&str>| -> UpdateTableInput {
             let mut v = serde_json::json!({
                 "TableName": "t",
                 "GlobalSecondaryIndexUpdates": [{ "Create": {
                     "IndexName": "gix",
                     "KeySchema": [
-                        { "AttributeName": "g", "KeyType": "HASH" },
-                        { "AttributeName": "r", "KeyType": "RANGE" },
+                        { "AttributeName": keys[0], "KeyType": "HASH" },
+                        { "AttributeName": keys[1], "KeyType": "RANGE" },
                     ],
                     "Projection": { "ProjectionType": "ALL" },
                 }}],
             });
             if let Some(d) = defs {
-                v["AttributeDefinitions"] = d;
+                v["AttributeDefinitions"] = d
+                    .split_whitespace()
+                    .map(|n| serde_json::json!({ "AttributeName": n, "AttributeType": "S" }))
+                    .collect();
             }
             serde_json::from_value(v).unwrap()
         };
-        let message = |defs: Option<Value>| match validate_gsi_updates(&input(defs)).unwrap_err() {
-            DynamoDbError::ValidationException(m) => m,
-            other => panic!("{other:?}"),
-        };
-        assert_eq!(
-            message(None),
-            "One or more parameter values were invalid: AttributeDefinitions is not specified for index: gix"
-        );
-        assert_eq!(
-            message(Some(serde_json::json!([]))),
-            "Invalid KeySchema: Some index key attribute have no definition"
-        );
-        assert_eq!(
-            message(Some(
-                serde_json::json!([{ "AttributeName": "g", "AttributeType": "S" }])
-            )),
-            "Invalid KeySchema: Some index key attribute have no definition"
-        );
-        assert_eq!(
-            message(Some(serde_json::json!([
-                { "AttributeName": "pk", "AttributeType": "S" },
-                { "AttributeName": "g", "AttributeType": "S" },
-            ]))),
-            "One or more parameter values were invalid: Some index key attributes are not defined in AttributeDefinitions. Keys: [g, r], AttributeDefinitions: [pk, g]"
-        );
-        assert_eq!(
-            message(Some(serde_json::json!([
-                { "AttributeName": "g", "AttributeType": "S" },
-                { "AttributeName": "g", "AttributeType": "S" },
-            ]))),
-            "Attribute Name is duplicated: g"
-        );
-        validate_gsi_updates(&input(Some(serde_json::json!([
-            { "AttributeName": "g", "AttributeType": "S" },
-            { "AttributeName": "r", "AttributeType": "S" },
-        ]))))
-        .unwrap();
+        // Definitions as space-separated names; `None` leaves the member out.
+        let cases = [
+            (["g", "r"], None, ABSENT),
+            (["g", "r"], Some(""), FEWER),
+            (["g", "r"], Some("g"), FEWER),
+            (["g", "r"], Some("other"), FEWER),
+            (["r", "g"], Some("r pk"), LISTED),
+            (["g", "r"], Some("pk g"), LISTED_PK_G),
+            (["g", "r"], Some("g g"), "Attribute Name is duplicated: g"),
+        ];
+        for (keys, defs, expected) in cases {
+            assert_eq!(
+                message(validate_gsi_updates(&input(keys, defs))),
+                expected,
+                "keys {keys:?}, definitions {defs:?}"
+            );
+        }
+        validate_gsi_updates(&input(["g", "r"], Some("g r"))).unwrap();
     }
 
     #[test]

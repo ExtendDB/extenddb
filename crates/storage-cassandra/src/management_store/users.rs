@@ -3,6 +3,8 @@
 
 //! User management operations for `CassandraCatalogStore`.
 
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use crate::catalog_store::CassandraCatalogStore;
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_storage::management_store::{OpError, OpResult, UserDetail};
@@ -76,7 +78,8 @@ impl CassandraCatalogStore {
         );
 
         session
-            .query_with_values(
+            .run(
+                Stmt::Write,
                 &policy_query,
                 cdrs_tokio::query_values!(
                     account_id.as_str(),
@@ -319,7 +322,7 @@ impl CassandraCatalogStore {
         );
 
         // Quorum commit, so the console's quorum session check sees the new hash.
-        crate::cassandra_util::apply_lwt_quorum(
+        crate::cassandra_util::apply_lwt(
             self.session(),
             &update_query,
             cdrs_tokio::query_values!(password_hash, account_id, user_name),
