@@ -422,6 +422,7 @@ jobs:
                    --certificate-identity-regexp '^https://github\.com/ExtendDB/extenddb/\.github/workflows/(release-dev-image|sign-image)\.yml@refs/heads/main$' \
                    --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
                    --certificate-github-workflow-trigger workflow_dispatch \
+                   --certificate-github-workflow-repository 'ExtendDB/extenddb' \
                    "${REPO}@${EXISTING}" >/dev/null; then
                 echo "::error::${REPO}:${VERSION} carries a signature artifact that does NOT verify as a keyless ExtendDB dev-image signature; refusing to skip. A key-signed version from before the keyless cutover cannot be re-released through this path; handle it manually. Investigate before re-dispatching."
                 exit 1
@@ -498,6 +499,7 @@ jobs:
           image-repo: docker.io/${{ env.IMAGE_REPO }}
           digest: ${{ steps.push.outputs.digest }}
           release-tag: v${{ needs.gate.outputs.version }}
+          signer-workflow: release-dev-image
 
       - name: Summarise for the release checklist
         run: |

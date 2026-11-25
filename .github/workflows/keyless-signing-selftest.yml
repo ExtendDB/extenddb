@@ -13,6 +13,11 @@
 # proves the MECHANISM and prints the exact certificate identity cosign
 # records; the release workflows use the same identity shape with their own
 # workflow names (release-image, release-dev-image, sign-image) on main.
+#
+# The selftest-called job runs the same signing action in a workflow that
+# this one calls (keyless-signing-selftest-called.yml), the way
+# release-publish.yml will call the release workflows, and checks the
+# identity a called workflow's certificate carries.
 
 name: keyless signing selftest
 
@@ -23,6 +28,7 @@ on:
       - '.github/actions/sign-image/**'
       - '.github/actions/promote-registry/**'
       - '.github/workflows/keyless-signing-selftest.yml'
+      - '.github/workflows/keyless-signing-selftest-called.yml'
 
 permissions:
   contents: read
@@ -103,6 +109,7 @@ jobs:
             --certificate-identity-regexp "$IDENTITY_RE" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             --certificate-github-workflow-trigger "$GITHUB_EVENT_NAME" \
+            --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
             "${DST}@${DIGEST}" >/dev/null
           echo "Roundtrip keyless verify of the copied signature: OK"
           # Informational: record the exact certificate identity cosign saw.
@@ -128,3 +135,13 @@ jobs:
             skopeo delete "docker://${ref}" 2>/dev/null
           done
           true
+
+  # The same signing action, run in a called workflow. Same skip rule as the
+  # job above.
+  selftest-called:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      packages: write   # GHCR scratch repo
+      id-token: write   # keyless signing (Sigstore/Fulcio) via OIDC
+    uses: ./.github/workflows/keyless-signing-selftest-called.yml

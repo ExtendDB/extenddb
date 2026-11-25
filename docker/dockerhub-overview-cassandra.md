@@ -109,6 +109,7 @@ deploying it:
 cosign verify \
   --certificate-identity-regexp '^https://github\.com/ExtendDB/extenddb/\.github/workflows/(release-image|sign-image)\.yml@refs/heads/main$' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+  --certificate-github-workflow-repository 'ExtendDB/extenddb' \
   docker.io/extenddb/extenddb-cassandra:X.Y.Z
 ```
 

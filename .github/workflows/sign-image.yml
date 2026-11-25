@@ -131,6 +131,7 @@ jobs:
           digest: ${{ env.DIGEST }}
           release-tag: ${{ env.RELEASE }}
           extra-annotation: org.extenddb.break-glass-reason=${{ inputs.reason }}
+          signer-workflow: sign-image
 
       - name: Log out
         if: always()
