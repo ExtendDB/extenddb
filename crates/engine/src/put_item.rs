@@ -32,19 +32,6 @@ pub async fn handle_put_item(
     // Validate table name from raw body first (takes priority over enum errors)
     if let Some(table_name) = body.get("TableName").and_then(|v| v.as_str()) {
         extenddb_core::validation::validate_table_name(table_name, &ctx.limits)?;
-    } else if body
-        .get("TableName")
-        .is_some_and(serde_json::Value::is_string)
-    {
-        // empty string — caught by validate_table_name above
-    } else if body.get("TableName").is_none()
-        || body
-            .get("TableName")
-            .is_some_and(serde_json::Value::is_null)
-    {
-        return Err(DynamoDbError::ValidationException(
-            "1 validation error detected: Value null at 'tableName' failed to satisfy constraint: Member must not be null".to_owned()
-        ));
     }
 
     // Pre-validate enum fields (report all invalid enums together)
@@ -74,7 +61,7 @@ pub async fn handle_put_item(
     )?;
     crate::validate_put_delete_return_values(&body)?;
 
-    let input: PutItemInput = serde_json::from_value(body).map_err(|e| {
+    let input: PutItemInput = crate::read_input(body, &["Item", "TableName"], |e| {
         let msg = e.to_string();
         if msg.contains("parameter values were invalid")
             || msg.contains("may not be empty")

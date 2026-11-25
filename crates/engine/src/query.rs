@@ -50,7 +50,7 @@ pub async fn handle_query(
     // The request-time checks on the raw body, before typed deserialization;
     // see `query_key_values::validate_query_request_body`.
     crate::query_key_values::validate_query_request_body(&body)?;
-    let input: QueryInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
+    let input: QueryInput = crate::read_input(body, &["TableName"], crate::deserialize_error)?;
 
     // P118: Fetch key_info first so we can use table_id for index lookup.
     let key_info = ctx

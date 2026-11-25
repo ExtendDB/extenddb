@@ -126,6 +126,9 @@ mod tests {
             table_class: None,
             tags: None,
             warm_throughput: None,
+            resource_policy: None,
+            global_table_settings_replication_mode: None,
+            global_table_source_arn: None,
         };
 
         // Create table

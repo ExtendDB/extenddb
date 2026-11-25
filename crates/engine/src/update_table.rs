@@ -27,8 +27,8 @@ pub async fn handle_update_table(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
-    // Per-member enum validation precedes everything else, including the table
-    // lookup, matching the measured service ordering.
+    // Per-member enum validation precedes everything else but a missing name,
+    // including the table lookup, matching the measured service ordering.
     crate::validate_enum_fields(
         &body,
         &[
@@ -43,11 +43,12 @@ pub async fn handle_update_table(
                 clause: crate::EnumClause::Named("tableThroughputMode"),
             },
         ],
-    )?;
+    )
+    .or_else(|fault| crate::require_members(&body, &["TableName"]).and(Err(fault)))?;
 
     crate::require_stream_enabled_member(&body)?;
     let mut input: UpdateTableInput =
-        serde_json::from_value(body).map_err(crate::deserialize_error)?;
+        crate::read_input(body, &["TableName"], crate::deserialize_error)?;
     input.resolve_table_throughput_mode();
 
     if input.table_name.is_empty() {

@@ -363,6 +363,11 @@ fn update_input(table: &str) -> UpdateTableInput {
         vector_index_updates: None,
         warm_throughput: None,
         sse_specification: None,
+        replica_updates: None,
+        multi_region_consistency: None,
+        global_table_witness_updates: None,
+        global_table_settings_replication_mode: None,
+        disassociation_protection_enabled: None,
     }
 }
 

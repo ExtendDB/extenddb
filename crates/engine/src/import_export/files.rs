@@ -437,6 +437,9 @@ fn create_table_input_from_params(tcp: &TableCreationParameters) -> CreateTableI
         table_class: None,
         on_demand_throughput: None,
         warm_throughput: None,
+        resource_policy: None,
+        global_table_settings_replication_mode: None,
+        global_table_source_arn: None,
     }
 }
 

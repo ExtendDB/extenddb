@@ -274,6 +274,9 @@ impl TestTable {
             table_class: None,
             deletion_protection_enabled: None,
             warm_throughput: None,
+            resource_policy: None,
+            global_table_settings_replication_mode: None,
+            global_table_source_arn: None,
         };
 
         let table_desc = engine.create_table(account_id, input).await.unwrap();
@@ -358,6 +361,9 @@ impl TestTable {
             table_class: None,
             deletion_protection_enabled: None,
             warm_throughput: None,
+            resource_policy: None,
+            global_table_settings_replication_mode: None,
+            global_table_source_arn: None,
         };
 
         let table_desc = engine.create_table(&account_id, input).await.unwrap();
@@ -453,6 +459,9 @@ impl TestTable {
             table_class: None,
             deletion_protection_enabled: None,
             warm_throughput: None,
+            resource_policy: None,
+            global_table_settings_replication_mode: None,
+            global_table_source_arn: None,
         };
 
         let table_desc = engine.create_table(&account_id, input).await.unwrap();
@@ -551,6 +560,9 @@ impl TestTable {
             table_class: None,
             deletion_protection_enabled: None,
             warm_throughput: None,
+            resource_policy: None,
+            global_table_settings_replication_mode: None,
+            global_table_source_arn: None,
         };
 
         let table_desc = engine.create_table(&account_id, input).await.unwrap();
@@ -758,6 +770,9 @@ pub async fn isolated_gsi_account(
         table_class: None,
         deletion_protection_enabled: None,
         warm_throughput: None,
+        resource_policy: None,
+        global_table_settings_replication_mode: None,
+        global_table_source_arn: None,
     };
     isolated_account(isolated, input).await
 }

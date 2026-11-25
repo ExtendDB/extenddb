@@ -4987,16 +4987,16 @@
       ]
     },
     {
-      "name": "table names: GetItem with a TableName outside the pattern and no Key answers SerializationException",
+      "name": "table names: GetItem with a TableName outside the pattern and no Key answers the null Key",
       "op": "GetItem",
       "body": {
         "TableName": "bad name!"
       },
-      "error": "SerializationException",
+      "error": "ValidationException",
       "checks": [
         {
           "path": "/message",
-          "equals": "Start of structure or map found where not expected: missing field `Key`"
+          "equals": "1 validation error detected: Value null at 'key' failed to satisfy constraint: Member must not be null"
         }
       ]
     },
