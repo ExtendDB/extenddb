@@ -6,12 +6,13 @@
 //!
 //! `log_storage_fault!` expands at its call site, so the event keeps the
 //! site's own `target`, `module_path`, `file` and `line`; an operator who
-//! filters on `extenddb_engine::backup` still matches the backup mapper's
-//! line. The macro adds `request_id` and `operation` from the request scope
-//! the server sets around the request (see `extenddb_storage::request_scope`),
-//! so the line can be matched to the `x-amzn-RequestId` the client received.
-//! Outside a request both are `None`, and `tracing` records nothing for a
-//! `None`, so the line carries neither field.
+//! filters on `extenddb_engine::backup_requests` still matches the backup
+//! mapper's line. The macro adds `request_id` and `operation` from the
+//! request scope the server sets around the request (see
+//! `extenddb_storage::request_scope`), so the line can be matched to the
+//! `x-amzn-RequestId` the client received. Outside a request both are
+//! `None`, and `tracing` records nothing for a `None`, so the line carries
+//! neither field.
 
 /// Write an event for a storage fault.
 ///

@@ -172,13 +172,13 @@ fn sites() -> Vec<Site> {
             target: "extenddb_engine::create_table",
         },
         Site {
-            name: "backup::storage_err_to_dynamo",
+            name: "backup_requests::storage_err_to_dynamo",
             error: internal,
-            map: crate::backup::storage_err_to_dynamo,
+            map: crate::backup_requests::storage_err_to_dynamo,
             status: 500,
             message: "backup storage error",
             level: "ERROR",
-            target: "extenddb_engine::backup",
+            target: "extenddb_engine::backup_requests",
         },
         Site {
             name: "update_table::update_table_err_to_dynamo",
@@ -332,7 +332,7 @@ async fn the_detached_restore_carries_the_scope_into_its_task() {
             request_id: Some("req-restore".to_owned()),
             operation: Some("RestoreTableFromBackup".to_owned()),
             message: "backup storage error".to_owned(),
-            target: "extenddb_engine::backup".to_owned(),
+            target: "extenddb_engine::backup_requests".to_owned(),
             level: "ERROR".to_owned(),
         }],
         "one fault line for the failed source lookup, naming the request"
