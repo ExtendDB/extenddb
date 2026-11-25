@@ -771,7 +771,7 @@ The plans here are for the statements shown, which carry no sort key
 condition. With an equality on the index sort key, PostgreSQL planned a Sort
 over a Bitmap Index Scan on every GSI page. A `BETWEEN` kept the Index Scan.
 On an LSI with 50 items per sort key value, both plans of each page with an
-equality were an Index Scan at Limit 10. At Limit 101, the custom plan of the
+equality were an Index Scan at Query Limit 10. At Query Limit 100, the custom plan of the
 first page was a Sort over a Bitmap Heap Scan. SQLite seeks on the condition's
 terms and applies the cursor as a filter.
 
