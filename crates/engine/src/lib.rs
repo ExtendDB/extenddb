@@ -380,10 +380,10 @@ pub struct DispatchMetrics {
     /// GSI/LSI name when the operation targets a secondary index.
     /// Used to attribute metrics to the specific index.
     pub index_name: Option<String>,
-    /// The tables of a batch that answered 200 with requests or keys a
-    /// backend throttled left unprocessed, by table name, once each. The
-    /// server records a throttle for each: its own bucket never saw them.
-    pub throttled_tables: Vec<String>,
+    /// The requests or keys a backend throttled in a batch that answered 200,
+    /// counted per table by its catalog name. The server records each count
+    /// as read or write throttle events: its own bucket never saw them.
+    pub throttled_tables: std::collections::BTreeMap<String, u32>,
 }
 
 /// Result of an engine dispatch: the JSON response body plus sideband metrics.

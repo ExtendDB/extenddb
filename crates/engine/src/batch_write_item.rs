@@ -3,7 +3,7 @@
 
 //! `BatchWriteItem` operation handler.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -216,7 +216,7 @@ async fn write_batch(
     // How many requests the backend throttled, and the first throttle error.
     let mut throttled_count: usize = 0;
     let mut first_throttle: Option<DynamoDbError> = None;
-    let mut throttled_tables: Vec<String> = Vec::new();
+    let mut throttled_tables: BTreeMap<String, u32> = BTreeMap::new();
 
     'tables: for (table_index, ((table_name, reqs), key_info)) in
         tables.iter().zip(&key_infos).enumerate()
@@ -301,9 +301,9 @@ async fn write_batch(
                         if first_throttle.is_none() {
                             first_throttle = Some(e);
                         }
-                        if !throttled_tables.contains(&key_info.table_name) {
-                            throttled_tables.push(key_info.table_name.clone());
-                        }
+                        *throttled_tables
+                            .entry(key_info.table_name.clone())
+                            .or_default() += 1;
                     }
                     unprocessed
                         .entry(table_name.to_owned())

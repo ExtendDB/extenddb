@@ -21,7 +21,7 @@
 #[path = "batch_partial/failing_store.rs"]
 mod failing_store;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -63,6 +63,11 @@ fn pks(list: &Value) -> BTreeSet<String> {
         .iter()
         .map(|k| k["pk"]["S"].as_str().expect("pk").to_owned())
         .collect()
+}
+
+/// The throttled entry count per table the engine hands the server.
+fn counts(rows: &[(&str, u32)]) -> BTreeMap<String, u32> {
+    rows.iter().map(|(t, n)| ((*t).to_owned(), *n)).collect()
 }
 
 /// The error of a handler result, or a panic naming the body that came back.
@@ -197,7 +202,7 @@ async fn batch_get_one_table_throttled_beside_a_served_table() {
         json!([{"TableName": "U", "CapacityUnits": 1.0}])
     );
     assert_eq!(result.metrics.read_capacity_units, 1.0);
-    assert_eq!(result.metrics.throttled_tables, ["T"]);
+    assert_eq!(result.metrics.throttled_tables, counts(&[("T", 2)]));
 }
 
 /// Every key of every table throttled: the call fails with the throttle
@@ -460,7 +465,7 @@ async fn batch_write_one_applied_entry_is_a_partial_success() {
         result.body["ConsumedCapacity"],
         json!([{"TableName": "T", "CapacityUnits": 1.0}])
     );
-    assert_eq!(result.metrics.throttled_tables, ["T"]);
+    assert_eq!(result.metrics.throttled_tables, counts(&[("T", 2)]));
 }
 
 /// Nothing throttled: `UnprocessedItems` is present as `{}` (13 of 13 fully
