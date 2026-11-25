@@ -1,0 +1,166 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Rehearses a release on the release PR's head commit, before the merge
+# creates the tag.
+#
+# Release tags are protected against update and deletion, so a release
+# failure that needs a code change after the tag exists costs a version
+# number. Each push to the release PR's branch (release-please's branch,
+# which the release workflow pushes with the release App's token) starts
+# this workflow on the pushed commit. It runs the three publish workflows'
+# gates and builds with dry_run, so such a failure shows before the merge:
+# release-image for each backend image (both architectures, smoke tests,
+# the vulnerability scan, SBOMs), release-dev-image, and npm-publish (five
+# platform binaries, their smoke tests and the launcher suite). These are
+# the dispatched dry runs of packaging/README.md step 2. The crates.io
+# check of step 2 is not here: run `devtools/release-dry-run --crates` on
+# the release PR's head before merging it. A dry run publishes, signs and
+# attests nothing, and the gates accept a commit input only with dry_run.
+#
+# release-pr.yml holds the check to make required on main. On the release
+# PR it waits for this workflow's run on the PR's head commit and passes
+# only if that run succeeded. This workflow never runs on pull_request or
+# merge_group, so a PR from a fork never starts it.
+#
+# A newer push to the branch cancels the run for the older head.
+# workflow_dispatch, from main only, rehearses a commit on main or the
+# release PR's head with the tag it will get; release-pr.yml does not read
+# dispatched runs.
+#
+# The called workflows' publish jobs ask for id-token, packages and
+# attestations write, and a caller must grant at least what a called job
+# asks for, even when that job is skipped. No job of a dry run requests a
+# token, and the environments those jobs name accept only main.
+
+name: release rehearsal
+
+on:
+  push:
+    branches: [release-please--branches--main--components--extenddb]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'The tag the commit will get, vX.Y.Z; it must match Cargo.toml at the commit'
+        required: true
+      commit:
+        description: 'Full SHA of the commit to rehearse, on main or the head of the release PR'
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-rehearsal-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  target:
+    # A push that deletes the branch has nothing to rehearse.
+    if: ${{ !github.event.deleted }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.target.outputs.tag }}
+      commit: ${{ steps.target.outputs.commit }}
+    steps:
+      - name: A dispatch runs from main
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          [[ "$GITHUB_REF" == refs/heads/main ]] \
+            || { echo "::error::dispatch release-rehearsal.yml from main; a run on ${GITHUB_REF} uses that ref's copy of the release workflows"; exit 1; }
+
+      - name: Check out the commit to rehearse
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.commit || github.sha }}
+          persist-credentials: false
+
+      - name: Name the tag and the commit
+        id: target
+        env:
+          EVENT: ${{ github.event_name }}
+          RAW_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          COMMIT=$(git rev-parse HEAD)
+          if [[ "$EVENT" == "push" ]]; then
+            # The release PR's version is the one release-please wrote to
+            # the manifest; the gates check it against Cargo.toml.
+            TAG="v$(jq -r '."."' .release-please-manifest.json)"
+          else
+            TAG="$RAW_TAG"
+          fi
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "::error::'${TAG}' is not vMAJOR.MINOR.PATCH"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+          echo "### Rehearsing ${TAG} on ${COMMIT}" >> "$GITHUB_STEP_SUMMARY"
+
+  # One job per image rather than a matrix, so that each image has its own
+  # result and "Re-run failed jobs" reruns the image that failed.
+  image-postgres:
+    needs: target
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+      attestations: write
+    uses: ./.github/workflows/release-image.yml
+    with:
+      tag: ${{ needs.target.outputs.tag }}
+      image: extenddb-postgres
+      dry_run: true
+      commit: ${{ needs.target.outputs.commit }}
+
+  image-mongodb:
+    needs: target
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+      attestations: write
+    uses: ./.github/workflows/release-image.yml
+    with:
+      tag: ${{ needs.target.outputs.tag }}
+      image: extenddb-mongodb
+      dry_run: true
+      commit: ${{ needs.target.outputs.commit }}
+
+  image-cassandra:
+    needs: target
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+      attestations: write
+    uses: ./.github/workflows/release-image.yml
+    with:
+      tag: ${{ needs.target.outputs.tag }}
+      image: extenddb-cassandra
+      dry_run: true
+      commit: ${{ needs.target.outputs.commit }}
+
+  dev-image:
+    needs: target
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+      attestations: write
+    uses: ./.github/workflows/release-dev-image.yml
+    with:
+      tag: ${{ needs.target.outputs.tag }}
+      dry_run: true
+      commit: ${{ needs.target.outputs.commit }}
+
+  npm:
+    needs: target
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/npm-publish.yml
+    with:
+      tag: ${{ needs.target.outputs.tag }}
+      dry_run: true
+      commit: ${{ needs.target.outputs.commit }}

@@ -1,0 +1,273 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# The release PR check. Its one job, `release-pr`, is the check to make
+# required on main.
+#
+#   - On the release PR (release-please's branch, from this repository) it
+#     checks the branch: the manifest, Cargo.toml and the npm manifest name
+#     one version, Cargo.lock matches Cargo.toml, the release freezes its
+#     catalog migrations, and the branch holds only release-please's commit
+#     and at most push-release-pr's commit. Between release-please's push
+#     and push-release-pr's commit, Cargo.lock does not match, so the PR
+#     cannot merge in that window. Then it waits for the
+#     release-rehearsal.yml run that the push of the PR's head commit
+#     started (up to 90 minutes) and passes only if that run succeeded.
+#   - On a merge queue entry whose own change (the merge group's head
+#     against its first parent, which is the head of the entry ahead or
+#     main) touches .release-please-manifest.json, it passes only when the
+#     entry's tree equals the tree of the release PR branch's head. If
+#     another PR merges ahead of the release PR, the trees differ and the
+#     queue drops the release PR; the next release.yml run rebuilds it on
+#     the new main. A PR other than the release PR that changes the
+#     manifest fails here the same way. This relies on the merge queue
+#     setting "Only merge non-failing pull requests". With it off, a
+#     failing release PR entry merges with the entries behind it.
+#   - On any other PR or queue entry it passes at once.
+#
+# The job needs to read the repository and the rehearsal's runs, and
+# nothing else, so it runs the same way on a PR from a fork. A newer push
+# to a PR cancels the run for its previous head. If the rehearsal fails
+# and a rerun of its failed jobs passes, rerun this job too.
+
+name: release PR
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+  merge_group:
+
+permissions:
+  contents: read
+  actions: read     # the rehearsal's runs
+
+concurrency:
+  group: release-pr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release-pr:
+    runs-on: ubuntu-latest
+    # The branch checks take a few minutes; the wait is up to 90.
+    timeout-minutes: 110
+    env:
+      RELEASE_BRANCH: release-please--branches--main--components--extenddb
+      IS_RELEASE_PR: >-
+        ${{ github.event_name == 'pull_request' &&
+            github.event.pull_request.head.ref == 'release-please--branches--main--components--extenddb' &&
+            github.event.pull_request.head.repo.full_name == github.repository }}
+    steps:
+      - name: Not the release PR
+        if: github.event_name == 'pull_request' && env.IS_RELEASE_PR != 'true'
+        run: |
+          echo "ok: not the release PR"
+
+      # The release PR.
+
+      - name: Check out the release PR's head
+        if: env.IS_RELEASE_PR == 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0         # the commit check reads the branch against main
+          persist-credentials: false
+
+      - name: The manifest, Cargo.toml and the npm manifest name one version
+        if: env.IS_RELEASE_PR == 'true'
+        run: |
+          set -euo pipefail
+          VERSION=$(jq -r '."."' .release-please-manifest.json)
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "::error::the manifest's version '${VERSION}' is not MAJOR.MINOR.PATCH"; exit 1; }
+          CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          [[ "$CARGO_VERSION" == "$VERSION" ]] \
+            || { echo "::error::Cargo.toml says ${CARGO_VERSION}, the manifest ${VERSION}"; exit 1; }
+          # The launcher's version and the five platform packages it pins.
+          NPM_VERSIONS=$(jq -r '[.version, (.optionalDependencies[])] | unique | join(" ")' packaging/npm/package.json)
+          [[ "$NPM_VERSIONS" == "$VERSION" ]] \
+            || { echo "::error::packaging/npm/package.json names ${NPM_VERSIONS}, the manifest ${VERSION}"; exit 1; }
+          echo "ok: every manifest names ${VERSION}"
+
+      - if: env.IS_RELEASE_PR == 'true'
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.97.0
+
+      - name: Cargo.lock matches Cargo.toml
+        if: env.IS_RELEASE_PR == 'true'
+        run: |
+          set -euo pipefail
+          # Resolves the workspace without building it. The Dockerfiles and
+          # release-crates build with --locked, so a tag on a commit that
+          # fails here could not be released.
+          cargo metadata --locked --format-version 1 > /dev/null \
+            || { echo "::error::Cargo.lock does not match Cargo.toml; wait for push-release-pr's commit"; exit 1; }
+
+      - name: The release freezes the catalog migrations it ships
+        if: env.IS_RELEASE_PR == 'true'
+        run: python3 devtools/check-released-through
+
+      - name: The branch holds only release-please's commit and push-release-pr's commit
+        if: env.IS_RELEASE_PR == 'true'
+        env:
+          BASE: origin/main
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          VERSION=$(jq -r '."."' .release-please-manifest.json)
+          [[ -z "$(git rev-list --min-parents=2 "${BASE}..HEAD")" ]] \
+            || { echo "::error::the release PR branch has a merge commit"; exit 1; }
+          mapfile -t COMMITS < <(git rev-list --reverse "${BASE}..HEAD")
+          (( ${#COMMITS[@]} == 1 || ${#COMMITS[@]} == 2 )) \
+            || { echo "::error::the release PR branch has ${#COMMITS[@]} commits on top of main; expected release-please's commit and at most push-release-pr's"; exit 1; }
+
+          # release-please's commit: the PR title as its subject, made with
+          # the App's token, and only the files release-please updates
+          # (release-please-config.json).
+          RP=${COMMITS[0]}
+          SUBJECT=$(git log -1 --format=%s "$RP")
+          [[ "$SUBJECT" == "chore(release): ${VERSION}" ]] \
+            || { echo "::error::the first commit's subject is '${SUBJECT}', expected 'chore(release): ${VERSION}'"; exit 1; }
+          AUTHOR=$(git log -1 --format='%an <%ae>' "$RP")
+          APP_AUTHOR='^[a-z0-9-]+\[bot\] <'
+          [[ "$AUTHOR" =~ $APP_AUTHOR ]] \
+            || { echo "::error::the first commit's author is ${AUTHOR}, not an App"; exit 1; }
+          RP_FILES=$(git diff-tree -r --no-commit-id --no-renames --name-only "$RP")
+          grep -qx '.release-please-manifest.json' <<< "$RP_FILES" \
+            || { echo "::error::the first commit does not change .release-please-manifest.json"; exit 1; }
+          while IFS= read -r f; do
+            case "$f" in
+              .release-please-manifest.json|CHANGELOG.md|Cargo.toml|packaging/npm/package.json|\
+              docs/getting-started.md|docs/manuals/04-quickstart-setup-guide.md) ;;
+              *) echo "::error::release-please's commit changes ${f}"; exit 1 ;;
+            esac
+          done <<< "$RP_FILES"
+
+          # push-release-pr's commit, if it has landed: the same author, and
+          # only content changes to regular files on its allowed list.
+          # Authorship is not authenticated; the main ruleset's approval of
+          # the last push covers who pushed.
+          if (( ${#COMMITS[@]} == 2 )); then
+            LOCK=${COMMITS[1]}
+            LOCK_AUTHOR=$(git log -1 --format='%an <%ae>' "$LOCK")
+            [[ "$LOCK_AUTHOR" == "$AUTHOR" ]] \
+              || { echo "::error::the second commit's author is ${LOCK_AUTHOR}, expected ${AUTHOR}"; exit 1; }
+            # git quotes an unusual path, which then matches no entry below.
+            while IFS=$'\t' read -r meta f; do
+              read -r old_mode new_mode _ _ status <<< "$meta"
+              [[ "$old_mode" == ":100644" && "$new_mode" == "100644" && "$status" == "M" ]] \
+                || { echo "::error::the second commit's change to ${f} is '${status}' from ${old_mode#:} to ${new_mode}; only content changes are allowed"; exit 1; }
+              case "$f" in
+                Cargo.lock|SOFTWARE-LICENSE-NOTICES.html|SOFTWARE-LICENSE-NOTICES-MONGODB.html|\
+                SOFTWARE-LICENSE-NOTICES-CASSANDRA.html|SOFTWARE-LICENSE-NOTICES-DEV.html|\
+                crates/storage/src/migrations/registry.rs|\
+                crates/storage-sqlite/src/migrations/mod.rs|crates/storage-postgres/src/migrations/mod.rs|\
+                crates/storage-mongodb/src/migrations/mod.rs|crates/storage-cassandra/src/migrations/mod.rs) ;;
+                *) echo "::error::the second commit changes ${f}, which push-release-pr may not change"; exit 1 ;;
+              esac
+            done < <(git diff-tree -r --no-commit-id --no-renames "$LOCK")
+          fi
+          echo "ok: ${#COMMITS[@]} commit(s) on top of main, as release-please and push-release-pr make them"
+
+      - name: The rehearsal of the PR's head passed
+        if: env.IS_RELEASE_PR == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # The run that the push of this commit to the release branch
+          # started. A rerun keeps its run id; a later push of the same
+          # commit starts a run with a higher one.
+          RUNS="repos/${GITHUB_REPOSITORY}/actions/workflows/release-rehearsal.yml/runs?event=push&branch=${RELEASE_BRANCH}&head_sha=${HEAD_SHA}"
+          URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs"
+          # Polls are 30 seconds apart: 180 are 90 minutes, 30 are 15.
+          idle=0 last="" ID=""
+          for (( poll = 1; poll <= 180; poll++ )); do
+            if ! RUN=$(gh api "$RUNS" --jq '.workflow_runs | max_by(.id) // empty | "\(.id) \(.status) \(.conclusion // "")"'); then
+              echo "::warning::could not list the rehearsal runs; trying again"
+              sleep 30
+              continue
+            fi
+            ID="" STATUS=none CONCLUSION=""
+            if [[ -n "$RUN" ]]; then
+              read -r ID STATUS CONCLUSION <<< "$RUN"
+            fi
+            case "${STATUS}/${CONCLUSION}" in
+              completed/success)
+                echo "ok: the rehearsal of ${HEAD_SHA} passed: ${URL}/${ID}"
+                exit 0
+                ;;
+              none/* | completed/cancelled)
+                # No run yet, or the newest was cancelled. Wait 15 minutes
+                # for one to start, or for a rerun of the cancelled one.
+                idle=$((idle + 1))
+                if (( idle > 30 )); then
+                  if [[ -z "$ID" ]]; then
+                    echo "::error::no release-rehearsal.yml run for a push of ${HEAD_SHA} to ${RELEASE_BRANCH} started within 15 minutes"
+                  else
+                    echo "::error::the rehearsal of ${HEAD_SHA} was cancelled (${URL}/${ID}) and no run started within 15 minutes; rerun it, then rerun this job"
+                  fi
+                  exit 1
+                fi
+                ;;
+              completed/*)
+                echo "::error::the rehearsal of ${HEAD_SHA} ended with '${CONCLUSION}': ${URL}/${ID}. Rerun its failed jobs, then rerun this job."
+                exit 1
+                ;;
+              *)
+                idle=0
+                ;;
+            esac
+            if [[ "${ID} ${STATUS} ${CONCLUSION}" != "$last" ]]; then
+              if [[ -z "$ID" ]]; then
+                echo "no rehearsal run for ${HEAD_SHA} yet"
+              else
+                echo "rehearsal run ${URL}/${ID}: ${STATUS}${CONCLUSION:+ (${CONCLUSION})}"
+              fi
+              last="${ID} ${STATUS} ${CONCLUSION}"
+            fi
+            sleep 30
+          done
+          echo "::error::the rehearsal of ${HEAD_SHA} did not finish within 90 minutes${ID:+: ${URL}/${ID}}"
+          exit 1
+
+      # A merge queue entry.
+
+      - name: Check out the merge group's head
+        if: github.event_name == 'merge_group'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.merge_group.head_sha }}
+          fetch-depth: 2         # the head and its first parent
+          persist-credentials: false
+
+      - name: The release PR's entry holds the release PR's tree
+        if: github.event_name == 'merge_group'
+        env:
+          HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::the merge group event has no head_sha"; exit 1; }
+          # The entry's own change: the merge group's head against its first
+          # parent, which is the head of the entry ahead or main.
+          PARENT=$(git rev-parse "${HEAD_SHA}^1")
+          if git diff --quiet --no-renames "$PARENT" "$HEAD_SHA" -- .release-please-manifest.json; then
+            echo "ok: this entry does not change .release-please-manifest.json"
+            exit 0
+          fi
+          # The release PR's entry. Its tree must be the tree that was
+          # rehearsed and checked on the PR, so that nothing queued ahead of
+          # it is in the commit the tag goes on.
+          git fetch --no-tags --depth=1 origin "refs/heads/${RELEASE_BRANCH}" \
+            || { echo "::error::this entry changes .release-please-manifest.json, and there is no ${RELEASE_BRANCH} branch"; exit 1; }
+          RELEASE_HEAD=$(git rev-parse FETCH_HEAD)
+          ENTRY_TREE=$(git rev-parse "${HEAD_SHA}^{tree}")
+          RELEASE_TREE=$(git rev-parse "${RELEASE_HEAD}^{tree}")
+          if [[ "$ENTRY_TREE" != "$RELEASE_TREE" ]]; then
+            echo "::error::this entry changes .release-please-manifest.json, and its tree ${ENTRY_TREE} is not the tree ${RELEASE_TREE} of the release PR's head ${RELEASE_HEAD}. Another PR is ahead of it in the queue, or the release PR is not up to date with main; the next release workflow run rebuilds it."
+            git diff --stat "$RELEASE_HEAD" "$HEAD_SHA" | tail -n 20
+            exit 1
+          fi
+          echo "ok: the entry's tree is the release PR head's tree (${RELEASE_HEAD})"
