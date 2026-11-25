@@ -577,8 +577,8 @@ fn validate_expression_attribute_value_numbers(
 /// [`validate_expression_attribute_value_numbers`] (rows K1 to K16, measured
 /// 2026-11-22). The handler's key type and value count checks come after it.
 /// The conditions are visited in attribute name order and each list in the
-/// order of its values. No measured request has two faults. A value the
-/// service cannot read as one type is left to the deserializer.
+/// order of its values. No measured request has two faults in one field. A
+/// value the service cannot read as one type is left to the deserializer.
 fn validate_condition_value_numbers(body: &Value) -> Result<(), DynamoDbError> {
     refuse_first_fault(
         ["QueryFilter", "KeyConditions"]
