@@ -1,0 +1,485 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Keeps the release PR up to date, and creates the tag and a draft GitHub
+# release when the release PR merges. It publishes nothing.
+#
+# release-please (release-please-config.json, .release-please-manifest.json)
+# reads the conventional commits on main since the last release and keeps
+# one PR, `chore(release): X.Y.Z`, open with CHANGELOG.md and the new
+# version on every line between its start and end markers (Cargo.toml, three
+# lines of sample output in the docs) and, by JSON path, in
+# packaging/npm/package.json. Every release is a minor release unless a
+# commit's `Release-As: X.Y.Z` footer names another version
+# (`always-bump-minor`). Every push to main rebuilds the PR on the new main
+# (`always-update`), and two more jobs then finish it with the changes
+# release-please cannot make: Cargo.lock, the four license notices, and the
+# migration freeze (devtools/freeze-migrations). When the release PR merges,
+# release-please creates the tag vX.Y.Z on the merge commit and a draft
+# release. Publishing then follows packaging/README.md.
+#
+# Jobs, and why they are split:
+#
+#   release-please   Runs release-please with a GitHub App token, because a
+#                    PR that the default GITHUB_TOKEN opens or pushes to
+#                    starts no workflow, and the release PR needs CI. After
+#                    a release it checks that the tag is on the merge
+#                    commit: with force-tag-creation, release-please adopts
+#                    a tag that already exists.
+#
+#   prepare-release-pr
+#                    Checks that the release PR's branch is one
+#                    release-please commit on top of main, which changes
+#                    only the version and the changelog, and that its
+#                    version is above every release tag on main. Then
+#                    regenerates Cargo.lock and the license notices and runs
+#                    devtools/freeze-migrations. It holds no credential:
+#                    cargo runs build scripts and installs cargo-about, so
+#                    the result leaves the job as a patch artifact.
+#
+#   push-release-pr  Applies that patch, refuses it unless the index then
+#                    holds only content changes to the allowed files and
+#                    the content changes are workspace versions in
+#                    Cargo.lock, the license notices and the migration
+#                    freeze, and pushes one commit to the release PR's
+#                    branch. It runs no project code, and it mints the App
+#                    token only after the checks, for the push.
+#
+# Off until configured. The App's client id is the repository variable
+# RELEASE_APP_CLIENT_ID and its private key the secret
+# RELEASE_APP_PRIVATE_KEY of the `release-please` environment, whose
+# deployment branch rule is `branch: main` and which has no required
+# reviewers. Without the variable every job is skipped; packaging/README.md,
+# "The release PR", says when to set it. The App needs read and write
+# access to contents, pull requests and issues (release-please labels its
+# PR).
+#
+# Repository settings this relies on (packaging/README.md): squash is the
+# only merge method on main, with the PR title as the commit subject and the
+# PR body as the commit message, so that the subjects release-please reads
+# are the titles the PR title check validated.
+
+name: release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# One run at a time, never cancelled: a run that is creating a release must
+# finish. A newer push waits, and GitHub keeps only the newest waiting run.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    if: vars.RELEASE_APP_CLIENT_ID != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release-please
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+      sha: ${{ steps.release.outputs.sha }}
+      prs_created: ${{ steps.release.outputs.prs_created }}
+      pr: ${{ steps.release.outputs.pr }}
+    steps:
+      - name: Mint a GitHub App token
+        id: app
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+
+      - name: Run release-please
+        id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ steps.app.outputs.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          target-branch: main
+
+      - name: The tag must be on the release PR's merge commit
+        if: steps.release.outputs.release_created == 'true'
+        env:
+          TAG: ${{ steps.release.outputs.tag_name }}
+          SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+            || { echo "::error::unexpected tag name '${TAG}'"; exit 1; }
+          # release-please reports a release on a tag that already existed
+          # (force-tag-creation). An annotated tag's commit is on its ^{} line.
+          REFS=$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" \
+            "refs/tags/${TAG}" "refs/tags/${TAG}^{}")
+          TAG_SHA=$(awk -v ref="refs/tags/${TAG}" '
+            $2 == ref { sha = $1 }
+            $2 == ref "^{}" { peeled = $1 }
+            END { print (peeled != "" ? peeled : sha) }' <<< "$REFS")
+          if [[ -z "$SHA" || "$TAG_SHA" != "$SHA" ]]; then
+            echo "::error::${TAG} points at ${TAG_SHA:-nothing}, not at the release PR's merge commit ${SHA:-(none reported)}. Do not publish this tag or its draft release."
+            exit 1
+          fi
+
+      - name: Summarize
+        env:
+          RELEASE_CREATED: ${{ steps.release.outputs.release_created }}
+          TAG: ${{ steps.release.outputs.tag_name }}
+          SHA: ${{ steps.release.outputs.sha }}
+          PRS_CREATED: ${{ steps.release.outputs.prs_created }}
+          PR: ${{ steps.release.outputs.pr }}
+        run: |
+          {
+            if [[ "$RELEASE_CREATED" == "true" ]]; then
+              echo "### Created ${TAG} on ${SHA} and its draft release"
+            elif [[ "$PRS_CREATED" == "true" ]]; then
+              echo "### Updated the release PR: $(jq -r '"#\(.number) \(.title)"' <<< "$PR")"
+            else
+              echo "### No release created and no release PR updated"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  prepare-release-pr:
+    needs: release-please
+    if: needs.release-please.outputs.prs_created == 'true'
+    # Dedicated ExtendDB runner group, as in licenses.yml: this job builds
+    # four storage crates' tests and cargo-about.
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 60
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+      head: ${{ steps.version.outputs.head }}
+      branch: ${{ steps.pr.outputs.branch }}
+    steps:
+      - name: Read the release PR
+        id: pr
+        env:
+          PR: ${{ needs.release-please.outputs.pr }}
+        run: |
+          set -euo pipefail
+          BRANCH=$(jq -r '.headBranchName' <<< "$PR")
+          # release-please names its branch
+          # release-please--branches--<target>--components--<package-name>.
+          [[ "$BRANCH" == "release-please--branches--main--components--extenddb" ]] \
+            || { echo "::error::unexpected release PR branch '${BRANCH}'"; exit 1; }
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the release PR's branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ steps.pr.outputs.branch }}
+          # The checks below need main's history and its release tags.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Anyone with write access can push to the branch, and the App's push
+      # below would then make the App the last pusher of that commit. So the
+      # branch must be exactly what release-please writes.
+      - name: The branch must be one release-please commit on main
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          if [[ -n "$(git rev-parse -q --verify 'HEAD^2' || true)" ]] \
+            || ! git merge-base --is-ancestor HEAD^ origin/main \
+            || git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::the release PR branch is not one commit on top of main"
+            exit 1
+          fi
+          python3 - <<'EOF'
+          import json, re, subprocess, sys
+
+          def git(*args):
+              return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout
+
+          def git_bytes(*args):
+              return subprocess.run(["git", *args], check=True, capture_output=True).stdout
+
+          # The manifest and the extra-files of release-please-config.json.
+          VERSIONED = {
+              ".release-please-manifest.json",
+              "Cargo.toml",
+              "packaging/npm/package.json",
+              "docs/getting-started.md",
+              "docs/manuals/04-quickstart-setup-guide.md",
+          }
+          old = json.loads(git("show", "HEAD^:.release-please-manifest.json"))["."]
+          new = json.loads(git("show", "HEAD:.release-please-manifest.json"))["."]
+          old_re_b = re.compile(rb"(?<![0-9.])" + re.escape(old.encode()) + rb"(?![0-9])")
+          errors = []
+          fields = git("diff", "--no-renames", "--raw", "-z", "HEAD^", "HEAD").split("\0")[:-1]
+          for meta, path in zip(fields[0::2], fields[1::2]):
+              old_mode, new_mode, _, _, status = meta.lstrip(":").split()
+              if path == "CHANGELOG.md" and status in ("A", "M") and new_mode == "100644":
+                  continue
+              if path not in VERSIONED or status != "M" or old_mode != new_mode:
+                  errors.append(f"{path}: status {status}, mode {old_mode} -> {new_mode}")
+                  continue
+              # Compare the two blobs as bytes split on LF only, so that neither
+              # git's binary detection (a NUL) nor another line break (a CR,
+              # U+2028) can hide a change: every line is unchanged or is the
+              # old line with the version replaced.
+              old_lines = git_bytes("show", f"HEAD^:{path}").split(b"\n")
+              new_lines = git_bytes("show", f"HEAD:{path}").split(b"\n")
+              if len(old_lines) != len(new_lines) or any(
+                  a != b and old_re_b.sub(new.encode(), a) != b for a, b in zip(old_lines, new_lines)
+              ):
+                  errors.append(f"{path}: changes more than the version {old} -> {new}")
+          for e in errors:
+              print(f"::error::the release PR's commit is not release-please's: {e}")
+          sys.exit(1 if errors else 0)
+          EOF
+
+      - name: Record the head and the version; it must be above every release on main
+        id: version
+        run: |
+          set -euo pipefail
+          HEAD=$(git rev-parse HEAD)
+          VERSION=$(jq -r '."."' .release-please-manifest.json)
+          SEMVER='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+          [[ "$VERSION" =~ ^${SEMVER}$ ]] \
+            || { echo "::error::the manifest's version '${VERSION}' is not MAJOR.MINOR.PATCH"; exit 1; }
+          CARGO_VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          [[ "$CARGO_VERSION" == "$VERSION" ]] \
+            || { echo "::error::Cargo.toml says ${CARGO_VERSION}, the manifest ${VERSION}; check the release-please markers"; exit 1; }
+          # Releases are made only from main, so a version at or below the
+          # highest release tag on main would be a back-line release. A
+          # Release-As footer can ask for one; refuse it.
+          HIGHEST=$(git tag -l 'v*' | while IFS= read -r t; do
+            [[ "$t" =~ ^v${SEMVER}$ ]] || continue
+            git merge-base --is-ancestor "${t}^{commit}" origin/main || continue
+            echo "${t#v}"
+          done | sort -V | tail -1)
+          if [[ -n "$HIGHEST" ]]; then
+            TOP=$(printf '%s\n%s\n' "$HIGHEST" "$VERSION" | sort -V | tail -1)
+            if [[ "$VERSION" == "$HIGHEST" || "$TOP" != "$VERSION" ]]; then
+              echo "::error::the release PR's version ${VERSION} is not above v${HIGHEST}, the highest release on main; a Release-As footer must name a higher version"
+              exit 1
+            fi
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "head=$HEAD" >> "$GITHUB_OUTPUT"
+          echo "::notice::release PR ${VERSION} at ${HEAD}, above v${HIGHEST:-(no release)}"
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.97.0
+          components: rustfmt
+
+      - name: Regenerate Cargo.lock; only the workspace crates may change
+        run: |
+          set -euo pipefail
+          cp Cargo.lock "$RUNNER_TEMP/Cargo.lock.before"
+          cargo update --workspace
+          python3 - "$RUNNER_TEMP/Cargo.lock.before" Cargo.lock <<'EOF'
+          import sys, tomllib
+          # Keyed on the version too: a crate can be in the lock in two
+          # versions from the same source.
+          def packages(path):
+              with open(path, "rb") as f:
+                  lock = tomllib.load(f)
+              return {(p["name"], p["version"], p.get("source")): p for p in lock["package"]}
+          before, after = packages(sys.argv[1]), packages(sys.argv[2])
+          moved = sorted({
+              name for (name, version, source) in before.keys() | after.keys()
+              if before.get((name, version, source)) != after.get((name, version, source))
+              and not (source is None and name.startswith("extenddb"))
+          })
+          if moved:
+              sys.exit("Cargo.lock entries other than the workspace crates changed: " + ", ".join(moved))
+          EOF
+
+      - name: Regenerate the license notices
+        run: |
+          set -euo pipefail
+          # Same pin as the release gate and licenses.yml; not cached, because
+          # its output is committed to the release PR.
+          cargo install --locked --version 0.9.0 --features cli cargo-about
+          ./devtools/generate-software-license-notices
+          ./devtools/generate-software-license-notices --backend mongodb
+          ./devtools/generate-software-license-notices --backend cassandra
+          ./devtools/generate-dev-license-notices
+
+      - name: Freeze the catalog migrations this release ships
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: python3 devtools/freeze-migrations --release-version "$VERSION"
+
+      - name: Write the patch
+        id: diff
+        run: |
+          set -euo pipefail
+          git diff --binary > "$RUNNER_TEMP/release-pr.patch"
+          if [[ -s "$RUNNER_TEMP/release-pr.patch" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git diff --stat
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::the release PR needs no further change"
+          fi
+
+      - name: Upload the patch
+        if: steps.diff.outputs.changed == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-pr-patch
+          path: ${{ runner.temp }}/release-pr.patch
+          retention-days: 1
+
+  push-release-pr:
+    needs: [release-please, prepare-release-pr]
+    if: needs.prepare-release-pr.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release-please
+    steps:
+      - name: Check out the commit the patch was made on
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.prepare-release-pr.outputs.head }}
+          persist-credentials: false
+
+      - name: Download the patch
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-pr-patch
+          path: ${{ runner.temp }}/patch
+
+      - name: Apply the patch; refuse anything but content changes to the allowed files
+        run: |
+          set -euo pipefail
+          PATCH="$RUNNER_TEMP/patch/release-pr.patch"
+          git apply --index "$PATCH"
+          # Check the index, not the patch's own file list: a rename into an
+          # allowed path deletes its source, and `git apply --numstat` names
+          # only the destination. --no-renames shows that source as a
+          # deletion.
+          FAILED=0
+          while IFS= read -r -d '' META && IFS= read -r -d '' F; do
+            read -r OLD_MODE NEW_MODE _ _ STATUS <<< "${META#:}"
+            if [[ "$STATUS" != "M" || "$OLD_MODE" != "100644" || "$NEW_MODE" != "100644" ]]; then
+              echo "::error::${F}: status ${STATUS}, mode ${OLD_MODE} -> ${NEW_MODE}; the release PR job may only change the content of a regular file"
+              FAILED=1
+              continue
+            fi
+            case "$F" in
+              Cargo.lock|SOFTWARE-LICENSE-NOTICES.html|SOFTWARE-LICENSE-NOTICES-MONGODB.html|\
+              SOFTWARE-LICENSE-NOTICES-CASSANDRA.html|SOFTWARE-LICENSE-NOTICES-DEV.html|\
+              crates/storage/src/migrations/registry.rs|\
+              crates/storage-sqlite/src/migrations/mod.rs|crates/storage-postgres/src/migrations/mod.rs|\
+              crates/storage-mongodb/src/migrations/mod.rs|crates/storage-cassandra/src/migrations/mod.rs) ;;
+              *) echo "::error::the patch changes ${F}, which the release PR job may not change"; FAILED=1 ;;
+            esac
+          done < <(git diff --cached --no-renames --raw -z)
+          git diff --cached --stat
+          exit "$FAILED"
+
+      # prepare-release-pr checks Cargo.lock before its later steps run build
+      # scripts, which could change any file it hands on. So the content is
+      # checked again here, with the standard library only. The license
+      # notices are generated HTML and may change freely.
+      - name: The patch may change only workspace versions in Cargo.lock and the migration freeze
+        run: |
+          python3 - <<'EOF'
+          import difflib, re, subprocess, sys
+
+          def blob(spec):
+              return subprocess.run(["git", "show", spec], check=True, capture_output=True).stdout
+
+          errors = []
+
+          # Cargo.lock: only the version line of a workspace entry (a name
+          # starting with extenddb and no source line) may change.
+          VERSION = re.compile(rb'version = "[0-9A-Za-z.+-]+"')
+          NAME = re.compile(rb'name = "extenddb[a-z0-9-]*"')
+          a, b = blob("HEAD:Cargo.lock").split(b"\n"), blob(":Cargo.lock").split(b"\n")
+          if len(a) != len(b) or any(
+              x != y and not (
+                  VERSION.fullmatch(x) and VERSION.fullmatch(y) and 0 < i < len(b) - 1
+                  and a[i - 1] == b[i - 1] and NAME.fullmatch(b[i - 1])
+                  and not b[i + 1].startswith(b"source = ")
+              )
+              for i, (x, y) in enumerate(zip(a, b))
+          ):
+              errors.append("Cargo.lock: a change other than the version of a workspace crate")
+
+          # registry.rs: only the RELEASED_THROUGH line may change.
+          BOUND = re.compile(rb"pub const RELEASED_THROUGH: u32 = \d+;")
+          REGISTRY = "crates/storage/src/migrations/registry.rs"
+          a, b = blob(f"HEAD:{REGISTRY}").split(b"\n"), blob(f":{REGISTRY}").split(b"\n")
+          for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+              if tag != "equal" and not (tag == "replace" and i2 - i1 == j2 - j1 == 1
+                                         and BOUND.fullmatch(a[i1]) and BOUND.fullmatch(b[j1])):
+                  errors.append(f"{REGISTRY}: a change other than the RELEASED_THROUGH line")
+
+          # Each backend's mod.rs: only Released entries added at the end of
+          # the RELEASED table. The fingerprint allows no quote or backslash,
+          # so an entry cannot end a string early.
+          ENTRY = (
+              rb'Released \{ id: MigrationId::[A-Za-z0-9]+, store: StoreKind::[A-Za-z]+, '
+              rb'checksum: "[0-9a-f]{64}", fingerprint: (?:None|Some\("[A-Za-z0-9_./-]+"\)), '
+              rb'kind: Kind::(?:Breaking|Additive), convergent: (?:true|false), rebless: None, \},'
+          )
+          ENTRIES = re.compile(ENTRY + rb"(?: " + ENTRY + rb")*")
+          TABLE = re.compile(rb"^pub\(crate\) const RELEASED: &\[Released\] = &\[\n(.*?)^\];\n", re.M | re.S)
+          for backend in ("sqlite", "postgres", "mongodb", "cassandra"):
+              path = f"crates/storage-{backend}/src/migrations/mod.rs"
+              a, b = blob(f"HEAD:{path}"), blob(f":{path}")
+              ta, tb = list(TABLE.finditer(a)), list(TABLE.finditer(b))
+              ok = (len(ta) == len(tb) == 1 and a[:ta[0].start()] == b[:tb[0].start()]
+                    and a[ta[0].end():] == b[tb[0].end():])
+              if ok:
+                  old_body = b" ".join(ta[0].group(1).split())
+                  new_body = b" ".join(tb[0].group(1).split())
+                  added = new_body[len(old_body):].strip()
+                  ok = new_body.startswith(old_body) and (added == b"" or ENTRIES.fullmatch(added) is not None)
+              if not ok:
+                  errors.append(f"{path}: a change other than Released entries added at the end of the table")
+
+          for e in errors:
+              print(f"::error::{e}")
+          sys.exit(1 if errors else 0)
+          EOF
+
+      - name: Mint a GitHub App token
+        id: app
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+
+      - name: Commit and push to the release PR's branch
+        env:
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ needs.prepare-release-pr.outputs.branch }}
+          PREPARED: ${{ needs.prepare-release-pr.outputs.head }}
+        run: |
+          set -euo pipefail
+          # With always-update, every push to main rebuilds the branch. If
+          # it moved since the patch was made, the run that the newer push
+          # started makes the patch again, so this run stops here.
+          REMOTE=$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" "refs/heads/${BRANCH}" | cut -f1)
+          if [[ "$REMOTE" != "$PREPARED" ]]; then
+            echo "::notice::${BRANCH} moved from ${PREPARED} to ${REMOTE}; the newer run updates it"
+            exit 0
+          fi
+          BOT_ID=$(gh api "/users/${APP_SLUG}%5Bbot%5D" --jq .id)
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${BOT_ID}+${APP_SLUG}[bot]@users.noreply.github.com"
+          git commit -q -s -m "chore(release): update Cargo.lock, license notices and the migration freeze" \
+            -m "Made by the release workflow's push-release-pr job."
+          # The token is used here only, not stored in .git/config. Not
+          # forced: if the branch moved after the check above, the push
+          # fails, and the newer run makes the patch again.
+          git push "https://x-access-token:${APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "HEAD:refs/heads/${BRANCH}"

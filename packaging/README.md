@@ -105,7 +105,10 @@ cargo build --release --locked --no-default-features --features sqlite,dev-mode 
 Flow (mirrors the container release: candidate first, promotion is a
 deliberate second step):
 
-1. Land the release state on `main`. Bump the workspace version and the 13
+1. Land the release state on `main`. With the release PR ("The release PR"
+   below), the PR carries every change this step lists, and merging it
+   creates the tag `vX.Y.Z` on the merge commit and a draft GitHub release.
+   By hand: bump the workspace version and the 13
    `=X.Y.Z` pins in the root `[workspace.dependencies]`, regenerate the four
    license notices, and bump `npm/package.json` to match. Tag that commit
    `vX.Y.Z` and push the tag. The tagged commit itself must carry the matching
@@ -120,18 +123,20 @@ deliberate second step):
    both edits. The gate jobs of the release workflows run
    `devtools/check-released-through` on the tag and refuse it otherwise.
 2. Rehearse first. Before the tag is pushed, run `devtools/release-dry-run`
-   on the release commit: it runs the image workflows' gate and build steps
-   on a developer's machine for the host's architecture (`--crates` adds
-   the crates.io verify steps on the release's pinned toolchain), and a
-   failure there costs a new commit, not a new version. Then push the tag
-   and dispatch `npm-publish`, `release-dev-image` and `release-image` (once
-   per backend image) against it with `dry_run` checked. Each runs its
+   on the release commit (with the release PR, on its head commit before
+   merging it, since the merge creates the tag): it runs the image
+   workflows' gate and build steps on a developer's machine for the host's
+   architecture (`--crates` adds the crates.io verify steps on the
+   release's pinned toolchain), and a failure there costs a new commit, not
+   a new version. Then push the tag (or merge the release PR) and dispatch
+   `npm-publish`, `release-dev-image` and `release-image` (once per backend
+   image) against it with `dry_run` checked. Each runs its
    gates and its builds as for the release (the image workflows: both
    architectures, smoke tests, scans and SBOMs; the npm workflow: the five
    platform binaries, their smoke tests and the launcher suite) and
    publishes nothing. The `protect-release-tags` ruleset blocks any update
    or deletion of a `v*` tag, so a rehearsal failure that needs a code
-   change after the tag is pushed takes the next patch version.
+   change after the tag is pushed costs the version.
 3. A maintainer dispatches the container and npm publish workflows
    independently against the tag; the crates.io workflow runs last, after
    `promote-image`. Dispatch the `npm-publish` workflow from `main` with the
@@ -159,6 +164,141 @@ against the long-established `extend` package. Then create a granular
 automation token scoped to the `@extenddb` scope with publish permission only,
 and create the GitHub environment `npm` with deployment branch rule `main`,
 required reviewers, and the token as `NPM_TOKEN`.
+
+### The release PR
+
+`release.yml` keeps one PR, `chore(release): X.Y.Z`, open against `main`.
+On every push to `main`, release-please (`release-please-config.json`,
+`.release-please-manifest.json`) reads the conventional commit subjects since
+the last release tag and rebuilds the PR on the new `main`
+(`"always-update": true`).
+
+Every release from `main` is a minor release (`"versioning":
+"always-bump-minor"`), whatever the commit types: `docs/versioning.md` ships
+a change that makes ExtendDB answer a request as DynamoDB does in a minor
+release (or a patch release when it closes a security issue), and most
+fixes are such changes. A `!` or a `BREAKING
+CHANGE:` footer is listed in the changelog and does not make a major
+release. For a patch or a major release, merge a commit whose body has a
+`Release-As: X.Y.Z` footer; the next run proposes that version.
+
+A release needs at least one commit that the changelog shows: a `feat`,
+`fix`, `perf` or `revert` commit, a breaking change, or a commit with a
+`Release-As:` footer. Commits of the other types (`build`, `chore`, `ci`,
+`docs`, `refactor`, `style`, `test`) alone open no release PR. So a
+dependency update that fixes a security issue is titled `fix(deps): ...`,
+not `build(deps): ...`. To release with no such commit, merge a commit
+`chore: release X.Y.Z` with a `Release-As: X.Y.Z` footer; the changelog
+lists it under Chores. CONTRIBUTING.md says how release-please reads a PR
+description.
+
+The PR changes `CHANGELOG.md` and every line between
+`x-release-please-start-version` and `x-release-please-end` markers: the
+workspace version and the 13 pins in `Cargo.toml`, and three lines of sample
+output in `docs/getting-started.md` and
+`docs/manuals/04-quickstart-setup-guide.md`. By JSON path it also changes
+the version and the five pins in `npm/package.json`. A version shortly
+after the word `extenddb` in `docs/`, `docker/` or `README.md` (sample
+output, an image tag) that is not between markers keeps the old version,
+and `doc_version_literals` fails on the release PR. A stale pin in
+`Cargo.toml` fails cargo. Nothing checks other versions. A new line that
+carries the version in one of these files needs markers. A new file that
+carries the version also needs an entry in `extra-files` in
+`release-please-config.json` (markers, or a JSON path for a JSON file), and
+the file must be added to `VERSIONED` in the `prepare-release-pr` job of
+`release.yml`, which otherwise refuses the release PR.
+
+Two more jobs then finish the PR. The first, `prepare-release-pr`, refuses
+the PR's branch unless it is one release-please commit on top of `main`
+that changes only `CHANGELOG.md` and the version lines, and refuses a
+version that is not above the highest release tag on `main`. Do not push to
+the branch: a commit pushed there stops the jobs until the next push to
+`main` rebuilds the branch. The job then makes `Cargo.lock` (`cargo update
+--workspace`; it fails if an entry other than the workspace crates
+changes), the four license notices, and the migration freeze
+(`devtools/freeze-migrations --release-version X.Y.Z`, CONTRIBUTING.md
+"Adding a catalog migration"). The second job, `push-release-pr`, checks
+the result again: in `Cargo.lock` only the workspace crates' versions may
+change, and in the migration files only the `RELEASED_THROUGH` line and
+`Released` entries added at the end of each table. It then commits the
+result to the PR's branch: push-release-pr's commit. Until that commit
+lands, the checks on release-please's own commit fail on the stale
+`Cargo.lock`; the checks that count are those on the head commit after it.
+The freeze refuses a breaking migration in a patch release; merge a commit
+with a `Release-As:` footer that names the next minor version, which
+overrides the older footer.
+
+The release workflows release only commits on `main`, by hand or through
+the release PR. So a patch release for an earlier minor release (a 1.0.x
+after 1.1.0) cannot be made until release branches exist, which is
+follow-up work to #1395. `docs/versioning.md` promises such releases; until
+then, a fix for an earlier minor release ships only in the next release
+from `main`. A security fix ships in the next release from `main` with
+everything merged since the last one, and it is public on `main` before
+that release ships. A fix that must not be public before its release also
+needs a release branch.
+
+The release PR does not write the upgrade manual
+(`docs/manuals/07-upgrade-manual.md`). Each PR that changes behavior adds
+its `vX.Y.Z:` entry under "Behavior Changes by Release". Before the release
+PR merges, a maintainer lands a normal PR that names the version in "Current
+Status", "General Upgrade Procedure" and "Rollback Procedure". The release
+PR's reviewer checks that the manual names the version.
+
+The PR is reviewed and merged like any other. Its reviewer reads the
+changelog and the version: release-please takes a merged PR's commit message
+from a `BEGIN_COMMIT_OVERRIDE` block in that PR's description, which can be
+edited after the merge, so such a block can change the changelog and carry
+a `Release-As:` footer. Each push to `main` rebuilds the PR, and the jobs
+push to its branch again. The `main` ruleset's `require_last_push_approval`
+requires an approval of the most recent push, by someone other than the one
+who pushed it, and with that setting GitHub also dismisses an approval when
+the PR's merge base changes. So approve the PR after the last push to its
+branch, and merge it with no merge to `main` in between. Merging it creates
+the tag `vX.Y.Z` on the merge commit and a draft GitHub release whose body
+is the changelog section. If the tag already existed on another commit,
+release-please keeps it and the run fails; do not publish that tag or its
+draft release. Then publish as for a tag pushed by hand: the dry-run
+dispatches of step 2, steps 3 to 5, `promote-image` for the container
+images, and "Releasing to crates.io" below. Publish the draft release when
+the promotions are done, with `gh release edit vX.Y.Z --draft=false
+--latest`.
+
+A `v*` tag made by hand also stops releases. On a commit on `main`, at or
+above the release PR's version, it makes the first job refuse every release
+PR. The `protect-release-tags` ruleset forbids deleting a tag, so only an
+admin can remove a stray one.
+
+One-time setup, before `release.yml` does anything:
+
+- Repository settings: allow squash merging only, and set its default
+  commit message to "Pull request title and description" (API:
+  `squash_merge_commit_title=PR_TITLE`, `squash_merge_commit_message=PR_BODY`),
+  so the subjects release-please reads are the titles the PR title check
+  validated and the footers it reads are in the PR descriptions. The `main`
+  ruleset's allowed merge methods and the merge queue's merge method become
+  `squash` only.
+- The `protect-release-tags` ruleset gets the rule "Restrict creations",
+  with the release App and the maintainers as bypass actors. Today anyone
+  with write access can create a `v*` tag.
+- A GitHub App owned by the organization, installed on this repository only,
+  with read and write access to contents, pull requests and issues and no
+  other permission. A PR that the default `GITHUB_TOKEN` opens starts no
+  workflow, so the release PR would get no CI. With these permissions the
+  App can open, update and review PRs, push to any branch that no ruleset
+  protects, and create and edit tags and releases. It cannot push to `main`
+  or approve an environment.
+- A GitHub environment `release-please` with deployment branch rule
+  `branch: main`, no required reviewers, and the App's private key as the
+  secret `RELEASE_APP_PRIVATE_KEY`. Only the two jobs that mint the App's
+  token name this environment.
+- Required checks on `main`: the PR title check's `conventional` and, once
+  `release-rehearsal.yml` exists, its `release-pr`.
+- Last, the repository variable `RELEASE_APP_CLIENT_ID` with the App's client
+  id (the App's settings page, "Client ID"). Until it is set, every job of
+  `release.yml` is skipped, so `release.yml` can be on `main` before the
+  rest of the setup. Set it only after `release-rehearsal.yml` (the next
+  change in #1395) is merged and its `release-pr` check is required.
 
 ## Releasing to crates.io
 

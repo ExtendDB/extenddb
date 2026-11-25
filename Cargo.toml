@@ -29,7 +29,11 @@ members = [
 ]
 
 [workspace.package]
+# release-please updates the version between these two markers
+# (release-please-config.json).
+# x-release-please-start-version
 version = "1.0.0"
+# x-release-please-end
 edition = "2024"
 rust-version = "1.91.1"
 license = "Apache-2.0"
@@ -46,6 +50,9 @@ homepage = "https://extenddb.org/"
 # pin that is not exact.
 # Internal dev-dependencies are declared by path in each crate instead, with
 # no version, so that cargo drops them from the published manifests.
+# release-please updates the first version on each line between the two
+# markers, so only internal crates belong between them.
+# x-release-please-start-version
 extenddb-core = { path = "crates/core", version = "=1.0.0" }
 extenddb-cache = { path = "crates/cache", version = "=1.0.0" }
 extenddb-backup-store = { path = "crates/backup-store", version = "=1.0.0" }
@@ -67,6 +74,7 @@ extenddb-storage-sqlite = { path = "crates/storage-sqlite", version = "=1.0.0" }
 extenddb-auth = { path = "crates/auth", version = "=1.0.0" }
 extenddb-server = { path = "crates/server", version = "=1.0.0" }
 extenddb-app = { path = "crates/app", version = "=1.0.0" }
+# x-release-please-end
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

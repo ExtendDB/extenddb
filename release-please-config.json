@@ -1,0 +1,38 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "release-type": "simple",
+  "versioning": "always-bump-minor",
+  "always-update": true,
+  "include-v-in-tag": true,
+  "include-component-in-tag": false,
+  "pull-request-title-pattern": "chore(release): ${version}",
+  "pull-request-header": "This PR releases the commits listed below. Merging it creates the tag and a draft GitHub release; see packaging/README.md.",
+  "draft": true,
+  "force-tag-creation": true,
+  "changelog-sections": [
+    { "type": "feat", "section": "Features" },
+    { "type": "fix", "section": "Bug fixes" },
+    { "type": "perf", "section": "Performance" },
+    { "type": "revert", "section": "Reverts" },
+    { "type": "refactor", "section": "Refactoring", "hidden": true },
+    { "type": "docs", "section": "Documentation", "hidden": true },
+    { "type": "test", "section": "Tests", "hidden": true },
+    { "type": "ci", "section": "CI", "hidden": true },
+    { "type": "build", "section": "Build", "hidden": true },
+    { "type": "chore", "section": "Chores", "hidden": true },
+    { "type": "style", "section": "Style", "hidden": true }
+  ],
+  "packages": {
+    ".": {
+      "package-name": "extenddb",
+      "changelog-path": "CHANGELOG.md",
+      "extra-files": [
+        { "type": "generic", "path": "Cargo.toml" },
+        { "type": "json", "path": "packaging/npm/package.json", "jsonpath": "$.version" },
+        { "type": "json", "path": "packaging/npm/package.json", "jsonpath": "$.optionalDependencies.*" },
+        { "type": "generic", "path": "docs/getting-started.md" },
+        { "type": "generic", "path": "docs/manuals/04-quickstart-setup-guide.md" }
+      ]
+    }
+  }
+}
