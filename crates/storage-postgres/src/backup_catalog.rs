@@ -1321,23 +1321,29 @@ impl BackupCatalog for PostgresEngine {
             // terminated) until its next beat finds the loss, so the take
             // waits for the window, as the other backends' does. A released
             // claim leaves no row.
-            let young: Option<String> = sqlx::query_scalar(
+            let young: Result<Option<String>, _> = sqlx::query_scalar(
                 "SELECT holder FROM backup_maintenance \
                  WHERE heartbeat_at >= now() - make_interval(secs => $1)",
             )
             .bind(stale_after.as_secs_f64())
             .fetch_optional(session.connection())
-            .await
-            .map_err(db_err)?;
+            .await;
+            let young = match young {
+                Ok(young) => young,
+                Err(e) => {
+                    end_unkept_maintenance_take(session).await;
+                    return Err(db_err(e));
+                }
+            };
             if let Some(current) = young {
-                session.close().await;
+                end_unkept_maintenance_take(session).await;
                 return Err(StorageError::AlreadyExists(format!(
                     "the backup maintenance claim is held by {current} (its catalog session \
                      ended, and its heartbeat is younger than the stale window)"
                 )));
             }
             let generation = session.generation();
-            sqlx::query(
+            let inserted = sqlx::query(
                 "INSERT INTO backup_maintenance (singleton, holder, owner_generation) \
                  VALUES (TRUE, $1, $2) \
                  ON CONFLICT (singleton) DO UPDATE SET holder = EXCLUDED.holder, \
@@ -1347,8 +1353,11 @@ impl BackupCatalog for PostgresEngine {
             .bind(holder)
             .bind(generation_column(generation))
             .execute(session.connection())
-            .await
-            .map_err(db_err)?;
+            .await;
+            if let Err(e) = inserted {
+                end_unkept_maintenance_take(session).await;
+                return Err(db_err(e));
+            }
             Ok(Box::new(PostgresMaintenanceClaim {
                 session: Mutex::new(Some(session)),
                 generation,
@@ -1395,6 +1404,17 @@ impl BackupCatalog for PostgresEngine {
 /// The advisory-lock key of the maintenance claim, in the one lock key space
 /// (`RESTORE_LOCK_SEED`) the job claims use.
 const MAINTENANCE_LOCK_KEY: &str = "backup_maintenance";
+
+/// End a maintenance take that is not kept (refused for a young row, or
+/// stopped by an error): unlock, then close, so a check right after it does
+/// not read the closing session's lock as a live claim. A failed unlock is
+/// logged; the close still frees the lock once the server's backend exits.
+async fn end_unkept_maintenance_take(mut session: ClaimSession) {
+    if let Err(e) = session.unlock(MAINTENANCE_LOCK_KEY).await {
+        tracing::warn!("unlocking a maintenance take that was not kept: {e}");
+    }
+    session.close().await;
+}
 
 /// How many times `maintenance_claim` tries the exclusive lock (on its one
 /// claim connection), and the pause between tries. `check_maintenance_claim` holds the key's shared lock for
@@ -1680,12 +1700,7 @@ impl MaintenanceClaim for PostgresMaintenanceClaim {
                 .execute(session.connection())
                 .await
                 .map_err(db_err)?;
-            sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, $2))")
-                .bind(MAINTENANCE_LOCK_KEY)
-                .bind(crate::backup_engine::RESTORE_LOCK_SEED)
-                .execute(session.connection())
-                .await
-                .map_err(db_err)?;
+            session.unlock(MAINTENANCE_LOCK_KEY).await.map_err(db_err)?;
             session.close().await;
             Ok(())
         })

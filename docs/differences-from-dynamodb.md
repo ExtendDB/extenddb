@@ -60,6 +60,13 @@ from a request sent to that service or backend.
 | U+0000 in a key attribute name, an index key attribute name or a projected attribute name | Accepted; `DescribeTable` returns each name byte for byte (measured 2026-09-18 and 2026-10-24, and again on 2026-11-04) | The same on all four backends. PostgreSQL `jsonb` cannot hold U+0000, so a PostgreSQL deployment stores these names through an escape, U+0000 as U+0001 U+0001 and U+0001 as U+0001 U+0002. Catalog migration 11 applies the escape to the names an earlier release stored (see the [Upgrade Manual](manuals/07-upgrade-manual.md#general-upgrade-procedure)) |
 | Stream disable and enable | `UpdateTable StreamEnabled=false` answers `UPDATING`; the stream reports `DISABLED` a few seconds later with every shard closed, and every write acknowledged before that lands in the closed stream. `StreamEnabled=true` afterwards creates a new stream with a later label; both streams stay listed, and a disabled stream stays describable after its table is deleted | The shards close inside the `UpdateTable` call and the response says `ACTIVE`. A write that reaches storage after the close is acknowledged and recorded in no stream (on MongoDB it is recorded past the shard's `EndingSequenceNumber` instead); the window is one write wide. A disabled stream is removed with its table. A stream created by a release before this one loses its ARN once the table is disabled and re-enabled (its label lived only in the table row) |
 
+## Streams
+
+| Area | DynamoDB | ExtendDB |
+|------|----------|------|
+| Shards | Shards open and close over time, with parent and child shards | Four shards per stream, assigned by partition key hash. They close when the stream is disabled (see Stream disable and enable under Control Plane) |
+| `AT_TIMESTAMP` iterator | The first record created at or after `Timestamp`, compared at millisecond precision; older than retention resolves to the oldest record; past the newest record resolves to after it; more than about a second in the future is a `ValidationException` | The same, on all four backends. The seek compares the record's stored creation time, taken from the same clock read as its `ApproximateCreationDateTime`. The future buffer is one second against the server clock |
+
 ## Time to Live (TTL)
 
 | Area | DynamoDB | ExtendDB |
@@ -203,6 +210,23 @@ alone, with the same wording. For PartiQL this holds in `ExecuteStatement`,
 | On-demand capacity | Automatic scaling | Fixed initial burst capacity (4000 WCU / 12000 RCU), no auto-scaling |
 | Warm throughput | Pre-provisions partitions to the requested read and write units; raising it is a long-running operation (`Status: UPDATING` for minutes, the previous values reported meanwhile); a request above the account's table maximum is `LimitExceededException` | Stored and reported with the same shape, defaults and validation so clients that read it (the Terraform AWS provider since 6.13.0) work: the previous values are reported with `Status: UPDATING` for `control_plane_delay_seconds` after a change, then the new values `ACTIVE`; a decrease is measured against the reported values, as on the service. Nothing acts on the values: no pre-warming and no scaling at the database level. The account maximum is not known to ExtendDB and is not enforced. A provisioned table whose warm throughput was never set, or was set on one side only, reports its new units at once after a capacity change, where the service reports the old units until the table is `ACTIVE`. Switching a table to `PAY_PER_REQUEST` stores 12000 read and 4000 write units where its warm throughput is lower, and the stored values stay after a switch back to `PROVISIONED`, as on the service; the response to the switch reads the new values with `Status: UPDATING` for `control_plane_delay_seconds`, where the service answers with the previous values and `Status: ACTIVE` |
 | Throttling | Always on; throttles requests that exceed provisioned/burst capacity. No setting to disable | Configurable via `throttling_enabled` runtime setting (default: `true`) |
+
+## Transactions
+
+ExtendDB decides whether a `TransactWriteItems` request, or an
+`ExecuteTransaction` write, with a known `ClientRequestToken` is a replay. It
+compares a fingerprint of the `TransactItems` JSON, `ReturnConsumedCapacity`
+and `ReturnItemCollectionMetrics` with the fingerprint stored for the token.
+For an `ExecuteTransaction` write, ExtendDB builds the `TransactItems` from the
+parsed statements. The service compares the parsed request.
+
+| Area | DynamoDB | ExtendDB |
+|------|----------|------|
+| `TransactWriteItems` token retry that changes only the spelling of a number (`1` and `1.0`) or the spacing of an expression | Replays it (measured 2026-10-24) | Answers `IdempotentParameterMismatchException`, because the fingerprint hashes the `TransactItems` JSON as the request writes it (measured on SQLite) |
+| `TransactWriteItems` token retry that names an attribute through an `ExpressionAttributeNames` alias, or adds `ReturnValuesOnConditionCheckFailure: NONE` inside an item | Replays it (measured 2026-10-24) | Answers `IdempotentParameterMismatchException`, for the same reason (measured on SQLite) |
+| `TransactWriteItems` token retry whose item lists the same attributes in another key order | Answers 200, as it does to an identical retry (measured 2026-11-10) | Replays in a build without the MongoDB backend, where serde_json writes map keys in sorted order. A build with the MongoDB backend keeps map keys in request order (bson enables serde_json's `preserve_order`), so the retry answers `IdempotentParameterMismatchException` *(from the code)* |
+| Unknown top-level field in `TransactWriteItems` | A raw signed request with the field answers 200 and writes the item (measured 2026-11-10) | Refused with `SerializationException` "Start of structure or map found where not expected: unknown field ..." (measured on SQLite) |
+| `ReturnItemCollectionMetrics: SIZE` on the first call, table without a local secondary index | `{"ItemCollectionMetrics": {}}` (measured 2026-11-10) | `{}`, without the key (measured on SQLite) |
 
 ## PartiQL
 

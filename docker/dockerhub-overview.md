@@ -30,7 +30,7 @@ cosign verify --key extenddb-signing.pub.pem docker.io/extenddb/extenddb-postgre
 
 The earliest releases, 0.1.5 and 0.1.6, predate transparency logging; add `--insecure-ignore-tlog=true` to verify those two.
 
-From the first release after the keyless migration (named in the release notes), signatures are keyless: the certificate names the GitHub Actions workflow and ref that signed the image, and no public key is needed.
+From 0.1.15, signatures are keyless: the certificate names the GitHub Actions workflow and ref that signed the image, and no public key is needed.
 
 ```console
 cosign verify \
