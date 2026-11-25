@@ -301,7 +301,7 @@ fn check_text(text: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::partiql::number::UNDERFLOW_MESSAGE;
-    use crate::types::NUMBER_SET_DUPLICATES;
+    use crate::validation::number::NUMBER_SET_DUPLICATES;
 
     fn doc(json: &str) -> Vec<Value> {
         match serde_json::from_str::<Value>(json).unwrap() {

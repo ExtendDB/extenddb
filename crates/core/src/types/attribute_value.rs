@@ -9,6 +9,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use crate::validation::number::{NUMBER_SET_DUPLICATES, has_equal_numbers};
+
 /// Virtual `DynamoDB` attribute value — the fundamental data type.
 ///
 /// Each variant maps to a `DynamoDB` type descriptor. Custom Serialize/Deserialize
@@ -327,12 +329,6 @@ fn from_descriptor(key: &str, value: serde_json::Value) -> Result<AttributeValue
 /// The start of the duplicates text of a set.
 const INVALID: &str = "One or more parameter values were invalid: ";
 
-/// The text `BatchWriteItem` and a PartiQL parameter give for a number set
-/// two of whose members have one value, at any depth (measured 2026-11-06
-/// and 2026-11-22: `{"NS": ["1", "1.0"]}` and `{"NS": ["1", "1"]}`). The
-/// other operations give it after [`INVALID`] and with a period.
-pub const NUMBER_SET_DUPLICATES: &str = "Input collection contains duplicates";
-
 /// The members of a set as the service lists them in its duplicates text:
 /// the members ahead of the first one equal to an earlier one, sorted, then
 /// that member and the members after it, as sent. `None` when no member
@@ -390,16 +386,7 @@ pub fn duplicates_as_sent(tag: &str, members: &[serde_json::Value]) -> Option<St
         .collect::<Option<_>>()?;
     match tag {
         "SS" => listed(&texts).map(|_| duplicates_text(tag, &format!("[{}]", texts.join(", ")))),
-        "NS" => {
-            let numbers: Vec<String> = texts
-                .iter()
-                .map(|text| {
-                    crate::validation::number::validate_and_normalize_number(text)
-                        .unwrap_or_else(|_| (*text).to_owned())
-                })
-                .collect();
-            listed(&numbers).map(|_| NUMBER_SET_DUPLICATES.to_owned())
-        }
+        "NS" => has_equal_numbers(members).then(|| NUMBER_SET_DUPLICATES.to_owned()),
         "BS" => {
             let bytes = texts
                 .iter()

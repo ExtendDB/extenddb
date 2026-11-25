@@ -12,10 +12,11 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::ExpressionMaps;
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{
-    BatchWriteItemInput, BatchWriteItemOutput, Item, KeySchemaElement, NUMBER_SET_DUPLICATES,
-    ReturnItemCollectionMetrics, TableKeyInfo, WriteRequest, check_binaries, decode_padded_base64,
-    extract_key, first_duplicates_as_sent, is_listed_duplicates, item_size_bytes,
+    BatchWriteItemInput, BatchWriteItemOutput, Item, KeySchemaElement, ReturnItemCollectionMetrics,
+    TableKeyInfo, WriteRequest, check_binaries, decode_padded_base64, extract_key,
+    first_duplicates_as_sent, is_listed_duplicates, item_size_bytes,
 };
+use extenddb_core::validation::number::NUMBER_SET_DUPLICATES;
 use extenddb_core::validation::{
     AttributeNameRequestForm, IndexKeyRef, validate_attribute_name_sizes, validate_batch_item_keys,
     validate_batch_key_only, validate_index_keys, validate_item_nesting_depth, validate_item_size,

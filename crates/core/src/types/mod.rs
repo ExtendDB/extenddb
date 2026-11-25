@@ -14,9 +14,9 @@ mod transaction;
 mod warm_throughput;
 
 pub use attribute_value::{
-    AttributeValue, EMPTY_ATTRIBUTE_VALUE, MULTI_ATTRIBUTE_VALUE, NUMBER_SET_DUPLICATES,
-    check_binaries, decode_base64, decode_padded_base64, duplicates_as_sent,
-    first_duplicates_as_sent, is_base64_refusal, is_listed_duplicates,
+    AttributeValue, EMPTY_ATTRIBUTE_VALUE, MULTI_ATTRIBUTE_VALUE, check_binaries, decode_base64,
+    decode_padded_base64, duplicates_as_sent, first_duplicates_as_sent, is_base64_refusal,
+    is_listed_duplicates,
 };
 pub use backup::{
     BackupDescription, BackupDetails, BackupSummary, ContinuousBackupsDescription,

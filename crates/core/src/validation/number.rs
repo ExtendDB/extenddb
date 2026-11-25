@@ -24,9 +24,11 @@ pub const NOT_A_NUMBER: &str = "The parameter cannot be converted to a numeric v
 /// The service's refusal of a number set two of whose members have one
 /// value, the same at any depth and for members written alike. Measured
 /// 2026-11-06 on a statement parameter (`{"NS": ["1", "1.0"]}`, `{"NS":
-/// ["1", "1"]}`, and inside a map and a list), and 2026-11-24 on a `Query`
-/// `ExpressionAttributeValues` entry beside a second type descriptor, as
-/// `ExpressionAttributeValues contains invalid value: ... for key :z`.
+/// ["1", "1"]}`, and inside a map and a list), 2026-11-22 on `BatchWriteItem`,
+/// and 2026-11-24 on a `Query` `ExpressionAttributeValues` entry beside a
+/// second type descriptor, as `ExpressionAttributeValues contains invalid
+/// value: ... for key :z`. Other requests give it after `One or more
+/// parameter values were invalid: ` and with a period (measured 2026-11-22).
 pub const NUMBER_SET_DUPLICATES: &str = "Input collection contains duplicates";
 
 /// Whether two members of a number set have one value: `1` and `1.0` do.
