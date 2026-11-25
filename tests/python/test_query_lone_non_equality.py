@@ -33,12 +33,15 @@ and an invalid ``Select`` are reported ahead of the key schema wording. An
 ``ExclusiveStartKey`` and a key value size are reported after it.
 
 On a schema with one HASH attribute, two conditions on one attribute are
-reported first. Then a wrong-typed value in the clause on the HASH attribute,
-and ``begins_with`` on a number HASH attribute in either clause, are reported
-before the key schema wording and after an unused value and an invalid
-``FilterExpression`` (rows M8c, 5a, 5b and 6, and ``TestValueTypes``). No
-other value is checked. On an index with several key attributes the HASH
-wording comes first (row 4, ``h > :n``).
+reported ahead of a wrong-typed value (``TestValueTypes``). A wrong-typed
+value in the clause on the HASH attribute is reported before the key schema
+wording (row M8c and ``TestValueTypes``). It is reported after an unused value
+and an invalid ``FilterExpression`` (rows 5a and 5b). No other value is
+checked against its key attribute's type. A ``begins_with`` with a number
+value on a number HASH attribute gets the operand type message instead of the
+key schema wording. Row 6 and the two-clause ``begins_with`` rows show this
+for either clause. On an index with several key attributes the HASH wording
+comes first (row 4, ``h > :n``).
 """
 
 from __future__ import annotations
