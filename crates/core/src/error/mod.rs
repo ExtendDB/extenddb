@@ -356,40 +356,30 @@ impl DynamoDbError {
 pub const SERIALIZATION_FAILURE_BODY: &[u8] =
     br#"{"__type":"com.amazonaws.dynamodb.v20120810#InternalServerError","message":"Internal error"}"#;
 
-/// Build the DynamoDB-shaped error document for `error`.
+/// Build the DynamoDB-shaped error document for `error`, as JSON bytes.
 ///
-/// Returns the JSON body a client receives for a failed request: `__type` with
-/// its namespace prefix (REQ-ERR-001), an optional message under the key
-/// `message_key` picks (REQ-ERR-002), omitted when empty
-/// (REQ-ERR-003 — real DynamoDB omits it for `UnknownOperationException` and
-/// other messageless errors), and the `CancellationReasons` /`Item` members
-/// that `TransactionCanceledException` and `ConditionalCheckFailedException`
-/// carry. This is only the body; the HTTP status line and headers belong to a
-/// transport and stay with the caller that has one. Error responses are part of
-/// the observable contract, so every entry point builds this body the same way.
+/// Returns the JSON body a client receives for a failed request, with its
+/// members in the order DynamoDB writes them (us-east-1, raw bodies,
+/// 2026-11-20): `__type` with its namespace prefix (REQ-ERR-001), then the
+/// `CancellationReasons` of a `TransactionCanceledException` or the `Item` of
+/// a `ConditionalCheckFailedException`, then the message under the key
+/// `message_key` picks (REQ-ERR-002), omitted when empty (REQ-ERR-003:
+/// DynamoDB omits it for `UnknownOperationException` and other messageless
+/// errors). The top-level members are written one by one, so their order does
+/// not depend on serde_json's `preserve_order` feature, which bson turns on in
+/// any build that includes the MongoDB backend. If the body cannot be
+/// serialized, the bytes are [`SERIALIZATION_FAILURE_BODY`]. This is only the
+/// body; the HTTP status line and headers belong to a transport and stay with
+/// the caller that has one. Error responses are part of the observable
+/// contract, so every entry point builds this body the same way.
 #[doc(hidden)]
 #[must_use]
-pub fn error_document(error: &DynamoDbError) -> serde_json::Value {
-    let mut body = serde_json::json!({ "__type": error.full_error_type() });
-    let message = error.message();
-    if !message.is_empty() {
-        body[message_key(error)] = serde_json::Value::String(message.to_owned());
-    }
-    if let Some(reasons) = error.cancellation_reasons() {
-        body["CancellationReasons"] = serde_json::to_value(reasons).unwrap_or_default();
-    }
-    if let Some(item) = error.condition_check_item() {
-        body["Item"] = serde_json::to_value(item).unwrap_or_default();
-    }
-    body
+pub fn error_document(error: &DynamoDbError) -> Vec<u8> {
+    error_body(error).unwrap_or_else(|_| SERIALIZATION_FAILURE_BODY.to_vec())
 }
 
-/// The body of `error`, with its members in the order `DynamoDB` writes them
-/// (us-east-1, raw bodies, 2026-11-20): `__type` first, then the
-/// `CancellationReasons` of a `TransactionCanceledException` or the `Item` of
-/// a `ConditionalCheckFailedException`, then the message.
-#[doc(hidden)]
-pub fn error_body(error: &DynamoDbError) -> serde_json::Result<Vec<u8>> {
+/// The members of [`error_document`], in its order.
+fn error_body(error: &DynamoDbError) -> serde_json::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut serializer = serde_json::Serializer::new(&mut bytes);
     let mut body = serializer.serialize_map(None)?;
@@ -562,9 +552,14 @@ mod tests {
         assert_eq!(err.message(), "Table already exists: t");
     }
 
+    /// The body `error_document` writes for `error`, parsed.
+    fn document(error: &DynamoDbError) -> serde_json::Value {
+        serde_json::from_slice(&error_document(error)).expect("an error document is JSON")
+    }
+
     #[test]
     fn error_document_carries_type_and_message() {
-        let doc = error_document(&DynamoDbError::ValidationException("bad input".to_owned()));
+        let doc = document(&DynamoDbError::ValidationException("bad input".to_owned()));
         assert_eq!(
             doc["__type"],
             serde_json::json!("com.amazon.coral.validate#ValidationException")
@@ -575,7 +570,7 @@ mod tests {
     #[test]
     fn error_document_omits_empty_message() {
         // REQ-ERR-003: real DynamoDB omits `message` when it is empty.
-        let doc = error_document(&DynamoDbError::UnknownOperationException(String::new()));
+        let doc = document(&DynamoDbError::UnknownOperationException(String::new()));
         assert_eq!(
             doc["__type"],
             serde_json::json!("com.amazon.coral.service#UnknownOperationException")
@@ -585,7 +580,7 @@ mod tests {
 
     #[test]
     fn error_document_includes_cancellation_reasons() {
-        let doc = error_document(&DynamoDbError::TransactionCanceledException {
+        let doc = document(&DynamoDbError::TransactionCanceledException {
             message: "Transaction cancelled".to_owned(),
             cancellation_reasons: vec![CancellationReason {
                 code: "ConditionalCheckFailed".to_owned(),

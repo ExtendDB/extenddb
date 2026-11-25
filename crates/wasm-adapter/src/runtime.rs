@@ -145,13 +145,13 @@ impl Engine {
     /// operation that takes no parameters).
     #[must_use]
     pub async fn submit(&self, operation: &str, body_json: &str) -> String {
-        let value = match self.dispatch(operation, body_json).await {
-            Ok(body) => body,
-            Err(err) => error_document(&err),
-        };
-        serde_json::to_string(&value).unwrap_or_else(|_| {
-            String::from_utf8_lossy(extenddb_core::error::SERIALIZATION_FAILURE_BODY).into_owned()
-        })
+        match self.dispatch(operation, body_json).await {
+            Ok(body) => serde_json::to_string(&body).unwrap_or_else(|_| {
+                String::from_utf8_lossy(extenddb_core::error::SERIALIZATION_FAILURE_BODY)
+                    .into_owned()
+            }),
+            Err(err) => String::from_utf8_lossy(&error_document(&err)).into_owned(),
+        }
     }
 
     /// The response to a call whose `argument` (`"operation"` or `"body"`) is
@@ -162,9 +162,7 @@ impl Engine {
     #[must_use]
     pub fn non_string_argument(argument: &str) -> String {
         let err = DynamoDbError::ValidationException(format!("{argument} must be a string"));
-        serde_json::to_string(&error_document(&err)).unwrap_or_else(|_| {
-            String::from_utf8_lossy(extenddb_core::error::SERIALIZATION_FAILURE_BODY).into_owned()
-        })
+        String::from_utf8_lossy(&error_document(&err)).into_owned()
     }
 
     /// Apply the browser-build operation policy and the engine's pre-dispatch

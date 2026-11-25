@@ -5,7 +5,7 @@
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use extenddb_core::error::{DynamoDbError, SERIALIZATION_FAILURE_BODY, error_body};
+use extenddb_core::error::{DynamoDbError, SERIALIZATION_FAILURE_BODY, error_document};
 use serde_json::Value;
 
 #[cfg(test)]
@@ -34,10 +34,14 @@ pub(crate) fn success_response(body: &Value, request_id: &str) -> Response {
 }
 
 /// REQ-ERR-001: `__type` with prefix. REQ-ERR-002: message field, under the
-/// key `error_body` picks. REQ-ERR-003: Omit the message field when empty
+/// key `error_document` picks. REQ-ERR-003: Omit the message field when empty
 /// (real `DynamoDB` behavior, verified 2026-05-04).
 pub(crate) fn error_response(error: &DynamoDbError, request_id: &str) -> Response {
-    let body_bytes = error_body(error).unwrap_or_else(|_| SERIALIZATION_FAILURE_BODY.to_vec());
+    // The body (`__type`, then `CancellationReasons` or `Item`, then the
+    // message) is written by the shared `error_document` helper so the wire
+    // body and the in-process body come from the same code; this transport adds
+    // the HTTP status and headers.
+    let body_bytes = error_document(error);
     let crc = crc32fast::hash(&body_bytes);
     let status =
         StatusCode::from_u16(error.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
