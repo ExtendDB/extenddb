@@ -353,15 +353,16 @@ if [[ " ${RUN_TESTS_ARGS[*]} " == *" --rust"* ]]; then
     EXTENDDB_TEST_MONGODB_URI="mongodb://localhost:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
         cargo test -p extenddb-storage-mongodb --lib -- --ignored records_live
     echo ""
-    # The catalog migration tests: each runs in databases of its own on this
-    # server, and EXTENDDB_TEST_MONGODB_REQUIRED turns a skip for a missing
-    # server into a failure.
-    echo "=== Running MongoDB catalog migration tests (migrations_*) ==="
+    # The catalog migration tests and the metrics store test: each runs in
+    # databases of its own on this server, and EXTENDDB_TEST_MONGODB_REQUIRED
+    # turns a skip for a missing server into a failure.
+    echo "=== Running MongoDB catalog migration tests (migrations_*, metrics_store) ==="
     echo ""
     EXTENDDB_TEST_MONGODB_URI="mongodb://localhost:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
     EXTENDDB_TEST_MONGODB_REQUIRED=1 \
         cargo test -p extenddb-storage-mongodb --test migrations_fresh --test migrations_guards \
-            --test migrations_holders --test migrations_locks --test migrations_released
+            --test migrations_holders --test migrations_locks --test migrations_released \
+            --test migrations_spill --test metrics_store
     echo ""
 fi
 echo "=== Running test suite via devtools/run-tests --backend mongodb ==="
@@ -441,6 +442,21 @@ if $RUST_LIVE; then
         echo "  ✓ MongoDB backup engine live Rust tests passed"
     else
         echo "  ✗ MongoDB backup engine live Rust tests failed"
+        RC=1
+    fi
+
+    # A deleted principal or account leaves nothing behind (#693, #694): the
+    # shared `iam_leftovers_conformance` check, and a deleted account's user
+    # and role granting nothing. Direct integration tests in tests/, which
+    # skip without a URI; REQUIRED makes that a failure here.
+    echo ""
+    echo "=== MongoDB IAM delete direct integration tests (storage-mongodb) ==="
+    if EXTENDDB_TEST_MONGODB_REQUIRED=1 \
+        cargo test -p extenddb-storage-mongodb --test iam_leftovers -- \
+        --test-threads=1; then
+        echo "  ✓ MongoDB IAM delete direct integration tests passed"
+    else
+        echo "  ✗ MongoDB IAM delete direct integration tests failed"
         RC=1
     fi
 

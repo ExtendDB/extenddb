@@ -327,7 +327,7 @@ async fn every_policy_document(db: &Path) -> String {
     text
 }
 
-/// Record what a release before 1.0 leaves when it writes to a migrated
+/// Record what a release before 0.1.15 leaves when it writes to a migrated
 /// catalog, then reconverge: migration 2 is named as skipped, and the
 /// catalog is current again.
 async fn reconverge_after_an_older_release_wrote(db: &Path) {
@@ -349,7 +349,7 @@ async fn reconverge_after_an_older_release_wrote(db: &Path) {
     assert_eq!(status(db).await, CatalogStatus::Current { version: LATEST });
 }
 
-/// From 1.0 on a `dynamodb:ResourceTag` key written through the API has no
+/// From 0.1.15 on a `dynamodb:ResourceTag` key written through the API has no
 /// effect, as on the service. Migration 2 is not convergent, so a reconverge
 /// leaves a policy written after it, in each of the six places, with the
 /// text it was written with, and so with the decision it had.

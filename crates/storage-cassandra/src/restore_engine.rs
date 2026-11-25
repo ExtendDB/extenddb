@@ -106,7 +106,7 @@ impl CassandraEngine {
              attribute_definitions FROM {}.tables WHERE account_id = ? AND table_name = ?",
             self.catalog_keyspace()
         );
-        let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+        let rows = crate::cassandra_util::query_rows::<StorageError>(
             &self.session,
             &query,
             cdrs_tokio::query_values!(key.account_id.as_str(), key.table_name.as_str()),
@@ -538,7 +538,7 @@ impl RestoreEngine for CassandraEngine {
             let account_keyspace = self.account_keyspace(&key.account_id);
             let data_table = data_table_name(&key.table_id);
             let query = format!("SELECT COUNT(*) AS c FROM {account_keyspace}.{data_table}");
-            let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+            let rows = crate::cassandra_util::query_rows::<StorageError>(
                 &self.session,
                 &query,
                 cdrs_tokio::query_values!(),
@@ -581,7 +581,7 @@ impl RestoreEngine for CassandraEngine {
                     .map(|index| index_table_name(&index.index_id).to_lowercase()),
             );
             for table in tables {
-                let rows = crate::cassandra_util::query_rows::<StorageError>(
+                let rows = crate::cassandra_util::system_read::<StorageError>(
                     &self.session,
                     "SELECT table_name FROM system_schema.tables WHERE keyspace_name = ? AND \
                      table_name = ?",

@@ -6,6 +6,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Core types, validation, errors and limits of the ExtendDB server. Internal crate of the extenddb binary, with no API stability promise."
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 serde = { workspace = true }
@@ -18,6 +21,72 @@ md-5 = { workspace = true }
 sha2 = { workspace = true }
 time = { workspace = true }
 uuid = { workspace = true }
+zeroize = { workspace = true }
+web-time = { workspace = true }
+
+# The shared crypto module (src/crypto.rs) uses AWS-LC through aws-lc-rs on
+# every target except wasm32. The server already links aws-lc-rs through
+# rustls, and the extenddb binary through rcgen as well, so this edge adds no
+# package to their builds; it adds AWS-LC to the dependency closure of
+# extenddb-core itself.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+aws-lc-rs = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# On wasm32-unknown-unknown `uuid`'s v4 generator needs one of its `js`,
+# `rng-getrandom` or `rng-rand` features to name a randomness source, and
+# fails to compile without one. With `js` it calls the Web Crypto
+# `crypto.getRandomValues` through its own wasm-bindgen binding, not through
+# getrandom. Both hold from 1.13.0, which this entry requires on top of the
+# workspace's `uuid` (`[dependencies]` above); before it, `js` enabled
+# getrandom 0.2's `js` backend.
+uuid = { version = "1.13", features = ["js"] }
+# Pure-Rust crypto backend for wasm32 (src/crypto.rs): HMAC-SHA256 via `hmac`
+# over `sha2`, constant-time compare via `subtle`, AES-256-GCM via `aes-gcm`,
+# and randomness via `getrandom`'s browser backend. `aes-gcm` runs with default
+# features off (dropping its built-in getrandom 0.2 RNG, which does not build on
+# wasm32); the nonce is drawn from getrandom 0.3 directly.
+hmac = "0.12"
+subtle = "2"
+# 0.10.3 is the first 0.10 release of aes-gcm that checks the tag before it
+# decrypts: 0.10.0 to 0.10.2 decrypt in place first, so a value whose tag check
+# fails leaves its plaintext in the buffer (RUSTSEC-2023-0096).
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc", "zeroize"] }
+# Each crate in the AES-256-GCM stack wipes only its own key material, and only
+# under its own `zeroize` feature: aes-gcm wipes the GHASH key it derives, aes
+# the AES round keys, ghash the keys it derives for POLYVAL, and polyval the
+# POLYVAL key and state. aes-gcm's feature does not enable the others, so they
+# are named here to turn the feature on, which an entry does only in the
+# version it resolves to. aes wipes its round keys from 0.8.2; in 0.8.0 and
+# 0.8.1 its `zeroize` feature only enables cipher's.
+# The docstring of devtools/check-wasm-clippy-guard, in the repository this
+# crate's manifest names, says how the zeroize features of these crates are
+# checked in the wasm32 build.
+aes = { version = "0.8.2", features = ["zeroize"] }
+ghash = { version = "0.5", features = ["zeroize"] }
+polyval = { version = "0.6", features = ["zeroize"] }
+# 0.3.4 is the lowest release this build compiles with: from 0.3.4 the
+# `wasm_js` feature alone selects the browser backend on
+# wasm32-unknown-unknown, where 0.3.0 to 0.3.3 also need
+# `--cfg getrandom_backend="wasm_js"` in RUSTFLAGS and fail to compile without
+# it (getrandom's CHANGELOG for 0.3.4).
+getrandom = { version = "0.3.4", features = ["wasm_js"] }
+# On wasm32 the `time` crate's `OffsetDateTime::now_utc()` reads the clock via
+# `std::time::SystemTime::now()`, which panics on wasm32-unknown-unknown. The
+# `wasm-bindgen` feature makes it read `js_sys::Date` instead. This feature
+# unifies across the whole wasm build, so every crate that calls `now_utc()`
+# benefits. Target-scoped to wasm32; native builds do not enable it.
+time = { workspace = true, features = ["wasm-bindgen"] }
+
+[dev-dependencies]
+hex = "0.4"
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+# A floor of "0.3" here and in extenddb-storage-sqlite would admit 0.3.45,
+# which requires wasm-bindgen by a range and resolves with the rest of
+# Cargo.lock, and the wasm-bindgen-test-runner of the wasm-bindgen release
+# in Cargo.lock finds no test in the test module that 0.3.45 builds.
+wasm-bindgen-test = "0.3.80"
 
 [features]
 default = ["partiql"]

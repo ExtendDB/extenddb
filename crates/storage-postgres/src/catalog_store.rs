@@ -11,9 +11,13 @@
 
 use std::sync::Arc;
 
+use extenddb_storage::diagnostics::{DiagError, DiagResult, OrphanDrop, StorageRelationCheck};
 use extenddb_storage::management_store::{MetricsRow, OpError, OpResult};
+use extenddb_storage::secret_keys::SecretKeys;
 use futures::future::BoxFuture;
 use sqlx::PgPool;
+
+use crate::data::catalog_check::CheckFailure;
 
 /// PostgreSQL-backed catalog store for settings, metrics, and rate limiting.
 ///
@@ -21,27 +25,45 @@ use sqlx::PgPool;
 /// and shared (via `Arc`) across management API handlers and background workers.
 pub struct PostgresCatalogStore {
     pool: PgPool,
-    /// P119: Cached encryption key (immutable after bootstrap). Avoids
-    /// per-request DB query on access key and assume-role operations.
-    encryption_key: Option<Arc<str>>,
+    /// The key holder the server's factory loaded at startup, shared with
+    /// the credential store: the catalog key, or the DEK of the key ring.
+    /// Access key creation and import encrypt with it, and AssumeRole
+    /// reads it through `CatalogStore::secret_keys`. `None` for a store
+    /// opened without a key, which writes no credential.
+    keys: Option<Arc<SecretKeys>>,
+    /// How long `catalog-check` waits for the index changes in flight
+    /// ([`crate::data::catalog_check::INDEX_LOCK_BUDGET`]).
+    index_lock_budget: std::time::Duration,
 }
 
 impl PostgresCatalogStore {
-    /// Create a new catalog store wrapping the given pool.
+    /// Create a new catalog store wrapping the given pool, with no key
+    /// holder.
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
+        Self::with_secret_keys(pool, None)
+    }
+
+    /// Create a new catalog store with the key holder the factory loaded.
+    #[must_use]
+    pub fn with_secret_keys(pool: PgPool, keys: Option<Arc<SecretKeys>>) -> Self {
         Self {
             pool,
-            encryption_key: None,
+            keys,
+            index_lock_budget: crate::data::catalog_check::INDEX_LOCK_BUDGET,
         }
     }
 
-    /// Create a new catalog store with a pre-loaded encryption key (P119).
+    /// A store whose `catalog-check` waits at most `budget` for the index
+    /// changes in flight, so a test can reach the end of the wait. Compiled
+    /// only with `test-hooks`.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
     #[must_use]
-    pub fn with_encryption_key(pool: PgPool, encryption_key: String) -> Self {
+    pub fn with_index_lock_budget(pool: PgPool, budget: std::time::Duration) -> Self {
         Self {
-            pool,
-            encryption_key: Some(Arc::from(encryption_key.as_str())),
+            index_lock_budget: budget,
+            ..Self::new(pool)
         }
     }
 
@@ -49,12 +71,6 @@ impl PostgresCatalogStore {
     #[must_use]
     pub fn pool(&self) -> &PgPool {
         &self.pool
-    }
-
-    /// Get the cached encryption key. Returns `None` if not loaded at startup.
-    #[must_use]
-    pub fn encryption_key(&self) -> Option<&Arc<str>> {
-        self.encryption_key.as_ref()
     }
 }
 
@@ -99,6 +115,29 @@ impl extenddb_storage::management_store::SettingsStore for PostgresCatalogStore 
         })
     }
 
+    fn replace_setting(
+        &self,
+        key: &str,
+        expected: &str,
+        value: &str,
+    ) -> futures::future::BoxFuture<'_, OpResult<bool>> {
+        let (key, expected, value) = (key.to_owned(), expected.to_owned(), value.to_owned());
+        let pool = self.pool.clone();
+        Box::pin(async move {
+            let done = sqlx::query("UPDATE settings SET value = $3 WHERE key = $1 AND value = $2")
+                .bind(&key)
+                .bind(&expected)
+                .bind(&value)
+                .execute(&pool)
+                .await
+                .map_err(|e| {
+                    tracing::error!("replace_setting: {e}");
+                    OpError::Internal("Database error".to_owned())
+                })?;
+            Ok(done.rows_affected() == 1)
+        })
+    }
+
     fn list_settings(&self) -> futures::future::BoxFuture<'_, OpResult<Vec<(String, String)>>> {
         let pool = self.pool.clone();
         Box::pin(async move {
@@ -112,10 +151,17 @@ impl extenddb_storage::management_store::SettingsStore for PostgresCatalogStore 
         })
     }
 
-    fn cached_encryption_key(&self) -> Option<String> {
-        self.encryption_key
-            .as_ref()
-            .map(std::string::ToString::to_string)
+    fn set_data_connection(
+        &self,
+        kek: &[u8; 32],
+        connection_string: &str,
+    ) -> BoxFuture<'_, OpResult<()>> {
+        let kek = zeroize::Zeroizing::new(*kek);
+        let connection_string = zeroize::Zeroizing::new(connection_string.to_owned());
+        Box::pin(async move {
+            self.set_data_connection_impl(&kek, &connection_string)
+                .await
+        })
     }
 }
 
@@ -154,65 +200,149 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for PostgresCatalogStore {
 
     fn test_data_database_connection(
         &self,
+        key: &extenddb_storage::server_components::KeySource,
     ) -> futures::future::BoxFuture<'_, extenddb_storage::diagnostics::DiagResult<String>> {
+        use extenddb_storage::diagnostics::DiagError;
         let pool = self.pool.clone();
+        let key = key.clone();
         Box::pin(async move {
-            // Get data database connection string and name from settings
-            let conn_row: Option<(String,)> = sqlx::query_as(
-                "SELECT value FROM settings WHERE key = 'data_database_connection_string'",
-            )
-            .fetch_optional(&pool)
-            .await
-            .map_err(|e| extenddb_storage::diagnostics::DiagError::QueryFailed(e.to_string()))?;
-
+            let not_configured =
+                || DiagError::QueryFailed("Data database not configured".to_string());
             let name_row: Option<(String,)> =
                 sqlx::query_as("SELECT value FROM settings WHERE key = 'data_database_name'")
                     .fetch_optional(&pool)
                     .await
-                    .map_err(|e| {
-                        extenddb_storage::diagnostics::DiagError::QueryFailed(e.to_string())
-                    })?;
+                    .map_err(|e| DiagError::QueryFailed(e.to_string()))?;
+            let (name,) = name_row.ok_or_else(not_configured)?;
+            let conn = data_connection_row(&pool, key)
+                .await
+                .map_err(|e| DiagError::QueryFailed(e.to_string()))?
+                .ok_or_else(not_configured)?;
+            connect_data(&conn).await?;
+            Ok(name)
+        })
+    }
 
-            match (conn_row, name_row) {
-                (Some((conn,)), Some((name,))) => {
-                    // Test connection
-                    sqlx::postgres::PgPoolOptions::new()
-                        .max_connections(1)
-                        .connect(&conn)
-                        .await
-                        .map_err(|e| {
-                            extenddb_storage::diagnostics::DiagError::ConnectionFailed(
-                                e.to_string(),
-                            )
-                        })?;
-                    Ok(name)
-                }
-                _ => Err(extenddb_storage::diagnostics::DiagError::QueryFailed(
-                    "Data database not configured".to_string(),
-                )),
-            }
+    fn check_storage_relations(
+        &self,
+        key: &extenddb_storage::server_components::KeySource,
+    ) -> BoxFuture<'_, DiagResult<StorageRelationCheck>> {
+        let key = key.clone();
+        Box::pin(async move {
+            let data = data_pool(&self.pool, key).await?;
+            let budget = self.index_lock_budget;
+            crate::data::catalog_check::check(&self.pool, &data, budget)
+                .await
+                .map_err(|e| catalog_check_error(&e, budget, "the check did not finish"))
+        })
+    }
+
+    fn drop_orphaned_relations(
+        &self,
+        key: &extenddb_storage::server_components::KeySource,
+        orphaned: Vec<String>,
+    ) -> BoxFuture<'_, DiagResult<Vec<(String, OrphanDrop)>>> {
+        let key = key.clone();
+        Box::pin(async move {
+            let data = data_pool(&self.pool, key).await?;
+            let budget = self.index_lock_budget;
+            crate::data::catalog_check::drop_orphaned(&self.pool, &data, orphaned, budget)
+                .await
+                .map_err(|e| catalog_check_error(&e, budget, "nothing was dropped"))
         })
     }
 }
 
+/// The error `catalog-check` reports when its catalog work fails. A wait for
+/// the `SHARE` lock on `indexes` that ran out its budget says so, with
+/// `outcome`, the effect on this run.
+fn catalog_check_error(e: &CheckFailure, budget: std::time::Duration, outcome: &str) -> DiagError {
+    match e {
+        CheckFailure::IndexLock(e) => DiagError::QueryFailed(format!(
+            "index changes in progress kept the index catalog locked for more than {} \
+             seconds, so {outcome}; run the command again: {e}",
+            budget.as_secs()
+        )),
+        CheckFailure::Sql(e) => DiagError::QueryFailed(e.to_string()),
+    }
+}
+
+/// The pool that holds the data relations: the data database the catalog
+/// names, as `extenddb init` records it.
+///
+/// A catalog without the setting, or with an empty one, is refused: the data
+/// relations could then only be looked for in the catalog's own database, a
+/// layout `init` does not create, where another deployment's relations can
+/// sit unnamed by this catalog. A row the key does not open is refused in
+/// the same way, so the command prints the refusal on its own.
+async fn data_pool(
+    catalog: &PgPool,
+    key: extenddb_storage::server_components::KeySource,
+) -> DiagResult<PgPool> {
+    let conn = data_connection_row(catalog, key)
+        .await
+        .map_err(|e| match e {
+            extenddb_storage::migrations::MigrationError::Refused(refusal) => {
+                DiagError::NotConfigured(refusal)
+            }
+            e => DiagError::QueryFailed(e.to_string()),
+        })?;
+    let Some(conn) = conn.filter(|conn| !conn.is_empty()) else {
+        return Err(DiagError::NotConfigured(
+            "No data database connection string in settings. Run `extenddb init`.".to_owned(),
+        ));
+    };
+    connect_data(&conn).await
+}
+
+/// The catalog's `data_database_connection_string` row as the server reads
+/// it: in a catalog with a key ring the row is encrypted, and `key` opens it
+/// (RFC-0000 section 12). The read takes only the catalog's rows, so the
+/// target needs no data database name.
+async fn data_connection_row(
+    catalog: &PgPool,
+    key: extenddb_storage::server_components::KeySource,
+) -> Result<Option<zeroize::Zeroizing<String>>, extenddb_storage::migrations::MigrationError> {
+    let target = crate::migrations::PostgresTarget::new((*catalog.connect_options()).clone(), "")
+        .with_key_source(key, false);
+    crate::migrations::data_connection_string(&target).await
+}
+
+/// A pool on the data database at `conn`. Statement logging is off, so a
+/// drop that waits out its lock timeout does not print a slow-statement line
+/// in the middle of the command's report.
+async fn connect_data(conn: &str) -> DiagResult<PgPool> {
+    let options = conn
+        .parse::<sqlx::postgres::PgConnectOptions>()
+        .map_err(|e| DiagError::ConnectionFailed(e.to_string()))?;
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(sqlx::ConnectOptions::disable_statement_logging(options))
+        .await
+        .map_err(|e| DiagError::ConnectionFailed(e.to_string()))
+}
+
 // ── MetricsStore ───────────────────────────────────────────────────────
 
+/// `account_metrics`: migration 10 replaced `metrics` with it.
 impl extenddb_storage::management_store::MetricsStore for PostgresCatalogStore {
     fn insert_metrics(&self, rows: &[MetricsRow]) -> BoxFuture<'_, OpResult<()>> {
         let rows = rows.to_vec();
         Box::pin(async move {
             for row in &rows {
                 let result = sqlx::query(
-                    "INSERT INTO metrics \
-                     (bucket, metric, table_name, index_name, operation, sum, count, min, max) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
-                     ON CONFLICT (bucket, metric, table_name, index_name, operation) \
-                     DO UPDATE SET sum = metrics.sum + EXCLUDED.sum, \
-                                   count = metrics.count + EXCLUDED.count, \
-                                   min = LEAST(metrics.min, EXCLUDED.min), \
-                                   max = GREATEST(metrics.max, EXCLUDED.max)",
+                    "INSERT INTO account_metrics \
+                     (bucket, account_id, metric, table_name, index_name, operation, \
+                      sum, count, min, max) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+                     ON CONFLICT (bucket, account_id, metric, table_name, index_name, operation) \
+                     DO UPDATE SET sum = account_metrics.sum + EXCLUDED.sum, \
+                                   count = account_metrics.count + EXCLUDED.count, \
+                                   min = LEAST(account_metrics.min, EXCLUDED.min), \
+                                   max = GREATEST(account_metrics.max, EXCLUDED.max)",
                 )
                 .bind(row.bucket)
+                .bind(row.account_id.as_deref().unwrap_or(""))
                 .bind(&row.metric)
                 .bind(row.table_name.as_deref().unwrap_or(""))
                 .bind(row.index_name.as_deref().unwrap_or(""))
@@ -235,41 +365,35 @@ impl extenddb_storage::management_store::MetricsStore for PostgresCatalogStore {
         &self,
         start: time::OffsetDateTime,
         end: time::OffsetDateTime,
-        table_name: Option<&str>,
-        metric: Option<&str>,
+        filter: &extenddb_storage::management_store::MetricsFilter,
     ) -> BoxFuture<'_, OpResult<Vec<MetricsRow>>> {
-        let table_name = table_name.map(std::borrow::ToOwned::to_owned);
-        let metric = metric.map(std::borrow::ToOwned::to_owned);
+        let filters: Vec<(&'static str, String)> = [
+            ("account_id", filter.account_id()),
+            ("table_name", filter.table_name()),
+            ("metric", filter.metric()),
+        ]
+        .into_iter()
+        .filter_map(|(column, value)| value.map(|v| (column, v.to_owned())))
+        .collect();
         Box::pin(async move {
             use std::fmt::Write as _;
 
             let mut sql = String::from(
-                "SELECT bucket, metric, table_name, index_name, operation, \
+                "SELECT bucket, account_id, metric, table_name, index_name, operation, \
                  sum, count, min, max \
-                 FROM metrics WHERE bucket >= $1 AND bucket <= $2",
+                 FROM account_metrics WHERE bucket >= $1 AND bucket <= $2",
             );
-            let mut param_idx = 3u32;
-
-            let table_filter = table_name.as_deref().filter(|s| !s.is_empty());
-            if table_filter.is_some() {
-                let _ = write!(sql, " AND table_name = ${param_idx}");
-                param_idx += 1;
+            for (i, (column, _)) in filters.iter().enumerate() {
+                let _ = write!(sql, " AND {column} = ${}", i + 3);
             }
-            if metric.is_some() {
-                let _ = write!(sql, " AND metric = ${param_idx}");
-            }
-            let _ = param_idx;
             sql.push_str(" ORDER BY bucket");
 
             // Build the query with dynamic binds.
             let mut query = sqlx::query_as::<_, DbMetricsRow>(&sql)
                 .bind(start)
                 .bind(end);
-            if let Some(tn) = table_filter {
-                query = query.bind(tn);
-            }
-            if let Some(mn) = metric.as_deref() {
-                query = query.bind(mn);
+            for (_, value) in &filters {
+                query = query.bind(value);
             }
 
             let rows = query.fetch_all(&self.pool).await.map_err(|e| {
@@ -277,26 +401,16 @@ impl extenddb_storage::management_store::MetricsStore for PostgresCatalogStore {
                 OpError::Internal("Database error".to_owned())
             })?;
 
+            let present = |s: String| (!s.is_empty()).then_some(s);
             Ok(rows
                 .into_iter()
                 .map(|r| MetricsRow {
                     bucket: r.bucket,
+                    account_id: present(r.account_id),
                     metric: r.metric,
-                    table_name: if r.table_name.is_empty() {
-                        None
-                    } else {
-                        Some(r.table_name)
-                    },
-                    index_name: if r.index_name.is_empty() {
-                        None
-                    } else {
-                        Some(r.index_name)
-                    },
-                    operation: if r.operation.is_empty() {
-                        None
-                    } else {
-                        Some(r.operation)
-                    },
+                    table_name: present(r.table_name),
+                    index_name: present(r.index_name),
+                    operation: present(r.operation),
                     sum: r.sum,
                     count: r.count,
                     min: r.min,
@@ -311,7 +425,7 @@ impl extenddb_storage::management_store::MetricsStore for PostgresCatalogStore {
             #[allow(clippy::cast_possible_wrap)] // retention seconds fit in i64
             let cutoff = time::OffsetDateTime::now_utc()
                 - time::Duration::seconds(retention.as_secs() as i64);
-            sqlx::query("DELETE FROM metrics WHERE bucket < $1")
+            sqlx::query("DELETE FROM account_metrics WHERE bucket < $1")
                 .bind(cutoff)
                 .execute(&self.pool)
                 .await
@@ -328,6 +442,7 @@ impl extenddb_storage::management_store::MetricsStore for PostgresCatalogStore {
 #[derive(sqlx::FromRow)]
 struct DbMetricsRow {
     bucket: time::OffsetDateTime,
+    account_id: String,
     metric: String,
     table_name: String,
     index_name: String,
@@ -434,9 +549,7 @@ impl extenddb_storage::management_store::RateLimitStore for PostgresCatalogStore
 
 // Implement CatalogStore supertrait
 impl extenddb_storage::CatalogStore for PostgresCatalogStore {
-    fn cached_encryption_key(&self) -> Option<String> {
-        self.encryption_key
-            .as_ref()
-            .map(std::string::ToString::to_string)
+    fn secret_keys(&self) -> Option<&SecretKeys> {
+        self.keys.as_deref()
     }
 }

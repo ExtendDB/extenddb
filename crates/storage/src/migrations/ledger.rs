@@ -97,16 +97,16 @@ impl LedgerRow {
     }
 }
 
-/// What a release before 1.0 left in the catalog's settings, read beside the
+/// What a release before 0.1.15 left in the catalog's settings, read beside the
 /// ledger.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CatalogTraces {
     /// The `catalog_version` settings row. A dotted value (`0.0.3`) comes from
-    /// a release before 1.0; the runner writes an integer.
+    /// a release before 0.1.15; the runner writes an integer.
     pub catalog_version: Option<String>,
     /// Whether the `resource_tag_migration` row exists. Every released
     /// baseline seeded it and migration 1 deletes it, so on a catalog with a
-    /// ledger it means a release before 1.0 wrote to the catalog.
+    /// ledger it means a release before 0.1.15 wrote to the catalog.
     pub resource_tag_marker: bool,
 }
 
@@ -124,7 +124,7 @@ impl CatalogTraces {
         }
     }
 
-    /// The version row holds a dotted pre-1.0 version.
+    /// The version row holds the dotted version of a release before 0.1.15.
     #[must_use]
     pub fn dotted_version(&self) -> bool {
         self.catalog_version

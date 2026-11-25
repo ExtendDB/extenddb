@@ -45,10 +45,10 @@ macro_rules! migration_ids {
 }
 
 migration_ids! {
-    /// Creates the v1.0 schema on an empty store and brings every released
+    /// Creates the catalog schema on an empty store and brings every released
     /// catalog to it.
     Baseline = 1, "baseline",
-        "create the v1.0 catalog schema, or bring a released catalog to it";
+        "create the catalog schema, or bring a released catalog to it";
     /// Rewrites stored policies from `dynamodb:ResourceTag/<key>` to
     /// `aws:ResourceTag/<key>`.
     ResourceTagConditionKeys = 2, "resource_tag_condition_keys",
@@ -93,12 +93,32 @@ migration_ids! {
     /// a global secondary index is stored.
     WarmThroughput = 9, "warm_throughput",
         "add a nullable warm_throughput column to the tables and indexes catalogs";
+    /// Replaces the catalog's `metrics` table with `account_metrics`, whose
+    /// key has the account a row was recorded for, so two accounts' tables
+    /// of the same name keep their own rows (#728). The rows of `metrics`
+    /// are dropped, not copied: they carry no account, and the server keeps
+    /// metrics for a day. A later migration must not create a table named
+    /// `metrics`: `--reconverge` runs migration 1, which creates it, and then
+    /// this drop again before the later one.
+    AccountMetrics = 10, "account_metrics",
+        "replace the metrics table with account_metrics, keyed by account; drops the rows \
+         recorded without one";
+    /// Rewrites the stored documents that carry attribute names through the
+    /// escape that lets a PostgreSQL catalog hold U+0000 in a name (#367).
+    AttributeNameEscape = 11, "attribute_name_escape",
+        "store attribute names through the escape that lets PostgreSQL jsonb hold U+0000";
+    /// Makes every access key ID unique. PostgreSQL, SQLite and Cassandra key
+    /// `access_keys` by the ID; MongoDB had no unique index on it, so an
+    /// import stored a second key under an ID that a key already had.
+    UniqueAccessKeyIds = 12, "unique_access_key_ids",
+        "make every access key ID unique, which the MongoDB catalog did not enforce";
 }
 
 /// Highest id that has shipped in a release. Bodies at or below it are frozen:
 /// each backend pins their checksums, kinds and convergent flags, and
-/// `forget` refuses them. The v1.0 release PR raises it to 9.
-pub const RELEASED_THROUGH: u32 = 0;
+/// `forget` refuses them. Each release PR raises it to the last id
+/// (CONTRIBUTING.md, "Adding a catalog migration", step 7).
+pub const RELEASED_THROUGH: u32 = 12;
 
 impl MigrationId {
     /// The highest id this binary carries.

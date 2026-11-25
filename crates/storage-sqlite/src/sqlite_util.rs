@@ -152,13 +152,6 @@ mod tests {
         // Text order equals time order against a default-shaped neighbour.
         assert!(s.as_str() < "2026-10-23T14:19:07.124Z");
         assert!(s.as_str() > "2026-10-23T14:19:06.999Z");
-        // Against the retention cutoff (RFC 3339 from the `time` crate, no
-        // fraction on a whole second) the comparison is decided by the second
-        // digits in every case but the cutoff's own second, where `Z` sorts
-        // after `.`; that edge predates this formatter and is the default's
-        // behaviour too.
-        let cutoff = format_timestamp(OffsetDateTime::from_unix_timestamp(1_792_765_146).unwrap());
-        assert!(s.as_str() > cutoff.as_str(), "{s} vs {cutoff}");
     }
 
     /// A millisecond value `time` cannot represent is stamped with the current

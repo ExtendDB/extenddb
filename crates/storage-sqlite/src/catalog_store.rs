@@ -12,8 +12,9 @@ use std::sync::Arc;
 use extenddb_storage::CatalogStore;
 use extenddb_storage::diagnostics::{DiagError, DiagResult, DiagnosticsStore};
 use extenddb_storage::management_store::{
-    MetricsRow, MetricsStore, OpError, OpResult, RateLimitStore, SettingsStore,
+    MetricsFilter, MetricsRow, MetricsStore, OpError, OpResult, RateLimitStore, SettingsStore,
 };
+use extenddb_storage::secret_keys::SecretKeys;
 use futures::future::BoxFuture;
 use sqlx::SqlitePool;
 use time::OffsetDateTime;
@@ -22,23 +23,25 @@ use crate::sqlite_util::{format_timestamp, parse_timestamp};
 
 /// Catalog store over the shared SQLite pool.
 ///
-/// The encryption key is cached at construction (from the `settings` table) so
-/// access-key creation/import can encrypt secrets without an extra query.
+/// The key holder is the one the server's factory loaded, shared with the
+/// credential store, so access-key creation and import encrypt without an
+/// extra query.
 pub struct SqliteCatalogStore {
     pool: SqlitePool,
-    encryption_key: Option<Arc<str>>,
+    keys: Option<Arc<SecretKeys>>,
     /// Serializes this store's writers with the engine's (design decision D1,
     /// see `store.rs`). For a file-backed database the catalog pool opens the
     /// same file as the engine pool, so an uncoordinated catalog write can
     /// hold the SQLite file write lock past a locked writer's `busy_timeout`
     /// (and vice versa), failing an unrelated request with `database is
-    /// locked`. The server wiring in `lib.rs` shares the engine's lock here so
-    /// both sets of writers queue on one lock.
+    /// locked`. The server wiring in `server_backend.rs` shares the engine's
+    /// lock here so both sets of writers queue on one lock.
     write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl SqliteCatalogStore {
-    /// Construct without a cached encryption key (settings/diagnostics-only use).
+    /// Construct without a key holder (settings/diagnostics-only use). The
+    /// store refuses to create or import an access key.
     ///
     /// Used by the out-of-process factories (the `settings`/`doctor` CLI
     /// paths), where no engine exists in the process; the fresh lock still
@@ -46,32 +49,28 @@ impl SqliteCatalogStore {
     pub fn new(pool: SqlitePool) -> Self {
         Self {
             pool,
-            encryption_key: None,
+            keys: None,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
-    /// Construct with the cached AES-256-GCM encryption key (base64) and the
-    /// engine's write lock, so catalog writers queue with engine writers
-    /// (design decision D1).
-    pub fn with_encryption_key(
+    /// Construct with the key holder the factory loaded (`None` for a caller
+    /// that passed `KeySource::None`) and the engine's write lock, so catalog
+    /// writers queue with engine writers (design decision D1).
+    pub fn with_secret_keys(
         pool: SqlitePool,
-        encryption_key: String,
+        keys: Option<Arc<SecretKeys>>,
         write_lock: Arc<tokio::sync::Mutex<()>>,
     ) -> Self {
         Self {
             pool,
-            encryption_key: Some(Arc::from(encryption_key.as_str())),
+            keys,
             write_lock,
         }
     }
 
     pub(crate) fn pool(&self) -> &SqlitePool {
         &self.pool
-    }
-
-    pub(crate) fn encryption_key(&self) -> Option<&Arc<str>> {
-        self.encryption_key.as_ref()
     }
 
     /// Acquire the write lock (design decision D1: every writer holds it for
@@ -119,6 +118,27 @@ impl SettingsStore for SqliteCatalogStore {
         })
     }
 
+    fn replace_setting(
+        &self,
+        key: &str,
+        expected: &str,
+        value: &str,
+    ) -> BoxFuture<'_, OpResult<bool>> {
+        let (key, expected, value) = (key.to_owned(), expected.to_owned(), value.to_owned());
+        Box::pin(async move {
+            // D1: every writer holds the write lock.
+            let _writer = self.lock_writes().await;
+            let done = sqlx::query("UPDATE settings SET value = ? WHERE key = ? AND value = ?")
+                .bind(&value)
+                .bind(&key)
+                .bind(&expected)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| OpError::Internal(format!("replace_setting: {e}")))?;
+            Ok(done.rows_affected() == 1)
+        })
+    }
+
     fn list_settings(&self) -> BoxFuture<'_, OpResult<Vec<(String, String)>>> {
         Box::pin(async move {
             sqlx::query_as("SELECT key, value FROM settings ORDER BY key")
@@ -127,17 +147,14 @@ impl SettingsStore for SqliteCatalogStore {
                 .map_err(|e| OpError::Internal(format!("list_settings: {e}")))
         })
     }
-
-    fn cached_encryption_key(&self) -> Option<String> {
-        self.encryption_key.as_ref().map(|k| k.to_string())
-    }
 }
 
 // ── MetricsStore ───────────────────────────────────────────────────────
 
-#[derive(sqlx::FromRow)]
+sqlite_row_struct! {
 struct DbMetricsRow {
     bucket: String,
+    account_id: String,
     metric: String,
     table_name: String,
     index_name: String,
@@ -147,7 +164,9 @@ struct DbMetricsRow {
     min: f64,
     max: f64,
 }
+}
 
+/// `account_metrics`: migration 10 replaced `metrics` with it.
 impl MetricsStore for SqliteCatalogStore {
     fn insert_metrics(&self, rows: &[MetricsRow]) -> BoxFuture<'_, OpResult<()>> {
         let rows = rows.to_vec();
@@ -158,16 +177,19 @@ impl MetricsStore for SqliteCatalogStore {
             for row in &rows {
                 let bucket = format_timestamp(row.bucket);
                 let result = sqlx::query(
-                    "INSERT INTO metrics \
-                     (bucket, metric, table_name, index_name, operation, sum, count, min, max) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
-                     ON CONFLICT(bucket, metric, table_name, index_name, operation) DO UPDATE SET \
-                       sum = metrics.sum + excluded.sum, \
-                       count = metrics.count + excluded.count, \
-                       min = MIN(metrics.min, excluded.min), \
-                       max = MAX(metrics.max, excluded.max)",
+                    "INSERT INTO account_metrics \
+                     (bucket, account_id, metric, table_name, index_name, operation, \
+                      sum, count, min, max) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                     ON CONFLICT(bucket, account_id, metric, table_name, index_name, operation) \
+                     DO UPDATE SET \
+                       sum = account_metrics.sum + excluded.sum, \
+                       count = account_metrics.count + excluded.count, \
+                       min = MIN(account_metrics.min, excluded.min), \
+                       max = MAX(account_metrics.max, excluded.max)",
                 )
                 .bind(&bucket)
+                .bind(row.account_id.as_deref().unwrap_or(""))
                 .bind(&row.metric)
                 .bind(row.table_name.as_deref().unwrap_or(""))
                 .bind(row.index_name.as_deref().unwrap_or(""))
@@ -190,20 +212,23 @@ impl MetricsStore for SqliteCatalogStore {
         &self,
         start: OffsetDateTime,
         end: OffsetDateTime,
-        table_name: Option<&str>,
-        metric: Option<&str>,
+        filter: &MetricsFilter,
     ) -> BoxFuture<'_, OpResult<Vec<MetricsRow>>> {
-        let table_name = table_name.map(str::to_owned);
-        let metric = metric.map(str::to_owned);
+        let account_id = filter.account_id().map(str::to_owned);
+        let table_name = filter.table_name().map(str::to_owned);
+        let metric = filter.metric().map(str::to_owned);
         let start_str = format_timestamp(start);
         let end_str = format_timestamp(end);
         Box::pin(async move {
             let mut sql = String::from(
-                "SELECT bucket, metric, table_name, index_name, operation, sum, count, min, max \
-                 FROM metrics WHERE bucket >= ? AND bucket <= ?",
+                "SELECT bucket, account_id, metric, table_name, index_name, operation, \
+                 sum, count, min, max \
+                 FROM account_metrics WHERE bucket >= ? AND bucket <= ?",
             );
-            let table_filter = table_name.as_deref().filter(|s| !s.is_empty());
-            if table_filter.is_some() {
+            if account_id.is_some() {
+                sql.push_str(" AND account_id = ?");
+            }
+            if table_name.is_some() {
                 sql.push_str(" AND table_name = ?");
             }
             if metric.is_some() {
@@ -214,11 +239,8 @@ impl MetricsStore for SqliteCatalogStore {
             let mut q = sqlx::query_as::<_, DbMetricsRow>(&sql)
                 .bind(&start_str)
                 .bind(&end_str);
-            if let Some(tn) = table_filter {
-                q = q.bind(tn.to_owned());
-            }
-            if let Some(m) = metric.as_deref() {
-                q = q.bind(m.to_owned());
+            for value in [&account_id, &table_name, &metric].into_iter().flatten() {
+                q = q.bind(value.clone());
             }
 
             let rows = q
@@ -231,6 +253,7 @@ impl MetricsStore for SqliteCatalogStore {
                 .filter_map(|r| {
                     Some(MetricsRow {
                         bucket: parse_timestamp(&r.bucket).ok()?,
+                        account_id: (!r.account_id.is_empty()).then_some(r.account_id),
                         metric: r.metric,
                         table_name: (!r.table_name.is_empty()).then_some(r.table_name),
                         index_name: (!r.index_name.is_empty()).then_some(r.index_name),
@@ -252,7 +275,7 @@ impl MetricsStore for SqliteCatalogStore {
             let cutoff_str = format_timestamp(cutoff);
             // D1: every writer holds the write lock.
             let _writer = self.lock_writes().await;
-            sqlx::query("DELETE FROM metrics WHERE bucket < ?")
+            sqlx::query("DELETE FROM account_metrics WHERE bucket < ?")
                 .bind(&cutoff_str)
                 .execute(&self.pool)
                 .await
@@ -377,7 +400,10 @@ impl DiagnosticsStore for SqliteCatalogStore {
         })
     }
 
-    fn test_data_database_connection(&self) -> BoxFuture<'_, DiagResult<String>> {
+    fn test_data_database_connection(
+        &self,
+        _key: &extenddb_storage::server_components::KeySource,
+    ) -> BoxFuture<'_, DiagResult<String>> {
         Box::pin(async move {
             // Catalog and data share one SQLite file; report its recorded name.
             let row: Option<(String,)> =
@@ -393,7 +419,7 @@ impl DiagnosticsStore for SqliteCatalogStore {
 // ── CatalogStore supertrait ────────────────────────────────────────────
 
 impl CatalogStore for SqliteCatalogStore {
-    fn cached_encryption_key(&self) -> Option<String> {
-        self.encryption_key.as_ref().map(|k| k.to_string())
+    fn secret_keys(&self) -> Option<&SecretKeys> {
+        self.keys.as_deref()
     }
 }

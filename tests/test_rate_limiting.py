@@ -302,3 +302,59 @@ class TestRateLimiting:
         assert resp.status_code == 200, (
             f"Expected 200 from another address, got {resp.status_code}: {resp.text}"
         )
+
+    # Failed logins are recorded under the sign-in name, `account_id/user_name`,
+    # not under the user. A user created with the name of a deleted one, or in
+    # an account created again with a deleted one's id, starts with none of
+    # them (#923).
+
+    def _lock_out(self) -> None:
+        for i in range(_LOCKOUT_THRESHOLD):
+            resp = self._management_request_with_password("wrongpassword")
+            assert resp.status_code == 401, (
+                f"Expected 401 on attempt {i + 1}, got {resp.status_code}: {resp.text}"
+            )
+        resp = self._management_request_with_password("ValidPass123!")
+        assert resp.status_code == 429, (
+            f"Expected 429 for the right password after {_LOCKOUT_THRESHOLD} failures, "
+            f"got {resp.status_code}: {resp.text}"
+        )
+
+    def _assert_signs_in(self, when: str) -> None:
+        resp = self._management_request_with_password("ValidPass123!")
+        assert resp.status_code == 200, (
+            f"Expected 200 for the right password {when}, "
+            f"got {resp.status_code}: {resp.text}"
+        )
+
+    def test_a_user_created_again_after_its_delete_starts_with_no_failures(self):
+        self._lock_out()
+        resp = self.mgmt.delete_user(self.account_id, self.user_name)
+        assert resp.status_code in (200, 204), resp.text
+        resp = self.mgmt.create_user(self.account_id, self.user_name, "ValidPass123!")
+        assert resp.status_code == 201, resp.text
+        self._assert_signs_in("from the same address once the user is created again")
+
+    def test_a_user_created_under_a_name_with_failures_starts_with_none(self):
+        """Failures recorded while no user had the name do not carry over to
+        the user created with it."""
+        resp = self.mgmt.delete_user(self.account_id, self.user_name)
+        assert resp.status_code in (200, 204), resp.text
+        for i in range(_LOCKOUT_THRESHOLD):
+            resp = self._management_request_with_password("wrongpassword")
+            assert resp.status_code == 401, (
+                f"Expected 401 on attempt {i + 1}, got {resp.status_code}: {resp.text}"
+            )
+        resp = self.mgmt.create_user(self.account_id, self.user_name, "ValidPass123!")
+        assert resp.status_code == 201, resp.text
+        self._assert_signs_in("from the same address once the user is created")
+
+    def test_a_user_of_an_account_created_again_starts_with_no_failures(self):
+        self._lock_out()
+        resp = self.mgmt.delete_account(self.account_id)
+        assert resp.status_code in (200, 204), resp.text
+        resp = self.mgmt.create_account(self.account_id, f"ratelimit-acct-{self.account_id}")
+        assert resp.status_code == 201, resp.text
+        resp = self.mgmt.create_user(self.account_id, self.user_name, "ValidPass123!")
+        assert resp.status_code == 201, resp.text
+        self._assert_signs_in("from the same address once the account and user are created again")

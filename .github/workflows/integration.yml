@@ -221,11 +221,11 @@ jobs:
           devtools/check-postgres-catalog-lock ./target/release/extenddb
           postgresql://postgres:devpass@127.0.0.1:5432 18452
 
-      # The last 0.1.x image's verify, migrate --yes and serve against
+      # The 0.1.14 image's verify, migrate --yes and serve against
       # catalogs this binary created and migrated: what each writes, and that
       # this binary then reports WrittenByOlderRelease and --reconverge
       # restores Current.
-      - name: Check the last 0.1.x release against migrated catalogs
+      - name: Check the 0.1.14 release against migrated catalogs
         run: |
           docker pull extenddb/extenddb-postgres:0.1.14
           devtools/check-postgres-older-binary ./target/release/extenddb \
@@ -243,7 +243,7 @@ jobs:
           EXTENDDB_ADMIN_PASSWORD: ${{ steps.init.outputs.admin_password }}
           EXTENDDB_TEST_PG_ADMIN_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
           EXTENDDB_TEST_BACKUP_STORE: filesystem
-        run: devtools/run-tests --extenddb --pytest --comprehensive --terraform --parallel --filter "not import_export"
+        run: devtools/run-tests --extenddb --pytest --comprehensive --terraform --parallel
 
       # moto for the job suite's store-outage cell, the one cell that
       # exercises `spool_path` on PostgreSQL (an S3 download into the spool,
@@ -322,10 +322,10 @@ jobs:
       - name: Check serve and migrate on one catalog
         run: devtools/check-sqlite-catalog-lock ./target/release/extenddb 18450
 
-      # The last 0.1.x dev image's serve and migrate --yes against catalogs
+      # The 0.1.14 dev image's serve and migrate --yes against catalogs
       # this binary migrated: what each writes, and that this binary then
       # reports WrittenByOlderRelease and --reconverge restores Current.
-      - name: Check the last 0.1.x release against migrated catalogs
+      - name: Check the 0.1.14 release against migrated catalogs
         run: |
           docker pull extenddb/extenddb-dev:0.1.14
           devtools/check-sqlite-older-binary ./target/release/extenddb \
@@ -422,7 +422,7 @@ jobs:
           # A file-backed SQLite server without [backup.store] writes to the
           # defaulted root beside the database file.
           EXTENDDB_TEST_BACKUP_STORE: filesystem
-        run: devtools/run-tests --extenddb --pytest --comprehensive --terraform --parallel --filter "not import_export"
+        run: devtools/run-tests --extenddb --pytest --comprehensive --terraform --parallel
 
       - name: Run the backup store and job suites
         run: python3 -m pytest tests/test_backup_store_config.py tests/test_backup_job.py -v -rP -p no:cacheprovider
@@ -729,6 +729,14 @@ jobs:
   run-postgres-storage-tests:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 40
+    # For both test steps below.
+    env:
+      EXTENDDB_TEST_PG_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
+      # table_snapshot fails rather than skips without the string above.
+      EXTENDDB_TEST_PG_REQUIRED: "1"
+      # catalog_check fails when its data database has no pgvector, so
+      # its tests create and check a vector index relation on this image.
+      EXTENDDB_EXPECT_VECTORS: "1"
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -766,8 +774,10 @@ jobs:
       # holds a row lock open while a write waits on it, and the backup restore
       # cases need catalog rows the current binary would not write; all need
       # direct access. The online GSI build tests reorder queue rows by hand and
-      # pause writers with a test hook. They build their own throwaway databases;
-      # the connection string is the server, not a database. `--tests` runs
+      # pause writers with a test hook. The LSI query plan test reads the
+      # statement the engine sent from pg_stat_activity and explains it, which
+      # the wire cannot show. They build their own throwaway databases; the
+      # connection string is the server, not a database. `--tests` runs
       # every target of the crate, so a new test file needs no edit here, and
       # EXTENDDB_TEST_PG_REQUIRED turns a test's skip for a missing connection
       # string into a failure.
@@ -775,11 +785,15 @@ jobs:
         # table_snapshot: the SnapshotEngine consistency check; it needs the
         # shared page-size hook, compiled only into the crate's own test
         # build, and scratch databases it creates and drops itself.
-        env:
-          EXTENDDB_TEST_PG_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
-          # table_snapshot fails rather than skips without the string above.
-          EXTENDDB_TEST_PG_REQUIRED: "1"
+        # catalog_check: the data relations the engine creates compared with
+        # the catalog, on a deployment with a separate data database.
         run: cargo test --release -p extenddb-storage-postgres --tests
+
+      # `extenddb catalog-check` run as the binary on the deployment the
+      # catalog_check tests above build: the lines it prints, its exit code,
+      # and its refusal of a catalog without the data database setting.
+      - name: Run the catalog-check command test
+        run: cargo test --release -p extenddb --test catalog_check
 
   # The runtime-detection proof: the same binary, against a PostgreSQL with no
   # pgvector, must refuse vector indexes over the wire. Today the job above runs
@@ -876,6 +890,7 @@ jobs:
           cargo test --release -p extenddb-storage-postgres
           --test migrations_fresh --test migrations_released --test migrations_crash
           --test migrations_golden --test migrations_guards --test migrations_runs
+          --test migrations_name_escape
 
       # The daemonized server logs to syslog; dump it so server-side failures
       # are diagnosable from the job log.

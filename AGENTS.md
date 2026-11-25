@@ -5,11 +5,11 @@ This document provides AI agents with essential context for working on the Exten
 ## Project Overview
 
 **ExtendDB** is an open source DynamoDB-compatible runtime with pluggable storage, released under the Apache 2.0
-License. ExtendDB is a clean-room implementation of the DynamoDB wire protocol, written in Rust and initially developed
-by AWS engineers. It is not a fork of DynamoDB and contains no DynamoDB source code. ExtendDB speaks the DynamoDB wire
+License. ExtendDB is a clean-room implementation of the DynamoDB wire protocol, written in Rust and maintained
+by AWS. It is not a fork of DynamoDB and contains no DynamoDB source code. ExtendDB speaks the DynamoDB wire
 protocol: any AWS SDK, CLI, or tool that works with DynamoDB works with ExtendDB, unchanged.
 
-- **Language:** Rust (edition 2024, MSRV 1.88+)
+- **Language:** Rust (edition 2024, MSRV 1.91.1+)
 - **Storage backends:** PostgreSQL 14+ (default), SQLite (bundled, no server or client install required; feature flag `sqlite`, also `sqlite-memory` for dev and CI), MongoDB 7.0+ (feature flag `mongodb`), Cassandra 4.1+ (experimental; feature flag `cassandra`). One backend per binary, selected by mutually exclusive Cargo features.
 - **Architecture:** Async (tokio), trait-based storage abstraction
 - **Authentication:** Mandatory SigV4 with built-in IAM (users, groups, roles, policies)
@@ -33,14 +33,15 @@ extenddb/
 │   ├── bin/              # CLI, config, daemon lifecycle (extenddb binary)
 │   ├── cache/            # Auth and authz caches
 │   ├── config/           # Config parsing shared by the CLI and the server
-│   ├── core/             # Pure sync types, validation, expression parsing (no async)
+│   ├── core/             # Sync types, validation, expression parsing (no async)
 │   ├── engine/           # DynamoDB operation handlers (PutItem, Query, etc.)
 │   ├── server/           # HTTP server, management API, web console
 │   ├── storage/          # Storage trait definitions (TableEngine trait)
 │   ├── storage-cassandra/ # Cassandra implementation (experimental; feature flag)
 │   ├── storage-mongodb/  # MongoDB implementation (feature flag)
 │   ├── storage-postgres/ # PostgreSQL implementation (default/reference)
-│   └── storage-sqlite/   # SQLite implementation (dev, CI, and embedded use)
+│   ├── storage-sqlite/   # SQLite implementation (dev, CI, and embedded use)
+│   └── wasm-adapter/     # Experimental WebAssembly build (publish = false)
 ├── tests/                # Python integration tests (pytest)
 ├── docs/
 │   ├── design/           # Architecture and component design docs
@@ -72,16 +73,21 @@ All operations are **account-scoped** via `account_id` parameter for multi-tenan
 extenddb (bin)
   └─> extenddb-server
        ├─> extenddb-engine
-       │    ├─> extenddb-core (pure sync, no async)
+       │    ├─> extenddb-core (sync, no async runtime)
        │    └─> extenddb-storage (trait definitions)
        ├─> extenddb-auth
        ├─> extenddb-storage-postgres  (feature: postgres)
        ├─> extenddb-storage-sqlite    (feature: sqlite / sqlite-memory)
        ├─> extenddb-storage-mongodb   (feature: mongodb)
        └─> extenddb-storage-cassandra (feature: cassandra)
+
+extenddb-wasm-adapter (experimental WebAssembly build; publish = false)
+  └─> extenddb-engine, extenddb-storage-sqlite, extenddb-storage, extenddb-auth, extenddb-core
 ```
 
-- **extenddb-core:** Pure synchronous Rust. No async, no I/O. Types, validation, expression parsing.
+- **extenddb-core:** Synchronous Rust. No async runtime. Types, validation, expression parsing, and the crypto
+  module (AWS-LC through `aws-lc-rs` natively; on `wasm32`, the RustCrypto `sha2`, `hmac` and `aes-gcm` crates,
+  `subtle` and `getrandom`).
 - **extenddb-storage:** Trait definitions only. No implementation.
 - **extenddb-storage-postgres:** Concrete PostgreSQL implementation.
 - **extenddb-storage-sqlite:** Concrete SQLite implementation, the dev and CI backend.
@@ -92,12 +98,14 @@ extenddb (bin)
 - **extenddb-server:** HTTP server, management API, web console.
 - **extenddb-auth:** SigV4 signature verification, IAM policy evaluation.
 - **extenddb (bin):** CLI, config parsing, daemon lifecycle.
+- **extenddb-wasm-adapter:** Experimental WebAssembly build of the engine over in-memory SQLite, called
+  in process from JavaScript. Not published.
 
 ## Building and Running
 
 ### Prerequisites
 
-- Rust 1.88+ (`rustup update`)
+- Rust 1.91.1+ (`rustup update`)
 - Storage backend (one of):
   - PostgreSQL 14+ running locally (see `docs/local-postgres-setup.md`)
   - SQLite (embedded; nothing to install)
@@ -151,7 +159,7 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 This creates:
-- Databases (`extenddb_catalog`, `extenddb_data`)
+- Databases (`extenddb_catalog` and `extenddb` on PostgreSQL; `extenddb_catalog` and `extenddb_data` on MongoDB)
 - Admin user credentials (printed to stdout — save the password!)
 - Self-signed TLS certificate at `~/.extenddb/tls/cert.pem`
 - Config file `extenddb.toml`
@@ -273,6 +281,18 @@ devtools/run-coverage
 ```bash
 devtools/check-licenses
 ```
+
+### WebAssembly Build
+
+The WebAssembly workflow (`.github/workflows/wasm.yml`) builds, lints and tests the code for
+`wasm32-unknown-unknown`. Run one of its steps locally as the header of
+`devtools/run-wasm-step` describes:
+
+```bash
+devtools/run-wasm-step <step>
+```
+
+The README's "Experimental: WebAssembly build" says what that build is.
 
 ## Configuration
 
@@ -397,6 +417,7 @@ Expression parsing lives in `crates/core/src/expression/`. This is pure sync Rus
 | Admin Guide | `docs/manuals/05-admin-guide.md`                  | Server lifecycle, configuration, IAM   |
 | Security Model | `docs/manuals/10-security-model.md`               | Threat model, auth, authz              |
 | Deployment Guide | `docs/manuals/11-deployment-guide.md`             | Self-hosted, multi-cloud, air-gapped   |
+| Backup and Restore | `docs/manuals/14-backup-and-restore.md`           | Backup strategy, drills, recovery      |
 | Differences from DynamoDB | `docs/differences-from-dynamodb.md`               | Behavioral differences                 |
 | Troubleshooting | `docs/troubleshooting.md`                         | Common errors and solutions            |
 | Storage Component Design | `docs/design/04-component-storage.md`             | Storage trait design                   |
@@ -406,7 +427,7 @@ Expression parsing lives in `crates/core/src/expression/`. This is pure sync Rus
 | Local MongoDB Setup | `docs/local-mongodb-setup.md`                     | MongoDB installation and config        |
 | Cassandra Setup | `docs/cassandra-setup.md`                         | Cassandra install, config, and deployment (experimental) |
 | Testing Design | `docs/design/09-testing.md`                       | Test strategy and infrastructure       |
-| Extending Storage | `12-backend-plugin-architecture.md` | Guide to implementing storage backends |
+| Extending Storage | `docs/manuals/12-extending-extenddb-storage.md` | Guide to implementing storage backends |
 
 Build PDFs:
 
@@ -417,7 +438,7 @@ python3 docs/build-docs.py
 ## Code Style and Conventions
 
 - **Rust edition:** 2024
-- **MSRV:** 1.88
+- **MSRV:** 1.91.1
 - **Async:** tokio, no `#[async_trait]` (use RPITIT)
 - **Error handling:** `thiserror` for library errors, `anyhow` for application errors
 - **Serialization:** `serde` + `serde_json`

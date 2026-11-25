@@ -13,6 +13,7 @@ mod authorization_store;
 mod backup_catalog;
 mod backup_engine;
 mod bootstrapper;
+mod catalog_json;
 mod catalog_store;
 pub mod config;
 mod create_table;
@@ -32,7 +33,9 @@ mod snapshot_engine;
 pub use snapshot_engine::{
     MIN_NEXT_PAGE_ROWS, MIN_PAGE_ROWS, SNAPSHOT_SLOT_BOUND, map_fetch_error, page_sql_for,
 };
+mod stream_at_timestamp;
 mod stream_engine;
+mod stream_lifecycle;
 #[doc(hidden)]
 pub mod stream_records_sql;
 mod table_engine;
@@ -45,9 +48,17 @@ mod warm_throughput;
 mod worker_store;
 mod workers;
 
+#[doc(hidden)]
+pub use backup_catalog::{
+    REWRITE_ATTEMPTS, REWRITE_BATCH, REWRITE_LOCK_TIMEOUT, REWRITE_STATEMENT_TIMEOUT,
+};
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use backup_engine::claim_session_settings;
+/// Pause the legacy reader's item stream after its AVAILABLE re-check.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use backup_engine::legacy_items_pause;
 #[doc(hidden)]
 pub use backup_engine::{CLAIM_KEEPALIVES, RESTORE_LOCK_SEED};
 pub use bootstrapper::PostgresBootstrapper;
@@ -55,6 +66,13 @@ pub use catalog_store::PostgresCatalogStore;
 pub use config::PostgresStorageConfig;
 pub use config::parse_connection_string;
 pub use credential_store::DbCredentialStore;
+/// Hold a `catalog-check` comparison between its first catalog read and its
+/// second listing of the data relations.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use data::catalog_check::test_pause::{
+    CatalogCheckPause, CatalogCheckPoint, arm_catalog_check_pause,
+};
 /// Finish GSI builds left `CREATING`, once. The server runs it from a background
 /// worker; exported for its test.
 pub use data::gsi_build::reconcile_creating_gsis;
@@ -94,8 +112,9 @@ pub use data::vector_index::reconcile_incomplete_vector_indexes;
 #[doc(hidden)]
 pub use data::{data_table_name, index_table_name, vector_table_name};
 /// Hold a `DeleteTable` between its in-use probe and its drops, or (separate
-/// data database) between its catalog commit and its data commit; and shorten
-/// the bound on the drop retried after a failed data commit.
+/// data database) between its catalog commit and its data commit, or after
+/// its data commit; and shorten the bound on the drop retried after a failed
+/// data commit.
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use delete_table::test_pause::{
@@ -172,13 +191,17 @@ pub fn backend() -> extenddb_storage::Backend {
         diagnostics_store: |connection_string| {
             let connection_string = connection_string.to_string();
             Box::pin(async move {
-                let pool = sqlx::PgPool::connect(&connection_string)
-                    .await
-                    .map_err(|e| {
-                        extenddb_storage::diagnostics_store::DiagnosticsStoreError::ConnectionFailed(
-                            e.to_string(),
-                        )
-                    })?;
+                use extenddb_storage::diagnostics_store::DiagnosticsStoreError;
+                // Statement logging is off, as on the store's data pool, so a
+                // catalog read that waits on a lock does not print a
+                // slow-statement line in the middle of the command's report.
+                let pool = async {
+                    let options: sqlx::postgres::PgConnectOptions = connection_string.parse()?;
+                    let options = sqlx::ConnectOptions::disable_statement_logging(options);
+                    sqlx::PgPool::connect_with(options).await
+                }
+                .await
+                .map_err(|e| DiagnosticsStoreError::ConnectionFailed(e.to_string()))?;
                 Ok(Box::new(PostgresCatalogStore::new(pool))
                     as Box<dyn extenddb_storage::diagnostics::DiagnosticsStore>)
             })
@@ -348,8 +371,30 @@ impl Drop for ControlPlanePollerGuard {
     }
 }
 
+/// Where [`PostgresEngine::open`] finds the data database's connection
+/// string.
+pub(crate) enum DataConnection<'a> {
+    /// The catalog's `data_database_connection_string` row, as stored: a
+    /// catalog without a key ring keeps it in plaintext.
+    Row,
+    /// The string the server's registration opened, or `None` when the
+    /// catalog has no such row.
+    Opened(Option<&'a str>),
+}
+
 impl PostgresEngine {
     pub async fn new(config: &PostgresConfig, region: &str) -> Result<Self, StorageError> {
+        Self::open(config, region, DataConnection::Row).await
+    }
+
+    /// [`PostgresEngine::new`] with the data database's connection string
+    /// taken from `data_connection`. Without a string the catalog pool
+    /// serves the data too.
+    pub(crate) async fn open(
+        config: &PostgresConfig,
+        region: &str,
+        data_connection: DataConnection<'_>,
+    ) -> Result<Self, StorageError> {
         // Enforce a minimum of 10 connections per pool. Smaller values starve
         // the auth/authz query fanout under concurrent load. If the configured
         // value is below the floor, log a warning and clamp.
@@ -378,19 +423,25 @@ impl PostgresEngine {
 
         // P54 Bug 1: Read data database connection string from catalog settings.
         // Falls back to the catalog pool if no separate data database is configured.
+        let row = match data_connection {
+            DataConnection::Row => sqlx::query_as::<_, (String,)>(
+                "SELECT value FROM settings WHERE key = 'data_database_connection_string'",
+            )
+            .fetch_optional(&pool)
+            .await
+            .ok()
+            .flatten()
+            .map(|(value,)| zeroize::Zeroizing::new(value)),
+            DataConnection::Opened(value) => value.map(|v| zeroize::Zeroizing::new(v.to_owned())),
+        };
         let mut shared_data_pool = false;
-        let data_pool = match sqlx::query_as::<_, (String,)>(
-            "SELECT value FROM settings WHERE key = 'data_database_connection_string'",
-        )
-        .fetch_optional(&pool)
-        .await
-        {
-            Ok(Some((data_conn,))) if !data_conn.is_empty() => PgPoolOptions::new()
+        let data_pool = match row.as_deref() {
+            Some(data_conn) if !data_conn.is_empty() => PgPoolOptions::new()
                 .max_connections(pool_size)
                 .min_connections(min_conns)
                 .test_before_acquire(false)
                 .max_lifetime(std::time::Duration::from_secs(1800))
-                .connect(&data_conn)
+                .connect(data_conn)
                 .await
                 .map_err(|e| {
                     StorageError::Connection(format!("data database connection failed: {e}"))
@@ -847,15 +898,26 @@ fn server_components_factory(
         options.max_concurrent_jobs,
     );
     let region = region.to_string();
+    let mut options = options;
+    let key_source = std::mem::take(&mut options.key_source);
     Box::pin(async move {
         // Every caller registers, a command too: a migration must not run
-        // under one. A command's session carries its own name.
-        let registration = migrations::ServerRegistration::register_as(
+        // under one. A command's session carries its own name. The key
+        // loads inside the registration, before the catalog status is read
+        // (RFC-0000 sections 7 and 12).
+        let registration = migrations::ServerRegistration::register_keyed(
             &connection_string,
             options.command.unwrap_or(migrations::SERVE_APPLICATION),
+            key_source,
         )
-        .await
-        .map_err(BackendError::Catalog)?;
+        .await?;
+        let keys = registration.secret_keys();
+        // In a catalog with a key ring the row is encrypted, and the one key
+        // holder the registration loaded opens it.
+        let data_connection = registration
+            .data_connection_string()
+            .await
+            .map_err(BackendError::Catalog)?;
 
         // Build PostgresConfig from extracted values
         let pg_config = PostgresConfig {
@@ -865,12 +927,17 @@ fn server_components_factory(
         };
 
         // Create PostgresEngine
-        let mut engine = PostgresEngine::new(&pg_config, &region)
-            .await
-            .map_err(|e| BackendError::ConnectionFailed {
-                backend: "postgres".to_string(),
-                details: e.to_string(),
-            })?;
+        let mut engine = PostgresEngine::open(
+            &pg_config,
+            &region,
+            DataConnection::Opened(data_connection.as_deref().map(String::as_str)),
+        )
+        .await
+        .map_err(|e| BackendError::ConnectionFailed {
+            backend: "postgres".to_string(),
+            details: e.to_string(),
+        })?;
+        drop(data_connection);
         engine.serving = Some(Arc::new(registration));
 
         // The startup recovery is a server's; a command reading beside one,
@@ -944,27 +1011,14 @@ fn server_components_factory(
                 details: format!("Failed to create catalog pool: {e}"),
             })?;
 
-        // Load encryption key
-        let enc_key: Option<String> =
-            sqlx::query_scalar("SELECT value FROM settings WHERE key = 'encryption_key'")
-                .fetch_optional(&catalog_pool)
-                .await
-                .map_err(|e| {
-                    BackendError::InitializationFailed(format!(
-                        "Failed to fetch encryption key: {e}"
-                    ))
-                })?;
+        let catalog_store = Arc::new(PostgresCatalogStore::with_secret_keys(
+            catalog_pool.clone(),
+            keys.clone(),
+        )) as Arc<dyn extenddb_storage::CatalogStore>;
 
-        let catalog_store = Arc::new(match enc_key {
-            Some(k) => PostgresCatalogStore::with_encryption_key(catalog_pool.clone(), k),
-            None => return Err(BackendError::MissingEncryptionKey),
-        }) as Arc<dyn extenddb_storage::CatalogStore>;
-
-        // Create auth provider
-        let enc_key = extenddb_storage::CatalogStore::cached_encryption_key(&*catalog_store)
-            .ok_or(BackendError::MissingEncryptionKey)?;
+        // The credential store shares the catalog store's key holder.
         let cred_store: Arc<dyn CredentialStore> =
-            Arc::new(DbCredentialStore::new(catalog_pool.clone(), enc_key));
+            Arc::new(DbCredentialStore::new(catalog_pool.clone(), keys));
 
         // Create runtime hooks
         let runtime_hooks = Box::new(PostgresRuntimeHooks {

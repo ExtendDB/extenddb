@@ -289,12 +289,12 @@ async fn sweep_expired_items(
                 Err(e) => tracing::warn!("TTL worker: delete failed for {table_name}: {e}"),
                 Ok(_) => {
                     deleted += 1;
-                    metrics.record_ttl_deletion(table_name);
+                    metrics.record_ttl_deletion(account_id, table_name);
                     if let Some(s) = staleness {
                         // Staleness seconds are small and well within f64's
                         // exact-integer range; used only for telemetry.
                         #[allow(clippy::cast_precision_loss)]
-                        metrics.record_ttl_staleness(table_name, s as f64);
+                        metrics.record_ttl_staleness(account_id, table_name, s as f64);
                     }
                 }
             }

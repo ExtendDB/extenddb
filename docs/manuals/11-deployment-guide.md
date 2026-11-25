@@ -17,7 +17,7 @@ This guide covers deploying extenddb in various environments beyond local develo
 extenddb is a single Rust binary that connects to a storage backend. All durable state lives in the backend; extenddb keeps only short-lived credential, policy, and table-metadata caches in process. This means:
 
 - Multiple extenddb instances can share one backend catalog (with caveats — see Multi-Instance below)
-- The backend's own HA, backup, and replication tools provide durability
+- The backend's own HA, backup, and replication tools provide durability; with `[backup.store]` configured (file-backed SQLite has one by default), table backups go to the store on PostgreSQL, SQLite and MongoDB; without one, and always on Cassandra, they are in-catalog backups inside the database; the [Backup and Restore manual](14-backup-and-restore.md) covers both
 - extenddb can run anywhere the storage backend is reachable
 
 ## Deployment Models
@@ -73,8 +73,8 @@ ExtendDB runs in Docker or Kubernetes. The binary has no runtime dependencies be
 Example Dockerfile:
 
 ```dockerfile
-# Match rust-version in Cargo.toml
-FROM rust:1.95 AS builder
+# Match rust-version in Cargo.toml, and the Debian release of the runtime stage
+FROM rust:1.91.1-bookworm AS builder
 WORKDIR /src
 COPY . .
 RUN cargo build --release
@@ -143,7 +143,7 @@ There is no readiness endpoint yet, so do not expect a Kubernetes
 becomes unreachable. Until a readiness endpoint that probes the storage layer
 exists, treat backend failures as something clients retry through.
 
-For Kubernetes, run `extenddb init` as an init container or a one-time Job, then deploy extenddb as a Deployment with the generated `extenddb.toml` mounted as a ConfigMap or Secret.
+For Kubernetes, run `extenddb init` as an init container or a one-time Job, then deploy extenddb as a Deployment with the generated `extenddb.toml` mounted as a ConfigMap or Secret. A deployment that keeps its stored secrets under a key-encryption key (KEK) file (the admin guide's [Encryption Key](05-admin-guide.md#encryption-key) section) mounts the KEK as a Secret volume with `defaultMode: 0400`, runs the pod with `securityContext: {runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001}`, and points `EXTENDDB__AUTH__ENCRYPTION__KEY_FILE` at the mounted file. kubelet gives the file to root with group 10001 at mode 0440, which the server accepts only when its effective group is 10001. The server cannot see who belongs to that group, and every member can read the file, so give group 10001 no other members. Without `fsGroup` the file belongs to group root and uid 10001 cannot open it. Secrets are unencrypted in etcd unless the cluster enables encryption at rest. The `extenddb encryption-key` commands that need every server stopped run as a Job that mounts the same Secret while the Deployment has 0 replicas.
 
 ### Air-Gapped
 
@@ -152,6 +152,7 @@ ExtendDB requires no internet connectivity. All functionality is self-contained 
 Requirements in the air-gapped environment:
 - A supported storage backend, reachable from the ExtendDB host
 - The `extenddb` binary (statically linked or with matching libc)
+- The KEK file, when the deployment encrypts its stored secrets under one (`[auth.encryption] key_file`), delivered by one of the routes in the admin guide's [Encryption Key](05-admin-guide.md#encryption-key) section, with a copy kept away from the host; no key source depends on a network key service
 
 ## Configuring PostgreSQL
 
@@ -211,6 +212,7 @@ extenddb init \
 - [ ] Change the admin password from the auto-generated one
 - [ ] Create named accounts and IAM users with least-privilege policies
 - [ ] Leave credential import off unless you need it. The server refuses imports unless `allow_credential_import` is `true`. If you enabled it to import keys, turn it off again: `extenddb settings set allow_credential_import false`
+- [ ] Encrypt stored secrets under a KEK file: `extenddb encryption-key switch --key-file <path> --yes` with every server stopped, then set `[auth.encryption] key_file`, and keep a copy of the KEK away from the host (the admin guide's [Encryption Key](05-admin-guide.md#encryption-key) section)
 
 ### Transport
 
@@ -229,12 +231,13 @@ extenddb init \
 - [ ] Use a dedicated PostgreSQL user for extenddb with minimal privileges
 - [ ] Configure PostgreSQL `max_connections` ≥ `2 * pool_size + catalog_pool_size + max_concurrent_jobs`, plus one per overlapping vector index build and one during a schema migration
 - [ ] Enable PostgreSQL TLS
-- [ ] Set up automated backups (pg_dump, WAL archiving, or managed service snapshots)
+- [ ] Set up automated backups that copy the catalog and data databases as one copy: a base backup with WAL archiving or managed service snapshots of the instance (either covers one instance, so only when both databases are on one PostgreSQL instance), or `pg_dump` of both with the server stopped, under `umask 077` (the admin guide's [Data Recovery](05-admin-guide.md#data-recovery) entry)
+- [ ] Configure `[backup.store]` (S3 for production) per the [Backup and Restore manual](14-backup-and-restore.md)
 - [ ] Monitor PostgreSQL disk usage, connection count, and query performance
 
 ### Monitoring
 
-- [ ] Poll `/metrics` for JSON snapshots and forward to your monitoring system (the response is custom JSON, not Prometheus exposition format; convert as needed)
+- [ ] Poll `/metrics` with an admin user's credentials (HTTP Basic auth) for JSON snapshots and forward to your monitoring system (the response is custom JSON, not Prometheus exposition format; convert as needed)
 - [ ] Forward syslog to a log aggregation service
 - [ ] Set up alerts on health check failures (`/health`)
 - [ ] Monitor extenddb process with systemd, supervisord, or equivalent
@@ -267,12 +270,20 @@ User=extenddb
 Group=extenddb
 Restart=on-failure
 RestartSec=5
+# The locked key store that holds the encryption key and the cached signing
+# keys needs about 640 KiB for the default [auth.cache] max_entries. Kernels
+# before 5.16 default the memlock limit to 64 KiB (the admin guide's Memory
+# locking section).
+LimitMEMLOCK=16M
 # On a host that backs up tables of large items, one malloc arena keeps a
 # backup job's high-water mark at the pipeline's terms whatever the number of
 # large items it reads (the admin guide's [backup] max_concurrent_jobs row
 # gives the figures). It costs the request path a few percent (3.5 to 9.2%
 # on GetItem, Query and Scan on SQLite, about 2% on PostgreSQL (the scans,
-# 2.1%)), so the line is left to the operator:
+# 2.1%)), so the line is left to the operator. On SQLite it also lowers
+# the peak of a restore of tables whose items are larger than a few
+# hundred bytes, of any attribute types (the Backup and Restore manual
+# gives the figures):
 #Environment=MALLOC_ARENA_MAX=1
 
 [Install]
@@ -284,6 +295,23 @@ sudo systemctl enable extenddb
 sudo systemctl start extenddb
 ```
 
+To keep the stored secrets under a key-encryption key (KEK) file instead of the catalog key (the admin guide's [Encryption Key](05-admin-guide.md#encryption-key) section), on a host with systemd 250 or later and a TPM 2.0 chip, seal the KEK to the TPM and let systemd decrypt it at each start of the unit. Keep a copy of the KEK away from the host first: the sealed file opens only with that TPM and is lost with the host.
+
+```bash
+systemd-creds encrypt --with-key=tpm2 --name=extenddb-kek kek /etc/credstore.encrypted/extenddb-kek
+```
+
+Then add two lines to the `[Service]` section above:
+
+```ini
+LoadCredentialEncrypted=extenddb-kek:/etc/credstore.encrypted/extenddb-kek
+Environment=EXTENDDB__AUTH__ENCRYPTION__KEY_FILE=%d/extenddb-kek
+```
+
+Run `extenddb encryption-key switch --key-file <path> --yes` with the unit stopped, through the admin guide's [`systemd-run` example](05-admin-guide.md#delivering-the-kek-file), which runs it as `extenddb` with the credential and gives the path under `/run/credentials/extenddb-keys.service/`, and then start the unit. The plaintext `kek` written under `umask 077` is root's at mode 0600, so the server's user cannot open it, and `/run/credentials/extenddb.service/` does not exist while the unit is stopped. systemd decrypts the credential into `/run/credentials/extenddb.service/` and unmounts that directory when the unit stops. On a ramfs the `extenddb` user owns the file at mode 0400; systemd 254 or later on Linux 6.4 or later uses a tmpfs, where root owns the file and an ACL entry lets the user read it. The server accepts both. With `LimitMEMLOCK=` in the unit the locked key store fits on every kernel; without `key_file` a server that cannot lock its memory warns and starts, with it the server refuses unless `require_locked_memory = false` is set.
+
+With this unit only the `extenddb` user and root can read export files: the server creates them with mode 0600, and the import and export roots and account directories it creates with mode 0700, which the daemon's umask (027) can only narrow; before v0.1.15 that umask gave the `extenddb` group read access (see [the v0.1.15 entry](07-upgrade-manual.md#v0115-export-files-are-created-0600-and-the-import-and-export-directories-the-server-creates-0700) of the upgrade manual). To give a group access to a root, for example to put import files into it, create the root before the first start with that group and the mode you want, since an existing directory keeps its mode; export files in it are still created 0600. Import files go under `<root>/<account id>`. When one directory is both an import and an export root (the deprecated `import_export_root`, or the same path under `[import]` and `[export]`), the first export of an account creates that directory 0700, so also create each `<root>/<account id>` beforehand with the group and mode you want, or use separate import and export roots. Keep each parent directory of a root writable by its owner only (root or `extenddb`): the server logs a warning at startup for a parent directory that group or others can write to without the sticky bit, since a user who can write to it could replace the root.
+
 ## Multi-Instance Considerations
 
 Run one extenddb instance per catalog. Multiple instances behind a load balancer are not supported in this release:
@@ -291,7 +319,7 @@ Run one extenddb instance per catalog. Multiple instances behind a load balancer
 - Credentials, policies, and table metadata are cached in each process (see the cache TTLs in the admin guide). Nothing invalidates a cache on another instance, so a key revoked or a policy changed through one instance stays in force on the others until the TTL expires.
 - Every instance runs every background worker (TTL expiry, GSI backfill, stream retention, control-plane transitions). The workers are safe to run twice, but the work is duplicated.
 - `/health` is a liveness check that does not query the database, so a load balancer cannot use it to take an instance with a broken database connection out of rotation. It does report the backup store: `components.backup_store` is `unhealthy` and `status` is `degraded` while the configured store cannot be reached or fails its identity check, with HTTP 200 kept, so a store outage never drains a replica.
-- Instances that share a catalog must share one backup store root (`[backup.store]`: one S3 bucket and prefix, or one shared mount that supports hard links, which the store's conditional create needs; some CIFS and FUSE mounts refuse `link(2)` with `EPERM`, and the server then reports the store as having failed validation, with the `link` error in the log line). A host-local directory configured at the same path on each host is not one root: once the catalog has rows for the root, the second instance finds the root's identity file missing or the newest backup's manifest absent and starts with the store unhealthy. While the catalog has no rows for the root (a fresh deployment, or one whose backups were purged), nothing tells the two directories apart: each instance creates its own identity file and store id and both start healthy, and the first backups then split the rows between two ids, which the next check reports as an identity mismatch that only `backup purge` resolves. Point every instance at one root before the first backup. Each instance on a host needs its own `spool_path`; the spool's `.lock` refuses a second instance. An existing spool directory must be owned by the server's user with mode `0700`, as the root must; a spool created `0755` stops startup naming it.
+- Instances that share a catalog must share one backup store root (`[backup.store]`: one S3 bucket and prefix, or one shared mount that supports hard links, which the store's conditional create needs; some CIFS and FUSE mounts refuse `link(2)` with `EPERM`, and the server then reports the store as having failed validation, with the `link` error in the log line). A host-local directory configured at the same path on each host is not one root: once the catalog has rows for the root, the second instance finds the root's identity file missing or the newest backup's manifest absent and starts with the store unhealthy. While the catalog has no rows for the root (a fresh deployment, or one whose backups were purged), nothing tells the two directories apart: each instance creates its own identity file and store id and both start healthy, and the first backups then split the rows between two ids, which the next check reports as an identity mismatch. `backup purge`, plain `backup sync` and `--prune-missing` all refuse while the store is unhealthy, and `--forget-store` refuses the one root label both directories share. To clear it, keep one directory: remove each row that carries the other directory's store id with `extenddb backup sync --forget-backup <arn>` (`backup list` prints each row's `store_id`; the command runs on the unhealthy store and deletes no object), copy that directory's account directories, without its `extenddb-store.json`, into the kept one as the server's user, keeping directories `0700` and files `0600` (`cp -rp` or `rsync -a`; `backup sync` exits 1 on a directory left `0755`), point every instance at the kept directory over a shared mount, and run plain `backup sync`, which adopts them; or restore the catalog from a copy taken before the split, keep the directory whose store id the restored rows carry, and copy the other directory's account directories into it the same way before `backup sync` (the backups that the other directory's instance took after the catalog's copy are otherwise unknown to it). The [Backup and Restore manual](14-backup-and-restore.md#configuration) gives both, with the case of a `DELETING` row among them. Point every instance at one root before the first backup. To change the root later without losing the backups, reconfigure every instance to the new root, copy the old root's tree there without its `extenddb-store.json` (the new root has its own once the instances restart) and run `extenddb backup sync --move-store <old root>` ([Moving a store to a new root](14-backup-and-restore.md#moving-a-store-to-a-new-root)). Each instance on a host needs its own `spool_path`; the spool's `.lock` refuses a second instance. An existing spool directory must be owned by the server's user with mode `0700`, as the root must; a spool created `0755` stops startup naming it.
 
 On SQLite this limit is enforced: `extenddb serve` holds an exclusive lock on `<database>.lock` and a second server on the same file refuses to start. On PostgreSQL, MongoDB, and Cassandra it is not enforced. On PostgreSQL, if you start a second instance anyway, size `pool_size × instance_count + 3 × instance_count ≤ PostgreSQL max_connections`.
 
@@ -360,6 +388,6 @@ ORDER BY mean_exec_time DESC LIMIT 10;
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

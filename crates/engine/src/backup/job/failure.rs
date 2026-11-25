@@ -31,14 +31,18 @@
 //! reconciler's (AVAILABLE from a complete manifest, FAILED otherwise).
 //!
 //! The backup job's failure path ([`fail_row`]) is the FAILED write
-//! followed, only when it matched, by `delete_prefix` of the backup's
-//! prefix; the holder of the claim owns the prefix, so a job whose FAILED
-//! write did not match never deletes. A deletion that fails leaves the
+//! followed, only when it matched, by the deletion fence and then
+//! `delete_prefix` of the backup's prefix; the holder of the claim owns the
+//! prefix, so a job whose FAILED write did not match never deletes, and a
+//! root another catalog adopted while the job ran is left as it is (the
+//! fence marks the store unhealthy). A deletion that fails leaves the
 //! prefix to the reconciler, which deletes a FAILED row's prefix once its
 //! heartbeat is stale. The restore job's failure path, FAILED then the
 //! target's removal under the same gate, is `super::super::restore::fail_restore`.
 
 use extenddb_backup_store::BackupStore;
+
+use super::super::StoreFence;
 use extenddb_core::metrics::MetricsCollector;
 use extenddb_storage::JobClaim;
 use extenddb_storage::backup_catalog::{JobStatus, StatusFields, WriteOutcome};
@@ -115,16 +119,21 @@ pub(crate) enum FailurePath {
     Deleted,
     /// FAILED written; the deletion failed and is the reconciler's.
     DeleteFailed(String),
+    /// FAILED written; the deletion fence refused, and nothing was
+    /// deleted.
+    Fenced(String),
     /// FAILED not written by this claim (the row is another's, or the claim
     /// connection failed): no store access was made.
     NoStoreAccess(String),
 }
 
-/// The failure path (module doc): FAILED with `reason`, then the deletion
-/// of `prefix` when the write matched.
+/// The failure path (module doc): FAILED with `reason`, then, when the
+/// write matched, the fence for `catalog_id` and the deletion of `prefix`.
 pub(crate) async fn fail_row(
     claim: &dyn JobClaim,
     store: &dyn BackupStore,
+    fence: &StoreFence,
+    catalog_id: &str,
     prefix: &str,
     reason: &str,
     metrics: Option<&MetricsCollector>,
@@ -137,6 +146,9 @@ pub(crate) async fn fail_row(
     match write_status(claim, JobStatus::Creating, JobStatus::Failed, &fields).await {
         Written::Matched => {}
         Written::NotMatched(why) | Written::Error(why) => return FailurePath::NoStoreAccess(why),
+    }
+    if let Err(problem) = fence.check(catalog_id).await {
+        return FailurePath::Fenced(problem.to_string());
     }
     match store.delete_prefix(prefix).await {
         Ok(_) => FailurePath::Deleted,

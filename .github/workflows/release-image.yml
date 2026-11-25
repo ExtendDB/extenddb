@@ -8,6 +8,15 @@
 # environment approval. Any defect's blast radius stays a tag no user
 # consumes.
 #
+# With the `dry_run` input the run ends after the build jobs: the gates and
+# both builds, smoke tests, scans and SBOMs run as for a release, and nothing
+# is published, signed or attested. A release rehearsal dispatches the three
+# publish workflows (this one per image, release-dev-image, npm-publish) this
+# way against the tag first, then again for real. Dry runs have a
+# concurrency group of their own, so a dry run never cancels a pending
+# release. devtools/release-dry-run runs the same gate and build steps on
+# a developer's machine, for the host's architecture.
+#
 # Shape, and why:
 #
 #   gate      Runs once. Cheap checks that do not need a build, so a bad input
@@ -81,6 +90,10 @@ on:
           - extenddb-mongodb
           - extenddb-cassandra
         default: extenddb-postgres
+      dry_run:
+        description: 'Rehearse only: run the gates and both builds with their smoke tests, scans and SBOMs; publish, sign, mirror and attest nothing'
+        type: boolean
+        default: false
 
 # Nothing is committed, so no write scope on the repo is needed.
 permissions:
@@ -89,7 +102,7 @@ permissions:
 # Two releases must never race. The group names the image, so a future second
 # backend does not serialise behind this one for no reason.
 concurrency:
-  group: release-image-${{ inputs.image }}
+  group: release-image-${{ inputs.image }}${{ inputs.dry_run && '-dry' || '' }}
   cancel-in-progress: false
 
 env:
@@ -252,7 +265,9 @@ jobs:
     # If one architecture fails, cancel the other: nothing is published either
     # way, so there is no point paying for the rest of the matrix.
     strategy:
-      fail-fast: true
+      # A release stops at the first failing architecture; a rehearsal lets
+      # both report.
+      fail-fast: ${{ !inputs.dry_run }}
       matrix:
         include:
           - arch: amd64
@@ -402,25 +417,11 @@ jobs:
             "$TRIVY_IMAGE" image --input /image.tar.gz \
             --format cyclonedx --no-progress --skip-version-check \
             > "sbom/sbom-${ARCH}.cdx.json"
-          REQUIRE_CRATES=0
-          grep -q 'cargo auditable build' "$DOCKERFILE" && REQUIRE_CRATES=1
-          python3 - "sbom/sbom-${ARCH}.cdx.json" "$REQUIRE_CRATES" <<'PY'
-          import json, re, sys
-          bom = json.load(open(sys.argv[1]))
-          crates = [c for c in bom.get("components", []) if c.get("purl", "").startswith("pkg:cargo/")]
-          ids = [p.get("value", "") for p in bom.get("metadata", {}).get("component", {}).get("properties", [])
-                 if p.get("name") == "aquasecurity:trivy:ImageID"]
-          if (bom.get("bomFormat") != "CycloneDX" or not bom.get("components") or len(ids) != 1
-                  or not re.fullmatch(r"sha256:[0-9a-f]{64}", ids[0])):
-              print(f"::error::{sys.argv[1]} is not a CycloneDX SBOM of one image")
-              sys.exit(1)
-          if not crates:
-              if sys.argv[2] == "1":
-                  print(f"::error::{sys.argv[1]} lists no crates, but the Dockerfile builds with cargo-auditable")
-                  sys.exit(1)
-              print(f"::warning::{sys.argv[1]} lists no crates: this tag's Dockerfile predates cargo-auditable")
-          print(f"{len(bom['components'])} components, {len(crates)} of them crates; image {ids[0]}")
-          PY
+          # The check is devtools/check-image-sbom at the tagged commit, shared
+          # with devtools/release-dry-run; a tag from before it has none.
+          [[ -x devtools/check-image-sbom ]] \
+            || { echo "::error::tagged commit has no devtools/check-image-sbom; use a tag created after it was merged"; exit 1; }
+          devtools/check-image-sbom "sbom/sbom-${ARCH}.cdx.json" "$DOCKERFILE"
 
       - name: Upload the SBOM artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
@@ -437,8 +438,32 @@ jobs:
           retention-days: 1
           compression-level: 0   # already gzipped
 
+  # A rehearsal's end: the gates and the builds ran as the release runs them,
+  # and nothing was published. The publish-side jobs are skipped by their
+  # `if`, so their environments ask no approval.
+  dry-run-summary:
+    needs: [gate, build]
+    if: ${{ inputs.dry_run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Summarise the rehearsal
+        run: |
+          {
+            echo "### Dry run: gates and builds passed, nothing published"
+            echo ""
+            echo "Both architectures of \`${{ needs.gate.outputs.image_repo }}\` built, passed the smoke test and the vulnerability scan, and produced SBOMs. Dispatch again without the dry run to publish the candidate."
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| tag | \`v${{ needs.gate.outputs.version }}\` |"
+            echo "| commit | \`${{ needs.gate.outputs.sha }}\` |"
+            echo "| version (from tag) | \`${{ needs.gate.outputs.version }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   publish-candidate:
     needs: [gate, build]
+    if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment: dockerhub       # approval 1: publish + sign (the only job with Docker Hub secrets)
