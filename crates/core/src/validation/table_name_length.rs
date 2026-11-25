@@ -46,8 +46,15 @@ pub(crate) const TOO_LONG: &str = "Member must have length less than or equal to
 /// The length clause a table name fails under the bounds `(min, max)`, in
 /// characters, or `None` for a name within them.
 #[must_use]
-pub fn length_clause(name: &str, (min, max): (usize, usize)) -> Option<&'static str> {
-    match name.chars().count() {
+pub fn length_clause(name: &str, bounds: (usize, usize)) -> Option<&'static str> {
+    count_clause(name.chars().count(), bounds)
+}
+
+/// [`length_clause`] for a name `count` units long, for an operation that
+/// counts a name in a unit other than characters.
+#[must_use]
+pub fn count_clause(count: usize, (min, max): (usize, usize)) -> Option<&'static str> {
+    match count {
         n if n < min => Some(TOO_SHORT),
         n if n > max => Some(TOO_LONG),
         _ => None,

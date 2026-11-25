@@ -20,7 +20,8 @@
 //! - A bare name outside `[a-zA-Z0-9_.-]+`: `Value '<name>' at '<location>'
 //!   failed to satisfy constraint: Member must satisfy regular expression
 //!   pattern: ...`. When the name is also shorter than 3 or longer than 255
-//!   characters the message lists both clauses, the length first, joined by
+//!   characters, or UTF-16 code units in the operations of `UTF16_LENGTH`,
+//!   the message lists both clauses, the length first, joined by
 //!   `; ` under `2 validation errors detected:` (measured at `tableName`;
 //!   derived for the other locations). Locations: `tableName` for `TableName`,
 //!   `targetTableName`, `sourceTableName`, `tableCreationParameters.tableName`,
@@ -68,7 +69,7 @@
 
 use extenddb_core::error::{DynamoDbError, validation_error, validation_errors};
 use extenddb_core::validation::table_name_length::{
-    MAP_KEYS_NAME, length_clause, transact_name_location,
+    MAP_KEYS_NAME, count_clause, length_clause, transact_name_location,
 };
 use serde_json::Value;
 
@@ -81,6 +82,14 @@ const LIST_STREAMS_NAME: &str =
 /// beside a pattern fault, and that request is refused whatever the
 /// deployment's bounds.
 const NAME_BOUNDS: (usize, usize) = (3, 255);
+
+/// The operations that count a table name in UTF-16 code units when they
+/// choose its length clause, so a character above U+FFFF counts twice
+/// (measured 2026-11-14 and 2026-11-18). The gate counts characters for every
+/// other operation. The service counts characters on GetItem and PutItem with
+/// their `Key` or `Item`, Query, Scan and TransactWriteItems (measured
+/// 2026-11-18), and on ListTables (measured 2026-11-25).
+const UTF16_LENGTH: [&str; 4] = ["CreateTable", "DeleteTable", "DescribeTable", "UpdateTable"];
 
 /// Refuse a table name outside the service's character pattern, in any field
 /// the operation carries one, before the name is used in any lookup. A
@@ -202,7 +211,8 @@ fn check_name(
     if in_pattern(name) && !(name.is_empty() && operation == "DescribeTable") {
         return Ok(());
     }
-    Err(bare_name_error(name, location))
+    let utf16 = UTF16_LENGTH.contains(&operation);
+    Err(bare_names_error(&[(name, location.to_owned())], utf16))
 }
 
 /// A member the service reads as a name (see the module docs): a value
@@ -224,16 +234,21 @@ fn check_name_member(value: Option<&Value>, location: &str) -> Result<(), Dynamo
 /// The service lists every failed constraint of a member in one message, the
 /// length clause before the pattern clause.
 fn bare_name_error(name: &str, location: &str) -> DynamoDbError {
-    bare_names_error(&[(name, location.to_owned())])
+    bare_names_error(&[(name, location.to_owned())], false)
 }
 
 /// [`bare_name_error`] for several members, in the order given. A name inside
 /// the pattern contributes its length clause alone.
-fn bare_names_error(names: &[(&str, String)]) -> DynamoDbError {
+fn bare_names_error(names: &[(&str, String)], utf16: bool) -> DynamoDbError {
     let pattern = pattern_clause();
     let mut faults: Vec<(&str, &str, &str)> = Vec::new();
     for (name, location) in names {
-        if let Some(clause) = length_clause(name, NAME_BOUNDS) {
+        let length = if utf16 {
+            count_clause(name.encode_utf16().count(), NAME_BOUNDS)
+        } else {
+            length_clause(name, NAME_BOUNDS)
+        };
+        if let Some(clause) = length {
             faults.push((name, location, clause));
         }
         if name.is_empty() || !in_pattern(name) {
@@ -316,7 +331,11 @@ fn check_transact_items(
             let location = transact_name_location(i, sub);
             if name.starts_with("arn:") {
                 if let Err(e) = arn_gate::check_transact_member_arn(name, &location) {
-                    return Err(if outside { bare_names_error(&names) } else { e });
+                    return Err(if outside {
+                        bare_names_error(&names, false)
+                    } else {
+                        e
+                    });
                 }
             } else if !in_pattern(name) {
                 if !list_lengths {
@@ -330,7 +349,7 @@ fn check_transact_items(
         }
     }
     if outside {
-        return Err(bare_names_error(&names));
+        return Err(bare_names_error(&names, false));
     }
     Ok(())
 }
@@ -835,6 +854,44 @@ mod tests {
             "DescribeTimeToLive",
         ] {
             assert_eq!(message(op, json!({ "TableName": "" })), None, "{op}");
+        }
+    }
+
+    /// Issue #1019 (measured 2026-11-14 and 2026-11-18), with Query and Scan as
+    /// operations that keep the character count. U+1F600 followed by `a` (3
+    /// code units) and 127 U+1F600 followed by `a` (255 code units) sit on the
+    /// two bounds.
+    #[test]
+    fn four_operations_count_a_name_in_utf16_code_units() {
+        let long = Some("Member must have length less than or equal to 255");
+        let utf16 = ["CreateTable", "DescribeTable", "DeleteTable", "UpdateTable"];
+        let (emoji, e_acute) = ("\u{1F600}", "\u{e9}");
+        // (operations, name, the clause listed before the pattern clause)
+        let rows = [
+            (&utf16[..], emoji.repeat(2), None),
+            (&utf16[..], format!("{emoji}a"), None),
+            (&utf16[..], format!("{}a", emoji.repeat(127)), None),
+            (&utf16[..], emoji.repeat(128), long),
+            (&utf16[..], e_acute.repeat(200), None),
+            (&["Query", "Scan"][..], emoji.repeat(128), None),
+        ];
+        for (ops, name, length) in rows {
+            let expected = match length {
+                Some(clause) => format!(
+                    "2 validation errors detected: Value '{name}' at 'tableName' failed to \
+                     satisfy constraint: {clause}; Value '{name}' at 'tableName' failed to \
+                     satisfy constraint: {PAT}"
+                ),
+                None => one(&name, "tableName", PAT),
+            };
+            for op in ops {
+                assert_eq!(
+                    message(op, json!({ "TableName": name })).as_deref(),
+                    Some(expected.as_str()),
+                    "{op} {} characters",
+                    name.chars().count()
+                );
+            }
         }
     }
 }

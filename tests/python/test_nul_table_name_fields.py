@@ -188,6 +188,52 @@ class TestSeveralConstraintsAtOnce:
             f"constraint: {MEMBER_PATTERN}",
         )
 
+    # Issue #1019, measured on 2026-11-14 and 2026-11-18 (us-east-1): an emoji
+    # (U+1F600) counts two code units and an é (U+00E9) one.
+    @pytest.mark.parametrize(
+        "call",
+        [
+            pytest.param(
+                lambda c, t: c.create_table(
+                    TableName=t,
+                    BillingMode="PAY_PER_REQUEST",
+                    AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+                    KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+                ),
+                id="CreateTable",
+            ),
+            pytest.param(lambda c, t: c.describe_table(TableName=t), id="DescribeTable"),
+            pytest.param(lambda c, t: c.delete_table(TableName=t), id="DeleteTable"),
+            pytest.param(
+                lambda c, t: c.update_table(TableName=t, BillingMode="PAY_PER_REQUEST"),
+                id="UpdateTable",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("name", "length_clause"),
+        [
+            pytest.param("\U0001f600" * 2, None, id="2-emoji"),
+            pytest.param(
+                "\U0001f600" * 128,
+                "Member must have length less than or equal to 255",
+                id="128-emoji",
+            ),
+            pytest.param("\u00e9" * 200, None, id="200-e-acute"),
+        ],
+    )
+    def test_utf16_code_units(self, raw_client, call, name, length_clause):
+        with pytest.raises(ClientError) as exc:
+            call(raw_client, name)
+        if length_clause is None:
+            assert_member_pattern(exc.value, "tableName", name)
+            return
+        first, second = (
+            f"Value '{name}' at 'tableName' failed to satisfy constraint: {clause}"
+            for clause in (length_clause, MEMBER_PATTERN)
+        )
+        assert_validation(exc.value, f"2 validation errors detected: {first}; {second}")
+
 
 class TestIndexName:
     def test_query_and_scan_with_nul_index_name(self, raw_client, nul_table):
