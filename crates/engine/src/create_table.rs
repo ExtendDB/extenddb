@@ -29,6 +29,7 @@ pub async fn handle_create_table(
         ],
     )?;
 
+    crate::require_stream_enabled_member(&body)?;
     let mut input: CreateTableInput = serde_json::from_value(body).map_err(|e| {
         let msg = e.to_string();
         if msg.contains("validation error detected")
@@ -150,6 +151,12 @@ pub fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> Dynamo
         StorageError::IndexAlreadyExists(name) => DynamoDbError::ValidationException(format!(
             "One or more parameter values were invalid: Index already exists: {name}"
         )),
+        // Raised by the backup catalog's claim alone, whose caller handles
+        // it; here it is a programming error, reported without the row.
+        StorageError::AlreadyExists(msg) => {
+            tracing::error!(internal_error = %msg, "unexpected already-exists storage error");
+            DynamoDbError::InternalServerError("Internal server error".to_owned())
+        }
         // The resource exists and the request is well formed; its current state
         // forbids the change. The backend owns the wording because it owns the
         // state: the documented delete-table sentence and the measured
@@ -181,14 +188,6 @@ pub fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> Dynamo
         // "unsupported" error class, and the request is invalid against this
         // deployment rather than a server failure.
         StorageError::Unsupported(msg) => DynamoDbError::ValidationException(msg),
-        StorageError::CatalogVersionMismatch { expected, found } => {
-            tracing::error!("Catalog version mismatch: expected {expected}, found {found}");
-            DynamoDbError::InternalServerError("Internal server error".to_owned())
-        }
-        StorageError::CatalogNotInitialized => {
-            tracing::error!("Catalog not initialized");
-            DynamoDbError::InternalServerError("Internal server error".to_owned())
-        }
         // Generic path: discard the old item (callers that need it use
         // `storage_err_to_dynamo_with_ccf` instead).
         StorageError::ConditionFailed(_) => DynamoDbError::ConditionalCheckFailedException(
@@ -214,10 +213,13 @@ pub fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> Dynamo
             DynamoDbError::InternalServerError("Internal server error".to_owned())
         }
         StorageError::TransactionConflict(msg) => {
-            // Single-item write raced an in-flight TransactWriteItems on
-            // the same item and the backend couldn't serialize them
-            // through internal retries. RFC-0003 §4.3 requires
-            // TransactionConflictException here — never InternalServerError.
+            // A single-item write met an in-flight TransactWriteItems on the
+            // same item and the backend did not wait it out. The service
+            // answers TransactionConflictException to a single-item write only
+            // while a TransactWriteItems holds the item. The MongoDB backend
+            // reports a write that lost to other single-item writers as
+            // Transient (503); Cassandra reports it as TransactionConflict.
+            // Never InternalServerError.
             DynamoDbError::TransactionConflictException(msg)
         }
         StorageError::Internal(msg) => {

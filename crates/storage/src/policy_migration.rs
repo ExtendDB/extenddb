@@ -15,216 +15,17 @@
 //!
 //! This module has two layers:
 //! - [`rewrite_policy_document`], a pure transform over a single policy
-//!   document (unit-tested per operator form), and
+//!   document (unit-tested per operator form). It defines catalog migration 2
+//!   and lives, frozen, in that migration's module; it is re-exported here.
 //! - [`migrate_resource_tag_condition_keys`], which drives it over every stored
 //!   policy reachable through [`ManagementStore`], backend-independently.
 
 use serde_json::Value;
 
-use crate::management_store::{ManagementStore, SessionPolicyEntry};
-
-/// The condition-key prefix the live service does not populate.
-const DYNAMODB_PREFIX: &str = "dynamodb:ResourceTag/";
-/// The condition-key prefix the live service evaluates resource tags as.
-const AWS_PREFIX: &str = "aws:ResourceTag/";
-
-/// ASCII-case-insensitive prefix strip, returning the untouched remainder.
-fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    let head = s.get(..prefix.len())?;
-    head.eq_ignore_ascii_case(prefix)
-        .then(|| &s[prefix.len()..])
-}
-
-/// Outcome of rewriting one policy document.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RewriteOutcome {
-    /// The rewritten document. Equal to the input when nothing changed or a
-    /// collision was found.
-    pub document: Value,
-    /// Number of rewrites applied (condition-key renames plus policy-variable
-    /// prefix rewrites). Zero when nothing changed or on a collision.
-    pub rewrites: usize,
-    /// A `Condition` operator block held both `aws:ResourceTag/k` and a
-    /// `dynamodb:ResourceTag/k` that would rewrite onto the same JSON key.
-    /// The two cannot share one JSON object, so the document is left unchanged
-    /// and the caller reports it for manual attention.
-    pub collision: bool,
-}
-
-impl RewriteOutcome {
-    /// Whether the document was rewritten (changed and no collision).
-    #[must_use]
-    pub fn changed(&self) -> bool {
-        self.rewrites > 0 && !self.collision
-    }
-}
-
-/// Rewrite every `dynamodb:ResourceTag/<key>` condition key and
-/// `${dynamodb:ResourceTag/...}` policy variable (any ASCII case) in a policy
-/// document to the `aws:ResourceTag/` form, inside `Condition` blocks only.
-///
-/// Idempotent: a document with no `dynamodb:ResourceTag` reference is returned
-/// unchanged with `rewrites == 0`. On a collision the input is returned
-/// unchanged with `collision == true`.
-#[must_use]
-pub fn rewrite_policy_document(document: &Value) -> RewriteOutcome {
-    let mut doc = document.clone();
-    let mut rewrites = 0usize;
-    let mut collision = false;
-
-    // Statement may be a single object or an array of objects.
-    match doc.get_mut("Statement") {
-        Some(Value::Array(statements)) => {
-            for stmt in statements.iter_mut() {
-                rewrite_statement(stmt, &mut rewrites, &mut collision);
-            }
-        }
-        Some(stmt @ Value::Object(_)) => {
-            rewrite_statement(stmt, &mut rewrites, &mut collision);
-        }
-        _ => {}
-    }
-
-    if collision {
-        // Leave the stored policy exactly as it was.
-        return RewriteOutcome {
-            document: document.clone(),
-            rewrites: 0,
-            collision: true,
-        };
-    }
-
-    RewriteOutcome {
-        document: if rewrites > 0 { doc } else { document.clone() },
-        rewrites,
-        collision: false,
-    }
-}
-
-/// Rewrite the `Condition` block of one statement in place.
-fn rewrite_statement(stmt: &mut Value, rewrites: &mut usize, collision: &mut bool) {
-    let Some(condition) = stmt.get_mut("Condition").and_then(Value::as_object_mut) else {
-        return;
-    };
-    for (_operator, block) in condition.iter_mut() {
-        let Some(map) = block.as_object_mut() else {
-            continue;
-        };
-        rewrite_operator_block(map, rewrites, collision);
-    }
-}
-
-/// Rewrite one operator block: its condition keys (object keys) and the policy
-/// variables in its values.
-fn rewrite_operator_block(
-    block: &mut serde_json::Map<String, Value>,
-    rewrites: &mut usize,
-    collision: &mut bool,
-) {
-    // First rewrite the variables inside the values, keyed by the current
-    // (pre-rename) condition key, so a value rewrite is not lost by the rename.
-    for value in block.values_mut() {
-        rewrite_variables_in_json(value, rewrites);
-    }
-
-    // Collect the condition-key renames.
-    let mut renames: Vec<(String, String)> = Vec::new();
-    for key in block.keys() {
-        if let Some(rest) = strip_prefix_ci(key, DYNAMODB_PREFIX) {
-            renames.push((key.clone(), format!("{AWS_PREFIX}{rest}")));
-        }
-    }
-    if renames.is_empty() {
-        return;
-    }
-    // A rename onto a key the block already has (an aws:ResourceTag key, or
-    // an earlier rename) is a duplicate when the two values are equal: both
-    // prefixes resolve from the same table tags, so the two conditions are
-    // the same condition and the dynamodb: one is dropped. Different values
-    // cannot share one JSON key, so the block is a collision.
-    let mut moves: Vec<(String, String)> = Vec::new();
-    let mut drops: Vec<String> = Vec::new();
-    for (old_key, new_key) in &renames {
-        let value = &block[old_key];
-        let existing = block.get(new_key).or_else(|| {
-            moves
-                .iter()
-                .find(|(_, n)| n == new_key)
-                .map(|(o, _)| &block[o])
-        });
-        match existing {
-            Some(v) if v == value => drops.push(old_key.clone()),
-            Some(_) => {
-                *collision = true;
-                return;
-            }
-            None => moves.push((old_key.clone(), new_key.clone())),
-        }
-    }
-    for old_key in drops {
-        block.remove(&old_key);
-        *rewrites += 1;
-    }
-    for (old_key, new_key) in moves {
-        if let Some(value) = block.remove(&old_key) {
-            block.insert(new_key, value);
-            *rewrites += 1;
-        }
-    }
-}
-
-/// Rewrite `${dynamodb:ResourceTag/...}` policy variables inside a value, which
-/// is a string or an array of strings.
-fn rewrite_variables_in_json(value: &mut Value, rewrites: &mut usize) {
-    match value {
-        Value::String(s) => {
-            if let Some(new) = rewrite_variables_in_str(s, rewrites) {
-                *s = new;
-            }
-        }
-        Value::Array(items) => {
-            for item in items.iter_mut() {
-                rewrite_variables_in_json(item, rewrites);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Rewrite the prefix of every `${dynamodb:ResourceTag/...}` variable in `s`,
-/// leaving all other text (including a literal `dynamodb:ResourceTag/...` not
-/// wrapped in `${...}`) untouched. Returns `None` when nothing changed.
-fn rewrite_variables_in_str(s: &str, rewrites: &mut usize) -> Option<String> {
-    if !s.contains("${") {
-        return None;
-    }
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    let mut changed = false;
-    while let Some(open) = rest.find("${") {
-        out.push_str(&rest[..open + 2]);
-        let after_open = &rest[open + 2..];
-        let Some(close) = after_open.find('}') else {
-            // No closing brace: copy the remainder and stop.
-            out.push_str(after_open);
-            rest = "";
-            break;
-        };
-        let inner = &after_open[..close];
-        if let Some(tag_rest) = strip_prefix_ci(inner, DYNAMODB_PREFIX) {
-            out.push_str(AWS_PREFIX);
-            out.push_str(tag_rest);
-            *rewrites += 1;
-            changed = true;
-        } else {
-            out.push_str(inner);
-        }
-        out.push('}');
-        rest = &after_open[close + 1..];
-    }
-    out.push_str(rest);
-    changed.then_some(out)
-}
+use crate::management_store::{ManagementStore, OpError, SessionPolicyEntry, StoredDocument};
+pub use crate::migrations::m0002_resource_tag_condition_keys::{
+    RewriteOutcome, rewrite_policy_document,
+};
 
 /// A policy that the migration could not rewrite automatically, with enough
 /// identity for an operator to find and fix it by hand. Carries no policy body.
@@ -233,6 +34,17 @@ pub struct NeedsAttention {
     pub account_id: String,
     pub principal: String,
     pub policy_name: String,
+}
+
+/// A stored policy whose document the store could not decode, so the
+/// migration cannot tell whether it names `dynamodb:ResourceTag`. Carries
+/// the decode error's text and no policy body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unreadable {
+    pub account_id: String,
+    pub principal: String,
+    pub policy_name: String,
+    pub error: String,
 }
 
 /// A policy the migration would rewrite (detect mode) or did rewrite (apply
@@ -252,10 +64,22 @@ pub struct MigrationReport {
     pub rewritten: Vec<Rewritten>,
     /// Policies left unchanged because of a collision.
     pub needs_attention: Vec<NeedsAttention>,
+    /// Policies left unchanged because the store could not decode their
+    /// documents. The pass reads the principal's other policies.
+    pub unreadable: Vec<Unreadable>,
     /// Count of storage errors encountered. The pass keeps going past an
     /// error so a single bad row does not hide the rest; the caller treats a
     /// non-zero count as a failed migration.
     pub errors: u64,
+    /// The first storage error. On a backend whose transaction rejects every
+    /// statement after a failed one, it is the one that says why, and its
+    /// database error code (a lock timeout) decides whether the runner runs
+    /// the body again.
+    pub first_error: Option<OpError>,
+    /// One line per storage error, in the order the pass met them: what it
+    /// was reading or writing (the account, the principal, the policy) and
+    /// the error's text.
+    pub failures: Vec<String>,
 }
 
 impl MigrationReport {
@@ -264,6 +88,93 @@ impl MigrationReport {
     pub fn total_rewrites(&self) -> usize {
         self.rewritten.iter().map(|r| r.rewrites).sum()
     }
+
+    /// Count a storage error met while doing `what`, keeping the first.
+    fn failed(&mut self, what: String, e: OpError) {
+        self.errors += 1;
+        self.failures.push(format!("{what}: {}", e.message()));
+        self.first_error.get_or_insert(e);
+    }
+}
+
+/// The items a person must fix before migration 2 can run, one line each:
+/// every policy whose two resource-tag forms collide, and every policy
+/// whose stored document the store could not decode, with its decode error.
+#[must_use]
+pub fn attention_items(report: &MigrationReport) -> Vec<String> {
+    let collisions = report.needs_attention.iter().map(|n| {
+        format!(
+            "account {} {} policy {} names aws:ResourceTag/<key> and dynamodb:ResourceTag/<key> \
+             for the same key with different values in one condition operator; remove one of \
+             the two forms",
+            n.account_id, n.principal, n.policy_name
+        )
+    });
+    let unreadable = report.unreadable.iter().map(|u| {
+        format!(
+            "account {} {} policy {} has a stored document that cannot be decoded ({}); \
+             replace or delete the policy",
+            u.account_id, u.principal, u.policy_name, u.error
+        )
+    });
+    collisions.chain(unreadable).collect()
+}
+
+/// How many failed lookups and writes [`failure_message`] names; the others
+/// are counted.
+const FAILURES_NAMED: usize = 5;
+
+/// The error of a pass that met storage errors: how many, and the first
+/// [`FAILURES_NAMED`] of them with what each was reading or writing.
+#[must_use]
+pub fn failure_message(report: &MigrationReport) -> String {
+    let mut message = format!(
+        "resource-tag rewrite: {} policy lookup(s) or write(s) failed:",
+        report.errors
+    );
+    for line in report.failures.iter().take(FAILURES_NAMED) {
+        message.push_str("\n  ");
+        message.push_str(line);
+    }
+    if report.failures.len() > FAILURES_NAMED {
+        message.push_str(&format!(
+            "\n  and {} more",
+            report.failures.len() - FAILURES_NAMED
+        ));
+    }
+    message
+}
+
+/// How many of the policies a pending migration 2 rewrites the `migrate`
+/// preview and `verify` name; the others are counted.
+pub const PREVIEW_NAMED: usize = 20;
+
+/// What the `migrate` preview and `verify` print about a pending migration
+/// 2 from a detect-mode `report`: the number of stored policies it rewrites,
+/// the first [`PREVIEW_NAMED`] of them with their account, principal, policy
+/// name and number of keys, and how many more there are.
+#[must_use]
+pub fn pending_rewrite_lines(report: &MigrationReport) -> Vec<String> {
+    let total = report.rewritten.len();
+    let mut lines = vec![match total {
+        0 => "Migration 2 rewrites no stored policy.".to_owned(),
+        1 => "Migration 2 rewrites 1 stored policy from dynamodb:ResourceTag to aws:ResourceTag:"
+            .to_owned(),
+        n => format!(
+            "Migration 2 rewrites {n} stored policies from dynamodb:ResourceTag to \
+             aws:ResourceTag:"
+        ),
+    }];
+    lines.extend(report.rewritten.iter().take(PREVIEW_NAMED).map(|r| {
+        format!(
+            "  account {} {} policy {} ({} key(s))",
+            r.account_id, r.principal, r.policy_name, r.rewrites
+        )
+    }));
+    if total > PREVIEW_NAMED {
+        lines.push(format!("  and {} more", total - PREVIEW_NAMED));
+    }
+    lines
 }
 
 /// Rewrite `dynamodb:ResourceTag/` condition keys to `aws:ResourceTag/` across
@@ -276,9 +187,11 @@ impl MigrationReport {
 ///
 /// With `apply` false nothing is written: the report lists what would change.
 /// With `apply` true each changed policy is written back. Every storage error
-/// is counted and the pass continues, so an interrupted or partial run is
-/// finished by the next `migrate`. Idempotent: a second pass finds nothing to
-/// rewrite. No policy body is ever logged or returned.
+/// is counted and named, and the pass continues, so an interrupted or partial
+/// run is finished by the next `migrate`. A policy whose stored document the
+/// store cannot decode is listed as unreadable, and the principal's other
+/// policies are read. Idempotent: a second pass finds nothing to rewrite. No
+/// policy body is ever logged or returned.
 pub async fn migrate_resource_tag_condition_keys(
     store: &dyn ManagementStore,
     apply: bool,
@@ -287,8 +200,8 @@ pub async fn migrate_resource_tag_condition_keys(
 
     let accounts = match store.list_all_accounts().await {
         Ok(a) => a,
-        Err(_) => {
-            report.errors += 1;
+        Err(e) => {
+            report.failed("list the accounts".to_owned(), e);
             return report;
         }
     };
@@ -333,6 +246,32 @@ fn record_outcome(
     Some(outcome.document)
 }
 
+/// [`record_outcome`] for a document as the store read it: one the store
+/// could not decode is recorded as unreadable, with its decode error.
+fn record_document(
+    report: &mut MigrationReport,
+    account_id: &str,
+    principal: &str,
+    policy_name: &str,
+    document: StoredDocument,
+) -> Option<Value> {
+    match document {
+        Ok(document) => record_outcome(report, account_id, principal, policy_name, &document),
+        Err(error) => {
+            report.unreadable.push(Unreadable {
+                account_id: account_id.to_owned(),
+                principal: principal.to_owned(),
+                policy_name: policy_name.to_owned(),
+                error,
+            });
+            None
+        }
+    }
+}
+
+/// The name the report gives a permissions boundary.
+const BOUNDARY: &str = "<permissions-boundary>";
+
 async fn migrate_account(
     store: &dyn ManagementStore,
     account_id: &str,
@@ -344,10 +283,10 @@ async fn migrate_account(
         Ok(users) => {
             for (_a, user_name, ..) in users {
                 migrate_inline(store, account_id, "user", &user_name, apply, report).await;
-                migrate_user_boundary(store, account_id, &user_name, apply, report).await;
+                migrate_boundary(store, account_id, "user", &user_name, apply, report).await;
             }
         }
-        Err(_) => report.errors += 1,
+        Err(e) => report.failed(format!("account {account_id}: list its users"), e),
     }
     match store.list_groups(account_id).await {
         Ok(groups) => {
@@ -355,16 +294,16 @@ async fn migrate_account(
                 migrate_inline(store, account_id, "group", &group_name, apply, report).await;
             }
         }
-        Err(_) => report.errors += 1,
+        Err(e) => report.failed(format!("account {account_id}: list its groups"), e),
     }
     match store.list_roles(account_id).await {
         Ok(roles) => {
             for (_a, role_name, ..) in roles {
                 migrate_inline(store, account_id, "role", &role_name, apply, report).await;
-                migrate_role_boundary(store, account_id, &role_name, apply, report).await;
+                migrate_boundary(store, account_id, "role", &role_name, apply, report).await;
             }
         }
-        Err(_) => report.errors += 1,
+        Err(e) => report.failed(format!("account {account_id}: list its roles"), e),
     }
 }
 
@@ -376,102 +315,114 @@ async fn migrate_inline(
     apply: bool,
     report: &mut MigrationReport,
 ) {
+    let principal = format!("{principal_type}/{principal_name}");
     let policies = match store
-        .list_policies(account_id, principal_type, principal_name)
+        .list_policy_documents(account_id, principal_type, principal_name)
         .await
     {
         Ok(p) => p,
-        Err(_) => {
-            report.errors += 1;
+        Err(e) => {
+            report.failed(
+                format!("account {account_id} {principal}: list its policies"),
+                e,
+            );
             return;
         }
     };
-    let principal = format!("{principal_type}/{principal_name}");
-    for (policy_name, document, _created) in policies {
-        if let Some(new_doc) =
-            record_outcome(report, account_id, &principal, &policy_name, &document)
-            && apply
-            && store
-                .put_policy(
-                    account_id,
-                    principal_type,
-                    principal_name,
-                    &policy_name,
-                    &new_doc,
-                )
-                .await
-                .is_err()
+    let rewrites = record_documents(report, account_id, &principal, policies);
+    if !apply {
+        return;
+    }
+    for (policy_name, new_doc) in rewrites {
+        if let Err(e) = store
+            .put_policy(
+                account_id,
+                principal_type,
+                principal_name,
+                &policy_name,
+                &new_doc,
+            )
+            .await
         {
-            report.errors += 1;
+            report.failed(
+                format!("account {account_id} {principal} policy {policy_name}: rewrite it"),
+                e,
+            );
         }
     }
 }
 
-async fn migrate_user_boundary(
-    store: &dyn ManagementStore,
-    account_id: &str,
-    user_name: &str,
-    apply: bool,
+/// Record each of a principal's policies, as the store read them, and return
+/// the rewritten documents to write back as `(policy_name, document)`. A
+/// document the store could not decode is recorded as unreadable, and the
+/// others are still read.
+fn record_documents(
     report: &mut MigrationReport,
-) {
-    match store.get_user_boundary(account_id, user_name).await {
-        Ok(Some(document)) => {
-            let principal = format!("user/{user_name}");
-            if let Some(new_doc) = record_outcome(
-                report,
-                account_id,
-                &principal,
-                "<permissions-boundary>",
-                &document,
-            ) && apply
-                && store
-                    .set_user_boundary(account_id, user_name, &new_doc)
-                    .await
-                    .is_err()
-            {
-                report.errors += 1;
-            }
-        }
-        Ok(None) => {}
-        Err(_) => report.errors += 1,
-    }
+    account_id: &str,
+    principal: &str,
+    policies: Vec<(String, StoredDocument)>,
+) -> Vec<(String, Value)> {
+    policies
+        .into_iter()
+        .filter_map(|(policy_name, document)| {
+            record_document(report, account_id, principal, &policy_name, document)
+                .map(|new_doc| (policy_name, new_doc))
+        })
+        .collect()
 }
 
-async fn migrate_role_boundary(
+/// The permissions boundary of a user or a role (`principal_type`).
+async fn migrate_boundary(
     store: &dyn ManagementStore,
     account_id: &str,
-    role_name: &str,
+    principal_type: &str,
+    principal_name: &str,
     apply: bool,
     report: &mut MigrationReport,
 ) {
-    match store.get_role_boundary(account_id, role_name).await {
-        Ok(Some(document)) => {
-            let principal = format!("role/{role_name}");
-            if let Some(new_doc) = record_outcome(
-                report,
-                account_id,
-                &principal,
-                "<permissions-boundary>",
-                &document,
-            ) && apply
-                && store
-                    .set_role_boundary(account_id, role_name, &new_doc)
-                    .await
-                    .is_err()
-            {
-                report.errors += 1;
-            }
+    let principal = format!("{principal_type}/{principal_name}");
+    let document = match store
+        .boundary_document(account_id, principal_type, principal_name)
+        .await
+    {
+        Ok(Some(document)) => document,
+        Ok(None) => return,
+        Err(e) => {
+            report.failed(
+                format!("account {account_id} {principal}: read its permissions boundary"),
+                e,
+            );
+            return;
         }
-        Ok(None) => {}
-        Err(_) => report.errors += 1,
+    };
+    let Some(new_doc) = record_document(report, account_id, &principal, BOUNDARY, document) else {
+        return;
+    };
+    if !apply {
+        return;
+    }
+    let written = if principal_type == "user" {
+        store
+            .set_user_boundary(account_id, principal_name, &new_doc)
+            .await
+    } else {
+        store
+            .set_role_boundary(account_id, principal_name, &new_doc)
+            .await
+    };
+    if let Err(e) = written {
+        report.failed(
+            format!("account {account_id} {principal} policy {BOUNDARY}: rewrite it"),
+            e,
+        );
     }
 }
 
 async fn migrate_sessions(store: &dyn ManagementStore, apply: bool, report: &mut MigrationReport) {
     let sessions = match store.list_session_policies().await {
         Ok(s) => s,
-        Err(_) => {
-            report.errors += 1;
+        Err(e) => {
+            report.failed("list the session policies".to_owned(), e);
             return;
         }
     };
@@ -487,18 +438,30 @@ async fn migrate_sessions(store: &dyn ManagementStore, apply: bool, report: &mut
         if let Some(new_doc) =
             record_outcome(report, &account_id, &principal, "<session-policy>", &policy)
             && apply
-            && store
-                .update_session_policy(&session_token, &new_doc)
-                .await
-                .is_err()
+            && let Err(e) = store.update_session_policy(&session_token, &new_doc).await
         {
-            report.errors += 1;
+            report.failed(
+                format!("account {account_id} {principal} policy <session-policy>: rewrite it"),
+                e,
+            );
         }
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The prefixes the evaluator resolves resource tags under, before and
+    /// after the change migration 2 follows.
+    const DYNAMODB_PREFIX: &str = "dynamodb:ResourceTag/";
+    const AWS_PREFIX: &str = "aws:ResourceTag/";
+
+    fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+        let head = s.get(..prefix.len())?;
+        head.eq_ignore_ascii_case(prefix)
+            .then(|| &s[prefix.len()..])
+    }
     use serde_json::json;
 
     fn stmt_cond(cond: Value) -> Value {
@@ -854,10 +817,132 @@ mod tests {
                     rewrites: 3,
                 },
             ],
-            needs_attention: vec![],
-            errors: 0,
+            ..MigrationReport::default()
         };
         assert_eq!(report.total_rewrites(), 5);
+    }
+
+    // ── Documents the store cannot decode ───────────────────────────────
+
+    /// A document the store could not decode is named with its account,
+    /// principal, policy and decode error, and the principal's other
+    /// policies are still read and rewritten.
+    #[test]
+    fn an_undecodable_document_is_named_and_the_other_policies_are_read() {
+        let mut report = MigrationReport::default();
+        let tagged = stmt_cond(json!({"StringEquals": {"dynamodb:ResourceTag/env": "prod"}}));
+        let plain = stmt_cond(json!({"StringEquals": {"aws:PrincipalTag/team": "eng"}}));
+        let policies = vec![
+            (
+                "broken".to_owned(),
+                Err("key must be a string at line 1 column 2".to_owned()),
+            ),
+            ("tagged".to_owned(), Ok(tagged)),
+            ("plain".to_owned(), Ok(plain)),
+        ];
+        let writes = record_documents(&mut report, "111122223333", "user/alice", policies);
+        assert_eq!(
+            report.unreadable,
+            vec![Unreadable {
+                account_id: "111122223333".to_owned(),
+                principal: "user/alice".to_owned(),
+                policy_name: "broken".to_owned(),
+                error: "key must be a string at line 1 column 2".to_owned(),
+            }]
+        );
+        assert_eq!(
+            writes
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["tagged"]
+        );
+        assert_eq!(report.rewritten.len(), 1);
+        assert_eq!(
+            attention_items(&report),
+            [
+                "account 111122223333 user/alice policy broken has a stored document that cannot \
+              be decoded (key must be a string at line 1 column 2); replace or delete the policy"
+            ]
+        );
+    }
+
+    /// A pass that met storage errors names what each was reading, with the
+    /// error's text, and counts the ones past the fifth.
+    #[test]
+    fn a_failed_lookup_is_named_in_the_error() {
+        let mut report = MigrationReport::default();
+        for i in 0..7 {
+            report.failed(
+                format!("account 111122223333 user/u{i}: list its policies"),
+                OpError::Internal(format!("failure {i}")),
+            );
+        }
+        assert_eq!(report.errors, 7);
+        assert_eq!(
+            report.first_error,
+            Some(OpError::Internal("failure 0".to_owned()))
+        );
+        let message = failure_message(&report);
+        let lines: Vec<&str> = message.lines().collect();
+        assert_eq!(
+            lines[..3],
+            [
+                "resource-tag rewrite: 7 policy lookup(s) or write(s) failed:",
+                "  account 111122223333 user/u0: list its policies: failure 0",
+                "  account 111122223333 user/u1: list its policies: failure 1",
+            ]
+        );
+        assert_eq!(lines.len(), 7, "{message}");
+        assert_eq!(lines[6], "  and 2 more");
+    }
+
+    // ── What the preview prints ─────────────────────────────────────────
+
+    fn rewritten(n: usize) -> MigrationReport {
+        MigrationReport {
+            rewritten: (0..n)
+                .map(|i| Rewritten {
+                    account_id: "111122223333".to_owned(),
+                    principal: format!("user/u{i}"),
+                    policy_name: "p".to_owned(),
+                    rewrites: 1,
+                })
+                .collect(),
+            ..MigrationReport::default()
+        }
+    }
+
+    /// The count, then the first 20 policies, then how many more.
+    #[test]
+    fn the_preview_names_the_first_twenty_rewrites_and_counts_the_rest() {
+        let lines = pending_rewrite_lines(&rewritten(23));
+        assert_eq!(
+            lines[0],
+            "Migration 2 rewrites 23 stored policies from dynamodb:ResourceTag to \
+             aws:ResourceTag:"
+        );
+        assert_eq!(
+            lines[1],
+            "  account 111122223333 user/u0 policy p (1 key(s))"
+        );
+        assert_eq!(
+            lines[20],
+            "  account 111122223333 user/u19 policy p (1 key(s))"
+        );
+        assert_eq!(lines[21], "  and 3 more");
+        assert_eq!(lines.len(), 22);
+        let lines = pending_rewrite_lines(&rewritten(20));
+        assert_eq!(lines.len(), 21);
+        assert!(lines.iter().all(|l| !l.contains("more")), "{lines:?}");
+        assert_eq!(
+            pending_rewrite_lines(&rewritten(1))[0],
+            "Migration 2 rewrites 1 stored policy from dynamodb:ResourceTag to aws:ResourceTag:"
+        );
+        assert_eq!(
+            pending_rewrite_lines(&rewritten(0)),
+            ["Migration 2 rewrites no stored policy."]
+        );
     }
 
     // ── Equivalence: rewrite preserves the decision ──────────────────────

@@ -1,0 +1,7 @@
+ok create_table seed_tbl
+ok update_time_to_live seed_tbl
+ok put_item seed_tbl x10
+ok create_backup seed_backup
+ok create_table seed_simple
+ok put_item seed_simple x3
+ok create_table vec_tbl with vector index vidx

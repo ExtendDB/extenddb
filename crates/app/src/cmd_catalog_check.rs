@@ -77,6 +77,7 @@ pub async fn run(args: CatalogCheckArgs) -> anyhow::Result<()> {
     let Some((data_conn_str,)) = data_conn else {
         anyhow::bail!("No data database connection string in settings. Run `extenddb init`.");
     };
+    let data_conn_str = data_connection_text(&catalog_pool, &app_config, data_conn_str).await?;
     let data_pool = PgPoolOptions::new()
         .max_connections(2)
         .connect(&data_conn_str)
@@ -213,4 +214,49 @@ pub async fn run(args: CatalogCheckArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// The data database connection string that the row `stored` holds: the
+/// row as it is in a catalog without a key ring; with a ring, the row
+/// decrypted under a DEK of the ring, which the KEK of `[auth.encryption]
+/// key_file` opens (RFC-0000 section 12). A row that no DEK opens is
+/// refused, plaintext included, as every reader but `switch` refuses it.
+async fn data_connection_text(
+    catalog: &sqlx::PgPool,
+    app_config: &config::AppConfig,
+    stored: String,
+) -> anyhow::Result<zeroize::Zeroizing<String>> {
+    use extenddb_storage::key_ring::{KEY_RING_SETTING, open_ring};
+    use extenddb_storage::secret_keys::CATALOG_ID_SETTING;
+    use extenddb_storage::server_components::KeySource;
+
+    let setting = async |key: &str| -> anyhow::Result<Option<String>> {
+        let row: Option<(String,)> = sqlx::query_as("SELECT value FROM settings WHERE key = $1")
+            .bind(key)
+            .fetch_optional(catalog)
+            .await?;
+        Ok(row.map(|(value,)| value))
+    };
+    let Some(ring) = setting(KEY_RING_SETTING).await? else {
+        return Ok(zeroize::Zeroizing::new(stored));
+    };
+    let KeySource::Kek(kek) = extenddb_server::key_file::key_source(&app_config.auth.encryption)
+        .map_err(anyhow::Error::msg)?
+    else {
+        anyhow::bail!(
+            "The catalog has a key ring, so its data database connection string is encrypted. \
+             Set [auth.encryption] key_file to the KEK file that the ring names"
+        );
+    };
+    let catalog_id = setting(CATALOG_ID_SETTING).await?;
+    let open = open_ring(&ring, catalog_id.as_deref(), &kek).map_err(|e| anyhow::anyhow!("{e}"))?;
+    open.deks
+        .iter()
+        .find_map(|dek| dek.decrypt_setting(&stored).ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "No DEK of the key ring opens the data_database_connection_string row. Run \
+                 `extenddb encryption-key status`"
+            )
+        })
 }

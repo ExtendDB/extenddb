@@ -9,6 +9,8 @@
 //! Architecture: `input string → tokenizer → tokens → parser → AST → evaluator → result`
 
 mod ast;
+#[cfg(test)]
+mod depth_tests;
 mod evaluator;
 mod key_condition;
 mod kind;
@@ -18,15 +20,17 @@ mod projection;
 mod reserved_words;
 mod resolver;
 mod search_condition;
+#[cfg(test)]
+mod test_timeout;
 mod tokenizer;
 mod update_evaluator;
 mod update_parser;
 
-pub use ast::{ArithOp, CompareOp, Expr, PathElement, UpdateAction};
+pub use ast::{ArithOp, CompareOp, Expr, PathElement, UpdateAction, removes_only};
 pub use evaluator::evaluate_condition;
 pub use key_condition::{
-    KeyClauseOperand, KeyCondition, SortKeyCondition, key_condition_clause_operands,
-    parse_key_condition,
+    KeyClauseOperand, KeyCondition, SortKeyCondition, has_duplicate_key_condition,
+    key_condition_clause_operands, parse_key_condition, parse_key_condition_with_maps,
 };
 pub use kind::ExpressionKind;
 pub use parser::{parse_condition, parse_condition_with_depth_limit};

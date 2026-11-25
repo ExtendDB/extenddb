@@ -8,8 +8,9 @@ use std::collections::HashMap;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
     Expr, ExpressionKind, ExpressionMaps, KeyCondition, PathElement, Token, UpdateAction,
-    parse_condition_with_depth_limit, parse_key_condition, parse_projection, parse_update_from,
-    tokenize_for, tokenize_with_limit, validate_no_reserved_words, validate_ordering_operand_types,
+    parse_condition_with_depth_limit, parse_key_condition_with_maps, parse_projection,
+    parse_update_from, tokenize_for, tokenize_with_limit, validate_no_reserved_words,
+    validate_ordering_operand_types,
 };
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{AttributeValue, ConditionalOperator, ExpectedAttributeValue};
@@ -114,7 +115,7 @@ pub fn parse_update_expr(
         if limits.enforce_reserved_keywords {
             validate_no_reserved_words(&update_tokens)?;
         }
-        parse_update_from(&update_tokens, update_expr)
+        parse_update_from(&update_tokens, update_expr, limits.max_expression_depth)
     })
     .map_err(|e| prefix_expression_error(e, ExpressionKind::Update))
 }
@@ -237,16 +238,24 @@ pub fn parse_projection_expr(
 
 /// Size-check, tokenize, reserved-word check, and parse a `KeyConditionExpression`.
 ///
+/// `maps` holds the request's `ExpressionAttributeNames` and
+/// `ExpressionAttributeValues`. The parse reads them to refuse an undefined
+/// reference, a `begins_with` operand of the wrong type and a second
+/// condition on one key attribute.
+///
 /// Errors carry the `KeyConditionExpression` prefix, matching Amazon `DynamoDB`.
 ///
 /// # Errors
 ///
 /// Returns `DynamoDbError::ValidationException` for over-size, syntax, or
-/// reserved-word errors.
+/// reserved-word errors, and for the faults above. A fault in the key
+/// condition's shape is the `Err` inside `Ok`, as
+/// [`parse_key_condition_with_maps`] returns it.
 pub fn parse_key_condition_expr(
     expr: &str,
+    maps: &ExpressionMaps,
     limits: &LimitsConfig,
-) -> Result<KeyCondition, DynamoDbError> {
+) -> Result<Result<KeyCondition, DynamoDbError>, DynamoDbError> {
     check_expression_size(expr, ExpressionKind::KeyCondition, limits)?;
     tokenize_for(
         expr,
@@ -257,7 +266,7 @@ pub fn parse_key_condition_expr(
         if limits.enforce_reserved_keywords {
             validate_no_reserved_words(&tokens)?;
         }
-        parse_key_condition(&tokens)
+        parse_key_condition_with_maps(&tokens, maps)
     })
     .map_err(|e| prefix_expression_error(e, ExpressionKind::KeyCondition))
 }
@@ -404,6 +413,139 @@ mod tests {
         assert!(
             matches!(&err, DynamoDbError::ValidationException(msg)
                 if msg.contains("Expression size has exceeded the maximum allowed size")),
+            "got {err:?}"
+        );
+    }
+
+    /// `parse_key_condition_expr` reads the request's `ExpressionAttributeNames`
+    /// and `ExpressionAttributeValues`, keyed with `#` and `:` as a request
+    /// carries them: a duplicate written through `#p` and an undefined `#u`
+    /// each answer the service's message. The core tests cover the other
+    /// rows.
+    #[test]
+    fn key_condition_parse_reads_the_request_maps() {
+        let names: HashMap<String, String> = [("#p".to_owned(), "pk".to_owned())].into();
+        let values: HashMap<String, AttributeValue> = [":a", ":b", ":c"]
+            .into_iter()
+            .map(|k| (k.to_owned(), AttributeValue::S("v".to_owned())))
+            .collect();
+        let maps = build_expression_maps(Some(&names), Some(&values));
+        for (expr, want) in [
+            (
+                "#p = :a AND pk = :b",
+                "Invalid KeyConditionExpression: KeyConditionExpressions must only contain \
+                 one condition per key",
+            ),
+            (
+                "pk = :a AND pk = :b AND #u = :c",
+                "Invalid KeyConditionExpression: An expression attribute name used in the \
+                 document path is not defined; attribute name: #u",
+            ),
+        ] {
+            let got = parse_key_condition_expr(expr, &maps, &LimitsConfig::default());
+            assert!(
+                matches!(&got, Err(DynamoDbError::ValidationException(msg)) if msg == want),
+                "expr {expr}: got {got:?}"
+            );
+        }
+    }
+
+    /// Size and token limits raised so only the depth limit refuses the
+    /// expressions below.
+    fn raised() -> LimitsConfig {
+        LimitsConfig {
+            max_expression_length_bytes: 4 << 20,
+            max_expression_tokens: 1 << 20,
+            ..LimitsConfig::default()
+        }
+    }
+
+    /// Run `parse` on a thread with half a server worker's 2 MiB stack,
+    /// failing the test after 10 seconds instead of hanging.
+    fn on_small_stack(
+        what: &'static str,
+        parse: impl FnOnce() -> Result<(), DynamoDbError> + Send + 'static,
+    ) -> Result<(), DynamoDbError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(move || {
+                let _ = tx.send(parse());
+            })
+            .expect("spawn the parse thread");
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(answer) => answer,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                std::panic::resume_unwind(worker.join().expect_err("no answer and no panic"))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("{what} ran for 10 s"),
+        }
+    }
+
+    #[test]
+    fn update_expression_past_the_depth_limit_is_refused() {
+        let limits = raised();
+        let nested = |levels: usize| {
+            format!(
+                "SET qty = {}:v{}",
+                "(qty + ".repeat(levels),
+                ")".repeat(levels)
+            )
+        };
+        let at_limit = nested(limits.max_expression_depth);
+        assert!(parse_update_expr(&at_limit, &limits).is_ok());
+        for levels in [limits.max_expression_depth + 1, 50_000] {
+            let expr = nested(levels);
+            let err = on_small_stack("deep update", move || {
+                parse_update_expr(&expr, &raised()).map(drop)
+            })
+            .unwrap_err();
+            assert!(
+                matches!(&err, DynamoDbError::ValidationException(msg)
+                    if msg == "Invalid UpdateExpression: expression nesting depth exceeded"),
+                "{levels} levels: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_expression_calls_past_the_depth_limit_are_refused() {
+        let expr = format!(
+            "SET qty = {}:v{}",
+            "list_append(qty, ".repeat(50_000),
+            ")".repeat(50_000)
+        );
+        let err = on_small_stack("deep update calls", move || {
+            parse_update_expr(&expr, &raised()).map(drop)
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+                if msg == "Invalid UpdateExpression: expression nesting depth exceeded"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn condition_and_filter_size_calls_past_the_depth_limit_are_refused() {
+        let expr = format!("{}qty{} > :v", "size(".repeat(50_000), ")".repeat(50_000));
+        let condition = expr.clone();
+        let err = on_small_stack("deep condition", move || {
+            parse_condition_expr(&condition, &raised()).map(drop)
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+                if msg == "Invalid ConditionExpression: expression nesting depth exceeded"),
+            "got {err:?}"
+        );
+        let err = on_small_stack("deep filter", move || {
+            parse_optional_filter(Some(&expr), &raised()).map(drop)
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+                if msg == "Invalid FilterExpression: expression nesting depth exceeded"),
             "got {err:?}"
         );
     }

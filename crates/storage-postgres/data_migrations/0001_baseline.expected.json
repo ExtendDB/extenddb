@@ -1,0 +1,242 @@
+{
+  "columns": {
+    "gsi_pending.id": {
+      "type": "bigint",
+      "not_null": true,
+      "default": "nextval('gsi_pending_id_seq'::regclass)",
+      "collation": null
+    },
+    "gsi_pending.index_context": {
+      "type": "jsonb",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "gsi_pending.new_item": {
+      "type": "jsonb",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "gsi_pending.old_item": {
+      "type": "jsonb",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "gsi_pending.ready_at": {
+      "type": "timestamp with time zone",
+      "not_null": true,
+      "default": "now()",
+      "collation": null
+    },
+    "gsi_pending.table_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "gsi_pending.worker_partition": {
+      "type": "integer",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "idempotency_tokens.account_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "idempotency_tokens.created_at": {
+      "type": "timestamp with time zone",
+      "not_null": true,
+      "default": "now()",
+      "collation": null
+    },
+    "idempotency_tokens.fingerprint": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "idempotency_tokens.token": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "schema_history.applied_at": {
+      "type": "timestamp with time zone",
+      "not_null": true,
+      "default": "now()",
+      "collation": null
+    },
+    "schema_history.filename": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "stream_records.created_at": {
+      "type": "timestamp with time zone",
+      "not_null": true,
+      "default": "now()",
+      "collation": null
+    },
+    "stream_records.event_name": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "stream_records.record_data": {
+      "type": "jsonb",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "stream_records.sequence_number": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "stream_records.shard_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "stream_records.table_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "stream_shards.created_at": {
+      "type": "timestamp with time zone",
+      "not_null": true,
+      "default": "now()",
+      "collation": null
+    },
+    "stream_shards.ending_sequence_number": {
+      "type": "text",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "stream_shards.parent_shard_id": {
+      "type": "text",
+      "not_null": false,
+      "default": null,
+      "collation": null
+    },
+    "stream_shards.shard_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "stream_shards.starting_sequence_number": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "stream_shards.table_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "vector_index_holds.created_at": {
+      "type": "timestamp with time zone",
+      "not_null": true,
+      "default": "now()",
+      "collation": null
+    },
+    "vector_index_holds.index_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    },
+    "vector_index_holds.table_id": {
+      "type": "text",
+      "not_null": true,
+      "default": null,
+      "collation": null
+    }
+  },
+  "indexes": {
+    "gsi_pending_pkey": {
+      "table": "gsi_pending",
+      "definition": "CREATE UNIQUE INDEX gsi_pending_pkey ON public.gsi_pending USING btree (id)",
+      "valid": true
+    },
+    "idempotency_tokens_pkey": {
+      "table": "idempotency_tokens",
+      "definition": "CREATE UNIQUE INDEX idempotency_tokens_pkey ON public.idempotency_tokens USING btree (account_id, token)",
+      "valid": true
+    },
+    "idx_gsi_pending_claim": {
+      "table": "gsi_pending",
+      "definition": "CREATE INDEX idx_gsi_pending_claim ON public.gsi_pending USING btree (worker_partition, ready_at, id)",
+      "valid": true
+    },
+    "idx_idempotency_tokens_created": {
+      "table": "idempotency_tokens",
+      "definition": "CREATE INDEX idx_idempotency_tokens_created ON public.idempotency_tokens USING btree (created_at)",
+      "valid": true
+    },
+    "idx_stream_records_created": {
+      "table": "stream_records",
+      "definition": "CREATE INDEX idx_stream_records_created ON public.stream_records USING btree (created_at)",
+      "valid": true
+    },
+    "idx_stream_shards_table": {
+      "table": "stream_shards",
+      "definition": "CREATE INDEX idx_stream_shards_table ON public.stream_shards USING btree (table_id)",
+      "valid": true
+    },
+    "idx_vector_index_holds_table": {
+      "table": "vector_index_holds",
+      "definition": "CREATE INDEX idx_vector_index_holds_table ON public.vector_index_holds USING btree (table_id)",
+      "valid": true
+    },
+    "schema_history_pkey": {
+      "table": "schema_history",
+      "definition": "CREATE UNIQUE INDEX schema_history_pkey ON public.schema_history USING btree (filename)",
+      "valid": true
+    },
+    "stream_records_pkey": {
+      "table": "stream_records",
+      "definition": "CREATE UNIQUE INDEX stream_records_pkey ON public.stream_records USING btree (shard_id, sequence_number)",
+      "valid": true
+    },
+    "stream_shards_pkey": {
+      "table": "stream_shards",
+      "definition": "CREATE UNIQUE INDEX stream_shards_pkey ON public.stream_shards USING btree (shard_id)",
+      "valid": true
+    },
+    "vector_index_holds_pkey": {
+      "table": "vector_index_holds",
+      "definition": "CREATE UNIQUE INDEX vector_index_holds_pkey ON public.vector_index_holds USING btree (table_id, index_id)",
+      "valid": true
+    }
+  },
+  "constraints": {
+    "gsi_pending.gsi_pending_pkey": "PRIMARY KEY (id)",
+    "idempotency_tokens.idempotency_tokens_pkey": "PRIMARY KEY (account_id, token)",
+    "schema_history.schema_history_pkey": "PRIMARY KEY (filename)",
+    "stream_records.stream_records_pkey": "PRIMARY KEY (shard_id, sequence_number)",
+    "stream_records.stream_records_shard_id_fkey": "FOREIGN KEY (shard_id) REFERENCES stream_shards(shard_id) ON DELETE CASCADE",
+    "stream_shards.stream_shards_pkey": "PRIMARY KEY (shard_id)",
+    "vector_index_holds.vector_index_holds_pkey": "PRIMARY KEY (table_id, index_id)"
+  },
+  "sequences": [
+    "gsi_pending_id_seq",
+    "stream_seq"
+  ]
+}

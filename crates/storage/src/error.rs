@@ -41,11 +41,13 @@ pub enum StorageError {
     IdempotentReplay,
     #[error("Idempotent parameter mismatch")]
     IdempotentMismatch,
-    /// A single-item write raced an in-flight `TransactWriteItems` on
-    /// the same item, and the backend was unable to serialize the two.
-    /// Maps to `DynamoDbError::TransactionConflictException` at the
-    /// engine boundary — DynamoDB's canonical error for this case
-    /// (RFC-0003 §4.3).
+    /// A single-item write met a concurrent writer that the backend could not
+    /// serialize it with. Maps to `DynamoDbError::TransactionConflictException`
+    /// at the engine boundary. The service answers that error to a single-item
+    /// write only while a `TransactWriteItems` holds the item. The Cassandra
+    /// backend also returns it when its retries after a lost
+    /// optimistic-concurrency race are spent; the MongoDB backend reports that
+    /// case as `Transient` instead.
     #[error("Transaction conflict: {0}")]
     TransactionConflict(String),
     #[error("No-op update: {0}")]
@@ -63,12 +65,22 @@ pub enum StorageError {
     /// `BackupInUseException`.
     #[error("{0}")]
     BackupInUse(String),
+    /// A catalog row that already exists, or whose claim a live owner holds
+    /// (`BackupCatalog::claim_backup`).
+    #[error("Already exists: {0}")]
+    AlreadyExists(String),
     /// A failure that is expected to succeed on retry: I/O errors, pool
     /// timeouts, SQLITE_BUSY / SQLITE_LOCKED. Exists so queue workers can tell
     /// "this row can never be applied" (drop it, or the whole queue stalls)
     /// from "the database hiccuped" (retry it, or the row's index write is
     /// silently lost). Before this distinction both collapsed to `Internal`
     /// and the worker dropped claimed rows on transient errors.
+    ///
+    /// The MongoDB backend also returns it for a single-item write that could
+    /// not commit in its 50 attempts; the message names the operation, the
+    /// attempt count and the last error that ended an attempt. The engine logs
+    /// the message and answers HTTP 503 `ServiceUnavailable`, which the SDKs
+    /// retry.
     #[error("{0}")]
     Transient(String),
     /// The backend discarded a consistent snapshot before the reader drained
@@ -77,12 +89,6 @@ pub enum StorageError {
     /// nothing read so far may be combined with a fresh snapshot.
     #[error("snapshot expired: {0}")]
     SnapshotExpired(String),
-    #[error(
-        "Catalog version mismatch: expected {expected}, found {found}. Run 'extenddb migrate' to update."
-    )]
-    CatalogVersionMismatch { expected: String, found: String },
-    #[error("Catalog not initialized. Run 'extenddb init' to set up the catalog.")]
-    CatalogNotInitialized,
     #[error("Connection error: {0}")]
     Connection(String),
     /// The backend does not implement the requested feature. Distinct from
