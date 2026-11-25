@@ -26,7 +26,7 @@ The credential cache and the key-info cache share one hard TTL of 60 seconds.
 One request before the fault leaves the access key cached, so authentication is
 served from cache and the faulted requests reach the key-info lookup rather
 than failing authentication first. Each faulted request costs the driver's
-30 second server-selection timeout, so the three run concurrently to finish
+30 second server-selection timeout, so the four run concurrently to finish
 inside that window, and they name tables the key-info cache has never seen so
 no cached entry answers for them.
 """
@@ -100,21 +100,24 @@ def _wait_primary(container: str) -> None:
     pytest.fail("mongod did not return to PRIMARY; later tests would fail too")
 
 
-def _status_and_code(client, call) -> tuple[int, str]:
+def _status_code_message(client, call) -> tuple[int, str, str]:
     try:
         response = call()
     except client.exceptions.ClientError as exc:
+        error = exc.response["Error"]
         return (
             exc.response["ResponseMetadata"]["HTTPStatusCode"],
-            exc.response["Error"].get("Code", ""),
+            error.get("Code", ""),
+            error.get("Message", ""),
         )
-    return response["ResponseMetadata"]["HTTPStatusCode"], "OK"
+    return response["ResponseMetadata"]["HTTPStatusCode"], "OK", ""
 
 
 def test_backend_unreachable_is_service_unavailable(
     dynamodb_client, no_retry_client, mongodb_container
 ):
-    """GetItem, PutItem and Query answer 503 while the backend is unreachable."""
+    """GetItem, PutItem, Query and BatchGetItem answer 503 while the backend
+    is unreachable."""
     # scoped_table deletes the table on exit, a failed assertion included; the
     # container is back by then, because the inner finally restarts it.
     with scoped_table(dynamodb_client) as table_name:
@@ -136,13 +139,16 @@ def test_backend_unreachable_is_service_unavailable(
                 KeyConditionExpression="pk = :p",
                 ExpressionAttributeValues={":p": {"S": "a"}},
             ),
+            "BatchGetItem": lambda: no_retry_client.batch_get_item(
+                RequestItems={f"{cold}-b": {"Keys": [{"pk": {"S": "a"}}]}}
+            ),
         }
 
         try:
             _docker(mongodb_container, "stop")
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(calls)) as pool:
                 futures = {
-                    name: pool.submit(_status_and_code, no_retry_client, call)
+                    name: pool.submit(_status_code_message, no_retry_client, call)
                     for name, call in calls.items()
                 }
                 observed = {name: future.result() for name, future in futures.items()}
@@ -150,8 +156,11 @@ def test_backend_unreachable_is_service_unavailable(
             _docker(mongodb_container, "start")
             _wait_primary(mongodb_container)
 
-        for name, (status, code) in observed.items():
-            assert (status, code) == (503, "ServiceUnavailable"), (
-                f"{name} answered {status} {code} while the backend was unreachable; "
-                "a transient backend fault must be a retryable ServiceUnavailable"
+        # The message tells a key-info 500 ("Internal server error") from an
+        # authentication 500 ("Internal error during authentication"), which
+        # the status and code alone cannot.
+        expected = (503, "ServiceUnavailable", "Service is temporarily unavailable")
+        for name, answer in observed.items():
+            assert answer == expected, (
+                f"{name} answered {answer} while the backend was unreachable"
             )
