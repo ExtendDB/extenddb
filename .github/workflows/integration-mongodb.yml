@@ -192,10 +192,10 @@ jobs:
           EXTENDDB_TEST_BACKUP_STORE: filesystem
         # No --rust: it runs the whole workspace's `cargo test`, which the Test
         # workflow runs on two toolchains. For --rust-integration,
-        # run-mongodb-tests still runs the storage-mongodb tests that need this
-        # replica set (records_live and the migration tests), and --rust-live
-        # runs the crate's other live tests. mongodb-snapshot runs the
-        # snapshot_engine tests.
+        # run-mongodb-tests still runs the storage-mongodb tests against this
+        # replica set (records_live and every test target of the crate), and
+        # --rust-live runs the crate's other live tests. mongodb-snapshot runs
+        # the snapshot_engine tests.
         run: devtools/run-mongodb-tests --rust-live -- --rust-integration
 
   # The store-backed CreateBackup on MongoDB: a server with a filesystem
