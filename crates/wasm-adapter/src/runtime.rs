@@ -43,15 +43,15 @@
 //! (`handle_request` in `crates/server/src/handler.rs`) and its authorization
 //! (`authorize_request` in `crates/server/src/request_helpers.rs`) check it.
 //! Of the server's checks, [`Engine::dispatch`] runs only the two the engine
-//! owns, the operation name check and `ParsedRequest::admit`, which it runs
-//! through `extenddb_engine::parse_request`, and runs neither for an
-//! operation [`unsupported_reason`] names, which it refuses first. It parses
-//! the body with `parse_request`, where the server parses it with its own
-//! parser. A request one of the others would refuse gets the answer
-//! this build gives it anyway: the engine handler's for the operation, or one
-//! of the refusals above. The README section "Checks the server makes that
-//! this build does not" describes the others, with the server's answer and
-//! this build's.
+//! owns, the operation name check, which it runs through
+//! `extenddb_engine::parse_request`, and `ParsedRequest::admit`, and runs
+//! neither for an operation [`unsupported_reason`] names, which it refuses
+//! first. It parses the body with `parse_request`, where the server parses
+//! it with its own parser. A request one of the others would refuse gets
+//! the answer this build gives it anyway: the engine handler's for the
+//! operation, or one of the refusals above. The README section "Checks the
+//! server makes that this build does not" describes the others, with the
+//! server's answer and this build's.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
