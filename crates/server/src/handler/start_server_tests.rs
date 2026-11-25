@@ -505,9 +505,23 @@ async fn a_console_tab_is_behind_the_session_check_and_listed_in_the_nav_bar() {
 #[tokio::test]
 async fn without_tabs_the_console_nav_bar_and_routes_are_unchanged() {
     let (addr, task) = serve_with_tabs(Vec::new(), Vec::new(), None, 0).await;
-    let r = raw(addr, &get_req("/console/chaos")).await;
-    // No tab mounted: the console's own fallback answers, behind no gate.
-    assert_eq!(r.status, 404, "{}", r.body);
+    // No tab mounted: an unmatched console path gets the server's own 404,
+    // the answer an unmatched path outside the console gets, headers
+    // included (HEAD carries no content-length).
+    for method in ["GET", "HEAD"] {
+        let request = |path: &str| {
+            format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                .into_bytes()
+        };
+        let console = raw(addr, &request("/console/chaos")).await;
+        assert_eq!(console.status, 404, "{method}: {}", console.body);
+        let outside = raw(addr, &request("/nope")).await;
+        assert_eq!(
+            normalised(&console, addr),
+            normalised(&outside, addr),
+            "{method}"
+        );
+    }
     let login_page = raw(addr, &get_req("/console/login")).await;
     assert_eq!(login_page.status, 200);
     assert!(!login_page.body.contains("/console/chaos"));

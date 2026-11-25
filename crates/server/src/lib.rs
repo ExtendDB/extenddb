@@ -269,13 +269,17 @@ pub async fn start_server(
             metrics: metrics_for_console,
             secure_cookies: tls_enabled,
         });
-        // The console's own fallback is explicit so that the fallbacks nested
-        // below it (each tab's, inside its session layer) are kept when the
-        // console is nested into the app; axum drops a child's fallback when
-        // its parent still has the default one.
-        let mut console_router = console::router()
-            .fallback(|| async { StatusCode::NOT_FOUND })
-            .with_state(console_state.clone());
+        // With a tab mounted, the console's own fallback is explicit so that
+        // the fallbacks nested below it (each tab's, inside its session layer)
+        // are kept when the console is nested into the app; axum drops a
+        // child's fallback when its parent still has the default one. With no
+        // tab the console keeps the default, so an unmatched console path gets
+        // the app's 404, headers included.
+        let mut console_router = console::router();
+        if !console_tabs.is_empty() {
+            console_router = console_router.fallback(|| async { StatusCode::NOT_FOUND });
+        }
+        let mut console_router = console_router.with_state(console_state.clone());
         for tab in console_tabs {
             let gate = axum::middleware::from_fn_with_state(
                 console_state.clone(),
