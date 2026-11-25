@@ -1385,6 +1385,57 @@ pub(crate) mod tests {
         assert_eq!(inner.session_data_calls.load(Ordering::SeqCst), 1);
     }
 
+    /// Two sessions of one role, as `AssumeRole` stores two under one session
+    /// name: the cached data of one is never served for the other's key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_session_is_never_served_another_sessions_cached_data() {
+        let inner = Arc::new(CountingAuthzStore::default());
+        for (key, project, issued) in [
+            ("ASIAKEY1", "Atlas", "2026-11-01T00:00:01Z"),
+            ("ASIAKEY2", "Borealis", "2026-11-01T00:00:02Z"),
+        ] {
+            inner.session_data.lock().unwrap().insert(
+                key.to_owned(),
+                Some(SessionData {
+                    session_policy: None,
+                    session_tags: vec![("Project".to_owned(), project.to_owned())],
+                    created_at: Some(issued.to_owned()),
+                }),
+            );
+        }
+        let cache = CachedAuthzStore::new(inner.clone(), fast_authz_cfg());
+
+        let first = cache
+            .fetch_session_data("a", "r", "ASIAKEY1")
+            .await
+            .unwrap()
+            .unwrap();
+        let second = cache
+            .fetch_session_data("a", "r", "ASIAKEY2")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first.session_tags.get("Project"), Some(&"Atlas".to_owned()));
+        assert_eq!(
+            second.session_tags.get("Project"),
+            Some(&"Borealis".to_owned())
+        );
+        assert_eq!(
+            first.token_issue_time.as_deref(),
+            Some("2026-11-01T00:00:01Z")
+        );
+        assert_eq!(
+            second.token_issue_time.as_deref(),
+            Some("2026-11-01T00:00:02Z")
+        );
+        assert_eq!(
+            inner.session_data_calls.load(Ordering::SeqCst),
+            2,
+            "the second session's key misses the cache and reads the store"
+        );
+    }
+
     // ─────────────────────────────────────────────────────────────────
     // PR3 tests — fanout invalidation
     // ─────────────────────────────────────────────────────────────────
@@ -1499,6 +1550,45 @@ pub(crate) mod tests {
             inner.user_tags_calls.load(Ordering::SeqCst),
             tags_calls + 1,
             "a1 user_tags re-fetched"
+        );
+    }
+
+    /// `invalidate_account` drops the cached session data of every role
+    /// session in the account, and leaves another account's sessions cached.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn invalidate_account_drops_the_accounts_session_data() {
+        let inner = Arc::new(CountingAuthzStore::default());
+        for key in ["ASIAKEY1", "ASIAKEY2", "ASIAKEY3"] {
+            inner.session_data.lock().unwrap().insert(
+                key.to_owned(),
+                Some(SessionData {
+                    session_policy: None,
+                    session_tags: vec![],
+                    created_at: None,
+                }),
+            );
+        }
+        let cache = CachedAuthzStore::new(inner.clone(), fast_authz_cfg());
+        let sessions = [
+            ("a1", "r", "ASIAKEY1"),
+            ("a1", "other-role", "ASIAKEY2"),
+            ("a2", "r", "ASIAKEY3"),
+        ];
+        for (account, role, key) in sessions {
+            cache.fetch_session_data(account, role, key).await.unwrap();
+        }
+        let primed = inner.session_data_calls.load(Ordering::SeqCst);
+
+        cache.invalidate_account("a1");
+        cache.session_data.run_pending_tasks().await;
+
+        for (account, role, key) in sessions {
+            cache.fetch_session_data(account, role, key).await.unwrap();
+        }
+        assert_eq!(
+            inner.session_data_calls.load(Ordering::SeqCst) - primed,
+            2,
+            "both of a1's sessions are re-fetched, a2's stays cached"
         );
     }
 }

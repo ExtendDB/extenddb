@@ -478,6 +478,9 @@ mod tests {
 mod arn_value_tests;
 
 #[cfg(test)]
+mod session_data_tests;
+
+#[cfg(test)]
 mod resource_tag_tests {
     use super::{check_role_authorization, check_user_authorization, fetch_authz_resource_tags};
     use crate::authz_cache::CachedAuthzStore;
