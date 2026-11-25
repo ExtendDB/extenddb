@@ -556,7 +556,9 @@ The checks of a request's names and ARNs (**table names**, **index names**,
 before the **accounts** answer, except that on the ten control-plane
 operations of **table ARNs** the account of a `TableName` ARN comes first,
 and on `RestoreTableFromBackup` the account of the `BackupArn` comes before
-the **table names** check of the `TargetTableName`. For
+the **table names** check of the `TargetTableName`. The **member types**
+check comes before the other checks of the members it reads and before the
+**accounts** answer. For
 an ARN in another account that the server's catalog holds, the **tag
 ResourceArn kind**, **StreamArn scope**, **BackupArn kind** and **export
 TableArn** checks come before the **accounts** answer; for one it does not
@@ -610,6 +612,8 @@ someone edits it.
 |---|---|---|---|
 | **body size** | any request whose body is over 16 MiB | `RequestEntityTooLargeException` (HTTP 413) "Request size has exceeded the maximum allowed size" | the request: it has no size limit, so `ListTables` with a 17 MiB body answers `{"TableNames":[]}` |
 | **signature** | a request without a SigV4 signature the server can verify with a key it issued and, outside developer mode, one its IAM policies do not allow | its authentication errors, such as `MissingAuthenticationToken`, `IncompleteSignatureException`, `UnrecognizedClientException` and `InvalidSignatureException`, and its authorization errors | the request, under account `000000000000` |
+| **member types** | a `BackupArn` that is neither a string nor null on `DescribeBackup`, `DeleteBackup` and `RestoreTableFromBackup`, and a `TargetTableName` that is neither a string nor null on `RestoreTableFromBackup` (the server checks the `TargetTableName` first) | `SerializationException` "Start of structure or map found where not expected: BackupArn", or "Start of structure or map found where not expected: TargetTableName" | the refusal of the operation (see "What it refuses") |
+| | a `TableName` that is neither a string nor null on `DescribeContinuousBackups` and `UpdateContinuousBackups`, except an `UpdateContinuousBackups` that enables point-in-time recovery, which `admit` refuses first on both builds (see "What it refuses") | `SerializationException` "Start of structure or map found where not expected: TableName" | `ValidationException` "The parameter 'TableName' is required but was not present in the request" |
 | **table names** | a non-empty `TableName` outside the pattern (`bad name!`) on `GetItem`, `Query`, `Scan`, `SearchVectors` and `UpdateTable` | `ValidationException` "1 validation error detected: Value '<name>' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"; for a name shorter than 3 or longer than 255 characters, "2 validation errors detected: ", the length clause ("Member must have length greater than or equal to 3" or "… less than or equal to 255") and then the pattern clause, joined by "; " | `ResourceNotFoundException` "Requested resource not found" |
 | | a non-empty `RequestItems` key outside the pattern on `BatchGetItem` and `BatchWriteItem` | the same, at 'requestItems', with the constraint "Map keys must satisfy constraint: [Member must have length less than or equal to 255, Member must have length greater than or equal to 3, Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+]" | `ResourceNotFoundException` "Requested resource not found" |
 | | a non-empty `TableName` outside the pattern in a `TransactItems` member on `TransactGetItems` and `TransactWriteItems` | the same, at 'transactItems.<n>.member.<op>.tableName', with `<n>` counted from 1 and `<op>` one of `get`, `put`, `delete`, `update` and `conditionCheck` | `ResourceNotFoundException` "Requested resource not found" |

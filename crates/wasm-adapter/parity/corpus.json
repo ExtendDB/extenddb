@@ -2560,6 +2560,37 @@
       ]
     },
     {
+      "name": "member types: DescribeContinuousBackups with a TableName of another JSON type answers the missing-parameter refusal",
+      "op": "DescribeContinuousBackups",
+      "body": {
+        "TableName": 5
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "The parameter 'TableName' is required but was not present in the request"
+        }
+      ]
+    },
+    {
+      "name": "member types: UpdateContinuousBackups disabling recovery with a TableName of another JSON type answers the missing-parameter refusal",
+      "op": "UpdateContinuousBackups",
+      "body": {
+        "TableName": 5,
+        "PointInTimeRecoverySpecification": {
+          "PointInTimeRecoveryEnabled": false
+        }
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "The parameter 'TableName' is required but was not present in the request"
+        }
+      ]
+    },
+    {
       "name": "table names: ListStreams with a two-character TableName lists no streams",
       "op": "ListStreams",
       "body": {
