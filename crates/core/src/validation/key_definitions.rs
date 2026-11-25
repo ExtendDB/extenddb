@@ -124,18 +124,29 @@ pub fn validate_keys_defined(
     )))
 }
 
+/// The hash a `java.util.HashMap` spreads for a `String` key: Java's
+/// `String.hashCode` of `name` over its UTF-16 code units (31 times the hash
+/// plus each unit, wrapping at 32 bits), combined by XOR with itself shifted
+/// right by 16 bits. The key's bucket in a table of `buckets` buckets is this
+/// value masked by `buckets - 1`.
+#[must_use]
+pub fn spread_hash(name: &str) -> u32 {
+    let hash = name.encode_utf16().fold(0_u32, |h, unit| {
+        h.wrapping_mul(31).wrapping_add(u32::from(unit))
+    });
+    hash ^ (hash >> 16)
+}
+
 /// The order in which the service lists the names of a key schema or of
 /// `AttributeDefinitions`: the iteration order of a `java.util.HashMap`
 /// created with 4 buckets and load factor 0.75, into which the names go in
-/// request order. A name's bucket is `spread & (buckets - 1)`, where `spread`
-/// is the Java `String.hashCode` of the name over its UTF-16 code units,
-/// combined by XOR with itself shifted right by 16 bits. The table doubles
-/// when it holds more names than three quarters of its buckets, and when a
-/// bucket that holds eight or more names takes another while the table has
-/// fewer than 64 buckets. The names come out bucket by bucket, in insertion
-/// order within a bucket (measured 2026-11-25, with lists of up to nine names
-/// in one bucket). A repeated name keeps its first position, as
-/// `HashMap::put` does. No measured list repeats a name.
+/// request order. A name's bucket is its [`spread_hash`] masked by
+/// `buckets - 1`. The table doubles when it holds more names than three
+/// quarters of its buckets, and when a bucket that holds eight or more names
+/// takes another while the table has fewer than 64 buckets. The names come out
+/// bucket by bucket, in insertion order within a bucket (measured 2026-11-25,
+/// with lists of up to nine names in one bucket). A repeated name keeps its
+/// first position, as `HashMap::put` does. No measured list repeats a name.
 ///
 /// Not modelled: a bucket that holds eight or more names and takes another
 /// while the table has 64 or more buckets. `HashMap` turns that bucket into a
@@ -149,10 +160,7 @@ fn listed<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
         if !seen.insert(name) {
             continue;
         }
-        let hash = name.encode_utf16().fold(0_u32, |h, unit| {
-            h.wrapping_mul(31).wrapping_add(u32::from(unit))
-        });
-        let spread = hash ^ (hash >> 16);
+        let spread = spread_hash(name);
         let mask = buckets - 1;
         let crowded = buckets < 64
             && entries

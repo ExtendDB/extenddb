@@ -6,6 +6,7 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use extenddb_core::validation::spread_hash;
 use serde_json::{Map, Value};
 
 /// The longest echo of a statement list, in bytes. Every echo measured is
@@ -210,12 +211,7 @@ fn print_order(members: &Map<String, Value>) -> Vec<(&String, &Value)> {
 
 /// The bucket of `key` in a Java `HashMap` table of `buckets` buckets.
 fn bucket(key: &str, buckets: usize) -> usize {
-    // Java's `String.hashCode`: 31 times the hash plus each UTF-16 unit,
-    // wrapping at 32 bits.
-    let hash = key.encode_utf16().fold(0_u32, |hash, unit| {
-        hash.wrapping_mul(31).wrapping_add(u32::from(unit))
-    });
-    (hash ^ (hash >> 16)) as usize & (buckets - 1)
+    spread_hash(key) as usize & (buckets - 1)
 }
 
 #[cfg(test)]

@@ -7,7 +7,7 @@ pub mod vector_item;
 pub mod warm_throughput;
 
 pub use key_definitions::{
-    validate_definition_count, validate_hash_and_range_differ, validate_keys_defined,
+    spread_hash, validate_definition_count, validate_hash_and_range_differ, validate_keys_defined,
     validate_unique_attribute_definitions,
 };
 pub use restorable_item::{
