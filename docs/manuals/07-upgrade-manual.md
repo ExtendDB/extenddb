@@ -388,6 +388,12 @@ Catalog upgrades change the schema; behavior changes alter how the running serve
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
 
+### IAM: a role session's policy, tags and issue time are read by its access key
+
+**What changed.** A request signed with a role session's credentials is authorized with the session policy, the session tags and the issue time (`aws:TokenIssueTime`) of the session whose access key signed it. Earlier releases read them by account, role and session name. AssumeRole stores a new session for every call, so once a session name had been used more than once, which session's data a request read could depend on row order.
+
+**Who is affected.** A deployment where a role has been assumed more than once under one session name, and a SQLite, PostgreSQL or MongoDB deployment that read a role session's data from the store for a request authenticated just before the session expired: there the read compared the session's expiry again, a moment after authentication had, and on PostgreSQL with the database's clock in place of the server's. No catalog migration or configuration change is required.
+
 ### v1.1.0: latency `segments` are summed into time buckets
 
 **What changed** (#398). The latency `segments` that `/metrics` and the console's `/console/metrics-data` return come from time buckets per account and operation. 1.0.0 kept one record per request for 24 hours. Each operation's count and means are still exact over the requests that the window covers. Four things change:
