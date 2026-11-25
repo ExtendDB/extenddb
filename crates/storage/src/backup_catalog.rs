@@ -977,6 +977,11 @@ impl JobPermit {
     /// it waits: the engine takes the permit last among a request's checks,
     /// before the backend opens a snapshot or a transaction. A free slot is
     /// taken at once, whatever `wait` is.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "its only caller is the engine's backup runtime, which the wasm build does not \
+                  compile"
+    )]
     pub async fn acquire_within(
         slots: &Arc<tokio::sync::Semaphore>,
         wait: Duration,
@@ -1667,6 +1672,11 @@ pub trait MaintenanceClaim: Send + Sync {
     /// default bounds the whole call; SQLite, whose beat queues behind its
     /// own process's engine write lock, measures the bound from the moment
     /// the beat holds that lock, as [`JobClaim::heartbeat_within`] does.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "its callers are the engine's backup maintenance claims, which the wasm build \
+                  does not compile"
+    )]
     fn heartbeat_within(
         &self,
         bound: Duration,
@@ -1706,6 +1716,11 @@ pub trait JobClaim: Send + Sync {
     /// takes) measures the bound from the moment the beat holds that lock,
     /// so a writer holding it past a period delays the beat and does not end
     /// the job: the queue is this process's, not a sign the claim is lost.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "its callers are the engine's backup job heartbeats, which the wasm build does \
+                  not compile"
+    )]
     fn heartbeat_within(
         &self,
         bound: Duration,

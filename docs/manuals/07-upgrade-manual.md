@@ -390,6 +390,17 @@ Catalog upgrades change the schema; behavior changes alter how the running serve
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
 
+### v1.1.0: latency `segments` are summed into time buckets
+
+**What changed** (#398). The latency `segments` that `/metrics` and the console's `/console/metrics-data` return come from time buckets per account and operation. 1.0.0 kept one record per request for 24 hours. Each operation's count and means are still exact over the requests that the window covers. Four things change:
+
+- A window of `W` seconds returns at least the last `W` seconds and at most one bucket width more: up to 1 second more for `LastMinute` and `Last5Minutes`, and up to 60 seconds more for `LastHour` and `LastDay`. 1.0.0 cut each window exactly `W` seconds before the query.
+- `AllTime` returns the same as `LastDay`. 1.0.0 returned every record it held, 24 hours to 24 hours and 5 minutes of requests.
+- The operations are sorted by name. 1.0.0 returned them in no fixed order.
+- The segment memory is bounded: at most 111,488 bytes of buckets for each operation of each account that sent it in the last day, about 4.46 MB for an account that sends all 40 operations every second. 1.0.0 kept about 250 bytes for each request that reached dispatch in the last 24 hours, so the sizing rule in the deployment guide's [Process Memory](11-deployment-guide.md#process-memory) section stops applying after the upgrade.
+
+No catalog migration or configuration change is required.
+
 ### v1.1.0: U+0000 in strings on PostgreSQL and MongoDB (catalog migration 13)
 
 DynamoDB accepts U+0000 anywhere a string appears. The PostgreSQL backend now stores the strings of an item document (attribute names, map keys and values, in `item_data`, the stream records, the queued index updates and `backup_items`) through an escape: U+0000 as U+0001 U+0001, U+0001 as U+0001 U+0002, and every other character as it is, so a string that holds neither character is stored as before. The PostgreSQL key columns hold the key text as before, and PostgreSQL `TEXT` cannot hold U+0000, so a request whose table key or index key value holds U+0000 gets a `ValidationException` where an earlier release answered 500 (see [Differences from DynamoDB](../differences-from-dynamodb.md)). The MongoDB backend escapes the field names (attribute names and map keys) of a document in which a name holds U+0000, and marks that document; BSON string values already held U+0000. SQLite and Cassandra store the character as written, and their stored data does not change.
