@@ -507,18 +507,8 @@ pub fn validate_begins_with_operands(
     maps: &ExpressionMaps,
 ) -> Result<(), DynamoDbError> {
     match expr {
-        Expr::Function { name, args } if name == "begins_with" => {
-            if args.len() == 2
-                && let Expr::Placeholder(ref placeholder) = args[1]
-                && let Some(val) = maps.values.get(placeholder)
-                && !matches!(val, AttributeValue::S(_) | AttributeValue::B(_))
-            {
-                let type_code = attribute_type_code(val);
-                return Err(DynamoDbError::ValidationException(format!(
-                    "Incorrect operand type for operator or function; operator or function: begins_with, operand type: {type_code}"
-                )));
-            }
-            Ok(())
+        Expr::Function { name, args } if name == "begins_with" && args.len() == 2 => {
+            check_begins_with_operand(&args[1], maps, "")
         }
         Expr::And(left, right) | Expr::Or(left, right) => {
             validate_begins_with_operands(left, maps)?;
@@ -527,6 +517,25 @@ pub fn validate_begins_with_operands(
         Expr::Not(inner) => validate_begins_with_operands(inner, maps),
         _ => Ok(()),
     }
+}
+
+/// Refuse a `begins_with` operand that is a `:value` other than a string or a
+/// binary value, with `prefix` ahead of the message.
+pub(crate) fn check_begins_with_operand(
+    operand: &Expr,
+    maps: &ExpressionMaps,
+    prefix: &str,
+) -> Result<(), DynamoDbError> {
+    if let Expr::Placeholder(placeholder) = operand
+        && let Some(val) = maps.values.get(placeholder)
+        && !matches!(val, AttributeValue::S(_) | AttributeValue::B(_))
+    {
+        let type_code = attribute_type_code(val);
+        return Err(DynamoDbError::ValidationException(format!(
+            "{prefix}Incorrect operand type for operator or function; operator or function: begins_with, operand type: {type_code}"
+        )));
+    }
+    Ok(())
 }
 
 /// Return the DynamoDB type code for an AttributeValue (S, N, B, BOOL, NULL,

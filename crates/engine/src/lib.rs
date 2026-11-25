@@ -94,7 +94,7 @@ pub use import_export::{handle_export_table, handle_import_table};
 pub use item_authorizer::{ItemAccess, ItemAuthorization, ItemAuthorizer};
 pub use list_tables::handle_list_tables;
 pub use put_item::handle_put_item;
-pub use query::handle_query;
+pub use query::{handle_query, refuse_duplicate_key_condition};
 pub use request_limits::check_request_item_counts;
 pub use scan::handle_scan;
 pub use search_vectors::handle_search_vectors;

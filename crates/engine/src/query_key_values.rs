@@ -73,8 +73,10 @@ const SELECT: &[&str] = &[
 /// deserialized and before the table is looked up, in the service's order:
 /// `Limit`, the `ReturnConsumedCapacity` enum, the expression and
 /// non-expression parameter mix, the `ExpressionAttributeNames` map (see
-/// `validate_names`), every number in `ExpressionAttributeValues`, then the
-/// `Select` enum (measured 2026-10-24 and 2026-11-11: a `Limit` of 0 is
+/// `validate_names`), then every number in `ExpressionAttributeValues`. The
+/// `Select` enum comes after them and after the `FilterExpression` and
+/// `KeyConditionExpression` checks of `handle_query`; see
+/// [`validate_query_select`] (measured 2026-10-24 and 2026-11-11: a `Limit` of 0 is
 /// reported ahead of an invalid enum value of either field and of a parameter
 /// mix, an invalid `ReturnConsumedCapacity` ahead of a mix with
 /// `AttributesToGet`, `QueryFilter`, `ConditionalOperator` or `KeyConditions`
@@ -121,8 +123,43 @@ const SELECT: &[&str] = &[
 /// Returns `DynamoDbError::ValidationException` with the service's text, or
 /// `DynamoDbError::SerializationException` for a body of the wrong shape.
 pub fn validate_query_request_body(body: &Value) -> Result<(), DynamoDbError> {
-    query_request_checks(body)
-        .map_err(|check| shape_fault_first::<QueryInput>(&readable_for_shape_check(body), check))
+    shape_fault_ahead_of(body, query_request_checks(body))
+}
+
+/// The `Select` enum check, with the shape fault rule of
+/// [`validate_query_request_body`]. `handle_query` runs it after that
+/// function's checks and after the `FilterExpression` and
+/// `KeyConditionExpression` checks, ahead of the table (measured 2026-11-11:
+/// an undefined filter name and a second key condition on one key attribute
+/// are reported ahead of an invalid `Select`). A body the service cannot read
+/// as one type reports `Select` with `ReturnConsumedCapacity` and `Limit`
+/// instead; see `unreadable_value_checks`.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` with the service's text, or
+/// `DynamoDbError::SerializationException` for a body of the wrong shape.
+pub fn validate_query_select(body: &Value) -> Result<(), DynamoDbError> {
+    shape_fault_ahead_of(
+        body,
+        crate::validate_enum_fields(
+            body,
+            &[crate::EnumField {
+                json_name: "Select",
+                valid: SELECT,
+                clause: crate::EnumClause::Named("select"),
+            }],
+        ),
+    )
+}
+
+/// `checked`, with a failed check replaced by the shape fault `body` holds, if
+/// any; see [`shape_fault_first`].
+fn shape_fault_ahead_of(
+    body: &Value,
+    checked: Result<(), DynamoDbError>,
+) -> Result<(), DynamoDbError> {
+    checked.map_err(|check| shape_fault_first::<QueryInput>(&readable_for_shape_check(body), check))
 }
 
 /// When a request-time check has failed with `check`, the deserializer's
@@ -268,8 +305,8 @@ fn query_request_checks(body: &Value) -> Result<(), DynamoDbError> {
     }
 
     // Query stops at the first invalid enum: ReturnConsumedCapacity ahead of
-    // the parameter mix, Select after the numbers (measured 2026-08-24 and
-    // 2026-11-11).
+    // the parameter mix, Select after the numbers and the expression checks
+    // (measured 2026-08-24 and 2026-11-11; see `validate_query_select`).
     crate::validate_enum_fields(
         body,
         &[crate::EnumField {
@@ -285,15 +322,7 @@ fn query_request_checks(body: &Value) -> Result<(), DynamoDbError> {
     if let Some(values) = values {
         validate_expression_attribute_value_numbers(values)?;
     }
-
-    crate::validate_enum_fields(
-        body,
-        &[crate::EnumField {
-            json_name: "Select",
-            valid: SELECT,
-            clause: crate::EnumClause::Named("select"),
-        }],
-    )
+    Ok(())
 }
 
 /// The expression and non-expression parameter mix check.

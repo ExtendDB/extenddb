@@ -473,6 +473,14 @@ pub(crate) async fn authorize_request(
         return Ok(authorized_key_info);
     }
 
+    if operation == "Query" {
+        extenddb_engine::refuse_duplicate_key_condition(
+            input,
+            &crate::leading_keys::names_map(input),
+            &state.limits,
+        )?;
+    }
+
     // Derive the targets the service authorizes this operation against. The
     // resource comes from the field the operation actually carries it in
     // (ResourceArn, StreamArn, BackupArn, TableArn, IndexName, or a table ARN

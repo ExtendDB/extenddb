@@ -7,7 +7,7 @@ use extenddb_core::error::DynamoDbError;
 use serde_json::json;
 
 use super::tests::{LIMIT_ZERO, NUMERIC_BOB, RCC_BAD, message, one_error};
-use super::{LIMIT_BELOW_ONE, validate_query_request_body};
+use super::{LIMIT_BELOW_ONE, validate_query_request_body, validate_query_select};
 
 #[test]
 fn request_time_checks_run_limit_then_mix_then_numbers() {
@@ -107,15 +107,17 @@ fn enum_checks_sit_on_either_side_of_the_numbers() {
             "{field}"
         );
     }
-    // With the numbers valid, an invalid Select is still reported.
+    // With the numbers valid, an invalid Select is still reported, by the
+    // check that runs after the expression checks.
     let mut only_select = serde_json::json!({
         "TableName": "t",
         "KeyConditionExpression": "pk = :u",
         "ExpressionAttributeValues": {":u": {"S": "bob"}},
     });
     only_select["Select"] = serde_json::json!("bad");
+    assert!(validate_query_request_body(&only_select).is_ok());
     assert!(
-        message(validate_query_request_body(&only_select))
+        message(validate_query_select(&only_select))
             .is_some_and(|m| m.contains("at 'select' failed to satisfy constraint"))
     );
 }
@@ -270,7 +272,11 @@ fn each_member_and_value_is_read_on_its_own_for_a_shape_fault() {
         .into_iter()
         .filter_map(|(values, extra, expected)| {
             let body = super::tests::body_with(values, extra);
-            let answer = match validate_query_request_body(&body) {
+            // The raw-body checks, then the Select check, as handle_query runs
+            // them before it deserializes the body.
+            let checked =
+                validate_query_request_body(&body).and_then(|()| validate_query_select(&body));
+            let answer = match checked {
                 Err(DynamoDbError::SerializationException(msg)) => ("SerializationException", msg),
                 Err(DynamoDbError::ValidationException(msg)) => ("ValidationException", msg),
                 other => panic!("{body}: unexpected answer {other:?}"),

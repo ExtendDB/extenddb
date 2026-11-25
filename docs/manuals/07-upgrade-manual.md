@@ -399,6 +399,16 @@ deployment, even when no catalog migration is required.
 
 No catalog migration or configuration change is required.
 
+### v1.1.0: `Query` refuses a second condition on one key attribute
+
+**What changed** (#484). Some `Query` requests that 1.0.0 ran now get `ValidationException`, as DynamoDB answers them:
+
+- a `KeyConditionExpression` with two conditions on one key attribute, such as `pk = :a AND pk = :b`: `Invalid KeyConditionExpression: KeyConditionExpressions must only contain one condition per key`
+- a `FilterExpression` that names a `:value` the request does not define, on a partition with no items
+- a `FilterExpression` beside `KeyConditions` that names `:_kc_pk` when the request does not define it. ExtendDB uses that name for the `KeyConditions` partition value, and 1.0.0 compared the filter with that value.
+
+ExtendDB refuses a key condition with two conditions on one key attribute before the IAM decision. A principal whose policy does not allow such a request got `AccessDeniedException` from 1.0.0 and now gets the `ValidationException`. The 0.1.15 LeadingKeys entry below says that an equality on the partition key decides `dynamodb:LeadingKeys`. That no longer holds for a key condition with two conditions on one key attribute. No catalog migration is required.
+
 ### v1.0.0: Cassandra reads and writes at `LOCAL_QUORUM`
 
 **What changed.** The Cassandra backend runs its reads and writes at `LOCAL_QUORUM`. 0.1.15 ran many of them at `ONE`, the driver's default, in each area: items (the reads of GetItem, Query and Scan among them), transactions, TTL, streams, the catalog, IAM and `init`. A read with `ConsistentRead` `false` also runs at `LOCAL_QUORUM`. A lightweight transaction runs Paxos at `LOCAL_SERIAL` and commits at `LOCAL_QUORUM`. 0.1.15 ran many of its lightweight transactions at those levels already, and others, among them the admin user creation and most IAM writes, at the driver's defaults, `SERIAL` and `ONE`. Batches ran at `LOCAL_QUORUM` before and still do. No setting changes these levels (#945).
