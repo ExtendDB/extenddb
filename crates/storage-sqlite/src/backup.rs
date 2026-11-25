@@ -570,6 +570,11 @@ impl SqliteEngine {
     /// which flips it ACTIVE and the record DONE in the copy's last batch, or
     /// mark the record FAILED and remove the target if the copy fails. Logs
     /// either outcome.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "runs in the task LegacyBackupReader::restore spawns; restore's only caller is \
+                  the engine's backup runtime, which the wasm build does not compile"
+    )]
     async fn finish_restore(
         &self,
         desc: &TableDescription,
@@ -988,6 +993,11 @@ impl SqliteEngine {
 }
 
 impl LegacyBackupReader for SqliteEngine {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "its only caller is the engine's backup runtime, which the wasm build does not \
+                  compile"
+    )]
     fn create(
         &self,
         account_id: &str,
@@ -1414,6 +1424,11 @@ impl LegacyBackupReader for SqliteEngine {
         })
     }
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "its only caller is the engine's backup runtime, which the wasm build does not \
+                  compile"
+    )]
     fn restore(
         &self,
         account_id: &str,
@@ -7551,6 +7566,17 @@ mod restore_tests {
             }
         }
 
+        /// Poll until no task holds `slot`: `false` if one still does after 30 s.
+        async fn slot_freed(engine: &SqliteEngine, slot: &str) -> bool {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while engine.job_slots.holds(slot) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .is_ok()
+        }
+
         /// A running restore holds its in-process slot for the copy's life,
         /// and the dead listing skips a RUNNING record whose slot is held
         /// whatever its heartbeat says: the heartbeat queues behind every
@@ -7603,8 +7629,10 @@ mod restore_tests {
                 wait_for_copy(&engine, &desc.table_id).await,
                 "the copy finishes"
             );
+            // The copy commits ACTIVE before its task drops the claim, so the
+            // slot is freed a moment after wait_for_copy returns.
             assert!(
-                !engine.job_slots.holds(&slot),
+                slot_freed(&engine, &slot).await,
                 "the slot is freed with the claim when the copy ends"
             );
 
@@ -7816,14 +7844,10 @@ mod restore_tests {
             drop(gate);
 
             // The copy stops: its slot is freed with its claim.
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-            while engine.job_slots.holds(&slot) {
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "the copy did not stop after its record was failed"
-                );
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            assert!(
+                slot_freed(&engine, &slot).await,
+                "the copy did not stop after its record was failed"
+            );
             let (copied, _) = target_counts(&engine, &desc.table_id).await;
             assert!(
                 copied < BULK_ITEMS,

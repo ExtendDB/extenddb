@@ -23,8 +23,10 @@
 //!   characters the message lists both clauses, the length first, joined by
 //!   `; ` under `2 validation errors detected:` (measured at `tableName`;
 //!   derived for the other locations). Locations: `tableName` for `TableName`,
-//!   `targetTableName`, `sourceTableName`, `tableCreationParameters.tableName`,
-//!   `exclusiveStartTableName`, `indexName` for `Query`, `Scan` and `SearchVectors`, and
+//!   `targetTableName` and `sourceTableName` of RestoreTableToPointInTime (a
+//!   RestoreTableFromBackup `TargetTableName` is described below),
+//!   `tableCreationParameters.tableName`, `exclusiveStartTableName`,
+//!   `indexName` for `Query`, `Scan` and `SearchVectors`, and
 //!   `transactItems.<n>.member.<op>.tableName` (1-based, `put`, `get`,
 //!   `delete`, `update`, `conditionCheck`). A name inside the pattern but of a
 //!   bad length is left to the engine handlers, whose answer the service's
@@ -653,22 +655,23 @@ mod tests {
     }
 
     /// Measured on DynamoDB on 20 Nov 2026: a restore's `TargetTableName`
-    /// that is neither a string nor null is answered before its `BackupArn`,
-    /// and a null is an absent member.
+    /// that is neither a string nor null is answered before the checks of the
+    /// value of `BackupArn`, and a null is an absent member. The text is
+    /// ExtendDB's (DynamoDB's texts are #1012).
     #[test]
-    fn a_restore_target_name_of_another_json_type_is_refused_before_the_backup_arn() {
+    fn a_restore_target_name_of_another_json_type_is_refused_before_the_backup_arn_value_checks() {
         let own =
             "arn:aws:dynamodb:us-east-1:123456789012:table/t367name/backup/01700000000000-abcdef12";
         let refused_arn = format!("{ARN}/backup/01700000000000-abcdef12");
         for target in [json!(5), json!(true), json!({}), json!([])] {
             let input = json!({ "BackupArn": refused_arn, "TargetTableName": target });
-            assert!(
-                matches!(
-                    check_table_name_chars("RestoreTableFromBackup", &input, "123456789012"),
-                    Err(DynamoDbError::SerializationException(_))
+            match check_table_name_chars("RestoreTableFromBackup", &input, "123456789012") {
+                Err(DynamoDbError::SerializationException(m)) => assert_eq!(
+                    m, "Start of structure or map found where not expected: TargetTableName",
+                    "{input}"
                 ),
-                "{input}"
-            );
+                other => panic!("{input}: {other:?}"),
+            }
         }
         let null = json!({ "BackupArn": own, "TargetTableName": null });
         assert!(message("RestoreTableFromBackup", null).is_none());
