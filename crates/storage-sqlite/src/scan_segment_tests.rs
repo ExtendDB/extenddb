@@ -3,8 +3,9 @@
 
 //! A parallel Scan returns every item of a partition key from one segment, on
 //! a table and on a GSI, and every item from one segment, with and without
-//! `Limit`, as DynamoDB does (measured in us-east-1, 13 and 14 Nov 2026). The
-//! start-key check answers with the rule the scan predicate applies.
+//! `Limit`, as DynamoDB does (measured in us-east-1 on 13 and 14 Nov 2026, and
+//! with `Limit` 1 on 17 Nov 2026). The start-key check answers with the rule
+//! the scan predicate applies.
 
 use std::collections::BTreeMap;
 

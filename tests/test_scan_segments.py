@@ -7,7 +7,7 @@ DynamoDB returns all items of a partition key from one segment, on a table and
 on a global secondary index, and every item from exactly one segment. That
 holds for every segment count, with a FilterExpression that every item
 matches, and across the pages of a segment read with a Limit (measured in
-us-east-1, 13 and 14 Nov 2026).
+us-east-1 on 13 and 14 Nov 2026, and with Limit 1 on 17 Nov 2026).
 """
 
 from __future__ import annotations
