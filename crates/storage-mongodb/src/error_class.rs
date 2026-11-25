@@ -70,9 +70,31 @@ pub(crate) fn catalog_read_err(e: &DriverError) -> StorageError {
     }
 }
 
+/// A connection string nothing listens on. Port 1 on loopback refuses the
+/// connection, and `serverSelectionTimeoutMS` is short so a read that waits
+/// for a server costs milliseconds. `MongoEngine::new` performs no I/O, so an
+/// engine built on it fails at its first read the way an unreachable
+/// deployment makes it fail, with `ErrorKind::ServerSelection` from the
+/// driver.
+#[cfg(test)]
+pub(crate) const CLOSED_PORT_URI: &str =
+    "mongodb://127.0.0.1:1/?directConnection=true&serverSelectionTimeoutMS=50";
+
+#[cfg(test)]
+pub(crate) async fn engine_on_a_closed_port() -> crate::MongoEngine {
+    crate::MongoEngine::new(
+        CLOSED_PORT_URI,
+        "us-east-1",
+        None,
+        mongodb::options::ReadConcern::local(),
+    )
+    .await
+    .expect("building the engine performs no I/O")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{RETRYABLE_READ_CODES, catalog_read_err};
+    use super::{CLOSED_PORT_URI, RETRYABLE_READ_CODES, catalog_read_err, engine_on_a_closed_port};
     use extenddb_storage::error::StorageError;
     use mongodb::bson::doc;
     use mongodb::error::{Error as DriverError, ErrorKind};
@@ -91,20 +113,16 @@ mod tests {
         ErrorKind::Command(command_error).into()
     }
 
-    /// The error #441 is about, taken from the driver rather than built by
-    /// hand: a client whose only server is not listening answers a catalog
-    /// read with `ErrorKind::ServerSelection`. Port 1 on loopback refuses the
-    /// connection, and `serverSelectionTimeoutMS` is short so the test costs
-    /// milliseconds. `ErrorKind::ServerSelection` is `#[non_exhaustive]` and
-    /// cannot be constructed outside the driver, so this is the only way to
-    /// assert on the real thing.
+    /// The error a stopped deployment produces, taken from the driver rather
+    /// than built by hand: a client whose only server is not listening answers
+    /// a catalog read with `ErrorKind::ServerSelection`. The variant is
+    /// `#[non_exhaustive]` and cannot be constructed outside the driver, so
+    /// this is the only way to assert on the real thing.
     #[tokio::test]
     async fn a_deployment_that_is_not_listening_is_transient() {
-        let client = mongodb::Client::with_uri_str(
-            "mongodb://127.0.0.1:1/?directConnection=true&serverSelectionTimeoutMS=50",
-        )
-        .await
-        .expect("a syntactically valid connection string");
+        let client = mongodb::Client::with_uri_str(CLOSED_PORT_URI)
+            .await
+            .expect("a syntactically valid connection string");
         let error = client
             .database("extenddb_catalog")
             .collection::<mongodb::bson::Document>("tables")
@@ -188,14 +206,11 @@ mod tests {
         assert!(message.contains("connection refused"), "{message}");
     }
 
-    /// #441 through the production lookups rather than the classifier alone.
-    ///
-    /// `MongoEngine::new` builds client options and a lazy client and performs
-    /// no I/O, so an engine can be pointed at a port nothing listens on and
-    /// the key-info lookups then fail the way an unreachable deployment makes
-    /// them fail. `key_info_for_authz` in the server and the engine both run
-    /// the result through `storage_err_to_dynamo`, which answers `Transient`
-    /// as `ServiceUnavailable`; that mapping has its own test in
+    /// The key-info lookups themselves, not only the classifier. Each fails at
+    /// its first read on the closed-port engine. `key_info_for_authz` in the
+    /// server and the engine both run the result through
+    /// `storage_err_to_dynamo`, which answers `Transient` as
+    /// `ServiceUnavailable`; that mapping has its own test in
     /// `crates/server/src/request_helpers.rs`, so what is asserted here is the
     /// classification this backend produces.
     ///
@@ -204,14 +219,7 @@ mod tests {
     async fn an_unreachable_deployment_makes_the_key_info_lookups_transient() {
         use extenddb_storage::TableEngine;
 
-        let engine = crate::MongoEngine::new(
-            "mongodb://127.0.0.1:1/?directConnection=true&serverSelectionTimeoutMS=50",
-            "us-east-1",
-            None,
-            mongodb::options::ReadConcern::local(),
-        )
-        .await
-        .expect("building the engine performs no I/O");
+        let engine = engine_on_a_closed_port().await;
 
         let by_name = engine
             .table_key_info("123456789012", "any-table")
