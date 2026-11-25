@@ -506,3 +506,37 @@ async fn index_table_names(engine: &CassandraEngine, table_id: &str) -> Vec<Stri
     })
     .collect()
 }
+
+/// A `DeleteTable` whose request is dropped once its claim has applied, as a
+/// request is when its client closes the connection. The claim and the
+/// removal run in a task that the request only awaits, so the table is still
+/// removed, within seconds rather than after the five-minute lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delete_whose_request_is_dropped_after_its_claim_still_removes_the_table() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, &test_config().keyspace_prefix).await;
+    let id = account.account_id.clone();
+    let test = {
+        let (engine, id) = (engine.clone(), id.clone());
+        async move {
+            let name = "DroppedAfterTheClaim";
+            let table = engine
+                .create_table(&id, gsi_input(name, 4))
+                .await
+                .expect("create the table");
+            activate(&engine, &id, name).await;
+            let call = {
+                let (engine, id) = (engine.clone(), id.clone());
+                tokio::spawn(async move { engine.delete_table(&id, delete_input(name)).await })
+            };
+            wait_for_status(&engine, &id, name, "DELETING").await;
+            call.abort();
+            wait_for_row_gone(&engine, &id, name).await;
+            assert!(!data_table_exists(&engine, &id, &table.table_id).await);
+        }
+    };
+    removing_rows_after(&engine, &id, test).await;
+}

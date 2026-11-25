@@ -20,14 +20,13 @@ use crate::CassandraEngine;
 /// then the row is left to the call that claimed it. When a statement of the
 /// removal fails after the claim or the take, the actor moves the deadline to
 /// the current time (`release_delete_lease`), so the sweep's next pass takes
-/// the row. A call that stops after the claim without an error, because its
-/// process stops or its request is dropped, leaves the row to the sweep,
-/// which removes the table after the deadline; with no deadline the sweep
-/// would never select the row, and the name would stay taken. A removal that
-/// stops part way, the call's or the sweep's, keeps the catalog row, since
-/// the row delete is its last statement, and a later pass takes the row over
-/// once the deadline written by the last claim, renewal or release has
-/// passed.
+/// the row. A call whose process stops after the claim leaves the row to the
+/// sweep, which removes the table after the deadline; with no deadline the
+/// sweep would never select the row, and the name would stay taken. A
+/// removal that stops part way, the call's or the sweep's, keeps the catalog
+/// row, since the row delete is its last statement, and a later pass takes
+/// the row over once the deadline written by the last claim, renewal or
+/// release has passed.
 ///
 /// The length decides how long a stopped call keeps the name refused, and
 /// how slow a call can be before the sweep takes the row over and runs the
@@ -316,41 +315,53 @@ impl CassandraEngine {
         let description =
             self.build_table_description_from_row(account_id, table_row, index_rows)?;
 
-        // Claim the row before the first drop. Two concurrent calls both read
-        // the same row; the claim applies for one of them and the other
-        // answers TableBeingDeleted, as the service answers the second of two
-        // concurrent calls (measured 2026-10-25, five rounds of five).
-        let lease = match caller {
-            DeleteTableCaller::Client => Some(
-                self.claim_delete_lease(account_id, &input.table_name, &table_id)
-                    .await?
-                    .ok_or_else(|| StorageError::TableBeingDeleted(input.table_name.clone()))?,
-            ),
-            DeleteTableCaller::RestoreCleanup { .. } => None,
-        };
+        // The claim and the removal run in a task of their own, which the call
+        // awaits, as the PostgreSQL backend's drops do. A request dropped from
+        // here on (its client closed the connection) detaches the task, so it
+        // does not stop the removal after the claim and leave the row to the
+        // lease.
+        let claim = matches!(caller, DeleteTableCaller::Client);
+        let engine = self.clone();
+        let account_id = account_id.to_owned();
+        let table_name = input.table_name;
+        let table_arn = description.table_arn.clone();
+        tokio::spawn(async move {
+            // Claim the row before the first drop. Two concurrent calls both
+            // read the same row; the claim applies for one of them and the
+            // other answers TableBeingDeleted, as the service answers the
+            // second of two concurrent calls (measured 2026-10-25, five
+            // rounds of five).
+            let lease = if claim {
+                Some(
+                    engine
+                        .claim_delete_lease(&account_id, &table_name, &table_id)
+                        .await?
+                        .ok_or_else(|| StorageError::TableBeingDeleted(table_name.clone()))?,
+                )
+            } else {
+                None
+            };
 
-        // When the renewal inside does not apply, this call outlived its lease
-        // and the control-plane sweep took the row over; the sweep finishes
-        // the removal and the call answers with the description all the same.
-        let removed = self
-            .remove_claimed_table(
-                account_id,
-                &input.table_name,
-                &table_id,
-                &description.table_arn,
-                lease,
-            )
-            .await;
-        if removed.is_err() && lease.is_some() {
-            // The failed removal handed the row back to the sweep. The wake
-            // has the poller start its next pass at once, and that pass
-            // takes the row and finishes the removal. A failure inside the
-            // sweep does not wake the poller: the poller runs that pass, and
-            // a wake from inside it would keep it polling every second for as
-            // long as the failure lasts.
-            self.control_plane_notify.notify_one();
-        }
-        removed?;
+            // When the renewal inside does not apply, this call outlived its
+            // lease and the control-plane sweep took the row over; the sweep
+            // finishes the removal and the call answers with the description
+            // all the same.
+            let removed = engine
+                .remove_claimed_table(&account_id, &table_name, &table_id, &table_arn, lease)
+                .await;
+            if removed.is_err() && lease.is_some() {
+                // The failed removal handed the row back to the sweep. The
+                // wake has the poller start its next pass at once, and that
+                // pass takes the row and finishes the removal. A failure
+                // inside the sweep does not wake the poller: the poller runs
+                // that pass, and a wake from inside it would keep it polling
+                // every second for as long as the failure lasts.
+                engine.control_plane_notify.notify_one();
+            }
+            removed
+        })
+        .await
+        .map_err(|e| StorageError::Internal(format!("DeleteTable task: {e}")))??;
         Ok(description)
     }
 
