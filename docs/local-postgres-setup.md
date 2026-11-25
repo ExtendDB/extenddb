@@ -41,10 +41,10 @@ You may need to add the current user to the `postgres` group; if initdb fails, c
 |---------|-------|
 | Host | `localhost` |
 | Port | `5432` |
-| Database | `extenddb` |
+| Database | `extenddb_catalog` (the catalog database `init` creates) |
 | User | `extenddb` |
 | Password | `extenddb-local-dev` |
-| Connection string | `postgresql://extenddb:extenddb-local-dev@localhost:5432/extenddb` |
+| Connection string | `postgresql://extenddb:extenddb-local-dev@localhost:5432/extenddb_catalog` |
 | Admin user | the OS user that ran `initdb` (trusted via local socket) |
 
 ## Starting / Stopping
@@ -85,7 +85,7 @@ pool_size = 20
 Or via environment variable:
 ```bash
 export EXTENDDB__STORAGE__POSTGRES__CONNECTION_STRING=\
-"postgresql://extenddb:extenddb-local-dev@localhost:5432/extenddb"
+"postgresql://extenddb:extenddb-local-dev@localhost:5432/extenddb_catalog"
 ```
 
 ---
