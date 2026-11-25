@@ -178,7 +178,6 @@ pub async fn handle_batch_get_item(
     // when every key was throttled the call fails with the throttle error
     // instead (API Reference; documented, not reached in the sample).
     let mut unprocessed_keys: HashMap<String, KeysAndAttributes> = HashMap::new();
-    let mut throttled_count: usize = 0;
     let mut first_throttle: Option<DynamoDbError> = None;
     let mut throttled_tables: BTreeMap<String, u32> = BTreeMap::new();
     let mut total_rcu: f64 = 0.0;
@@ -207,7 +206,6 @@ pub async fn handle_batch_get_item(
                 // error still fails the request.
                 Err(StorageError::Service(e)) if e.is_throttle() => {
                     table_unprocessed.push(key.clone());
-                    throttled_count += 1;
                     *throttled_tables
                         .entry(key_info.table_name.clone())
                         .or_default() += 1;
@@ -263,7 +261,7 @@ pub async fn handle_batch_get_item(
     // key was throttled beside a served table keeps an empty `Responses` list;
     // unmeasured as well.
     if let Some(e) = first_throttle
-        && throttled_count == total_keys
+        && throttled_tables.values().sum::<u32>() as usize == total_keys
     {
         return Err(e);
     }

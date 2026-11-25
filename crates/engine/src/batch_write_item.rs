@@ -213,8 +213,7 @@ async fn write_batch(
     // The error of the last request that was not applied, for the warning
     // logged once per batch below.
     let mut last_error = String::new();
-    // How many requests the backend throttled, and the first throttle error.
-    let mut throttled_count: usize = 0;
+    // The first throttle error; `throttled_tables` counts the throttled requests.
     let mut first_throttle: Option<DynamoDbError> = None;
     let mut throttled_tables: BTreeMap<String, u32> = BTreeMap::new();
 
@@ -297,7 +296,6 @@ async fn write_batch(
                     // `is_deferrable` takes a `Service` error only when it is
                     // a throttle.
                     if let StorageError::Service(e) = e {
-                        throttled_count += 1;
                         if first_throttle.is_none() {
                             first_throttle = Some(e);
                         }
@@ -345,7 +343,7 @@ async fn write_batch(
 
     if !unprocessed.is_empty() {
         let not_applied: usize = unprocessed.values().map(Vec::len).sum();
-        let all_throttled = throttled_count == not_applied;
+        let all_throttled = throttled_tables.values().sum::<u32>() as usize == not_applied;
         let outcome = if applied == 0 && all_throttled {
             "every request was throttled and the batch answers the first throttle error"
         } else if applied == 0 {
