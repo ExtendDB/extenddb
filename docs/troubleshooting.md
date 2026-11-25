@@ -1031,9 +1031,15 @@ Keys imported earlier keep working while import is disabled.
 
 ### An import ends `FAILED` with `ItemValidationError`
 
-**Cause:** The import refused a line or an item of the file, as DynamoDB does. A DYNAMODB_JSON line it cannot read (not a JSON object, no `Item` member, or a `B` value that is not padded base64), or an item holding a value that is not a number, ends the import of its file: the items before it are imported, the lines after it are not read. An item that fails a check (a missing key, a key of another type, a number out of range, a size or nesting limit) is skipped and the next line is read. Each counts as one error in `ErrorCount`; `ProcessedItemCount` is the imported items plus the errors. The table keeps the imported items.
+**Cause:** The import refused a line or an item of the file, as DynamoDB does. These end the import of their file:
 
-**Fix:** The server log has one line per refused line or item, with the import ARN, the line or item number and the cause. Each line must be one JSON object of the form `{"Item": {"pk": {"S": "val"}, ...}}`. Correct the file and import it into a new table.
+- a DYNAMODB_JSON line that is not a JSON object, has no `Item` member, or holds a `B` value that is not padded base64
+- a line whose `Item` the reader cannot read, such as one with an unknown type descriptor
+- an item holding a value that is not a number
+
+The items ahead of the line or item that ends the file are imported, and the lines after it are not read. An item that fails a check is skipped, and the import reads the next line. The checks are a missing key, a key of another type, a number out of range, and a size or nesting limit. Each counts as one error in `ErrorCount`. `ProcessedItemCount` is the imported items plus the errors. The table keeps the imported items.
+
+**Fix:** The server log has one line per refused line or item, with the import ARN, the line or item number and the cause. Each line must be one JSON object of the form `{"Item": {"pk": {"S": "val"}, ...}}`. Fix the file and import it into a new table.
 
 ### `Cannot write export file`
 
