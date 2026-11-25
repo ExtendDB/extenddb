@@ -37,6 +37,21 @@ pub(crate) const MAX_TRANSACT_ITEMS: usize = 100;
 /// (measured 2026-11-02).
 pub(crate) const MAX_PARTS: usize = 10;
 
+/// The service's refusal of the failed constraints `parts`, which is not
+/// empty: "1 validation error detected: <part>" for one and "N validation
+/// errors detected: <part>; <part>" for more, with the first [`MAX_PARTS`].
+pub(crate) fn validation_refusal(mut parts: Vec<String>) -> DynamoDbError {
+    parts.truncate(MAX_PARTS);
+    DynamoDbError::ValidationException(match parts.as_slice() {
+        [part] => format!("1 validation error detected: {part}"),
+        parts => format!(
+            "{} validation errors detected: {}",
+            parts.len(),
+            parts.join("; ")
+        ),
+    })
+}
+
 /// Check the item count of a transaction. `member` is `TransactGetItem` or
 /// `TransactWriteItem`. Over the limit, the message lists the member name once
 /// per item; the service lists each item's full serialization instead, so the
@@ -123,7 +138,6 @@ pub(crate) fn check_batch_counts(
 /// count is 0 or over `limit`, at its member path (measured 2026-11-20).
 fn per_table_count_error(get: bool, limit: usize, failed: &[(&str, usize)]) -> DynamoDbError {
     let member = if get { "member.Keys" } else { "member" };
-    let n = failed.len();
     let errors = failed
         .iter()
         .map(|&(table_name, count)| {
@@ -136,12 +150,8 @@ fn per_table_count_error(get: bool, limit: usize, failed: &[(&str, usize)]) -> D
                 "Value at 'RequestItems.{table_name}.{member}' failed to satisfy constraint: Member must have length {bound}"
             )
         })
-        .collect::<Vec<_>>()
-        .join("; ");
-    DynamoDbError::ValidationException(format!(
-        "{n} validation error{} detected: {errors}",
-        if n == 1 { "" } else { "s" }
-    ))
+        .collect();
+    validation_refusal(errors)
 }
 
 /// Refuse a batch or transaction request whose counts fall outside the
