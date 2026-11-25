@@ -109,9 +109,9 @@ on:
       commit:
         description: 'With dry_run only: rehearse this commit (full SHA) before it is tagged. It must be on main or be the head of the release PR. The tag is the one it will get.'
         default: ''
-  # release-rehearsal.yml calls this workflow with the same inputs. The
-  # image is a string here (workflow_call has no choice type); the gate's
-  # allowlist is what enforces it either way.
+  # release-publish.yml and release-rehearsal.yml call this workflow with
+  # the same inputs. The image is a string here (workflow_call has no
+  # choice type); the gate's allowlist is what enforces it either way.
   workflow_call:
     inputs:
       tag:
@@ -126,6 +126,17 @@ on:
       commit:
         type: string
         default: ''
+    # release-publish.yml verifies and promotes the candidate with these.
+    outputs:
+      digest:
+        description: 'Index digest of the published candidate (empty for a dry run)'
+        value: ${{ jobs.publish-candidate.outputs.digest }}
+      candidate:
+        description: 'The candidate tag, sha-<commit> (empty for a dry run)'
+        value: ${{ jobs.publish-candidate.outputs.candidate }}
+      sha:
+        description: 'The commit the candidate was built from'
+        value: ${{ jobs.gate.outputs.sha }}
 
 # Nothing is committed, so no write scope on the repo is needed.
 permissions:

@@ -274,11 +274,10 @@ branch, and merge it with no merge to `main` in between. Merging it creates
 the tag `vX.Y.Z` on the merge commit and a draft GitHub release whose body
 is the changelog section. If the tag already existed on another commit,
 release-please keeps it and the run fails; do not publish that tag or its
-draft release. Then publish as for a tag pushed by hand: steps 3 to 5,
-`promote-image` for the container images, and "Releasing to crates.io"
-below. Publish the draft release when
-the promotions are done, with `gh release edit vX.Y.Z --draft=false
---latest`.
+draft release. Then dispatch `release-publish.yml` with the tag
+("Publishing with release-publish.yml" below). The manual procedure of
+steps 3 to 5, `promote-image` and "Releasing to crates.io" stays for
+recovery.
 
 A `v*` tag made by hand also stops releases. On a commit on `main`, at or
 above the release PR's version, it makes the first job refuse every release
@@ -319,6 +318,115 @@ One-time setup, before `release.yml` does anything:
   id (the App's settings page, "Client ID"). Until it is set, every job of
   `release.yml` is skipped, so `release.yml` can be on `main` before the
   rest of the setup. Set it only after `release-pr` is a required check.
+
+### Publishing with release-publish.yml
+
+Merging the release PR creates the tag and the draft release, and nothing
+is published. A maintainer then dispatches `release-publish.yml` from `main`
+with the tag:
+
+```
+gh workflow run release-publish.yml --ref main -f tag=vX.Y.Z
+```
+
+What maintainers do for a release, in order:
+
+1. Merge a PR that names the version in the upgrade manual ("The release PR"
+   above). This push to `main` rebuilds the release PR.
+2. Wait until `release-pr` passes on the release PR.
+3. Review the release PR: the version, the changelog, the migration freeze,
+   and the manual. Approve it and queue it while no other PR is queued.
+4. If crates changed, run `devtools/release-dry-run --crates` on the release
+   commit. No workflow rehearses the package step of `release-crates`.
+5. Dispatch `release-publish.yml` from `main` with the tag, on a day when a
+   second maintainer can approve.
+6. A second maintainer approves each wave.
+7. Read the draft release, add the highlights, and publish it with the `gh
+   release edit` command in the summary of the `notes` job.
+
+The image builds keep their artifacts for one day, so the first approvals
+must come within a day of the dispatch. The run does what steps 3 to 5 and
+the container release do by hand:
+
+1. `release-image` for each backend image, `release-dev-image` and
+   `npm-publish`, called with the tag.
+2. One verify job per artifact. For each backend candidate and the dev image:
+   the revision and version labels, the keyless signature (from
+   `release-image`, `release-dev-image` or `sign-image` on `main`, in
+   `ExtendDB/extenddb`), and `extenddb version`. For npm: all six packages
+   have the version under the `candidate` dist-tag, and `@extenddb/dev@X.Y.Z`
+   installs and starts in memory and file mode.
+3. `promote-image` for each backend image, after that image's verify job,
+   with the digest its release run returned. `latest` moves only when the tag
+   is the highest `vX.Y.Z` tag whose commit is on `main`.
+4. `npm-latest` moves `latest` on the six npm packages, after the npm verify
+   job, when `latest` moves.
+5. `release-crates`, after the PostgreSQL image is promoted.
+6. `notes` writes the behavior changes, the image digests read back from
+   Docker Hub and the `cosign verify` command into the draft release, between
+   two HTML comment markers, so a rerun replaces its own block. It does not
+   edit a published release.
+
+A failure in one artifact stops that artifact's later jobs and `notes`. A
+PostgreSQL image failure also stops `crates`, because its gate reads the
+promoted `extenddb-postgres:X.Y.Z`. A higher `vX.Y.Z` tag on `main`, a stray
+one included, keeps `latest` where it is on every registry; the run still
+ends green, and the `target` job shows a warning.
+
+Approvals. All four environments have `prevent_self_review`, which excludes
+the run's original actor, the dispatcher, also on a rerun. A maintainer who
+reruns the run can approve it. So every publish needs two people: the
+dispatcher and an approver. Repository admins can bypass `dockerhub`, `ghcr`
+and `npm` until the setup below turns that off; `crates-io` allows no
+bypass. GitHub asks once for the jobs that wait at the
+same moment, and one review can approve several environments. An approver
+who waits until each wave is complete gives 5 reviews: the candidates and
+npm (`dockerhub`, `npm`), propagation (`ghcr`), promotion and npm `latest`
+(`dockerhub`, `npm`), the mirrors (`ghcr`), and crates.io (`crates-io`).
+Builds finish minutes apart, so answering each job as it arrives takes more.
+
+Recovery. "Re-run failed jobs" on the same run finishes a release while the
+build artifacts exist (one day). `npm-publish` skips a package version that
+is on npm with the same contents, so a rerun also finishes a partial npm
+publish. A new dispatch finishes a release only if nothing was published
+yet: `release-image` refuses a candidate that its run did not build, and
+`npm-publish` refuses a version that is on npm with other contents, which
+rebuilt binaries can give. Otherwise finish by hand: `promote-image` with
+the digest and candidate tag from the run's summary, the `npm dist-tag`
+commands of step 5 of the npm flow, and "Releasing to crates.io" below.
+
+Partial releases. Once the first wave (`dockerhub` and `npm`) is approved,
+the backend and npm candidates and the dev image, with `latest`, are
+public. A verify job that finds a defect stops only its own artifact's
+promotion, and the version is then released in part. The tag cannot move,
+so the next release fixes the defect, and the upgrade manual records which
+artifacts of the version were published.
+
+Setup before the first dispatch:
+
+- npm and crates.io match a trusted publisher against the workflow that was
+  dispatched, which is `release-publish.yml`. Add a second trusted publisher
+  to each of the six npm packages: repository `ExtendDB/extenddb`, workflow
+  `release-publish.yml`, environment `npm`, allowed actions `npm publish` and
+  `npm dist-tag`. npm gives an entry created after 2026-09-03 only `npm
+  stage publish` until these two are selected. An npm entry expires when nothing
+  publishes through it within two days of its creation, so add the npm
+  entries on the day of the first dispatch. Add one to each crate as well:
+  workflow `release-publish.yml`, environment `crates-io`. The existing
+  entries stay, so the manual dispatches keep working.
+- Clear "Allow administrators to bypass configured protection rules" on the
+  `dockerhub`, `ghcr` and `npm` environments (`can_admins_bypass: false`);
+  `crates-io` has it off already. All four required reviewers are repository
+  admins, so with the bypass on, one of them can publish the images and the
+  npm packages alone.
+- The AWS roles `ExtendDBDockerHubPublisher` and
+  `ExtendDBEcrPublicGitHubPublisher` trust the `dockerhub` and `ghcr`
+  environments through the OIDC `sub` claim,
+  `repo:ExtendDB/extenddb:environment:<name>`. A called job has the same
+  `sub`, and IAM cannot match the claims that name a workflow file, so the
+  trust policies do not change. If the repository later opts in to immutable
+  subject claims, `sub` changes for every workflow and both policies must
+  change with it.
 
 ## Releasing to crates.io
 

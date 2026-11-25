@@ -1,0 +1,607 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Publishes one release from an existing tag vX.Y.Z on main: it builds and
+# publishes the three backend image candidates, the dev image and the npm
+# candidates, checks each of them, promotes the backend images, moves npm
+# `latest`, publishes the crates to crates.io, and adds the published
+# artifacts to the draft release. release.yml creates the tag and the draft
+# release when the release PR merges and publishes nothing. A maintainer
+# then dispatches this workflow from main with the tag. packaging/README.md,
+# "Publishing with release-publish.yml", has the steps and the setup.
+#
+# Why a dispatch: main merges through a merge queue, so the actor of a push
+# run on main is github-merge-queue[bot], and prevent_self_review would
+# exclude nobody. The actor of this run is the maintainer who dispatched
+# it. All four environments (dockerhub, ghcr, npm, crates-io) have
+# prevent_self_review, which excludes the run's original actor, the
+# dispatcher, also on a rerun. A maintainer who reruns the run can approve
+# it. So every publish needs two people: the dispatcher and an approver.
+# Repository admins can bypass dockerhub, ghcr and npm until the one-time
+# setup in packaging/README.md turns that off; crates-io allows no bypass.
+#
+# Approvals: GitHub asks once for the jobs of a run that wait at the same
+# moment, and one review can approve several environments. An approver who
+# waits until each wave is complete gives 5 reviews:
+#   1. dockerhub and npm: the four image candidates and the npm candidates
+#   2. ghcr: each image's propagation to GHCR and ECR Public
+#   3. dockerhub and npm: the three promotions and npm `latest`
+#   4. ghcr: the promotions to the mirrors
+#   5. crates-io: the crates.io publish
+# Builds finish minutes apart, so answering each job as it arrives takes
+# more reviews. The image builds keep their artifacts for 1 day, so wave 1
+# must be approved within a day of the dispatch. Dispatch when approvers are
+# available.
+#
+# Jobs:
+#   target             Checks the tag: strict vX.Y.Z, exists, commit on main.
+#                      move_latest is true only when the tag is the highest
+#                      vX.Y.Z tag whose commit is on main; otherwise the job
+#                      warns and the run publishes without moving latest.
+#   image-<backend>,   Call release-image (once per backend image),
+#   dev-image, npm     release-dev-image and npm-publish with the tag.
+#   verify-<backend>,  .github/actions/verify-image on the digest that the
+#   verify-dev         image's run returned. Anonymous reads only.
+#   verify-npm         Installs @extenddb/dev@X.Y.Z and starts it in memory
+#                      and file mode.
+#   promote-<backend>  Calls promote-image with that digest. Needs only its
+#                      own image and verify job.
+#   npm-latest         Moves `latest` on the six npm packages, when
+#                      move_latest. Needs verify-npm.
+#   crates             Calls release-crates after promote-postgres, whose
+#                      promoted image the crates gate reads.
+#   notes              Runs when every other job succeeded. Writes the
+#                      published artifacts into the draft release.
+# A failure in one artifact stops that artifact's later jobs and notes. A
+# PostgreSQL image failure also stops crates, because its gate reads the
+# promoted extenddb-postgres:X.Y.Z.
+#
+# Recovery: "Re-run failed jobs" on the same run finishes a release while
+# the build artifacts exist (1 day). npm-publish skips a package version
+# that is on npm with the same contents, so a rerun also finishes a partial
+# npm publish. A new dispatch finishes a release only if nothing was
+# published yet: release-image refuses a candidate that its run did not
+# build, and npm-publish refuses a version that is on npm with other
+# contents, which rebuilt binaries can give. Otherwise a maintainer finishes
+# the release with the manual procedure in packaging/README.md.
+#
+# Partial releases: once wave 1 is approved, the backend and npm candidates
+# and the dev image, with `latest`, are public. A verify job that finds a
+# defect stops only its own artifact's promotion, and the version is then
+# released in part. The tag cannot move, so the next release fixes the
+# defect, and the upgrade manual records which artifacts of the version were
+# published.
+#
+# Trusted publishers: npm and crates.io match a trusted publisher against
+# the file of the workflow that was dispatched, which is this one. Each of
+# the six npm packages needs an entry for release-publish.yml with
+# environment npm and the allowed actions `npm publish` and `npm dist-tag`,
+# and each crate needs one with environment crates-io. The entries for
+# npm-publish.yml and release-crates.yml stay, for the manual procedure. The
+# AWS roles trust the dockerhub and ghcr environments through the OIDC `sub`
+# claim, which a called job keeps, so they do not change.
+
+name: release-publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag on main to publish, vX.Y.Z'
+        required: true
+
+permissions:
+  contents: read
+
+# One release at a time. Each called workflow also has its own group.
+concurrency:
+  group: release-publish
+  cancel-in-progress: false
+
+jobs:
+  target:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.target.outputs.tag }}
+      version: ${{ steps.target.outputs.version }}
+      sha: ${{ steps.target.outputs.sha }}
+      move_latest: ${{ steps.target.outputs.move_latest }}
+    steps:
+      - name: Gate - the run comes from main
+        # A dispatch from another branch runs that branch's copy of this
+        # file. The environments' branch rule would stop it only at the
+        # first approval, after the builds.
+        run: |
+          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+            echo "::error::dispatch release-publish from main, not from ${GITHUB_REF}"
+            exit 1
+          fi
+
+      - name: Check out main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check the tag; decide whether it moves latest
+        id: target
+        env:
+          # A dispatch input is untrusted; it reaches the shell only through
+          # the environment. Each called workflow's gate checks the tag again.
+          RAW_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ "$RAW_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "::error::'${RAW_TAG}' is not vMAJOR.MINOR.PATCH"; exit 1; }
+          git fetch --no-tags origin main
+          git fetch --no-tags origin "refs/tags/${RAW_TAG}:refs/tags/${RAW_TAG}" \
+            || { echo "::error::tag ${RAW_TAG} does not exist on origin"; exit 1; }
+          SHA=$(git rev-list -n 1 "refs/tags/${RAW_TAG}")
+          git merge-base --is-ancestor "$SHA" origin/main \
+            || { echo "::error::${RAW_TAG} (${SHA}) is not on main"; exit 1; }
+          # `latest` moves only to the highest vX.Y.Z tag whose commit is on
+          # main. Anyone with write access can create a v* tag on any
+          # commit, so a tag that is not on main does not count.
+          git fetch --no-tags origin '+refs/tags/v*:refs/tags/v*'
+          HIGHEST=""
+          while read -r t; do
+            if git merge-base --is-ancestor "$(git rev-list -n 1 "refs/tags/${t}")" origin/main; then
+              HIGHEST="$t"
+              break
+            fi
+          done < <(git tag -l 'v*' | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -rV)
+          MOVE_LATEST=false
+          [[ "$HIGHEST" == "$RAW_TAG" ]] && MOVE_LATEST=true
+          # A higher tag on main, a stray one included, keeps latest where
+          # it is on every registry, and the run still ends green.
+          [[ "$MOVE_LATEST" == true ]] \
+            || echo "::warning::${HIGHEST} is a higher release tag on main than ${RAW_TAG}; latest does not move on any registry"
+          {
+            echo "tag=$RAW_TAG"
+            echo "version=${RAW_TAG#v}"
+            echo "sha=$SHA"
+            echo "move_latest=$MOVE_LATEST"
+          } >> "$GITHUB_OUTPUT"
+          echo "### Publishing ${RAW_TAG} (${SHA}); latest moves: ${MOVE_LATEST}" >> "$GITHUB_STEP_SUMMARY"
+
+  # Wave 1 (dockerhub, npm), then wave 2 (ghcr) inside each image run.
+  image-postgres:
+    needs: target
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+      attestations: write
+    uses: ./.github/workflows/release-image.yml
+    with:
+      tag: ${{ needs.target.outputs.tag }}
+      image: extenddb-postgres
+
+  image-mongodb:
+    needs: target
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+      attestations: write
+    uses: ./.github/workflows/release-image.yml
+    with:
+      tag: ${{ needs.target.outputs.tag }}
+      image: extenddb-mongodb
+
+  image-cassandra:
+    needs: target
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+      attestations: write
+    uses: ./.github/workflows/release-image.yml
+    with:
+      tag: ${{ needs.target.outputs.tag }}
+      image: extenddb-cassandra
+
+  dev-image:
+    needs: target
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+      attestations: write
+    uses: ./.github/workflows/release-dev-image.yml
+    with:
+      tag: ${{ needs.target.outputs.tag }}
+
+  npm:
+    needs: target
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/npm-publish.yml
+    with:
+      tag: ${{ needs.target.outputs.tag }}
+
+  # The manual tests of the candidates (promote-image.yml's release flow,
+  # step 2, and packaging/README.md, step 4 of the npm flow), one job per
+  # artifact. No credential: every registry read is anonymous.
+  verify-postgres:
+    needs: [target, image-postgres]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out main (the composite action)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/verify-image
+        with:
+          image: extenddb-postgres
+          digest: ${{ needs.image-postgres.outputs.digest }}
+          version: ${{ needs.target.outputs.version }}
+          commit: ${{ needs.target.outputs.sha }}
+          signer-workflows: release-image|sign-image
+
+  verify-mongodb:
+    needs: [target, image-mongodb]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out main (the composite action)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/verify-image
+        with:
+          image: extenddb-mongodb
+          digest: ${{ needs.image-mongodb.outputs.digest }}
+          version: ${{ needs.target.outputs.version }}
+          commit: ${{ needs.target.outputs.sha }}
+          signer-workflows: release-image|sign-image
+
+  verify-cassandra:
+    needs: [target, image-cassandra]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out main (the composite action)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/verify-image
+        with:
+          image: extenddb-cassandra
+          digest: ${{ needs.image-cassandra.outputs.digest }}
+          version: ${{ needs.target.outputs.version }}
+          commit: ${{ needs.target.outputs.sha }}
+          signer-workflows: release-image|sign-image
+
+  # The dev image publishes its version tag and `latest` in its own run, so
+  # this check comes after that and gates only the notes.
+  verify-dev:
+    needs: [target, dev-image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out main (the composite action)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/verify-image
+        with:
+          image: extenddb-dev
+          digest: ${{ needs.dev-image.outputs.digest }}
+          version: ${{ needs.target.outputs.version }}
+          commit: ${{ needs.target.outputs.sha }}
+          signer-workflows: release-dev-image|sign-image
+
+  verify-npm:
+    needs: [target, npm]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      VERSION: ${{ needs.target.outputs.version }}
+    steps:
+      - name: Set up node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Verify the npm candidates (all six exist; install; both storage modes)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/npm-smoke" && cd "$RUNNER_TEMP/npm-smoke"
+          npm init -y > /dev/null
+          # The registry's CDN serves package metadata up to 5 minutes old,
+          # so a version published seconds ago may not install at once.
+          PLATFORM="@extenddb/$(node -p 'process.platform + "-" + process.arch')"
+          installed() { [[ "$(jq -r .version "node_modules/$1/package.json" 2>/dev/null)" == "$VERSION" ]]; }
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            rm -rf node_modules package-lock.json
+            if npm install --prefer-online --no-fund --no-audit "@extenddb/dev@${VERSION}" \
+                && installed @extenddb/dev && installed "$PLATFORM"; then
+              break
+            fi
+            [[ $i == 10 ]] && { echo "::error::@extenddb/dev@${VERSION} with ${PLATFORM} did not install"; exit 1; }
+            echo "@extenddb/dev@${VERSION} with ${PLATFORM} did not install; retrying in 30 seconds"
+            sleep 30
+          done
+          # npm-latest moves `latest` on the launcher and on every platform
+          # package it depends on, so each must exist at the version. The
+          # dist-tags endpoint is not cached; npm-publish publishes each
+          # package under `candidate`.
+          for pkg in $(jq -r '.optionalDependencies | keys[]' node_modules/@extenddb/dev/package.json); do
+            GOT=$(npm dist-tag ls "${pkg}" | awk -F': ' '$1=="candidate"{print $2}')
+            [[ "$GOT" == "$VERSION" ]] \
+              || { echo "::error::${pkg} candidate is '${GOT}', not ${VERSION}"; exit 1; }
+          done
+          cat > smoke.js <<'EOF'
+          const { start } = require("@extenddb/dev");
+          const fs = require("fs");
+          const os = require("os");
+          const path = require("path");
+          async function healthy(server) {
+            const res = await fetch(`${server.endpoint}/health`);
+            if (!res.ok) throw new Error(`/health answered ${res.status}`);
+          }
+          (async () => {
+            const memory = await start({ memory: true });
+            await healthy(memory);
+            await memory.stop();
+            const dbPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "edb-")), "dev.db");
+            for (const run of [1, 2]) {
+              const file = await start({ dbPath });
+              await healthy(file);
+              await file.stop();
+            }
+            if (!fs.existsSync(dbPath)) throw new Error("file mode left no database file");
+            console.log("npm candidate: memory and file mode start, answer /health and stop");
+          })().catch((e) => { console.error(e); process.exit(1); });
+          EOF
+          node smoke.js
+          echo "### \`@extenddb/dev@${VERSION}\` verified: memory and file mode" >> "$GITHUB_STEP_SUMMARY"
+
+  # Wave 3 (dockerhub) and wave 4 (ghcr) inside each promotion.
+  promote-postgres:
+    needs: [target, image-postgres, verify-postgres]
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    uses: ./.github/workflows/promote-image.yml
+    with:
+      version: ${{ needs.target.outputs.version }}
+      candidate_tag: ${{ needs.image-postgres.outputs.candidate }}
+      expected_digest: ${{ needs.image-postgres.outputs.digest }}
+      move_latest: ${{ needs.target.outputs.move_latest == 'true' }}
+      image: extenddb-postgres
+
+  promote-mongodb:
+    needs: [target, image-mongodb, verify-mongodb]
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    uses: ./.github/workflows/promote-image.yml
+    with:
+      version: ${{ needs.target.outputs.version }}
+      candidate_tag: ${{ needs.image-mongodb.outputs.candidate }}
+      expected_digest: ${{ needs.image-mongodb.outputs.digest }}
+      move_latest: ${{ needs.target.outputs.move_latest == 'true' }}
+      image: extenddb-mongodb
+
+  promote-cassandra:
+    needs: [target, image-cassandra, verify-cassandra]
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    uses: ./.github/workflows/promote-image.yml
+    with:
+      version: ${{ needs.target.outputs.version }}
+      candidate_tag: ${{ needs.image-cassandra.outputs.candidate }}
+      expected_digest: ${{ needs.image-cassandra.outputs.digest }}
+      move_latest: ${{ needs.target.outputs.move_latest == 'true' }}
+      image: extenddb-cassandra
+
+  # Wave 3 (npm). Trusted publishing moves a dist-tag from npm 11.21.0 on
+  # the 11 line, when the package's entry for this workflow allows
+  # `npm dist-tag`.
+  npm-latest:
+    needs: [target, verify-npm]
+    if: needs.target.outputs.move_latest == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      NPM_VERSION: 11.21.3
+    steps:
+      - name: Check out the tagged commit (the package list)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.target.outputs.sha }}
+          persist-credentials: false
+
+      - name: Set up node against the public registry
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install the pinned npm
+        run: |
+          set -euo pipefail
+          npm install -g "npm@${NPM_VERSION}"
+          [[ "$(npm --version)" == "$NPM_VERSION" ]] \
+            || { echo "::error::npm is $(npm --version), not ${NPM_VERSION}"; exit 1; }
+
+      - name: Move latest on the six packages
+        env:
+          VERSION: ${{ needs.target.outputs.version }}
+        run: |
+          set -euo pipefail
+          for pkg in $(jq -r '.optionalDependencies | keys[]' packaging/npm/package.json) @extenddb/dev; do
+            npm dist-tag add "${pkg}@${VERSION}" latest
+          done
+          # Read back through the dist-tags endpoint, which the registry's
+          # CDN does not cache.
+          for pkg in $(jq -r '.optionalDependencies | keys[]' packaging/npm/package.json) @extenddb/dev; do
+            GOT=$(npm dist-tag ls "${pkg}" | awk -F': ' '$1=="latest"{print $2}')
+            [[ "$GOT" == "$VERSION" ]] || { echo "::error::${pkg} latest is '${GOT}', expected ${VERSION}"; exit 1; }
+          done
+
+  # Wave 5 (crates-io). Its gate reads the promoted extenddb-postgres:X.Y.Z
+  # image.
+  crates:
+    needs: [target, promote-postgres]
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/release-crates.yml
+    with:
+      tag: ${{ needs.target.outputs.tag }}
+
+  # Writes what was published into the draft release, between two markers,
+  # so a rerun replaces its own block. A maintainer reads the draft, adds
+  # any notes, and publishes it.
+  notes:
+    needs:
+      - target
+      - image-postgres
+      - image-mongodb
+      - image-cassandra
+      - dev-image
+      - verify-postgres
+      - verify-mongodb
+      - verify-cassandra
+      - verify-dev
+      - verify-npm
+      - promote-postgres
+      - promote-mongodb
+      - promote-cassandra
+      - npm-latest
+      - crates
+    # npm-latest is skipped when latest does not move. A skipped job makes
+    # every job after it skip too, unless the job's `if` has a status
+    # function, so this condition names each result it needs.
+    if: >-
+      ${{ !cancelled() &&
+          needs.verify-postgres.result == 'success' &&
+          needs.verify-mongodb.result == 'success' &&
+          needs.verify-cassandra.result == 'success' &&
+          needs.verify-dev.result == 'success' &&
+          needs.verify-npm.result == 'success' &&
+          needs.promote-postgres.result == 'success' &&
+          needs.promote-mongodb.result == 'success' &&
+          needs.promote-cassandra.result == 'success' &&
+          needs.crates.result == 'success' &&
+          (needs.npm-latest.result == 'success' ||
+           (needs.npm-latest.result == 'skipped' && needs.target.outputs.move_latest == 'false')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write   # edit the draft release
+    steps:
+      - name: Check out the tagged commit (upgrade manual)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.target.outputs.sha }}
+          persist-credentials: false
+
+      - name: Write the published artifacts into the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.target.outputs.tag }}
+          VERSION: ${{ needs.target.outputs.version }}
+          MOVE_LATEST: ${{ needs.target.outputs.move_latest }}
+          POSTGRES: ${{ needs.image-postgres.outputs.digest }}
+          MONGODB: ${{ needs.image-mongodb.outputs.digest }}
+          CASSANDRA: ${{ needs.image-cassandra.outputs.digest }}
+          DEV: ${{ needs.dev-image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # Each digest is read back from Docker Hub by version tag, so the
+          # notes say what users pull, not what the run meant to publish.
+          for pair in "extenddb-postgres=$POSTGRES" "extenddb-mongodb=$MONGODB" \
+                      "extenddb-cassandra=$CASSANDRA" "extenddb-dev=$DEV"; do
+            image="${pair%%=*}"; want="${pair#*=}"
+            got=$(skopeo inspect --no-creds --format '{{.Digest}}' "docker://docker.io/extenddb/${image}:${VERSION}")
+            [[ "$got" == "$want" ]] \
+              || { echo "::error::docker.io/extenddb/${image}:${VERSION} is ${got}, not ${want}"; exit 1; }
+          done
+          python3 - > notes.md <<'EOF'
+          import os, re
+          v, tag = os.environ["VERSION"], os.environ["TAG"]
+          def slug(heading):
+              s = heading.strip().lower().replace("`", "")
+              s = re.sub(r"[^\w\- ]", "", s)
+              return s.replace(" ", "-")
+          changes = []
+          with open("docs/manuals/07-upgrade-manual.md", encoding="utf-8") as f:
+              for line in f:
+                  m = re.match(r"^### (" + re.escape(tag) + r": .*)$", line.rstrip("\n"))
+                  if m:
+                      changes.append(m.group(1))
+          out = ["## Behavior changes", ""]
+          if changes:
+              out += [f"- [{c}](https://github.com/ExtendDB/extenddb/blob/{tag}/docs/manuals/07-upgrade-manual.md#{slug(c)})" for c in changes]
+          else:
+              out.append(f"None: the upgrade manual has no `{tag}:` entry under Behavior Changes by Release.")
+          out += ["", "## Container images", "", "| image | tags | index digest |", "|---|---|---|"]
+          for name, env in (("extenddb-postgres", "POSTGRES"), ("extenddb-mongodb", "MONGODB"),
+                            ("extenddb-cassandra", "CASSANDRA"), ("extenddb-dev", "DEV")):
+              out.append(f"| `docker.io/extenddb/{name}` | `{v}` | `{os.environ[env]}` |")
+          out += ["", "The same digests are on `ghcr.io/extenddb/` and `public.ecr.aws/extenddb/`.", "",
+                  "## npm packages", "", f"`@extenddb/dev@{v}` and its five platform packages.", "",
+                  "## Verifying signatures", "", "```console",
+                  "cosign verify \\",
+                  "  --certificate-identity-regexp '^https://github\\.com/ExtendDB/extenddb/\\.github/workflows/(release-image|sign-image)\\.yml@refs/heads/main$' \\",
+                  "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\",
+                  "  --certificate-github-workflow-repository ExtendDB/extenddb \\",
+                  f"  docker.io/extenddb/extenddb-postgres:{v}",
+                  "```", "",
+                  "For `extenddb-dev`, the workflow is `release-dev-image` instead of `release-image`."]
+          print("\n".join(out))
+          EOF
+          cat notes.md >> "$GITHUB_STEP_SUMMARY"
+
+          # A published release is left as it is; its notes are a
+          # maintainer's. The block above is in the job summary.
+          DRAFT=$(gh release view "$TAG" --json isDraft --jq .isDraft) \
+            || { echo "::error::there is no release for ${TAG}, or gh could not read it; the notes this job would add are in the job summary"; exit 1; }
+          if [[ "$DRAFT" != "true" ]]; then
+            echo "::error::release ${TAG} is published, so this job does not edit it. The notes it would add are in the job summary."
+            exit 1
+          fi
+          gh release view "$TAG" --json body --jq .body > body.md
+          python3 - <<'EOF'
+          import sys
+          begin = "<!-- release-publish.yml: begin -->"
+          end = "<!-- release-publish.yml: end -->"
+          body = open("body.md", encoding="utf-8").read()
+          block = begin + "\n\n" + open("notes.md", encoding="utf-8").read().strip("\n") + "\n\n" + end
+          if body.count(begin) == 1 and body.count(end) == 1 and body.index(begin) < body.index(end):
+              before, rest = body.split(begin)
+              after = rest.split(end)[1]
+              new = before + block + after
+          elif begin in body or end in body:
+              print("::error::the draft release's release-publish.yml markers are not one begin before one end; fix the body by hand and rerun")
+              sys.exit(1)
+          else:
+              new = body.rstrip("\n") + "\n\n" + block + "\n"
+          open("new-body.md", "w", encoding="utf-8").write(new)
+          EOF
+          gh release edit "$TAG" --notes-file new-body.md
+          LATEST_FLAG="--latest"
+          [[ "$MOVE_LATEST" == "true" ]] || LATEST_FLAG="--latest=false"
+          {
+            echo ""
+            echo "### Draft release ${TAG} updated"
+            echo ""
+            echo "Read it, add any notes, and publish it: \`gh release edit ${TAG} --draft=false ${LATEST_FLAG}\`."
+          } >> "$GITHUB_STEP_SUMMARY"

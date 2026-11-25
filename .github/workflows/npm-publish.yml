@@ -4,8 +4,9 @@
 #
 # This workflow deliberately stops at the candidate. Every package is published
 # under the `candidate` dist-tag, never `latest`, so nothing a user installs by
-# default can come from an unverified run. Promotion is a maintainer step
-# recorded in packaging/README.md:
+# default can come from an unverified run. Promotion is a separate step:
+# the npm-latest job of release-publish.yml, after its verify-npm job, or a
+# maintainer by hand as packaging/README.md records:
 #
 #   npm dist-tag add @extenddb/dev@<version> latest   (and one per platform pkg)
 #
@@ -82,7 +83,11 @@
 #   Workflow filename:    npm-publish.yml
 #   Environment:          npm
 # Every field is matched exactly, the workflow filename included, so renaming
-# this file breaks publishing until the six entries are updated.
+# this file breaks publishing until the six entries are updated. When
+# release-publish.yml calls this workflow, npm matches the calling file
+# instead, so each package also has an entry with workflow filename
+# release-publish.yml, environment npm, and the allowed actions `npm publish`
+# and `npm dist-tag`.
 #
 # npm requires a package to exist before a trusted publisher can be configured,
 # so all six were first published as 0.0.0 placeholders under the `placeholder`
@@ -103,7 +108,8 @@ on:
       commit:
         description: 'With dry_run only: rehearse this commit (full SHA) before it is tagged. It must be on main or be the head of the release PR. The tag is the one it will get.'
         default: ''
-  # release-rehearsal.yml calls this workflow with the same inputs.
+  # release-publish.yml and release-rehearsal.yml call this workflow with
+  # the same inputs.
   workflow_call:
     inputs:
       tag:
@@ -329,26 +335,77 @@ jobs:
 
       # Trusted publishing needs npm >= 11.5.1 for the OIDC exchange, and the
       # Node 22 image bundles npm 10. Without this the publish falls back to
-      # looking for a token and fails with ENEEDAUTH.
-      - name: Upgrade npm to a trusted-publishing capable version
+      # looking for a token and fails with ENEEDAUTH. The version is exact,
+      # because this job holds a token that can publish all six packages.
+      - name: Install the pinned npm
+        env:
+          NPM_VERSION: 11.21.3
         run: |
           set -euo pipefail
-          npm install -g npm@11
-          npm --version
+          npm install -g "npm@${NPM_VERSION}"
+          [[ "$(npm --version)" == "$NPM_VERSION" ]] \
+            || { echo "::error::npm is $(npm --version), not ${NPM_VERSION}"; exit 1; }
 
       - name: Download the built binaries
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           path: artifacts/
           # Only this workflow's binaries: a caller's run can hold other
-          # workflows' artifacts, such as the image tarballs.
+          # workflows' artifacts, such as the image tarballs. Each lands in
+          # artifacts/bin-<platform>/.
           pattern: bin-*
+
+      # "Re-run failed jobs" after a partial publish runs both loops below
+      # from the start. A version that is already on npm with the same
+      # tarball is skipped, and one with another tarball fails the job.
+      # npm pack makes the same tarball that npm publish uploads, with fixed
+      # file times, so the two integrity values compare. A new run builds
+      # the binaries again, so its tarballs need not match.
+      - name: Write the publish helper
+        run: |
+          cat > "$RUNNER_TEMP/publish-once.sh" <<'EOF'
+          # publish_once DIR NAME: publish DIR as NAME@VERSION under the
+          # candidate dist-tag, unless npm already has NAME@VERSION.
+          publish_once() {
+            local dir=$1 name=$2 packed want got i
+            packed=$(npm pack --dry-run --json "$dir")
+            [[ "$(jq -r '.[0].id' <<< "$packed")" == "${name}@${VERSION}" ]] \
+              || { echo "::error::${dir} packs as $(jq -r '.[0].id' <<< "$packed"), not ${name}@${VERSION}"; return 1; }
+            want=$(jq -r '.[0].integrity' <<< "$packed")
+            # E404 means npm has no such version. Any other failed read is
+            # retried.
+            for i in 1 2 3 4 5 6; do
+              if got=$(npm view --json "${name}@${VERSION}" dist.integrity); then
+                got=$(jq -r . <<< "$got")
+                [[ -n "$got" ]] || { echo "::error::npm has ${name}@${VERSION} without dist.integrity"; return 1; }
+                break
+              fi
+              if [[ "$(jq -r '.error.code? // empty' <<< "$got" 2>/dev/null)" == E404 ]]; then
+                got=""
+                break
+              fi
+              [[ $i == 6 ]] && { echo "::error::could not read ${name}@${VERSION} from npm"; return 1; }
+              echo "Reading ${name}@${VERSION} from npm failed; retrying in 20 seconds"
+              sleep 20
+            done
+            if [[ -z "$got" ]]; then
+              echo "Publishing ${name}@${VERSION} (candidate)"
+              npm publish --provenance --access public --tag candidate "$dir"
+            elif [[ "$got" == "$want" ]]; then
+              echo "::notice::${name}@${VERSION} is already on npm with the same contents; not published again"
+            else
+              echo "::error::${name}@${VERSION} is already on npm with other contents (npm has ${got}, this run packs ${want})"
+              return 1
+            fi
+          }
+          EOF
 
       - name: Publish the five platform packages (candidate dist-tag)
         env:
           VERSION: ${{ needs.gate.outputs.version }}
         run: |
           set -euo pipefail
+          source "$RUNNER_TEMP/publish-once.sh"
 
           # The platform list is derived from the launcher's
           # optionalDependencies, the single source of truth, so the publish
@@ -376,8 +433,7 @@ jobs:
             jq --arg v "$VERSION" '.version = $v' "${dir}/package.json" > "${dir}/package.json.tmp"
             mv "${dir}/package.json.tmp" "${dir}/package.json"
 
-            echo "Publishing @extenddb/${pkg}@${VERSION} (candidate)"
-            npm publish --provenance --access public --tag candidate "${dir}"
+            publish_once "${dir}" "@extenddb/${pkg}"
           done
 
       - name: Publish the launcher package (candidate dist-tag)
@@ -385,6 +441,7 @@ jobs:
           VERSION: ${{ needs.gate.outputs.version }}
         run: |
           set -euo pipefail
+          source "$RUNNER_TEMP/publish-once.sh"
           cp LICENSE NOTICE packaging/npm/
           cd packaging/npm
 
@@ -397,5 +454,4 @@ jobs:
           ' package.json > package.json.tmp
           mv package.json.tmp package.json
 
-          echo "Publishing @extenddb/dev@${VERSION} (candidate)"
-          npm publish --provenance --access public --tag candidate
+          publish_once . @extenddb/dev

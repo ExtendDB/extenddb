@@ -74,10 +74,13 @@
 # commit and one toolchain, cargo writes the same bytes into each package.
 # The publish and index jobs compare those bytes.
 #
-# Trigger: manual workflow_dispatch only. A run that a pushed tag starts uses
-# the workflow file of the tagged commit. That file can be older than the
-# reviewed file on main. A dispatch from main runs the current file against
-# an existing tag.
+# Trigger: workflow_dispatch, or workflow_call from release-publish.yml,
+# which a maintainer dispatches. There is no tag trigger: a run that a
+# pushed tag starts uses the workflow file of the tagged commit. That file
+# can be older than the reviewed file on main. A dispatch from main runs the
+# current file against an existing tag. Any public repository can call a
+# public reusable workflow, so the gate first refuses to run outside
+# ExtendDB/extenddb.
 #
 # The release depends on two repository settings. packaging/README.md,
 # "Repository settings for crates.io", gives the commands that read them
@@ -102,7 +105,10 @@
 # to a run of this workflow from any branch. Then select "Require trusted
 # publishing for all new versions". crates.io matches the workflow filename
 # exactly. A rename of this file stops publishing until every crate's entry
-# names the new file.
+# names the new file. When release-publish.yml calls this workflow,
+# crates.io matches the calling file instead, so each crate also has an
+# entry with workflow filename release-publish.yml and environment
+# crates-io.
 
 name: release-crates
 
@@ -111,6 +117,15 @@ on:
     inputs:
       tag:
         description: 'Existing release tag to publish the crates of, e.g. v0.1.15'
+        required: true
+  # release-publish.yml calls this workflow after the PostgreSQL image is
+  # promoted. crates.io matches a trusted publisher against the calling
+  # workflow's file, so each crate carries a second publisher entry for
+  # release-publish.yml (packaging/README.md).
+  workflow_call:
+    inputs:
+      tag:
+        type: string
         required: true
 
 # No job commits anything, so no job needs to write to the repository. The
@@ -140,6 +155,15 @@ jobs:
       publish_count: ${{ steps.plan.outputs.publish_count }}
       first_new: ${{ steps.plan.outputs.first_new }}
     steps:
+      - name: Gate - the run is in ExtendDB/extenddb
+        # A call from another repository runs this file there, with that
+        # repository's checkout. Every later job needs this one.
+        run: |
+          if [[ "$GITHUB_REPOSITORY" != "ExtendDB/extenddb" ]]; then
+            echo "::error::this workflow publishes ExtendDB only, not from ${GITHUB_REPOSITORY}"
+            exit 1
+          fi
+
       - name: Gate - the run comes from main
         # A dispatch from another branch runs that branch's copy of this
         # file. The branch rule of the environment would stop it only at
