@@ -388,6 +388,12 @@ Catalog upgrades change the schema; behavior changes alter how the running serve
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
 
+### v1.1.0: UpdateTimeToLive refuses a request that names an attribute other than the enabled one
+
+**What changed.** With TTL enabled on a table, an UpdateTimeToLive that names an attribute other than the enabled one gets `ValidationException` `TimeToLive is active on a different AttributeName: current AttributeName is <name>` (#609). DynamoDB gives that answer in the enable and in the disable form. The comparison is byte-exact: `TTL` is an attribute other than `ttl`. 1.0.0 answered the enable form with `TimeToLive is already enabled`. It served the disable form with 200 on SQLite, PostgreSQL and MongoDB and disabled TTL. On Cassandra the disable is conditional on the enabled attribute, so it got `ResourceInUseException` `Table <name> is not in ACTIVE state` and TTL stayed enabled (read from the code, not measured). A disable that names the enabled attribute is served as in 1.0.0.
+
+**Who is affected.** A client that disables TTL with a name other than the enabled one. It now gets `ValidationException`, TTL stays enabled, and the TTL worker keeps deleting expired items. The client has to send the enabled attribute's name, which DescribeTimeToLive reports. No catalog migration is required.
+
 ### v1.0.0: Cassandra reads and writes at `LOCAL_QUORUM`
 
 **What changed.** The Cassandra backend runs its reads and writes at `LOCAL_QUORUM`. 0.1.15 ran many of them at `ONE`, the driver's default, in each area: items (the reads of GetItem, Query and Scan among them), transactions, TTL, streams, the catalog, IAM and `init`. A read with `ConsistentRead` `false` also runs at `LOCAL_QUORUM`. A lightweight transaction runs Paxos at `LOCAL_SERIAL` and commits at `LOCAL_QUORUM`. 0.1.15 ran many of its lightweight transactions at those levels already, and others, among them the admin user creation and most IAM writes, at the driver's defaults, `SERIAL` and `ONE`. Batches ran at `LOCAL_QUORUM` before and still do. No setting changes these levels (#945).
