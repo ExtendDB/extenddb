@@ -3,11 +3,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Remove the search-inequality-filters Cargo feature from every default list.
 
-Each crate that declares the feature has it in its `default` list, and the
+Each crate that declares the feature has it in its `default` list. Most
 crates take their internal dependencies with default features, so no cargo
-command line compiles it out. Removing it from every `default` list is how
-the feature is compiled out. This script edits the working tree's Cargo.toml
-files that way, then checks with `cargo tree` that nothing in the workspace
+command line compiles it out. The workspace takes extenddb-engine with its
+default features off, so the browser build's crate, extenddb-wasm-adapter,
+names the feature for the engine, core and the SQLite backend itself.
+Removing the feature from every `default` list is how it is compiled out.
+
+This script reads every crates/*/Cargo.toml, refuses to edit any of them
+unless exactly the expected number list the feature in `default`, then
+writes the edits and checks with `cargo tree` that nothing in the workspace
 enables the feature. CI builds, lints and tests the tree it leaves.
 
 Usage: devtools/compile-out-search-inequality-filters
@@ -24,35 +29,47 @@ FEATURE = "search-inequality-filters"
 CRATES = 8
 
 
-def main() -> int:
-    root = Path(__file__).resolve().parent.parent
+def feature_tree(root: Path, *args: str) -> str:
+    return subprocess.run(
+        ["cargo", "tree", "--locked", "-e", "features", *args],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
+def compile_out(root: Path) -> int:
     default = re.compile(r'^default = \[(.*)\]$', re.MULTILINE)
-    edited = []
+    edits = []
     for manifest in sorted(root.glob("crates/*/Cargo.toml")):
         text = manifest.read_text()
         match = default.search(text)
         if match is None or f'"{FEATURE}"' not in match.group(1):
             continue
         kept = [f for f in (e.strip() for e in match.group(1).split(",")) if f and f != f'"{FEATURE}"']
-        text = text[: match.start()] + f"default = [{', '.join(kept)}]" + text[match.end() :]
-        manifest.write_text(text)
-        edited.append(manifest.relative_to(root))
-    if len(edited) != CRATES:
-        print(f"error: expected {CRATES} crates with {FEATURE} in default, edited {edited}", file=sys.stderr)
+        edits.append((manifest, text[: match.start()] + f"default = [{', '.join(kept)}]" + text[match.end() :]))
+    names = [str(m.relative_to(root)) for m, _ in edits]
+    if len(edits) != CRATES:
+        print(
+            f"error: expected {CRATES} crates with {FEATURE} in default, found {len(edits)}: {names}; "
+            "no file was edited",
+            file=sys.stderr,
+        )
         return 1
-    tree = subprocess.run(
-        ["cargo", "tree", "--locked", "--workspace", "-e", "features", "-i", "extenddb-core"],
-        cwd=root,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
+    for manifest, text in edits:
+        manifest.write_text(text)
+    tree = feature_tree(root, "--workspace", "-i", "extenddb-core")
     if f'feature "{FEATURE}"' in tree:
         print(f"error: the workspace still enables {FEATURE}:\n{tree}", file=sys.stderr)
         return 1
-    for manifest in edited:
-        print(f"removed {FEATURE} from the default list of {manifest}")
+    for name in names:
+        print(f"removed {FEATURE} from the default list of {name}")
     return 0
+
+
+def main() -> int:
+    return compile_out(Path(__file__).resolve().parent.parent)
 
 
 if __name__ == "__main__":
