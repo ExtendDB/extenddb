@@ -180,9 +180,10 @@ pub fn expected_values(
 /// (#565). Measured on a table that does not exist, each body twice, in all
 /// three maps: one U+FF11 answers `ResourceNotFoundException` (2026-11-24),
 /// and so does one inside an `NS`, an `L` and an `M` (2026-11-25). Also on
-/// 2026-11-25, `a` then U+FF11 answers the number message for `a1`, and
-/// U+00E9, `1` then U+00E9, U+00B2, U+00BD, U+2160, U+FF0D then `1`, `1`
-/// then U+FF0E then `5`, and U+1D7CF answer it for the value as sent.
+/// 2026-11-25, `a` then U+FF11 answers the number message for `a1`, on its
+/// own and inside an `L`. U+00E9, `1` then U+00E9, U+00B2, U+00BD, U+2160,
+/// U+FF0D then `1`, `1` then U+FF0E then `5`, and U+1D7CF answer it for the
+/// value as sent, and so does U+00E9 inside an `NS`, an `L` and an `M`.
 ///
 /// # Errors
 ///

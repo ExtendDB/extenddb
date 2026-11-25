@@ -279,18 +279,29 @@ fn numbers_are_checked_before_the_operator_checks() {
     ] {
         assert_eq!(msg("EQ", std::slice::from_ref(&digits)), None, "{digits:?}");
     }
-    assert_eq!(msg("EQ", &[n("a\u{ff11}")]), bad("a1"));
-    for raw in [
-        "\u{e9}",
-        "1\u{e9}",
-        "\u{b2}",
-        "\u{bd}",
-        "\u{2160}",
-        "\u{ff0d}1",
-        "1\u{ff0e}5",
-        "\u{1d7cf}",
+    for (value, named) in [
+        (n("a\u{ff11}"), "a1"),
+        (n("\u{e9}"), "\u{e9}"),
+        (n("1\u{e9}"), "1\u{e9}"),
+        (n("\u{b2}"), "\u{b2}"),
+        (n("\u{bd}"), "\u{bd}"),
+        (n("\u{2160}"), "\u{2160}"),
+        (n("\u{ff0d}1"), "\u{ff0d}1"),
+        (n("1\u{ff0e}5"), "1\u{ff0e}5"),
+        (n("\u{1d7cf}"), "\u{1d7cf}"),
+        (AttributeValue::NS(["\u{e9}".to_owned()].into()), "\u{e9}"),
+        (AttributeValue::L(vec![n("\u{e9}")]), "\u{e9}"),
+        (
+            AttributeValue::M([("k".to_owned(), n("\u{e9}"))].into()),
+            "\u{e9}",
+        ),
+        (AttributeValue::L(vec![n("a\u{ff11}")]), "a1"),
     ] {
-        assert_eq!(msg("EQ", &[n(raw)]), bad(raw), "{raw:?}");
+        assert_eq!(
+            msg("EQ", std::slice::from_ref(&value)),
+            bad(named),
+            "{value:?}"
+        );
     }
 }
 

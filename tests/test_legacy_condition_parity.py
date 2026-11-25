@@ -63,18 +63,23 @@ def _in_each_legacy_map(label, value, error):
 # the digit it stands for (#565), so these requests reach the table lookup.
 DIGITS_READ = [("ff11", _n(FF11)), ("ns_ff11", {"NS": [FF11]}), ("l_ff11", {"L": [_n(FF11)]}), ("m_ff11", {"M": {"k": _n(FF11)}})]
 # Measured 2026-11-25: the service refuses the other characters outside ASCII
-# here before the table lookup, and names the value with its decimal digits
-# read. (id, N text, the text the message names)
+# here before the table lookup, in an N on its own and inside an NS, an L and
+# an M, and names the value with its decimal digits read. (id, value, the text
+# the message names)
 NOT_READ = [
-    ("e_acute", "\u00e9", "\u00e9"),
-    ("1_e_acute", "1\u00e9", "1\u00e9"),
-    ("a_ff11", "a" + FF11, "a1"),
-    ("superscript_two", "\u00b2", "\u00b2"),
-    ("vulgar_half", "\u00bd", "\u00bd"),
-    ("roman_one", "\u2160", "\u2160"),
-    ("fullwidth_minus_1", "\uff0d1", "\uff0d1"),
-    ("1_fullwidth_full_stop_5", "1\uff0e5", "1\uff0e5"),
-    ("bold_one_u1d7cf", "\U0001d7cf", "\U0001d7cf"),
+    ("e_acute", _n("\u00e9"), "\u00e9"),
+    ("1_e_acute", _n("1\u00e9"), "1\u00e9"),
+    ("a_ff11", _n("a" + FF11), "a1"),
+    ("superscript_two", _n("\u00b2"), "\u00b2"),
+    ("vulgar_half", _n("\u00bd"), "\u00bd"),
+    ("roman_one", _n("\u2160"), "\u2160"),
+    ("fullwidth_minus_1", _n("\uff0d1"), "\uff0d1"),
+    ("1_fullwidth_full_stop_5", _n("1\uff0e5"), "1\uff0e5"),
+    ("bold_one_u1d7cf", _n("\U0001d7cf"), "\U0001d7cf"),
+    ("ns_e_acute", {"NS": ["\u00e9"]}, "\u00e9"),
+    ("l_e_acute", {"L": [_n("\u00e9")]}, "\u00e9"),
+    ("m_e_acute", {"M": {"k": _n("\u00e9")}}, "\u00e9"),
+    ("l_a_ff11", {"L": [_n("a" + FF11)]}, "a1"),
 ]
 
 
@@ -238,7 +243,7 @@ class TestLegacyNumberValues:
             pytest.param("scan", {"ScanFilter": {"a": _cond("EQ", [_n("abc")])}}, ("ValidationException", NOT_A_NUMBER.format("abc")), id="scan_filter_abc"),
             pytest.param("scan", {"ScanFilter": {"a": _cond("EQ", [_n("abc")])}, "IndexName": "nope"}, ("ValidationException", NOT_A_NUMBER.format("abc")), id="scan_filter_abc_on_an_index"),
             *[row for label, value in DIGITS_READ for row in _in_each_legacy_map(label, value, TABLE_NOT_FOUND)],
-            *[row for label, raw, named in NOT_READ for row in _in_each_legacy_map(label, _n(raw), ("ValidationException", NOT_A_NUMBER.format(named)))],
+            *[row for label, value, named in NOT_READ for row in _in_each_legacy_map(label, value, ("ValidationException", NOT_A_NUMBER.format(named)))],
         ],
     )
     def test_number_check_on_a_table_that_does_not_exist(self, dynamodb_client_no_validation, missing_table, operation, args, error):
