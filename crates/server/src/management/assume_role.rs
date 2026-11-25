@@ -227,11 +227,11 @@ pub async fn assume_role(
 /// that does not load, such as one with a malformed CIDR or one over the size
 /// limit the request path parses it with, made every request with those
 /// credentials fail. A session policy with such an Arn value worked, and
-/// AssumeRole now refuses it for parity with the identity write check. The
+/// `AssumeRole` now refuses it for parity with the identity write check. The
 /// `Version` and `Sid` checks of a policy write do not apply, so a session
-/// policy that AssumeRole accepted for those keeps getting credentials. What
+/// policy that `AssumeRole` accepted for those keeps getting credentials. What
 /// STS answers for these session policies was not measured; the text after
-/// the code is ExtendDB's own.
+/// the code is `ExtendDB`'s own.
 fn check_session_policy(session_policy: &Value, max_bytes: usize) -> Result<(), String> {
     PolicyDocument::from_json_for_session_policy(&session_policy.to_string(), max_bytes)
         .map(|_| ())
