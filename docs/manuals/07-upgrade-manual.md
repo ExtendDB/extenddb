@@ -1277,6 +1277,35 @@ No catalog migration is required.
 
 ---
 
+### v1.1.0: CreateTable and UpdateTable enforce the table quota and the provisioned-capacity maxima
+
+**What changed.** Earlier releases accepted `max_tables_per_account`, `per_table_max_rcu`, `per_table_max_wcu`, `per_account_max_rcu` and `per_account_max_wcu` under `[limits]` and did not enforce them. Each refusal below is `LimitExceededException`.
+
+- `CreateTable` refuses a new table when the account already holds `max_tables_per_account` tables (default 2,500).
+- `CreateTable` refuses a provisioned throughput over the per-table maximum (default 40,000 read and 40,000 write units), which bounds the table and its global secondary indexes together. It also refuses one that takes the account over its maximum (default 80,000 of each). The account holds the sum of the provisioned units of its tables and their indexes. An on-demand table holds none.
+- `UpdateTable` refuses a table throughput over the per-table maximum, and a change that takes the account over its maximum. A unit that the request does not raise is not refused, so a table above a maximum can still be lowered. A table that returns from on-demand to `PROVISIONED` raises every unit it sets.
+
+`max_policy_document_bytes` now sets the size limit of a policy document. The management API, the console and `AssumeRole` check a new policy against it, and the server loads a stored policy with it. Earlier releases used 6,144 bytes on each of these paths, whatever the key held.
+
+`RestoreTableFromBackup` and `ImportTable` check none of these limits.
+
+**Who is affected.**
+
+- An account whose tables from earlier releases already hold more than an account maximum. It can create no provisioned table, and it can raise no table's units, until its tables hold less than that maximum. The server still accepts an on-demand `CreateTable` under the quota.
+- An account that holds `max_tables_per_account` tables or more. The server refuses its next `CreateTable`: at the default, the 2,501st table.
+- A table above the per-table maximum. The server refuses an `UpdateTable` that raises it and accepts one that lowers it.
+- A deployment that set `max_policy_document_bytes` below 6,144. A stored policy above the key no longer loads, and requests of its principal get `AccessDeniedException`. The management API, the console and `AssumeRole` refuse a new policy above the key. A deployment that set the key above 6,144 now accepts policies up to the key.
+
+**Before upgrading**, set these keys under `[limits]` for each account:
+
+- `max_tables_per_account` above its table count.
+- `per_account_max_rcu` and `per_account_max_wcu` above the sum of its provisioned units.
+- `per_table_max_rcu` and `per_table_max_wcu` at or above the units that any table must still reach.
+
+Keep `max_policy_document_bytes` at or above the size of the largest stored policy. No catalog migration is required.
+
+---
+
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
