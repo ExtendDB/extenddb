@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::time::{Duration, Instant, SystemTime};
+use web_time::{Duration, Instant, SystemTime};
 
 use super::accumulator::{Accumulator, DataPoint};
 use super::collector::{MetricKey, MetricsCollector, window_cutoff};

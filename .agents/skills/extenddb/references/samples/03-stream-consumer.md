@@ -17,6 +17,8 @@ export AWS_CA_BUNDLE=~/.extenddb/tls/cert.pem
 
 Note: `samples/stream_consumer.py` reads its endpoint from `EXTENDDB_TEST_ENDPOINT` rather than `EXTENDDB_ENDPOINT`. Set both to the same value, or export `EXTENDDB_TEST_ENDPOINT` in place of `EXTENDDB_ENDPOINT` before running this sample.
 
+One optional variable: `EXTENDDB_STREAM_SINCE`, an epoch time in seconds. When set, the poller starts each shard at the first record created at or after that time (`AT_TIMESTAMP`) instead of the oldest retained record (`TRIM_HORIZON`).
+
 ## 3. Run command
 
 ```bash
@@ -41,7 +43,7 @@ The sample runs three phases on a freshly created table, with a poller thread re
 
 1. **Create a table with streams enabled.** The main thread calls `CreateTable` with a `StreamSpecification` of `StreamEnabled=True` and `StreamViewType=NEW_AND_OLD_IMAGES`, then waits for the table to reach `ACTIVE`.
 2. **Discover the stream ARN.** The poller thread calls `DescribeTable` in a loop and reads `Table.LatestStreamArn`. The ARN appears once the stream is provisioned.
-3. **Iterate shards.** The poller calls `DescribeStream` on the `dynamodbstreams` client to list shards, then calls `GetShardIterator` with `ShardIteratorType=TRIM_HORIZON` for each new shard. It periodically refreshes the shard list to pick up splits.
+3. **Iterate shards.** The poller calls `DescribeStream` on the `dynamodbstreams` client to list shards, then calls `GetShardIterator` for each new shard: with `ShardIteratorType=AT_TIMESTAMP` and `Timestamp=EXTENDDB_STREAM_SINCE` when that variable is set, otherwise with `ShardIteratorType=TRIM_HORIZON`. It periodically refreshes the shard list to pick up splits.
 4. **Read records.** The poller calls `GetRecords` on each shard iterator, advances to `NextShardIterator`, and prints one line per record.
 5. **Writer phases.** A separate writer thread runs three sequential phases on items `item-1` through `item-5`: `PutItem` inserts (event `INSERT`), `UpdateItem` changes (event `MODIFY`), then `DeleteItem` removes (event `REMOVE`).
 6. **Cleanup.** When the writer completes, the main thread gives the poller five seconds to drain, signals stop, and deletes the table.
