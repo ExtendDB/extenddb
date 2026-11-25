@@ -145,13 +145,13 @@ impl Engine {
     /// operation that takes no parameters).
     #[must_use]
     pub async fn submit(&self, operation: &str, body_json: &str) -> String {
-        let value = match self.dispatch(operation, body_json).await {
-            Ok(body) => body,
-            Err(err) => error_document(&err),
-        };
-        serde_json::to_string(&value).unwrap_or_else(|_| {
-            String::from_utf8_lossy(extenddb_core::error::SERIALIZATION_FAILURE_BODY).into_owned()
-        })
+        match self.dispatch(operation, body_json).await {
+            Ok(body) => serde_json::to_string(&body).unwrap_or_else(|_| {
+                String::from_utf8_lossy(extenddb_core::error::SERIALIZATION_FAILURE_BODY)
+                    .into_owned()
+            }),
+            Err(err) => String::from_utf8_lossy(&error_document(&err)).into_owned(),
+        }
     }
 
     /// The response to a call whose `argument` (`"operation"` or `"body"`) is
@@ -162,9 +162,7 @@ impl Engine {
     #[must_use]
     pub fn non_string_argument(argument: &str) -> String {
         let err = DynamoDbError::ValidationException(format!("{argument} must be a string"));
-        serde_json::to_string(&error_document(&err)).unwrap_or_else(|_| {
-            String::from_utf8_lossy(extenddb_core::error::SERIALIZATION_FAILURE_BODY).into_owned()
-        })
+        String::from_utf8_lossy(&error_document(&err)).into_owned()
     }
 
     /// Apply the browser-build operation policy and the engine's pre-dispatch
@@ -333,5 +331,17 @@ mod tests {
                 "{out}"
             );
         }
+    }
+
+    /// An error answer is the body the server sends, with `__type` first. In
+    /// name order, the `Message` of a `SerializationException` would come
+    /// before `__type`.
+    #[tokio::test]
+    async fn an_error_answer_writes_type_first() {
+        let out = engine().await.submit("ListTables", "not json").await;
+        assert_eq!(
+            out,
+            r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Start of structure or map found where not expected: expected ident at line 1 column 2"}"#
+        );
     }
 }

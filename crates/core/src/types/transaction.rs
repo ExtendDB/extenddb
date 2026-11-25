@@ -259,17 +259,20 @@ pub struct TransactWriteItemsOutput {
 }
 
 /// Per-item cancellation reason in a `TransactionCanceledException`.
+///
+/// The fields are declared in the order `DynamoDB` writes the members of a
+/// reason (`Code`, `Item`, `Message`), and serialize in that order.
 #[derive(Debug, Clone, Serialize)]
 pub struct CancellationReason {
     /// Status code: `"None"`, `"ConditionalCheckFailed"`, `"ValidationError"`, etc.
     #[serde(rename = "Code")]
     pub code: String,
-    /// Human-readable message, omitted for items with no error.
-    #[serde(rename = "Message", skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
     /// The existing item when `ReturnValuesOnConditionCheckFailure` is `ALL_OLD`.
     #[serde(rename = "Item", skip_serializing_if = "Option::is_none")]
     pub item: Option<Item>,
+    /// Human-readable message, omitted for items with no error.
+    #[serde(rename = "Message", skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 impl CancellationReason {
