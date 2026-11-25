@@ -1214,11 +1214,10 @@ where
 /// order: (1) parse the overrides and check their shape, with no storage
 /// read; (2) check `BackupArn`: missing or malformed is a
 /// `ValidationException`, another account's is an `AccessDeniedException`;
-/// (3) check `TargetTableName`'s syntax, then the `IndexName` of each
-/// index override ([`overrides::IndexOverrides::check_index_names`]);
-/// (4) read the backup: the catalog
-/// index's row first ([`check_catalog_row_status`]: a CREATING row is
-/// `BackupInUseException`, a DELETING, DELETED or FAILED row
+/// (3) check `TargetTableName`'s syntax, then the `IndexName` of each index
+/// override ([`overrides::IndexOverrides::check_index_names`]); (4) read the
+/// backup: the catalog index's row first ([`check_catalog_row_status`]: a
+/// CREATING row is `BackupInUseException`, a DELETING, DELETED or FAILED row
 /// `BackupNotFoundException`), else the legacy reader's restore source, a
 /// missing backup being `BackupNotFoundException` whatever the target
 /// name's state; (5) check the target name under the account through
