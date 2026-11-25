@@ -48,6 +48,8 @@ whatever supervises it (container runtime, systemd, your shell) or send it
 SIGTERM directly. Alternatively start it with
 `serve --foreground --write-pid-file`, which writes the PID file to the usual
 `run_dir` path so `stop` and `status` work as they do in daemon mode.
+`stop`, `status` and `catalog-check` resolve a relative `run_dir` against the
+directory they run in, so run them in the directory `serve` was started in.
 
 ### Health Check
 
