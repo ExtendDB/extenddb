@@ -31,6 +31,11 @@ uuid = { workspace = true }
 # Failure-injection seam for the crate's own test suite; not part of the
 # supported API surface and never enabled by production consumers.
 test-util = []
+# `Serialize` on the four configuration types, for the tests of
+# `extenddb-config` that pin `extenddb.sample.toml` to them. Off in the
+# library build, so a value that can carry an endpoint's user information
+# has no serialize path there.
+serialize = []
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

@@ -26,4 +26,6 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# The sample pin tests serialize the backup store configuration types.
+extenddb-backup-store = { path = "../backup-store", features = ["serialize"] }
 tempfile = "3"

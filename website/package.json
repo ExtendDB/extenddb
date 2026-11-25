@@ -7,6 +7,8 @@
     "build": "docusaurus build",
     "serve": "docusaurus serve",
     "clear": "docusaurus clear",
+    "gen:config": "node scripts/gen-config-reference.mjs",
+    "check:config": "node scripts/gen-config-reference.mjs --check",
     "typecheck": "tsc"
   },
   "dependencies": {

@@ -131,6 +131,7 @@ pub const DEFAULT_ROOT_DIR_NAME: &str = "backups";
 pub const DEFAULT_SPOOL_DIR_NAME: &str = "backup-spool";
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Serialize))]
 #[serde(deny_unknown_fields)]
 pub struct BackupConfig {
     /// Uncompressed bytes per data file; a file closes once it reaches this,
