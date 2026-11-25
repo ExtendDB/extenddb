@@ -23,6 +23,7 @@
 mod backend;
 mod commands;
 mod connect;
+mod connection_row;
 mod failure;
 mod held;
 mod index_helper;
@@ -44,9 +45,11 @@ mod rows;
 mod sessions;
 mod vector_extension;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use extenddb_storage::file_body;
+use extenddb_storage::key_ring::Kek;
 use extenddb_storage::migrations::m0002_resource_tag_condition_keys::{
     self, ResourceTagConditionKeys,
 };
@@ -54,7 +57,10 @@ use extenddb_storage::migrations::{
     CatalogStatus, Kind, Migration, MigrationBackend, MigrationError, MigrationId, Released,
     RunReport, Runner, StatusNote, StoreBody, StoreKind,
 };
+use extenddb_storage::secret_keys::SecretKeys;
+use extenddb_storage::server_components::KeySource;
 use sqlx::postgres::PgConnectOptions;
+use zeroize::Zeroizing;
 
 pub use backend::{PostgresMigrations, PostgresStores};
 pub use commands::{PostgresCatalogMigrations, resolve};
@@ -62,7 +68,7 @@ pub use locks::{KEEPALIVE_INTERVAL, MigrationLock, SERVE_APPLICATION, ServingReg
 #[cfg(feature = "test-util")]
 pub use postcheck::{Column, Definitions, Index, compare, describe};
 pub use registrar::ServerRegistration;
-pub use sessions::{require_data_connection_row, served_data_options};
+pub use sessions::{data_connection_string, require_data_connection_row, served_data_options};
 pub use vector_extension::try_create_vector_extension;
 
 /// The definitions migration 1 creates in an empty catalog database, which
@@ -371,7 +377,9 @@ pub(crate) const fn runs_in(id: MigrationId) -> RunsIn {
 /// `data_database_connection_string` row, which the server connects with,
 /// when the catalog has it, and refuses when that row names another database
 /// than `data_database` unless `data_database_given`; without the row it
-/// uses the catalog's server and credentials with `data_database`.
+/// uses the catalog's server and credentials with `data_database`. In a
+/// catalog with a key ring the row is encrypted under the ring's DEK, and
+/// `data_key` opens it.
 #[derive(Debug, Clone)]
 pub struct PostgresTarget {
     /// The catalog database, with the credentials the command was given.
@@ -386,6 +394,52 @@ pub struct PostgresTarget {
     pub data_connection_row: Option<String>,
     /// Timeout for each connection attempt.
     pub(crate) connect_timeout: Duration,
+    /// What opens the connection string row of a catalog with a key ring.
+    pub(crate) data_key: DataKey,
+    /// Whether a status read covers the catalog store alone, reaching no
+    /// data database ([`PostgresMigrations::open_for_status`]).
+    pub(crate) catalog_store_alone: bool,
+}
+
+/// What opens the `data_database_connection_string` row of a catalog with a
+/// key ring (RFC-0000 section 12). A catalog without a ring keeps the row in
+/// plaintext, and every variant reads it as it is.
+#[derive(Clone, Default)]
+pub(crate) enum DataKey {
+    /// No key: a catalog with a ring is refused.
+    #[default]
+    None,
+    /// The KEK the command read: each read unwraps the ring with it and
+    /// opens the row with a DEK of the ring. `plaintext_during_switch`
+    /// accepts the plaintext row while the ring's `switch_from_catalog_key`
+    /// is true, for `encryption-key switch` alone.
+    Kek {
+        kek: Kek,
+        plaintext_during_switch: bool,
+    },
+    /// The key holder the server's registration loaded.
+    Loaded(Arc<SecretKeys>),
+    /// The connection string the command read from standard input
+    /// (`encryption-key reset`, RFC-0000 section 8.6), in place of the row,
+    /// which no key of the run opens.
+    Given(Arc<Zeroizing<String>>),
+}
+
+impl std::fmt::Debug for DataKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => f.write_str("None"),
+            Self::Kek {
+                plaintext_during_switch,
+                ..
+            } => write!(
+                f,
+                "Kek {{ plaintext_during_switch: {plaintext_during_switch} }}"
+            ),
+            Self::Loaded(keys) => write!(f, "Loaded({keys:?})"),
+            Self::Given(_) => f.write_str("Given(..)"),
+        }
+    }
 }
 
 impl PostgresTarget {
@@ -399,7 +453,43 @@ impl PostgresTarget {
             data_database_given: false,
             data_connection_row: None,
             connect_timeout: Duration::from_secs(10),
+            data_key: DataKey::None,
+            catalog_store_alone: false,
         }
+    }
+
+    /// Open the connection string row of a catalog with a key ring with the
+    /// key the command read: a KEK, which unwraps the ring at each read. The
+    /// catalog key and no key open no such row. `plaintext_during_switch` is
+    /// for `encryption-key switch` alone: it accepts the plaintext row while
+    /// the ring's `switch_from_catalog_key` is true.
+    #[must_use]
+    pub fn with_key_source(mut self, key_source: KeySource, plaintext_during_switch: bool) -> Self {
+        self.data_key = match key_source {
+            KeySource::Kek(kek) => DataKey::Kek {
+                kek,
+                plaintext_during_switch,
+            },
+            KeySource::CatalogKey | KeySource::None => DataKey::None,
+        };
+        self
+    }
+
+    /// Open the connection string row of a catalog with a key ring with a
+    /// key holder already loaded, as the server's registration does.
+    #[must_use]
+    pub fn with_secret_keys(mut self, keys: Arc<SecretKeys>) -> Self {
+        self.data_key = DataKey::Loaded(keys);
+        self
+    }
+
+    /// Reach the data database with `connection_string` in place of the
+    /// catalog's row, which `encryption-key reset` reads from standard input
+    /// because no key of the run opens the row (RFC-0000 section 8.6).
+    #[must_use]
+    pub fn with_given_data_connection(mut self, connection_string: &str) -> Self {
+        self.data_key = DataKey::Given(Arc::new(Zeroizing::new(connection_string.to_owned())));
+        self
     }
 
     /// Mark the data database as given on the command line.

@@ -3,12 +3,16 @@
 
 //! Core types, validation, error definitions, and limits for extenddb.
 //!
-//! This crate is pure synchronous Rust with no async runtime dependency.
+//! This crate is synchronous Rust with no async runtime dependency.
 //! It defines the Virtual `DynamoDB` type system, request/response envelopes,
-//! validation logic, and error types shared across all other crates.
+//! validation logic, and error types shared by the crates that depend on it.
 
 pub mod arn;
 pub mod backup_format;
+/// Shared cryptographic primitives with a single target-specific backend
+/// choice. Internal to the workspace; no API-stability promise.
+#[doc(hidden)]
+pub mod crypto;
 pub mod error;
 pub mod expression;
 pub mod limits;
