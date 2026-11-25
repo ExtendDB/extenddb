@@ -257,6 +257,17 @@ ROWS += [
     # (measured 2026-11-25).
     ("ut-sse-enabled-yes-kms", "UpdateTable",
      {"SSESpecification": {"Enabled": "yes", "SSEType": "KMS"}}, NOT_FOUND),
+    # The SSE faults come ahead of the stream view type and the index faults,
+    # also when the body sends the index first (measured 2026-11-25).
+    ("ut-sse-bogus-stream-bogus", "UpdateTable",
+     {"StreamSpecification": _stream(True, "BOGUS"),
+      "SSESpecification": {"Enabled": True, "SSEType": "BOGUS"}},
+     _both(SSE_BOGUS, _view("BOGUS"))),
+    ("ut-gsi-bogus-sse-bogus", "UpdateTable",
+     {"GlobalSecondaryIndexUpdates": [{"Create": _index("gsi1", "g", "BOGUS")}],
+      "AttributeDefinitions": _defs("g"),
+      "SSESpecification": {"Enabled": True, "SSEType": "BOGUS"}},
+     _both(SSE_BOGUS, _projection("BOGUS", "globalSecondaryIndexUpdates.1.member.create"))),
 ]
 
 # UpdateTable of an existing table keyed on pk alone, created without an
@@ -284,6 +295,7 @@ SSE_UPDATE_ROWS = [
     ("kms-key-without-enabled", KMS, {"KMSMasterKeyId": "alias/no-such-key"}, KMS_REQUIRED),
     ("default-disabled", None, {"Enabled": False},
      _invalid("Table is already encrypted by default")),
+    ("default-empty", None, {}, _invalid("Table is already encrypted by default")),
     # Measured on a table that does not exist on 2026-11-25. Each answer
     # comes before the table lookup.
     ("enabled-true-string", None, {"Enabled": "true", "SSEType": "AES256"},

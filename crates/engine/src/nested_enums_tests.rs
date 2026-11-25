@@ -350,6 +350,28 @@ fn rows() -> Vec<((&'static str, Value), Option<String>)> {
             refused(sse_type, SSE_TYPE, SSE_SET),
         ));
     }
+    // UpdateTable lists the SSE faults ahead of the stream view type and the
+    // index faults (measured 2026-11-25).
+    rows.extend([
+        (
+            update(with(
+                stream(true, "BOGUS"),
+                json!({"SSESpecification": {"Enabled": true, "SSEType": "BOGUS"}}),
+            )),
+            both(sse_bogus.clone(), refused("BOGUS", VIEW, VIEW_SET)),
+        ),
+        (
+            update(json!({
+                "GlobalSecondaryIndexUpdates": [{"Create": index("gsi1", "g", "BOGUS")}],
+                "AttributeDefinitions": defs(&["g"]),
+                "SSESpecification": {"Enabled": true, "SSEType": "BOGUS"},
+            })),
+            both(
+                sse_bogus.clone(),
+                projection("BOGUS", "globalSecondaryIndexUpdates.1.member.create"),
+            ),
+        ),
+    ]);
     for (spec, expected) in [
         (
             json!({"Enabled": true, "SSEType": "AES256"}),
