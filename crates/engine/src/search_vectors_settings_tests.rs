@@ -132,8 +132,8 @@ async fn off_and_a_list_still_restrict_the_grammar() {
     );
     let settings = Settings::new(Store::value("111111111111"));
     let listed = settings.enabled_accounts().await.unwrap();
-    assert!(listed.enabled_for("111111111111", None));
-    assert!(!listed.enabled_for("222222222222", None));
+    assert!(listed.enabled_for("111111111111"));
+    assert!(!listed.enabled_for("222222222222"));
 }
 
 /// A malformed value enables no account and is logged once per change.

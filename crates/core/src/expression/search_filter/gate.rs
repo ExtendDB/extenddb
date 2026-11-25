@@ -6,7 +6,9 @@
 //! The service serves the grammar to every account. The setting names the
 //! accounts ExtendDB serves it to: `all` (the default), `off`, or a
 //! comma-separated list of 12-digit account IDs, in which case a request
-//! gets the grammar when the caller or the table owner is listed.
+//! gets the grammar when the caller is listed. A request on a table of
+//! another account is refused before the grammar is chosen, so the caller
+//! owns the table.
 
 use std::collections::BTreeSet;
 
@@ -47,16 +49,13 @@ impl EnabledAccounts {
         Ok(Self::Listed(accounts))
     }
 
-    /// Whether a request by `caller` on a table owned by `owner` gets the
-    /// grammar. `owner` is `None` when the caller owns the table.
+    /// Whether a request by `caller` gets the grammar.
     #[must_use]
-    pub fn enabled_for(&self, caller: &str, owner: Option<&str>) -> bool {
+    pub fn enabled_for(&self, caller: &str) -> bool {
         match self {
             Self::Off => false,
             Self::All => true,
-            Self::Listed(accounts) => std::iter::once(caller)
-                .chain(owner)
-                .any(|account| accounts.contains(account)),
+            Self::Listed(accounts) => accounts.contains(caller),
         }
     }
 }
@@ -81,17 +80,16 @@ mod tests {
     fn off_and_all_parse() {
         assert_eq!(EnabledAccounts::parse("off"), Ok(EnabledAccounts::Off));
         assert_eq!(EnabledAccounts::parse("all"), Ok(EnabledAccounts::All));
-        assert!(!EnabledAccounts::Off.enabled_for("123456789012", None));
-        assert!(EnabledAccounts::All.enabled_for("123456789012", None));
+        assert!(!EnabledAccounts::Off.enabled_for("123456789012"));
+        assert!(EnabledAccounts::All.enabled_for("123456789012"));
     }
 
     #[test]
-    fn a_list_enables_the_caller_or_the_owner() {
+    fn a_list_enables_the_accounts_it_names() {
         let listed = EnabledAccounts::parse("111111111111, 222222222222").unwrap();
-        assert!(listed.enabled_for("111111111111", None));
-        assert!(listed.enabled_for("333333333333", Some("222222222222")));
-        assert!(!listed.enabled_for("333333333333", None));
-        assert!(!listed.enabled_for("333333333333", Some("444444444444")));
+        assert!(listed.enabled_for("111111111111"));
+        assert!(listed.enabled_for("222222222222"));
+        assert!(!listed.enabled_for("333333333333"));
     }
 
     #[test]

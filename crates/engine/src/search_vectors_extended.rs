@@ -90,7 +90,7 @@ mod imp {
         // the table owner.
         Ok(super::settings::enabled_accounts(storage)
             .await?
-            .enabled_for(account_id, None))
+            .enabled_for(account_id))
     }
 
     /// The partition the HASH condition selects and the filter the backend
