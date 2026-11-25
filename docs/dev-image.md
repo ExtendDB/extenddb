@@ -125,7 +125,10 @@ to the DynamoDB API and a console login are `POST`s, which carry `Origin`, so a
 web page whose name resolves to the loopback address cannot use the seeded
 credential or log in to the console. The allowance for `.localhost` names
 assumes a browser that resolves them to the loopback address itself. Chrome,
-Firefox and Edge do; Safari on macOS hands them to the system resolver.
+Firefox and Edge do. Safari on macOS hands them to the system resolver, which
+can pass a `.localhost` name to a DNS server on the network. That server can
+answer with its own address and serve a page under the name. When it then
+answers with the loopback address, the check serves that page's requests.
 
 The management routes (`/management` and below) and `/metrics` answer `GET`
 with the admin password, and a page's same-origin `GET` carries neither header.
@@ -137,11 +140,16 @@ container that calls these routes by the Compose service name, such as
 gets HTTP 403. Such a client needs no listed name if it uses an IP address,
 which the rule always serves. Point a metrics poller at the dev container's IP
 address, and run `extenddb manage` inside the dev container, where `127.0.0.1`
-reaches the server. The image has no config file, so give the endpoint:
+reaches the server. The image has no config file, so give the endpoint. Set
+`EXTENDDB_PASSWORD` in your shell to the admin password first: the one the
+container's log shows at first start, or the `EXTENDDB_ADMIN_PASSWORD` value
+the container started with. `-e EXTENDDB_PASSWORD` with no value copies the
+variable from your shell into the container, and the command line does not
+show the password:
 
 ```bash
-docker exec <container> extenddb manage --endpoint http://127.0.0.1:18080 \
-  --user admin --password <pw> list-accounts
+docker exec -e EXTENDDB_PASSWORD <container> extenddb manage \
+  --endpoint http://127.0.0.1:18080 --user admin list-accounts
 ```
 
 The setting is a single string of comma-separated bare host names, with no
@@ -166,10 +174,13 @@ listed too when a browser uses it, and so does the host name of the URL a cloud
 development environment forwards to the server, if it passes the browser's
 `Host` through unchanged.
 
-The server sends no CORS headers, so a page on another origin cannot call it
-directly, whether or not its name is listed. For a page at
+The server sends no CORS headers, so a page on another origin cannot call its
+DynamoDB API, whether or not the page's name is listed. For a page at
 `http://app.test:3000` that calls `http://localhost:18080`, the browser's
-preflight `OPTIONS` request gets 405 and the browser does not send the call.
+preflight `OPTIONS` request gets 405 and the browser does not send the call. A
+form on another origin can still post to the console login page. A form post
+needs no preflight, and the check reads the host from `Host`, whatever the
+`Origin` header says.
 
 A listed name is trusted for browser requests as `localhost` is, so a
 page served under it can call the server with the seeded credential. List a

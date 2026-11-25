@@ -92,11 +92,9 @@ pub struct AppState {
     /// is still verified). Only ever true in a `dev-mode` build bound to
     /// loopback; the bin's serve path enforces those preconditions.
     pub dev_mode: bool,
-    /// Host names a dev-mode browser request, and any dev-mode request to
-    /// `/management` or `/metrics`, may use beyond an IP literal, `localhost`
-    /// and a `.localhost` name. Validated and lowercased at startup from
-    /// `server.dev_allowed_hosts`. Empty outside dev mode, where the host guard
-    /// is not installed.
+    /// The names kept from `server.dev_allowed_hosts`, lowercased, for the
+    /// dev-mode host guard (`dev_host_guard`). Empty outside dev mode, where
+    /// the guard is not installed.
     pub dev_allowed_hosts: std::sync::Arc<[String]>,
     /// Allowed directories for import file operations. Empty means imports
     /// are disabled (secure default).
