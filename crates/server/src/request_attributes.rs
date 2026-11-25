@@ -360,7 +360,9 @@ impl<'a> Names<'a> {
     /// is set, then the map-less `parse_key_condition`, which accepts key
     /// conditions the engine refuses for an undefined reference, a
     /// `begins_with` operand type or a second condition on one key attribute.
-    /// A key condition `parse_key_condition` refuses gives none.
+    /// A key condition `parse_key_condition` refuses gives none. So does one
+    /// with no equality clause, which the parser accepts and the engine
+    /// refuses once it knows the key schema.
     fn key_condition(&mut self, value: Option<&Value>) {
         let Some(text) = self.text(value) else {
             return;
@@ -377,7 +379,7 @@ impl<'a> Names<'a> {
             }
             parse_key_condition(&tokens)
         });
-        let Ok(condition) = parsed else {
+        let Some(condition) = parsed.ok().filter(|kc| !kc.pk_path.is_empty()) else {
             return;
         };
         self.path(&condition.pk_path);

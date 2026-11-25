@@ -43,6 +43,28 @@ pub fn validation_errors_detected(clauses: &[String]) -> String {
 /// authorization; the `GetShardIterator` handler checks the presence.
 pub const INVALID_STREAM_ARN: &str = "Invalid StreamArn";
 
+/// The service's answer to a `Query` key condition it cannot serve, such as
+/// `pk > :x` on a key schema whose only HASH attribute is `pk`.
+pub const QUERY_KEY_CONDITION_NOT_SUPPORTED: &str = "Query key condition not supported";
+
+/// The service's answer to a `Query` key condition with no condition on
+/// `attribute`, a key attribute the query needs.
+#[must_use]
+pub fn missed_key_schema_element(attribute: &str) -> String {
+    format!("Query condition missed key schema element: {attribute}")
+}
+
+/// The service's answer to a `Query` key condition on a key schema with
+/// several key attributes when the HASH attributes in `attributes` have no
+/// equality condition.
+#[must_use]
+pub fn hash_attributes_without_equality(attributes: &[&str]) -> String {
+    format!(
+        "HASH key attributes {} must have equality conditions specified in the query",
+        attributes.join(", ")
+    )
+}
+
 /// Keys for error message templates. Compile-time checked — no stringly-typed lookups.
 #[derive(Debug, Clone, Copy)]
 pub enum ErrorMessageKey {

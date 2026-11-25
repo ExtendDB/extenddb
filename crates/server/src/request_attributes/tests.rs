@@ -357,10 +357,13 @@ fn a_query_of_a_table_that_does_not_exist_holds_its_key_condition_names() {
         "ExpressionAttributeNames": {"#s": "sort", "#p": "part"},
     });
     assert_eq!(single("Query", &prefix, None), names(&["part", "sort"]));
-    // A key condition the key condition parser refuses gives none. On this
-    // table, which does not exist, the engine answers
-    // ResourceNotFoundException before it reads the key condition.
+    // A key condition the key condition parser refuses, or one with no
+    // equality clause, gives none. On this table, which does not exist, the
+    // engine answers ResourceNotFoundException before it reads the key
+    // condition.
     let refused = json!({"TableName": "gone", "KeyConditionExpression": "pk > :v"});
+    assert_eq!(single("Query", &refused, None), None);
+    let refused = json!({"TableName": "gone", "KeyConditionExpression": "pk > :v AND sk > :s"});
     assert_eq!(single("Query", &refused, None), None);
     let refused = json!({"TableName": "gone", "KeyConditionExpression": "pk = :p OR sk = :s"});
     assert_eq!(single("Query", &refused, None), None);

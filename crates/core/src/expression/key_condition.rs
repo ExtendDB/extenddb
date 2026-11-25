@@ -22,6 +22,8 @@ use crate::types::{
     KeySchemaElement, KeyType, hash_key_elements, is_multipart_key_schema, range_key_elements,
 };
 
+mod no_hash_equality;
+
 /// Parsed key condition: partition key value expression(s) and optional sort key condition.
 ///
 /// For standard (single-attribute) keys, `pk_path`/`pk_value` hold the single PK condition
@@ -31,7 +33,10 @@ use crate::types::{
 /// `extra_pk_conditions` holds additional PK equality conditions.
 #[derive(Debug, Clone)]
 pub struct KeyCondition {
-    /// First partition key attribute path (resolved name).
+    /// First partition key attribute path (resolved name). Empty when the
+    /// expression held one or two clauses and none is an equality; they are
+    /// then `sk_condition` and `extra_sk_conditions`, and
+    /// [`KeyCondition::refuse_without_hash_equality`] refuses them.
     pub pk_path: Vec<PathElement>,
     /// First partition key value expression (placeholder or literal).
     pub pk_value: Expr,
@@ -635,9 +640,10 @@ pub fn has_duplicate_key_condition(
 /// # Errors
 ///
 /// As [`parse_key_condition`], plus `ValidationException` for each of the
-/// faults above. A fault in the key condition's shape, such as no equality
-/// on the partition key, is the `Err` inside `Ok`: the engine answers it
-/// after the table checks, where the service does.
+/// faults above. A fault in the key condition's shape, such as two
+/// non-equality clauses beside an equality, is the `Err` inside `Ok`, for the
+/// engine to answer after the table checks. A key condition with no equality
+/// clause parses, and the engine refuses it once it knows the key schema.
 pub fn parse_key_condition_with_maps(
     tokens: &[Token],
     maps: &ExpressionMaps,
@@ -828,9 +834,9 @@ fn classify_single(clause: RawClause) -> Result<KeyCondition, DynamoDbError> {
             sk_condition: None,
             extra_sk_conditions: Vec::new(),
         }),
-        _ => Err(validation_err(
-            "Invalid KeyConditionExpression: partition key condition must use equality (=)",
-        )),
+        // The wording of the refusal depends on the key schema, which is not
+        // known here. See `KeyCondition::refuse_without_hash_equality`.
+        other => Ok(KeyCondition::without_equality(raw_to_sk(other), None)),
     }
 }
 
@@ -838,7 +844,7 @@ fn classify_pair(a: RawClause, b: RawClause) -> Result<KeyCondition, DynamoDbErr
     // When both clauses are Eq, we assign the first as PK and second as SK.
     // The caller must call `resolve_pk_sk()` after parsing to correct the
     // assignment using the table's key schema (REQ-QUERY-002).
-    // One must be EQ (the PK), the other is the SK condition
+    // One is EQ (the PK) and the other is the SK condition
     match (a, b) {
         (RawClause::Eq(pk_path, pk_value), sk) | (sk, RawClause::Eq(pk_path, pk_value)) => {
             Ok(KeyCondition {
@@ -849,8 +855,11 @@ fn classify_pair(a: RawClause, b: RawClause) -> Result<KeyCondition, DynamoDbErr
                 extra_sk_conditions: Vec::new(),
             })
         }
-        _ => Err(validation_err(
-            "Invalid KeyConditionExpression: one condition must be an equality on the partition key",
+        // Neither clause is an equality. As for a single clause, the key
+        // schema decides the wording. See `KeyCondition::refuse_without_hash_equality`.
+        (a, b) => Ok(KeyCondition::without_equality(
+            raw_to_sk(a),
+            Some(raw_to_sk(b)),
         )),
     }
 }
@@ -2377,27 +2386,16 @@ mod tests {
     /// table checks.
     #[test]
     fn the_shape_is_refused_after_the_checks() {
-        for (expr, want) in [
-            ("pk > :a", "partition key condition must use equality (=)"),
-            (
-                "pk > :a AND sk > :b",
-                "one condition must be an equality on the partition key",
-            ),
-            (
-                "pk = :a AND sk > :b AND zz < :c",
-                "at most one non-equality condition is allowed",
-            ),
-        ] {
-            let tokens = tokenize(expr).unwrap();
-            let maps = ExpressionMaps::new(HashMap::new(), values_of(expr));
-            let shape = parse_key_condition_with_maps(&tokens, &maps)
-                .unwrap_or_else(|err| panic!("expr {expr} should pass the checks: {err:?}"));
-            assert_refused(
-                shape,
-                &format!("Invalid KeyConditionExpression: {want}"),
-                expr,
-            );
-        }
+        let expr = "pk = :a AND sk > :b AND zz < :c";
+        let tokens = tokenize(expr).unwrap();
+        let maps = ExpressionMaps::new(HashMap::new(), values_of(expr));
+        let shape = parse_key_condition_with_maps(&tokens, &maps)
+            .unwrap_or_else(|err| panic!("expr {expr} should pass the checks: {err:?}"));
+        assert_refused(
+            shape,
+            "Invalid KeyConditionExpression: at most one non-equality condition is allowed",
+            expr,
+        );
     }
 
     #[test]
