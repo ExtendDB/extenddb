@@ -24,6 +24,7 @@ STREAM_VIEW_TYPE_REQUIRED = (
 )
 NO_DEFINITION = "Invalid KeySchema: Some index key attribute have no definition"
 STREAM_NO_VIEW = {"StreamEnabled": True}
+WARM = {"ReadUnitsPerSecond": 13000, "WriteUnitsPerSecond": 5000}
 
 
 def _validation_message(exc_info) -> str:
@@ -50,6 +51,7 @@ def _definitions(*names: str) -> list[dict]:
 
 
 BY_G = _gsi_create("by-g", [("g", "HASH")], "ALL")
+IDX1_G = _gsi_create("idx1", [("g", "HASH")], "KEYS_ONLY")
 
 
 class TestStreamSpecification:
@@ -79,8 +81,9 @@ class TestStreamSpecification:
 
 
 class TestValidationOrder:
-    """Which refusal a request with two defects gets. A defective index Create
-    and the billing rules come before the view type."""
+    """Which refusal a request with two or more defects gets. A defective
+    index Create and the billing rules come before the view type, and both the
+    index Create and the view type come before the WarmThroughput rule."""
 
     NEVER_CREATED_ROWS = [
         pytest.param(
@@ -94,6 +97,40 @@ class TestValidationOrder:
             "One or more parameter values were invalid: "
             "ProvisionedThroughput must be specified when BillingMode is PROVISIONED",
             id="missing-throughput-before-the-view-type",
+        ),
+        pytest.param(
+            {"StreamSpecification": STREAM_NO_VIEW, "WarmThroughput": WARM},
+            STREAM_VIEW_TYPE_REQUIRED,
+            id="view-type-before-warm-throughput",
+        ),
+        pytest.param(
+            {
+                "StreamSpecification": STREAM_NO_VIEW,
+                "WarmThroughput": WARM,
+                "DeletionProtectionEnabled": True,
+            },
+            STREAM_VIEW_TYPE_REQUIRED,
+            id="view-type-before-warm-throughput-with-deletion-protection",
+        ),
+        pytest.param(
+            {
+                "StreamSpecification": STREAM_NO_VIEW,
+                "WarmThroughput": WARM,
+                "GlobalSecondaryIndexUpdates": IDX1_G,
+            },
+            "One or more parameter values were invalid: "
+            "AttributeDefinitions is not specified for index: idx1",
+            id="index-before-view-type-and-warm-throughput",
+        ),
+        pytest.param(
+            {
+                "WarmThroughput": WARM,
+                "BillingMode": "PAY_PER_REQUEST",
+                "GlobalSecondaryIndexUpdates": IDX1_G,
+            },
+            "One or more parameter values were invalid: "
+            "AttributeDefinitions is not specified for index: idx1",
+            id="index-before-warm-throughput-with-billing-mode",
         ),
     ]
 
