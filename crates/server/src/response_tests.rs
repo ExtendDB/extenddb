@@ -26,22 +26,26 @@ async fn body(error: &DynamoDbError) -> String {
 /// body: ExtendDB omits an empty message (REQ-ERR-003).
 #[tokio::test]
 async fn the_members_follow_the_service_per_error() {
-    let cancelled = DynamoDbError::TransactionCanceledException {
+    let cancelled = |item: Option<Item>| DynamoDbError::TransactionCanceledException {
         message: "Transaction cancelled, please refer cancellation reasons for specific \
                   reasons [ConditionalCheckFailed]"
             .to_owned(),
         cancellation_reasons: vec![CancellationReason {
             code: "ConditionalCheckFailed".to_owned(),
             message: Some("The conditional request failed".to_owned()),
-            item: None,
+            item,
         }],
     };
     let old_item = Item::from([("pk".to_owned(), AttributeValue::S("e1222".to_owned()))]);
     let failed = "The conditional request failed";
-    let rows: [(DynamoDbError, &str); 7] = [
+    let rows: [(DynamoDbError, &str); 8] = [
         (
-            cancelled,
+            cancelled(None),
             r#"{"__type":"com.amazonaws.dynamodb.v20120810#TransactionCanceledException","CancellationReasons":[{"Code":"ConditionalCheckFailed","Message":"The conditional request failed"}],"Message":"Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed]"}"#,
+        ),
+        (
+            cancelled(Some(old_item.clone())),
+            r#"{"__type":"com.amazonaws.dynamodb.v20120810#TransactionCanceledException","CancellationReasons":[{"Code":"ConditionalCheckFailed","Item":{"pk":{"S":"e1222"}},"Message":"The conditional request failed"}],"Message":"Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed]"}"#,
         ),
         (
             DynamoDbError::ConditionalCheckFailedException(failed.into(), Some(old_item)),

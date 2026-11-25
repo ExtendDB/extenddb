@@ -384,11 +384,10 @@ fn error_body(error: &DynamoDbError) -> serde_json::Result<Vec<u8>> {
     let mut serializer = serde_json::Serializer::new(&mut bytes);
     let mut body = serializer.serialize_map(None)?;
     body.serialize_entry("__type", &error.full_error_type())?;
-    // Through a `Value`, each reason writes its members in name order, as
-    // `DynamoDB` does: `Code`, `Item`, `Message`.
+    // Each reason writes `Code`, `Item`, `Message`, the field order of
+    // `CancellationReason` and the order `DynamoDB` writes.
     if let Some(reasons) = error.cancellation_reasons() {
-        let reasons = serde_json::to_value(reasons).unwrap_or_default();
-        body.serialize_entry("CancellationReasons", &reasons)?;
+        body.serialize_entry("CancellationReasons", reasons)?;
     }
     if let Some(item) = error.condition_check_item() {
         body.serialize_entry("Item", item)?;
