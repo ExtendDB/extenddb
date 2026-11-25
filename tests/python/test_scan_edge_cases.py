@@ -522,6 +522,7 @@ INDEX_START_KEY_ROWS = [
     ("scan", "lsi1", _key(LSI1, lsi1sk={"N": "1"}), ("lsi1sk", "N")),
     ("scan", "lsi1", _key(LSI1, lsi1sk={"B": b"a"}), ("lsi1sk", "B")),
     ("scan", "gsi2", _key(GSI2, lsi2sk=SS, sk=None), ("lsi2sk", "SS")),
+    ("scan", "gsi2", _key(GSI2, lsi2sk=SS, x=A), ("lsi2sk", "SS")),
     # Every key of its declared type.
     ("scan", "gsi2", _key(GSI2), 0),
     ("scan", "lsi1", _key(LSI1), 0),

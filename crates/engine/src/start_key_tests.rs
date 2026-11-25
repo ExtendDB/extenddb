@@ -405,12 +405,18 @@ fn index_start_key_faults_answer_as_dynamodb_does() {
         (Scan, gsi2, &[Omit("lsi2sk")], Invalid),
         (Scan, gsi2, &[Set("extra", "S")], Invalid),
         // Measured on 2026-11-19: a table key, and a key of the wrong type
-        // beside a key left out.
+        // beside a key left out or an extra attribute.
         (Scan, gsi2, &[Set("sk", "SS")], Names("sk", "SS")),
         (
             Scan,
             gsi2,
             &[Set("lsi2sk", "SS"), Omit("sk")],
+            Names("lsi2sk", "SS"),
+        ),
+        (
+            Scan,
+            gsi2,
+            &[Set("lsi2sk", "SS"), Set("x", "S")],
             Names("lsi2sk", "SS"),
         ),
         // Every key of its declared type.
