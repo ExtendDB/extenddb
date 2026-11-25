@@ -20,12 +20,13 @@ use super::resolver::{
 
 /// How two `N` values compare.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NumberPrecision {
+pub(crate) enum NumberPrecision {
     /// As decimals, exactly: condition, filter and key condition expressions.
     Exact,
     /// As the nearest IEEE 754 binary64 value of each side: the inline
     /// filters of a `SearchVectors` search condition. The validity of each
     /// number, and the BETWEEN bound check, stay exact.
+    #[cfg_attr(not(feature = "search-inequality-filters"), allow(dead_code))]
     Binary64,
 }
 
@@ -51,7 +52,7 @@ pub fn evaluate_condition(
 /// # Errors
 ///
 /// Returns `ValidationException` for unresolvable placeholders or type errors.
-pub fn evaluate_condition_at(
+pub(crate) fn evaluate_condition_at(
     expr: &Expr,
     item: &BTreeMap<String, AttributeValue>,
     maps: &ExpressionMaps,

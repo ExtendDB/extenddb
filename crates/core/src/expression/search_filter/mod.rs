@@ -199,11 +199,11 @@ impl SearchFilter {
     /// condition the evaluator would refuse, so this does not happen for a
     /// parsed filter.
     pub fn matches(&self, item: &Item) -> Result<bool, DynamoDbError> {
-        crate::expression::evaluate_condition_at(
+        crate::expression::evaluator::evaluate_condition_at(
             &self.expr,
             item,
             &self.maps,
-            crate::expression::NumberPrecision::Binary64,
+            crate::expression::evaluator::NumberPrecision::Binary64,
         )
     }
 }

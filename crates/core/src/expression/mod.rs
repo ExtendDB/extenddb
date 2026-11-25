@@ -30,7 +30,7 @@ mod update_evaluator;
 mod update_parser;
 
 pub use ast::{ArithOp, CompareOp, Expr, PathElement, UpdateAction, removes_only};
-pub use evaluator::{NumberPrecision, evaluate_condition, evaluate_condition_at};
+pub use evaluator::evaluate_condition;
 pub use key_condition::{
     KeyClauseOperand, KeyCondition, SortKeyCondition, key_condition_clause_operands,
     parse_key_condition,
