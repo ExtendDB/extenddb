@@ -30,8 +30,8 @@ pub use extenddb_core::backup_format::{
 #[must_use]
 pub fn new_backup_id() -> String {
     use rand::Rng;
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let millis = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or_default();
     format_backup_id(millis, rand::rng().random())

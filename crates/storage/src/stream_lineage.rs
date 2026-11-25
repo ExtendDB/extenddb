@@ -490,7 +490,7 @@ pub fn describe_stream(
         .into_iter()
         .find(|s| s.label == label)
         .ok_or_else(|| stream_not_found(&stream_arn))?;
-    let limit = usize::try_from(limit.unwrap_or(100)).unwrap_or(0).max(1);
+    let limit = extenddb_core::limits::page_size(limit.unwrap_or(100));
     let mut remaining: Vec<&ShardRow> = stream
         .shards
         .iter()

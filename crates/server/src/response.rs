@@ -5,17 +5,12 @@
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use extenddb_core::error::DynamoDbError;
-use serde::ser::{SerializeMap as _, Serializer as _};
+use extenddb_core::error::{DynamoDbError, SERIALIZATION_FAILURE_BODY, error_body};
 use serde_json::Value;
 
 #[cfg(test)]
 #[path = "response_tests.rs"]
 mod message_key_tests;
-
-/// Hardcoded fallback body for when response serialization itself fails.
-const SERIALIZATION_FAILURE_BODY: &[u8] =
-    br#"{"__type":"com.amazonaws.dynamodb.v20120810#InternalServerError","message":"Internal error"}"#;
 
 /// REQ-WIRE-010: `x-amzn-RequestId` on every response.
 /// REQ-WIRE-011: `x-amz-crc32` checksum.
@@ -39,7 +34,7 @@ pub(crate) fn success_response(body: &Value, request_id: &str) -> Response {
 }
 
 /// REQ-ERR-001: `__type` with prefix. REQ-ERR-002: message field, under the
-/// key [`message_key`] picks. REQ-ERR-003: Omit the message field when empty
+/// key `error_body` picks. REQ-ERR-003: Omit the message field when empty
 /// (real `DynamoDB` behavior, verified 2026-05-04).
 pub(crate) fn error_response(error: &DynamoDbError, request_id: &str) -> Response {
     let body_bytes = error_body(error).unwrap_or_else(|_| SERIALIZATION_FAILURE_BODY.to_vec());
@@ -57,48 +52,6 @@ pub(crate) fn error_response(error: &DynamoDbError, request_id: &str) -> Respons
         body_bytes,
     )
         .into_response()
-}
-
-/// The body of `error`, with its members in the order `DynamoDB` writes them
-/// (us-east-1, raw bodies, 2026-11-20): `__type` first, then the
-/// `CancellationReasons` of a `TransactionCanceledException` or the `Item` of
-/// a `ConditionalCheckFailedException`, then the message.
-fn error_body(error: &DynamoDbError) -> serde_json::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    let mut serializer = serde_json::Serializer::new(&mut bytes);
-    let mut body = serializer.serialize_map(None)?;
-    body.serialize_entry("__type", &error.full_error_type())?;
-    // Through a `Value`, each reason writes its members in name order, as
-    // `DynamoDB` does: `Code`, `Item`, `Message`.
-    if let Some(reasons) = error.cancellation_reasons() {
-        let reasons = serde_json::to_value(reasons).unwrap_or_default();
-        body.serialize_entry("CancellationReasons", &reasons)?;
-    }
-    if let Some(item) = error.condition_check_item() {
-        body.serialize_entry("Item", item)?;
-    }
-    let msg = error.message();
-    if !msg.is_empty() {
-        body.serialize_entry(message_key(error), msg)?;
-    }
-    body.end()?;
-    Ok(bytes)
-}
-
-/// The key that carries the error message: `Message` on the errors matched
-/// below, as `DynamoDB` sends them (us-east-1, raw bodies, 2026-10-29 to
-/// 2026-11-20), `message` on the others. `DynamoDB` also sends `Message` on
-/// `TransactionInProgressException`, which ExtendDB does not raise, and on
-/// `AccessDeniedException` (2026-11-12 and 2026-11-19), which keeps `message`
-/// here. REQ-ERR-002 in `docs/design/01-requirements.md` lists the errors
-/// measured.
-fn message_key(error: &DynamoDbError) -> &'static str {
-    match error {
-        DynamoDbError::TransactionCanceledException { .. }
-        | DynamoDbError::IdempotentParameterMismatchException(_)
-        | DynamoDbError::SerializationException(_) => "Message",
-        _ => "message",
-    }
 }
 
 /// Classify and record error metrics for a failed `DynamoDB` request.
