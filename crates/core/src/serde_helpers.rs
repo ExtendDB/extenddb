@@ -85,6 +85,27 @@ where
     Ok(Some(out))
 }
 
+/// Deserialize a `ReadCapacityUnits` or `WriteCapacityUnits` figure as
+/// `DynamoDB` reads it: a fraction is truncated toward zero and a figure
+/// outside the 64-bit range is saturated (measured 2026-11-14 and 2026-11-18).
+/// A figure with a fraction is read as a 64-bit float first, so above 2^53 it
+/// takes the nearest float before the truncation: `9007199254740993.5` reads
+/// as 9007199254740994. What the service reads there was not measured.
+///
+/// # Errors
+///
+/// Returns the deserializer error type when the value is not a number.
+pub fn deserialize_capacity_units<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let number = serde_json::Number::deserialize(deserializer)?;
+    // `as` truncates a float toward zero and saturates it at the 64-bit bounds.
+    #[allow(clippy::cast_possible_truncation)]
+    let float = || number.as_f64().map_or(0, |v| v as i64);
+    Ok(number.as_i64().unwrap_or_else(float))
+}
+
 /// Deserialize `ExpressionAttributeNames`: keys are `#<ident>` (at most 255
 /// bytes), the map is non-empty, and each mapped attribute name is non-empty.
 ///

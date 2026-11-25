@@ -44,6 +44,7 @@ pub(crate) async fn enforce_create_table(
     if let Some(requested) = limits::create_table_capacity(input) {
         let reserved = reserved_capacity(ctx, &names).await?;
         limits::check_create_table_capacity(requested, reserved, &ctx.limits, &ctx.region)?;
+        limits::check_create_table_indexes(input, &ctx.limits, &ctx.region)?;
     }
     limits::check_table_count(names.len(), &ctx.limits)
 }
