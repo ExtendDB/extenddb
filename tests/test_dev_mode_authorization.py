@@ -51,8 +51,16 @@ _ADMIN_AUTH = (
     os.environ.get("EXTENDDB_ADMIN_USER", "admin"),
     os.environ.get("EXTENDDB_ADMIN_PASSWORD", "not-the-password"),
 )
+# A password the server does not have. The admin routes answer it with 401,
+# which shows that a request passed the host guard.
+_WRONG_ADMIN_AUTH = ("admin", "not-the-password")
 _REBIND_HOST = "rebind.example"
 _GUARD_MESSAGE = "Developer mode refused a request"
+# The answer to an unsigned ListTables that passed the host guard.
+_MISSING_TOKEN = {
+    "__type": "com.amazon.coral.service#MissingAuthenticationToken",
+    "message": "Missing Authentication Token",
+}
 _SECURITY_HEADERS = {
     "x-frame-options": "DENY",
     "x-content-type-options": "nosniff",
@@ -339,7 +347,8 @@ class TestDevModeHostGuard:
 
     def test_same_request_without_a_marker_is_not_refused(self, endpoint_url):
         resp = _list_tables_unsigned(endpoint_url, {})
-        assert resp.status_code != 403, resp.text
+        assert resp.status_code == 400, resp.text
+        assert resp.json() == _MISSING_TOKEN
 
     def test_admin_get_under_a_rebinding_host_is_refused(self, endpoint_url):
         # A same-origin GET from a plain-HTTP page carries no marker.
@@ -355,9 +364,9 @@ class TestDevModeHostGuard:
 
     def test_admin_get_under_the_endpoint_host_is_not_refused(self, endpoint_url):
         resp = requests.get(
-            f"{_base(endpoint_url)}/management/accounts", auth=_ADMIN_AUTH, timeout=10
+            f"{_base(endpoint_url)}/management/accounts", auth=_WRONG_ADMIN_AUTH, timeout=10
         )
-        assert resp.status_code != 403, resp.text
+        assert (resp.status_code, resp.text) == (401, "Invalid credentials")
 
     def test_console_browser_request_under_a_rebinding_host_gets_the_html_403(
         self, endpoint_url
