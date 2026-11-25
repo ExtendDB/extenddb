@@ -413,8 +413,8 @@ Operations that need a facility the in-browser build lacks return a
 `ValidationException` (HTTP 400, which an SDK does not retry), with a message
 that names the build:
 
-- The store-backed backup operations — `CreateBackup`, `DescribeBackup`,
-  `DeleteBackup`, `RestoreTableFromBackup` — "… the code that serves it is not
+- The store-backed backup operations (`CreateBackup`, `DescribeBackup`,
+  `DeleteBackup`, `RestoreTableFromBackup`): "… the code that serves it is not
   compiled for wasm32." The engine's backup subsystem does not build for
   `wasm32`, so the engine refuses these four there, after the body parse, as
   it refuses any other known operation whose handler is compiled only off
@@ -425,8 +425,8 @@ that names the build:
   natively, the adapter runs the engine's backup handlers instead, and with no
   backup store `CreateBackup` backs a table up in the catalog, as a server
   without one does.
-- The PartiQL operations — `ExecuteStatement`, `BatchExecuteStatement`,
-  `ExecuteTransaction` — "… the PartiQL surface is not part of the browser build."
+- The PartiQL operations (`ExecuteStatement`, `BatchExecuteStatement`,
+  `ExecuteTransaction`): "… the PartiQL surface is not part of the browser build."
   This build refuses them by name, before it parses the body, so every body
   gets the refusal: a body that does not parse, which a server answers with
   `SerializationException` "Start of structure or map found where not
@@ -434,10 +434,10 @@ that names the build:
   such as an `ExecuteStatement` with no `Statement` (on a server, "1 validation
   error detected: Value null at 'statement' failed to satisfy constraint:
   Member must not be null").
-- `DescribeEndpoints` — "… it is called in-process and has no network endpoint
+- `DescribeEndpoints`: "… it is called in-process and has no network endpoint
   to report." It is refused by name too, so a body that does not parse gets the
   refusal, where a server answers `SerializationException`.
-- An `UpdateTable` that creates a vector index — "… it cannot build a vector
+- An `UpdateTable` that creates a vector index: "… it cannot build a vector
   index; create the table with its vector indexes instead." The SQLite backend
   refuses it after the engine has validated the request, so a request for a
   missing table or with a malformed `Create` gets the engine's own answer

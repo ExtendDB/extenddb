@@ -326,7 +326,7 @@ last.
 
 Cassandra's own `system_auth` keyspace, which holds the roles ExtendDB logs in
 with, starts at `SimpleStrategy` with replication factor 1 whatever `init` is
-given. To raise replication on a cluster — `system_auth` after any `init`, or
+given. To raise replication on a cluster, for `system_auth` after any `init` or for
 the deployment's keyspaces after an `init` at replication factor 1:
 
 1. Set `replication_factor` in `extenddb.toml` (example below), before you
