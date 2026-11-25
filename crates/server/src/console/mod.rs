@@ -79,8 +79,9 @@ pub struct ConsoleState {
 /// A POST handler on the tab checks the `_csrf` form field with
 /// [`csrf_matches`](Self::csrf_matches) before acting. Read by field; the
 /// struct may gain fields in a minor release, so build one for a test with
-/// [`ConsoleIdentity::new`].
-#[derive(Debug, Clone)]
+/// [`ConsoleIdentity::new`]. It has no `Debug`, so that no log line prints
+/// the token.
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct ConsoleIdentity {
     /// What the navigation bar shows for the user (`Admin: name` or
