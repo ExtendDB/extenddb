@@ -3,11 +3,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Remove the search-inequality-filters Cargo feature from every default list.
 
-Each crate that declares the feature has it in its `default` list. Most
-crates take their internal dependencies with default features, so no cargo
-command line compiles it out. The workspace takes extenddb-engine with its
-default features off, so the browser build's crate, extenddb-wasm-adapter,
-names the feature for the engine, core and the SQLite backend itself.
+Each crate that declares the feature has it in its `default` list. The
+storage crates and core are taken with their default features, so no cargo
+command line compiles it out. The workspace takes extenddb-engine and
+extenddb-server with their default features off: the server's feature turns
+on the engine's, the app's turns on the server's, and the browser build's
+crate, extenddb-wasm-adapter, names the feature for the engine, core and the
+SQLite backend itself.
 Removing the feature from every `default` list is how it is compiled out.
 
 This script reads every crates/*/Cargo.toml, refuses to edit any of them
@@ -33,7 +35,7 @@ import sys
 from pathlib import Path
 
 FEATURE = "search-inequality-filters"
-CRATES = 8
+CRATES = 7
 BROWSER = "extenddb-wasm-adapter"
 BROWSER_CRATES = ("extenddb-core", "extenddb-engine", "extenddb-storage-sqlite")
 

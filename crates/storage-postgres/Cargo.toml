@@ -21,7 +21,9 @@ test-hooks = ["extenddb-storage/test-hooks"]
 test-util = ["extenddb-storage/test-util"]
 # The SearchVectors inequality filter tests, which evaluate the extended
 # grammar on this backend. On by default. The backend applies whatever filter
-# the engine hands it, so the feature adds tests only.
+# the engine hands it, so its own code does not change; the feature compiles
+# those tests and turns on core's feature, which compiles core's grammar
+# module for every crate of the build.
 search-inequality-filters = ["extenddb-core/search-inequality-filters"]
 
 [dev-dependencies]

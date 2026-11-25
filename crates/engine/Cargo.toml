@@ -24,8 +24,9 @@ partiql = ["extenddb-core/partiql"]
 # grammar (comparators, BETWEEN, IN, OR, NOT, attribute_exists and
 # attribute_not_exists) for the accounts the `search_inequality_filters`
 # runtime setting names, every account when it is absent. On by default.
-# Removable: with this off, the grammar module is not compiled and
-# SearchVectors accepts only an AND of equalities.
+# With this off, SearchVectors accepts only an AND of equalities, whatever
+# core's feature. With it on and no settings store installed, which only the
+# server installs, every account gets the extended grammar.
 search-inequality-filters = ["extenddb-core/search-inequality-filters"]
 
 [dependencies]

@@ -23,11 +23,12 @@ concurrency:
 # and as a list of accounts, and against the build with the feature compiled
 # out.
 #
-# Most crates take their internal dependencies with default features, so no
+# The storage crates and core are taken with their default features, so no
 # cargo command line compiles the feature out. The workspace takes
-# extenddb-engine with its default features off, so extenddb-wasm-adapter,
-# the browser build, names the feature for the engine, core and the SQLite
-# backend itself. devtools/compile-out-search-inequality-filters removes the
+# extenddb-engine and extenddb-server with their default features off: the
+# server's feature turns on the engine's, the app's turns on the server's,
+# and extenddb-wasm-adapter, the browser build, names the feature for the
+# engine, core and the SQLite backend itself. devtools/compile-out-search-inequality-filters removes the
 # feature from the default list of every crate that declares it, which
 # compiles it out of the workspace, and checks that nothing enables it; with
 # `--check on` it checks that the browser build enables it on all three.
