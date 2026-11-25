@@ -858,7 +858,9 @@ mod tests {
     }
 
     /// Issue #1019 (measured 2026-11-14 and 2026-11-18), with Query and Scan as
-    /// operations that keep the character count.
+    /// operations that keep the character count. U+1F600 followed by `a` (3
+    /// code units) and 127 U+1F600 followed by `a` (255 code units) sit on the
+    /// two bounds.
     #[test]
     fn four_operations_count_a_name_in_utf16_code_units() {
         let long = Some("Member must have length less than or equal to 255");
@@ -867,6 +869,8 @@ mod tests {
         // (operations, name, the clause listed before the pattern clause)
         let rows = [
             (&utf16[..], emoji.repeat(2), None),
+            (&utf16[..], format!("{emoji}a"), None),
+            (&utf16[..], format!("{}a", emoji.repeat(127)), None),
             (&utf16[..], emoji.repeat(128), long),
             (&utf16[..], e_acute.repeat(200), None),
             (&["Query", "Scan"][..], emoji.repeat(128), None),
