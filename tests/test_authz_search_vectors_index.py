@@ -13,19 +13,25 @@ type against a running server.
 An IndexName outside ``[a-zA-Z0-9_.-]+`` (``vidx/extra``) gets ValidationException
 for every caller, before the policy decision, as Query and Scan do.
 
-The ``ROWS`` were measured on DynamoDB in us-east-1 on 2026-11-21, each
-request twice with the same answer, except the ``deny(null)`` rows that
-expect ValidationException, which were not sent. The ``deny(ssn)`` rows ran
-under a session policy that allows ``dynamodb:*`` and denies ``dynamodb:*``
-under ``ForAnyValue:StringEquals {"dynamodb:Attributes": ["ssn"]}``, the
-``deny(null)`` rows under one that denies under ``Null
-{"dynamodb:Attributes": "true"}``, and the ``allow-all`` rows with no session
-policy. The service sets no ``dynamodb:Attributes`` value on a SearchVectors
-request: it serves a projection of ``ssn`` under ``deny(ssn)``, and refuses
-every search under ``deny(null)``. The service makes the checks of a
-SearchVectors request that need no table, ``TopK`` and the
-``ExpressionAttributeNames`` keys among them, before the policy decision, so
-under ``deny(null)`` a request that fails one gets ValidationException.
+The ``ROWS`` that run under ``deny(ssn)``, ``allow-all`` and the
+``deny(null)`` rows that expect AccessDeniedException were measured on
+DynamoDB in us-east-1 on 2026-11-21, each request twice with the same answer.
+The ``deny(ssn)`` rows ran under a session policy that allows ``dynamodb:*``
+and denies ``dynamodb:*`` under ``ForAnyValue:StringEquals
+{"dynamodb:Attributes": ["ssn"]}``, the ``deny(null)`` rows under one that
+denies under ``Null {"dynamodb:Attributes": "true"}``, and the ``allow-all``
+rows with no session policy. The service sets no ``dynamodb:Attributes``
+value on a SearchVectors request: it serves a projection of ``ssn`` under
+``deny(ssn)``, and refuses every search under ``deny(null)``.
+
+The four ``deny(null)`` rows that expect ValidationException were not sent to
+DynamoDB under the ``Null`` session policy. They rest on three measurements.
+On 2026-11-21 in us-east-1 a Deny gated on ``Null`` ``true`` refused every
+SearchVectors sent. On 2026-11-24 in us-east-1 the same four requests, sent on
+a table ARN in another account, which the service refuses at its
+authorization decision, each answered ValidationException, so the service
+makes these checks ahead of that decision. Each row's message is the one the
+service answers for the same request without a policy.
 
 The ``deny(not-x)`` and ``allow(not-x)`` rows were not sent to DynamoDB
 either. They gate the statement on a bare ``StringNotEquals
