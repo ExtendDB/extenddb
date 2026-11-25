@@ -311,54 +311,20 @@ fn a_token_without_a_stream_arn_gets_the_answer_the_authorization_layer_gives() 
     }
 }
 
-// A backend-classified error reaches the client unchanged through the
-// streams mapper, keeping both its variant and its message.
-mod storage_error_mapping {
-    use super::super::storage_to_dynamo;
-    use extenddb_core::error::DynamoDbError;
-    use extenddb_storage::error::StorageError;
-
-    #[test]
-    fn service_internal_server_error_passes_through() {
-        let err = storage_to_dynamo(StorageError::Service(DynamoDbError::InternalServerError(
-            "backend internal".to_owned(),
-        )));
-        match err {
-            DynamoDbError::InternalServerError(msg) => assert_eq!(msg, "backend internal"),
-            other => panic!("expected InternalServerError, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn service_service_unavailable_passes_through() {
-        let err = storage_to_dynamo(StorageError::Service(DynamoDbError::ServiceUnavailable(
-            "retry shortly".to_owned(),
-        )));
-        match err {
-            DynamoDbError::ServiceUnavailable(msg) => assert_eq!(msg, "retry shortly"),
-            other => panic!("expected ServiceUnavailable, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn service_expired_iterator_passes_through() {
-        let err = storage_to_dynamo(StorageError::Service(
-            DynamoDbError::ExpiredIteratorException("Iterator expired.".to_owned()),
-        ));
-        match err {
-            DynamoDbError::ExpiredIteratorException(msg) => assert_eq!(msg, "Iterator expired."),
-            other => panic!("expected ExpiredIteratorException, got {other:?}"),
-        }
-    }
-
-    // Control: an unclassified driver error is still redacted behind the fixed
-    // string, with the driver text absent from the client message.
-    #[test]
-    fn internal_driver_text_is_redacted() {
-        let err = storage_to_dynamo(StorageError::Internal("driver text".to_owned()));
-        match err {
-            DynamoDbError::InternalServerError(msg) => assert_eq!(msg, "Internal server error"),
-            other => panic!("expected InternalServerError, got {other:?}"),
-        }
+// The shard lookup delegates a shard id within the length bound to
+// `storage_to_dynamo`, so a backend-classified error reaches the client as that
+// mapping gives it (`service_error_log_tests`).
+#[test]
+fn a_service_error_reaches_the_client_as_classified_through_the_shard_lookup() {
+    for (error, body) in crate::service_error_log_tests::rows() {
+        let got = super::shard_lookup_error(
+            65,
+            extenddb_storage::error::StorageError::Service(error.clone()),
+        );
+        assert_eq!(
+            extenddb_core::error::error_document(&got),
+            body,
+            "{error:?}"
+        );
     }
 }

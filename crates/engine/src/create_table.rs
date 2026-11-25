@@ -229,17 +229,26 @@ pub fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> Dynamo
             tracing::error!(internal_error = %msg, "storage internal error");
             DynamoDbError::InternalServerError("Internal server error".to_owned())
         }
-        // The backend already classified this failure into the service error
-        // vocabulary and chose the client-facing message. Pass it through
-        // with its variant and message unchanged; it is not a storage fault,
-        // so it is not logged as one. The one rule the engine keeps for itself
-        // is the item on a conditional check error: this generic path discards
-        // it, as it does for its own ConditionFailed, and
-        // `storage_err_to_dynamo_with_ccf` returns it when the caller asked.
-        StorageError::Service(DynamoDbError::ConditionalCheckFailedException(msg, _)) => {
+        StorageError::Service(e) => service_err_to_dynamo(e),
+    }
+}
+
+/// The client error inside a [`StorageError::Service`], as every mapping in
+/// the engine returns it. The backend already classified the failure and
+/// chose the message, so the error keeps its variant and message, and it is
+/// not logged as a storage fault. The one rule the engine keeps for itself is
+/// the item on a conditional check error: it is dropped here, as the generic
+/// path drops the item of the engine's own `ConditionFailed`, and only
+/// [`storage_err_to_dynamo_with_ccf`] returns it, to a request that set
+/// `ReturnValuesOnConditionCheckFailure` to `ALL_OLD`.
+///
+/// [`StorageError::Service`]: extenddb_storage::error::StorageError::Service
+pub(crate) fn service_err_to_dynamo(e: DynamoDbError) -> DynamoDbError {
+    match e {
+        DynamoDbError::ConditionalCheckFailedException(msg, _) => {
             DynamoDbError::ConditionalCheckFailedException(msg, None)
         }
-        StorageError::Service(e) => e,
+        other => other,
     }
 }
 
@@ -264,17 +273,13 @@ pub(crate) fn storage_err_to_dynamo_with_ccf(
                 return_item,
             )
         }
-        // The engine applies the ReturnValuesOnConditionCheckFailure rule to a
-        // backend-classified conditional check error as it does to its own: the
-        // message is the backend's, and the item crosses only when the caller
-        // asked for ALL_OLD, which only this mapper can see.
-        StorageError::Service(DynamoDbError::ConditionalCheckFailedException(msg, item)) => {
-            let return_item = if ccf == ReturnValuesOnConditionCheckFailure::AllOld {
-                item
-            } else {
-                None
-            };
-            DynamoDbError::ConditionalCheckFailedException(msg, return_item)
+        // A backend-classified conditional check error keeps its message, and
+        // its item crosses only when the caller asked for ALL_OLD, which only
+        // this mapper can see. Without ALL_OLD the generic mapping drops it.
+        StorageError::Service(DynamoDbError::ConditionalCheckFailedException(msg, item))
+            if ccf == ReturnValuesOnConditionCheckFailure::AllOld =>
+        {
+            DynamoDbError::ConditionalCheckFailedException(msg, item)
         }
         other => storage_err_to_dynamo(other),
     }
@@ -282,16 +287,12 @@ pub(crate) fn storage_err_to_dynamo_with_ccf(
 
 #[cfg(test)]
 mod storage_error_mapping_tests {
-    use super::{storage_err_to_dynamo, storage_err_to_dynamo_with_ccf};
-    use extenddb_core::error::DynamoDbError;
-    use extenddb_core::types::ReturnValuesOnConditionCheckFailure;
+    use extenddb_core::error::{DynamoDbError, error_document};
+    use extenddb_core::types::{AttributeValue, Item, ReturnValuesOnConditionCheckFailure};
     use extenddb_storage::error::StorageError;
+    use serde_json::json;
 
-    const INTERNAL_MSG: &str =
-        "The server encountered an internal error trying to fulfill the request.";
-    const UNAVAILABLE_MSG: &str = "The database is temporarily unavailable, retry shortly.";
-    const CAPACITY_MSG: &str =
-        "The level of configured provisioned throughput for the table was exceeded.";
+    use super::{storage_err_to_dynamo, storage_err_to_dynamo_with_ccf};
 
     /// A snapshot the backend discarded is retryable, like a transient error.
     #[test]
@@ -303,183 +304,38 @@ mod storage_error_mapping_tests {
         );
     }
 
-    // storage_err_to_dynamo: a backend-classified error reaches the client
-    // unchanged, keeping both its variant and its message.
-
+    /// Only this mapper reads `ReturnValuesOnConditionCheckFailure`: a
+    /// backend's conditional check error reaches the client with its own
+    /// message, and with its item only under `ALL_OLD`. The mappings that
+    /// drop the item are checked in `service_error_log_tests`.
     #[test]
-    fn service_internal_server_error_passes_through() {
-        let err = storage_err_to_dynamo(StorageError::Service(DynamoDbError::InternalServerError(
-            INTERNAL_MSG.to_owned(),
-        )));
-        match err {
-            DynamoDbError::InternalServerError(msg) => assert_eq!(msg, INTERNAL_MSG),
-            other => panic!("expected InternalServerError, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn service_service_unavailable_passes_through() {
-        let err = storage_err_to_dynamo(StorageError::Service(DynamoDbError::ServiceUnavailable(
-            UNAVAILABLE_MSG.to_owned(),
-        )));
-        match err {
-            DynamoDbError::ServiceUnavailable(msg) => assert_eq!(msg, UNAVAILABLE_MSG),
-            other => panic!("expected ServiceUnavailable, got {other:?}"),
-        }
-    }
-
-    // Any service error class passes through, not only the two above.
-    #[test]
-    fn service_capacity_error_passes_through() {
-        let err = storage_err_to_dynamo(StorageError::Service(
-            DynamoDbError::ProvisionedThroughputExceededException(CAPACITY_MSG.to_owned()),
-        ));
-        match err {
-            DynamoDbError::ProvisionedThroughputExceededException(msg) => {
-                assert_eq!(msg, CAPACITY_MSG);
-            }
-            other => panic!("expected ProvisionedThroughputExceededException, got {other:?}"),
-        }
-    }
-
-    // Control: a raw driver message is still redacted behind the fixed string.
-    #[test]
-    fn internal_driver_text_is_still_redacted() {
-        let err = storage_err_to_dynamo(StorageError::Internal("driver text".to_owned()));
-        match err {
-            DynamoDbError::InternalServerError(msg) => assert_eq!(msg, "Internal server error"),
-            other => panic!("expected InternalServerError, got {other:?}"),
-        }
-    }
-
-    // storage_err_to_dynamo_with_ccf delegates everything but ConditionFailed,
-    // so the same four cases hold through it.
-
-    #[test]
-    fn service_internal_server_error_passes_through_with_ccf() {
-        let err = storage_err_to_dynamo_with_ccf(
-            StorageError::Service(DynamoDbError::InternalServerError(INTERNAL_MSG.to_owned())),
-            ReturnValuesOnConditionCheckFailure::None,
-        );
-        match err {
-            DynamoDbError::InternalServerError(msg) => assert_eq!(msg, INTERNAL_MSG),
-            other => panic!("expected InternalServerError, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn service_service_unavailable_passes_through_with_ccf() {
-        let err = storage_err_to_dynamo_with_ccf(
-            StorageError::Service(DynamoDbError::ServiceUnavailable(
-                UNAVAILABLE_MSG.to_owned(),
-            )),
-            ReturnValuesOnConditionCheckFailure::AllOld,
-        );
-        match err {
-            DynamoDbError::ServiceUnavailable(msg) => assert_eq!(msg, UNAVAILABLE_MSG),
-            other => panic!("expected ServiceUnavailable, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn service_capacity_error_passes_through_with_ccf() {
-        let err = storage_err_to_dynamo_with_ccf(
-            StorageError::Service(DynamoDbError::ProvisionedThroughputExceededException(
-                CAPACITY_MSG.to_owned(),
-            )),
-            ReturnValuesOnConditionCheckFailure::None,
-        );
-        match err {
-            DynamoDbError::ProvisionedThroughputExceededException(msg) => {
-                assert_eq!(msg, CAPACITY_MSG);
-            }
-            other => panic!("expected ProvisionedThroughputExceededException, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn internal_driver_text_is_still_redacted_with_ccf() {
-        let err = storage_err_to_dynamo_with_ccf(
-            StorageError::Internal("driver text".to_owned()),
-            ReturnValuesOnConditionCheckFailure::None,
-        );
-        match err {
-            DynamoDbError::InternalServerError(msg) => assert_eq!(msg, "Internal server error"),
-            other => panic!("expected InternalServerError, got {other:?}"),
-        }
-    }
-
-    // A Service error carrying ConditionalCheckFailedException keeps the
-    // backend's message, and its item follows the caller's
-    // ReturnValuesOnConditionCheckFailure like the engine's own ConditionFailed.
-    fn backend_item() -> extenddb_core::types::Item {
-        let mut item = extenddb_core::types::Item::new();
-        item.insert(
-            "pk".to_owned(),
-            extenddb_core::types::AttributeValue::S("secret".to_owned()),
-        );
-        item
-    }
-
-    // The generic mapper has no ReturnValuesOnConditionCheckFailure to read, so
-    // it discards the item from a backend's conditional check error the way it
-    // does from the engine's own, and keeps the message.
-    #[test]
-    fn service_condition_failed_drops_the_backend_item_on_the_generic_path() {
-        let err = storage_err_to_dynamo(StorageError::Service(
-            DynamoDbError::ConditionalCheckFailedException(
-                "The conditional request failed".to_owned(),
-                Some(backend_item()),
+    fn a_backend_conditional_check_error_keeps_its_item_only_under_all_old() {
+        let message = "The stored item does not match the condition.";
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), AttributeValue::S("stored".to_owned()));
+        for (ccf, body) in [
+            (
+                ReturnValuesOnConditionCheckFailure::None,
+                json!({
+                    "__type": "com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException",
+                    "message": message,
+                }),
             ),
-        ));
-        match err {
-            DynamoDbError::ConditionalCheckFailedException(msg, item) => {
-                assert_eq!(msg, "The conditional request failed");
-                assert!(
-                    item.is_none(),
-                    "item reached the client on the generic path: {item:?}"
-                );
-            }
-            other => panic!("expected ConditionalCheckFailedException, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn service_condition_failed_drops_the_backend_item_with_ccf_none() {
-        let err = storage_err_to_dynamo_with_ccf(
-            StorageError::Service(DynamoDbError::ConditionalCheckFailedException(
-                "The conditional request failed".to_owned(),
-                Some(backend_item()),
-            )),
-            ReturnValuesOnConditionCheckFailure::None,
-        );
-        match err {
-            DynamoDbError::ConditionalCheckFailedException(msg, item) => {
-                assert_eq!(msg, "The conditional request failed");
-                assert!(
-                    item.is_none(),
-                    "item reached the client with ccf None: {item:?}"
-                );
-            }
-            other => panic!("expected ConditionalCheckFailedException, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn service_condition_failed_keeps_the_backend_item_with_ccf_all_old() {
-        let err = storage_err_to_dynamo_with_ccf(
-            StorageError::Service(DynamoDbError::ConditionalCheckFailedException(
-                "The conditional request failed".to_owned(),
-                Some(backend_item()),
-            )),
-            ReturnValuesOnConditionCheckFailure::AllOld,
-        );
-        match err {
-            DynamoDbError::ConditionalCheckFailedException(msg, item) => {
-                assert_eq!(msg, "The conditional request failed");
-                assert_eq!(item, Some(backend_item()));
-            }
-            other => panic!("expected ConditionalCheckFailedException, got {other:?}"),
+            (
+                ReturnValuesOnConditionCheckFailure::AllOld,
+                json!({
+                    "__type": "com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException",
+                    "message": message,
+                    "Item": {"pk": {"S": "stored"}},
+                }),
+            ),
+        ] {
+            let error = DynamoDbError::ConditionalCheckFailedException(
+                message.to_owned(),
+                Some(item.clone()),
+            );
+            let got = storage_err_to_dynamo_with_ccf(StorageError::Service(error), ccf);
+            assert_eq!(error_document(&got), body, "{ccf:?}");
         }
     }
 }
