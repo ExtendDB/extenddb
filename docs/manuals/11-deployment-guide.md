@@ -73,8 +73,8 @@ ExtendDB runs in Docker or Kubernetes. The binary has no runtime dependencies be
 Example Dockerfile:
 
 ```dockerfile
-# Match rust-version in Cargo.toml
-FROM rust:1.95 AS builder
+# Match rust-version in Cargo.toml, and the Debian release of the runtime stage
+FROM rust:1.91.1-bookworm AS builder
 WORKDIR /src
 COPY . .
 RUN cargo build --release
@@ -143,7 +143,7 @@ There is no readiness endpoint yet, so do not expect a Kubernetes
 becomes unreachable. Until a readiness endpoint that probes the storage layer
 exists, treat backend failures as something clients retry through.
 
-For Kubernetes, run `extenddb init` as an init container or a one-time Job, then deploy extenddb as a Deployment with the generated `extenddb.toml` mounted as a ConfigMap or Secret.
+For Kubernetes, run `extenddb init` as an init container or a one-time Job, then deploy extenddb as a Deployment with the generated `extenddb.toml` mounted as a ConfigMap or Secret. A deployment that keeps its stored secrets under a key-encryption key (KEK) file (the admin guide's [Encryption Key](05-admin-guide.md#encryption-key) section) mounts the KEK as a Secret volume with `defaultMode: 0400`, runs the pod with `securityContext: {runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001}`, and points `EXTENDDB__AUTH__ENCRYPTION__KEY_FILE` at the mounted file. kubelet gives the file to root with group 10001 at mode 0440, which the server accepts only when its effective group is 10001. The server cannot see who belongs to that group, and every member can read the file, so give group 10001 no other members. Without `fsGroup` the file belongs to group root and uid 10001 cannot open it. Secrets are unencrypted in etcd unless the cluster enables encryption at rest. The `extenddb encryption-key` commands that need every server stopped run as a Job that mounts the same Secret while the Deployment has 0 replicas.
 
 ### Air-Gapped
 
@@ -152,6 +152,7 @@ ExtendDB requires no internet connectivity. All functionality is self-contained 
 Requirements in the air-gapped environment:
 - A supported storage backend, reachable from the ExtendDB host
 - The `extenddb` binary (statically linked or with matching libc)
+- The KEK file, when the deployment encrypts its stored secrets under one (`[auth.encryption] key_file`), delivered by one of the routes in the admin guide's [Encryption Key](05-admin-guide.md#encryption-key) section, with a copy kept away from the host; no key source depends on a network key service
 
 ## Configuring PostgreSQL
 
@@ -211,6 +212,7 @@ extenddb init \
 - [ ] Change the admin password from the auto-generated one
 - [ ] Create named accounts and IAM users with least-privilege policies
 - [ ] Leave credential import off unless you need it. The server refuses imports unless `allow_credential_import` is `true`. If you enabled it to import keys, turn it off again: `extenddb settings set allow_credential_import false`
+- [ ] Encrypt stored secrets under a KEK file: `extenddb encryption-key switch --key-file <path> --yes` with every server stopped, then set `[auth.encryption] key_file`, and keep a copy of the KEK away from the host (the admin guide's [Encryption Key](05-admin-guide.md#encryption-key) section)
 
 ### Transport
 
@@ -268,6 +270,11 @@ User=extenddb
 Group=extenddb
 Restart=on-failure
 RestartSec=5
+# The locked key store that holds the encryption key and the cached signing
+# keys needs about 640 KiB for the default [auth.cache] max_entries. Kernels
+# before 5.16 default the memlock limit to 64 KiB (the admin guide's Memory
+# locking section).
+LimitMEMLOCK=16M
 # On a host that backs up tables of large items, one malloc arena keeps a
 # backup job's high-water mark at the pipeline's terms whatever the number of
 # large items it reads (the admin guide's [backup] max_concurrent_jobs row
@@ -287,6 +294,21 @@ WantedBy=multi-user.target
 sudo systemctl enable extenddb
 sudo systemctl start extenddb
 ```
+
+To keep the stored secrets under a key-encryption key (KEK) file instead of the catalog key (the admin guide's [Encryption Key](05-admin-guide.md#encryption-key) section), on a host with systemd 250 or later and a TPM 2.0 chip, seal the KEK to the TPM and let systemd decrypt it at each start of the unit. Keep a copy of the KEK away from the host first: the sealed file opens only with that TPM and is lost with the host.
+
+```bash
+systemd-creds encrypt --with-key=tpm2 --name=extenddb-kek kek /etc/credstore.encrypted/extenddb-kek
+```
+
+Then add two lines to the `[Service]` section above:
+
+```ini
+LoadCredentialEncrypted=extenddb-kek:/etc/credstore.encrypted/extenddb-kek
+Environment=EXTENDDB__AUTH__ENCRYPTION__KEY_FILE=%d/extenddb-kek
+```
+
+Run `extenddb encryption-key switch --key-file <path> --yes` with the unit stopped, through the admin guide's [`systemd-run` example](05-admin-guide.md#delivering-the-kek-file), which runs it as `extenddb` with the credential and gives the path under `/run/credentials/extenddb-keys.service/`, and then start the unit. The plaintext `kek` written under `umask 077` is root's at mode 0600, so the server's user cannot open it, and `/run/credentials/extenddb.service/` does not exist while the unit is stopped. systemd decrypts the credential into `/run/credentials/extenddb.service/` and unmounts that directory when the unit stops. On a ramfs the `extenddb` user owns the file at mode 0400; systemd 254 or later on Linux 6.4 or later uses a tmpfs, where root owns the file and an ACL entry lets the user read it. The server accepts both. With `LimitMEMLOCK=` in the unit the locked key store fits on every kernel; without `key_file` a server that cannot lock its memory warns and starts, with it the server refuses unless `require_locked_memory = false` is set.
 
 With this unit only the `extenddb` user and root can read export files: the server creates them with mode 0600, and the import and export roots and account directories it creates with mode 0700, which the daemon's umask (027) can only narrow; before v0.1.15 that umask gave the `extenddb` group read access (see [the v0.1.15 entry](07-upgrade-manual.md#v0115-export-files-are-created-0600-and-the-import-and-export-directories-the-server-creates-0700) of the upgrade manual). To give a group access to a root, for example to put import files into it, create the root before the first start with that group and the mode you want, since an existing directory keeps its mode; export files in it are still created 0600. Import files go under `<root>/<account id>`. When one directory is both an import and an export root (the deprecated `import_export_root`, or the same path under `[import]` and `[export]`), the first export of an account creates that directory 0700, so also create each `<root>/<account id>` beforehand with the group and mode you want, or use separate import and export roots. Keep each parent directory of a root writable by its owner only (root or `extenddb`): the server logs a warning at startup for a parent directory that group or others can write to without the sticky bit, since a user who can write to it could replace the root.
 
@@ -358,6 +380,70 @@ SELECT query, mean_exec_time, calls
 FROM pg_stat_statements WHERE usename = 'extenddb'
 ORDER BY mean_exec_time DESC LIMIT 10;
 ```
+
+### Process Memory
+
+The memory the metrics hold does not grow with the number of requests served.
+Counter metrics are held for at most two minutes before they are flushed to the
+catalog. So the memory they occupy scales with the request rate and not with
+uptime. A GetItem adds five or seven 40-byte points (seven when it returns an
+item), held for 60 to 120 seconds.
+Per-operation latency segments are summed into time buckets per account and
+operation. A bucket is 64 bytes and covers one second of the last five minutes
+or one minute of the last day. A bucket exists only for a second or minute in
+which the account sent that operation. An operation the account sends every
+second holds the most buckets, 1,742, which is 111,488 bytes (109 KiB). An
+operation the account sends once a day holds two buckets. With its keys and
+map entries that is 286 to 429 bytes when the account sends 3 to 40
+operations. The cost steps up each time the account's map of operations grows.
+It is 475 bytes with 2 operations, and 810 bytes when the account sends only
+that operation. These figures come from a release build with a counting
+allocator and 1,000 accounts, on 24 November 2026. With the 40
+operations the server dispatches, an account that sends every operation every
+second holds about 4.46 MB (4.25 MiB) of buckets. An account that sends each
+operation once a day holds about 14 KB. The memory of an operation's buckets
+does not shrink when the account sends it less often. The operation keeps the
+largest allocation it reached, up to 111,488 bytes, until a day passes with no
+request for it. Then the five-minute metrics prune drops its buckets, and it
+drops the account once the account holds no operation. That happens 1,440 to
+about 1,446 minutes after the last request. The buckets return to the
+allocator. The process's resident size can
+stay at the high-water mark the allocator reached. So the segments grow with
+the number of accounts that sent a request in the last day. They also grow with
+the seconds and minutes in which each of those accounts was active. Below one
+request a second per operation, they grow with the request rate. Above it, and
+with the table count or uptime, they do not grow. With
+`throttling_enabled = true` the throttle manager keeps a read and a write token
+bucket for each distinct value of the first attribute in the `Key` or `Item`
+of a GetItem, PutItem, UpdateItem or DeleteItem. That attribute comes first in
+name order, or in the request's order on a build with the MongoDB backend. So
+it can be the sort key. It never drops a bucket. Resident memory then grows
+with the number of distinct values those requests carry.
+
+Every release through 1.0.0 kept one latency segment record per request that
+reaches dispatch in memory for 24 hours. So does any later release before the
+one that carries this change. The upgrade manual's
+[v1.1.0 entry](07-upgrade-manual.md#v110-latency-segments-are-summed-into-time-buckets)
+lists what the change does to the `segments` that `/metrics` returns. A record
+takes about 190 bytes through 0.1.14, and about
+250 from 0.1.15 on, which also stores the account id. On those releases resident
+memory grows for the first 24 hours. It then holds at the level set by the
+busiest 24-hour window the process saw, and it does not come down short of a
+restart. To run one of those releases until you upgrade, size the memory limit
+as
+
+```
+limit >= baseline + bytes_per_request * requests_per_24h * 1.3
+```
+
+where `bytes_per_request` is 190 through 0.1.14 and 250 from 0.1.15 on. The
+factor 1.3 is a modelled allowance for allocator overhead, not a measured
+figure. At 274 requests per second, 23.7 million requests per day, the rule
+gives about 5.5 GiB plus baseline on 0.1.14. On 1.0.0 it gives about 7.2 GiB
+plus baseline. Or restart the process before the limit is reached.
+Stop with SIGTERM or `extenddb stop` so the last partial minute of counter
+metrics is flushed. Only the in-memory latency segments are lost on restart;
+counter metrics are in the catalog.
 
 ---
 

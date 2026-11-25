@@ -763,6 +763,12 @@ pub(crate) fn lock_not_available(e: &sqlx::Error) -> bool {
     sqlstate_is(e, &[SQLSTATE_LOCK_NOT_AVAILABLE])
 }
 
+/// Whether `e` is SQLSTATE `undefined_table` (42P01): the relation the
+/// statement names does not exist.
+pub(crate) fn undefined_table(e: &sqlx::Error) -> bool {
+    sqlstate_is(e, &["42P01"])
+}
+
 /// The SQLSTATEs that end a drop's lock wait without anything being wrong
 /// with the drop itself: `lock_not_available` (55P03, its `lock_timeout` ran
 /// out), `deadlock_detected` (40P01, the server chose its transaction as the

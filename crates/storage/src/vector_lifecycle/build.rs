@@ -122,6 +122,14 @@ pub trait VectorIndexBuild: Send {
 /// # Errors
 /// Propagates the first batch or heartbeat failure; rows already committed by
 /// earlier batches stay in place for the recovery rebuild to supersede.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "its callers are complete_build and rebuild_index, and none of theirs runs on \
+              wasm32: extenddb-storage-postgres is not part of that build, and \
+              extenddb-storage-sqlite calls them from its UpdateTable vector backfill, which \
+              no request starts there because creating a vector index is refused, and from \
+              its index recovery, which only the server's startup and worker run"
+)]
 pub async fn run_backfill<B: VectorIndexBuild>(
     ops: &mut B,
     batch_size: i64,
@@ -161,6 +169,13 @@ pub async fn run_backfill<B: VectorIndexBuild>(
 /// recovery repairs (its stuck-build sweep at runtime, its reconciler at
 /// startup). Flipping to ACTIVE on error would publish a partially populated
 /// index, and there is no failure state on the wire for an index to sit in.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "its callers are the UpdateTable vector-index backfills of \
+              extenddb-storage-sqlite and extenddb-storage-postgres, and neither runs on \
+              wasm32: the PostgreSQL backend is not part of that build, and there a request \
+              to create a vector index is refused, so the SQLite backend starts no backfill"
+)]
 pub async fn complete_build<B: VectorIndexBuild>(
     mut ops: B,
     index_name: &str,

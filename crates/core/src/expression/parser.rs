@@ -18,6 +18,9 @@
 //! path          → (ident | name_ref) ( '.' (ident | name_ref) | '[' number ']' )*
 //! function_call → function_name '(' operand ( ',' operand )* ')'
 //! ```
+//!
+//! A parenthesized condition, a `NOT` and a `size` call read as an operand
+//! each nest one level, up to `max_depth`.
 
 use super::ast::{CompareOp, Expr};
 use super::parser_common;
@@ -140,17 +143,17 @@ fn parse_primary(
             && *pos + 1 < tokens.len()
             && tokens[*pos + 1] == Token::LParen
         {
-            return parse_function_call(tokens, pos);
+            return parse_function_call(tokens, pos, depth, max_depth);
         }
     }
 
     // Operand — then check for comparator, BETWEEN, or IN
-    let left = parse_operand(tokens, pos)?;
+    let left = parse_operand(tokens, pos, depth, max_depth)?;
 
     if *pos < tokens.len() {
         if let Some(op) = try_comparator(&tokens[*pos]) {
             *pos += 1;
-            let right = parse_operand(tokens, pos)?;
+            let right = parse_operand(tokens, pos, depth, max_depth)?;
             return Ok(Expr::Compare {
                 left: Box::new(left),
                 op,
@@ -161,9 +164,9 @@ fn parse_primary(
         // BETWEEN operand AND operand
         if tokens[*pos] == Token::Between {
             *pos += 1;
-            let low = parse_operand(tokens, pos)?;
+            let low = parse_operand(tokens, pos, depth, max_depth)?;
             parser_common::expect_token(tokens, pos, &Token::And, "AND", "ConditionExpression")?;
-            let high = parse_operand(tokens, pos)?;
+            let high = parse_operand(tokens, pos, depth, max_depth)?;
             return Ok(Expr::Between {
                 operand: Box::new(left),
                 low: Box::new(low),
@@ -175,10 +178,10 @@ fn parse_primary(
         if tokens[*pos] == Token::In {
             *pos += 1;
             parser_common::expect_token(tokens, pos, &Token::LParen, "(", "ConditionExpression")?;
-            let mut list = vec![parse_operand(tokens, pos)?];
+            let mut list = vec![parse_operand(tokens, pos, depth, max_depth)?];
             while *pos < tokens.len() && tokens[*pos] == Token::Comma {
                 *pos += 1;
-                list.push(parse_operand(tokens, pos)?);
+                list.push(parse_operand(tokens, pos, depth, max_depth)?);
             }
             parser_common::expect_token(tokens, pos, &Token::RParen, ")", "ConditionExpression")?;
             return Ok(Expr::In {
@@ -194,7 +197,12 @@ fn parse_primary(
     ))
 }
 
-fn parse_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbError> {
+fn parse_operand(
+    tokens: &[Token],
+    pos: &mut usize,
+    depth: &mut usize,
+    max_depth: usize,
+) -> Result<Expr, DynamoDbError> {
     if *pos >= tokens.len() {
         return Err(validation_err(
             "Invalid ConditionExpression: expected operand",
@@ -213,7 +221,15 @@ fn parse_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbErro
                 && *pos + 1 < tokens.len()
                 && tokens[*pos + 1] == Token::LParen
             {
-                return parse_function_call(tokens, pos);
+                *depth += 1;
+                if *depth > max_depth {
+                    return Err(validation_err(
+                        "Invalid ConditionExpression: expression nesting depth exceeded",
+                    ));
+                }
+                let call = parse_function_call(tokens, pos, depth, max_depth)?;
+                *depth -= 1;
+                return Ok(call);
             }
             let elements = parser_common::parse_path(tokens, pos)?;
             Ok(Expr::Path(elements))
@@ -228,7 +244,12 @@ fn parse_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbErro
     }
 }
 
-fn parse_function_call(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbError> {
+fn parse_function_call(
+    tokens: &[Token],
+    pos: &mut usize,
+    depth: &mut usize,
+    max_depth: usize,
+) -> Result<Expr, DynamoDbError> {
     let name = match &tokens[*pos] {
         Token::Ident(n) => n.to_ascii_lowercase(),
         _ => {
@@ -243,10 +264,10 @@ fn parse_function_call(tokens: &[Token], pos: &mut usize) -> Result<Expr, Dynamo
 
     let mut args = Vec::new();
     if *pos < tokens.len() && tokens[*pos] != Token::RParen {
-        args.push(parse_operand(tokens, pos)?);
+        args.push(parse_operand(tokens, pos, depth, max_depth)?);
         while *pos < tokens.len() && tokens[*pos] == Token::Comma {
             *pos += 1;
-            args.push(parse_operand(tokens, pos)?);
+            args.push(parse_operand(tokens, pos, depth, max_depth)?);
         }
     }
 

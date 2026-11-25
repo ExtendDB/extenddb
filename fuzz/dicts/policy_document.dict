@@ -1,0 +1,62 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# libFuzzer dictionary for the policy_document target. Each entry is a token
+# that crates/auth/src/policy/document.rs matches: the policy keys, the Effect
+# and Version values, the condition operators with their ForAllValues:,
+# ForAnyValue: and IfExists forms, and the CIDR forms that IpAddress and
+# NotIpAddress values are checked against. The Fuzz workflow passes the file
+# with -dict. Keys carry their JSON quotes, so a token that libFuzzer inserts
+# can form a valid key.
+
+"\"Version\""
+"\"2012-10-17\""
+"\"2008-10-17\""
+"\"Statement\""
+"\"Sid\""
+"\"Effect\""
+"\"Allow\""
+"\"Deny\""
+"\"Action\""
+"\"NotAction\""
+"\"Resource\""
+"\"NotResource\""
+"\"Principal\""
+"\"NotPrincipal\""
+"\"AWS\""
+"\"Condition\""
+"\"*\""
+"ForAllValues:"
+"ForAnyValue:"
+"IfExists"
+"StringEquals"
+"StringNotEquals"
+"StringEqualsIgnoreCase"
+"StringNotEqualsIgnoreCase"
+"StringLike"
+"StringNotLike"
+"NumericEquals"
+"NumericNotEquals"
+"NumericLessThan"
+"NumericLessThanEquals"
+"NumericGreaterThan"
+"NumericGreaterThanEquals"
+"DateEquals"
+"DateNotEquals"
+"DateLessThan"
+"DateLessThanEquals"
+"DateGreaterThan"
+"DateGreaterThanEquals"
+"Bool"
+"Null"
+"ArnEquals"
+"ArnNotEquals"
+"ArnLike"
+"ArnNotLike"
+"IpAddress"
+"NotIpAddress"
+"aws:SourceIp"
+"10.0.0.0/8"
+"192.0.2.1/32"
+"2001:db8::/32"
+"::/0"
