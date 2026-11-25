@@ -1355,9 +1355,7 @@ async fn test_simultaneous_restores_of_one_backup_admit_exactly_one() {
     let admitted = format!("SimTarget{}", accepted[0]);
     // Liveness: the four have answered while the admitted copy is held.
     assert_eq!(
-        describe(&engine, &account_id, &admitted)
-            .await
-            .table_status,
+        describe(&engine, &account_id, &admitted).await.table_status,
         TableStatus::Creating,
         "the admitted target is still CREATING when the four have answered"
     );
