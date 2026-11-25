@@ -169,7 +169,10 @@ async fn an_empty_map_answers_before_a_dimension_mismatch() {
 /// us-east-1 on 2026-11-25 on a table name that does not exist, each request
 /// twice with the same answer: one 65,533-byte name `#x0` in 17 conditions
 /// `#x0 = :s AND ...` (1,114,277 bytes) answers the size refusal, and in 15
-/// conditions (983,185 bytes) ResourceNotFoundException.
+/// conditions (983,185 bytes) ResourceNotFoundException. The equality-only
+/// grammar refuses a repeated attribute first, so the test runs only with the
+/// extended grammar.
+#[cfg(feature = "search-inequality-filters")]
 #[tokio::test]
 async fn the_size_counts_a_name_at_each_use_before_a_missing_table() {
     let dir = TempDir::new().unwrap();
