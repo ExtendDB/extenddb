@@ -5,7 +5,11 @@ in-tree workspace crate selected by Cargo feature.
 
 ## Design
 
-Single-file (or in-memory) storage using SQLite via `sqlx`. Targets:
+Single-file (or in-memory) storage using SQLite via `sqlx`. On `wasm32`, which
+`sqlx`'s SQLite driver does not build for, the crate opens only an in-memory database and
+reaches it through `src/wasm_sqlx.rs`, a module that implements the part of the
+`sqlx` API the crate uses over the SQLite that `sqlite-wasm-rs` bundles; its
+module documentation lists the differences from `sqlx`. Targets:
 
 - Local development without PostgreSQL
 - CI / integration tests (especially the ephemeral in-memory mode)
@@ -19,7 +23,9 @@ Key differences from the PostgreSQL backend:
 - GSI propagation via a persistent `gsi_pending` queue with a configurable delay
   (a delay of 0 applies updates synchronously on the write path); LSI
   propagation is synchronous
-- OR-expansion for pagination (SQLite lacks row-value tuple comparison)
+- The pagination cursor is the same row-value comparison as on PostgreSQL,
+  with `?` placeholders and no `COLLATE` (SQLite's default `BINARY` collation
+  already compares text by byte value)
 
 It shares the PostgreSQL backend's catalog version gate: the server refuses to
 start unless its compiled `CATALOG_VERSION` matches the stored `catalog_version`.
@@ -94,7 +100,16 @@ SigV4 is verified — a request signed with a different secret is rejected with
 ## Conformance
 
 Per [RFC-0002](https://github.com/ExtendDB/extenddb/blob/main/docs/rfcs), this
-backend implements the full storage trait surface.
+backend implements the full storage trait surface. The `wasm32` build does
+not compile five of those implementations, which outside tests only the
+`extenddb` command-line tool and the server it starts use: `Bootstrapper`
+(`SqliteBootstrapper`), `ServerRuntimeHooks`, `OperationsEngine`,
+`CatalogMigrations` and `LockedStores`. Two methods answer
+`StorageError::Unsupported` there:
+`SnapshotEngine::open_table_snapshot`, for every table, since its native
+implementation uses `sqlx` API that the `wasm32` build does not provide, and
+`TableEngine::update_table`, for a request that creates a vector index, since
+the build cannot run the index backfill.
 
 Mandatory traits (required for acceptance):
 

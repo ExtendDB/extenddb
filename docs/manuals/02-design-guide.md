@@ -154,6 +154,7 @@ Each stream has a fixed set of shards (currently 4 shards per stream). On Postgr
 - `LATEST`: Start from the most recent record
 - `AT_SEQUENCE_NUMBER`: Start at a specific sequence number
 - `AFTER_SEQUENCE_NUMBER`: Start after a specific sequence number
+- `AT_TIMESTAMP`: Start at the first record created at or after the `Timestamp` (epoch seconds, rounded to the millisecond)
 
 Iterators expire after 15 minutes of inactivity.
 

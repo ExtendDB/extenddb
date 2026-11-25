@@ -33,7 +33,7 @@ extenddb (ExtendDB) is a standalone async Rust application structured as a Cargo
 │                     Engine (async operation handlers)               │
 │  Operation dispatch · response formatting · stream record assembly  │
 ├─────────────────────────────────────────────────────────────────────┤
-│                     Core (pure sync — no async runtime)             │
+│                       Core (sync — no async runtime)                │
 │  Types · expression parsing/evaluation · validation · capacity      │
 │  error types · configurable limits                                  │
 └──────────────┬───────────────────────────────────┬──────────────────┘
@@ -57,7 +57,7 @@ extenddb/
 ├── docs/                         # Design documentation (this folder)
 │
 ├── crates/
-│   ├── core/                     # DynamoDB types, expressions, validation (pure sync, no async runtime)
+│   ├── core/                     # DynamoDB types, expressions, validation (sync, no async runtime)
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs
@@ -157,6 +157,7 @@ graph TD
 
     ENGINE --> CORE
     ENGINE --> STORAGE
+    ENGINE --> AUTH
 
     AUTH --> CORE
 
@@ -164,9 +165,10 @@ graph TD
     STORAGE_PG --> CORE
 
     STORAGE --> CORE
+    STORAGE --> AUTH
 ```
 
-**Key principle:** `core` depends on nothing in the workspace and has no async runtime — it is pure sync Rust (types, expressions, validation, capacity, errors). `storage` depends only on `core`. `engine` depends on `core` + `storage` and contains the async operation handlers. Backend crates depend on `storage` + `core`. `auth` depends on `core`. `server` depends on `core` + `storage` + `auth` + `engine`. `bin` wires everything together.
+**Key principle:** `core` depends on nothing in the workspace and has no async runtime — it is sync Rust (types, expressions, validation, capacity, errors, and the crypto primitives that `auth` and `storage` share). `auth` depends on `core` and `cache`. `storage` depends on `core` and `auth`. `engine` depends on `core`, `auth` and `storage` (and on `backup-store`, except on wasm32) and contains the async operation handlers. Backend crates depend on `storage`, `auth` and `core`. `server` depends on `core`, `storage`, `auth` and `engine`, and on `cache`, `config` and `backup-store`. `bin` wires everything together. The graph is a simplified view and does not follow the manifests: `bin` reaches `server`, `auth`, `engine` and `core` through `extenddb-app`, which the graph leaves out; `cargo metadata` gives the dependencies.
 
 ## 3. Request Lifecycle
 
@@ -208,7 +210,7 @@ sequenceDiagram
 
 **Rationale:**
 - Compile-time enforcement of dependency boundaries — the storage trait crate physically cannot depend on PostgreSQL
-- `core` is pure sync Rust with no async runtime — types, expressions, validation, capacity, errors
+- `core` is sync Rust with no async runtime — types, expressions, validation, capacity, errors
 - `engine` contains async operation handlers that depend on `core` + `storage`, keeping the async boundary explicit
 - Independent testing — `cargo test -p dynamodb-core` needs no database and no async runtime
 - Faster incremental builds — changing the Postgres backend doesn't recompile the expression parser
@@ -447,8 +449,8 @@ There is no in-memory locking (no `Mutex`, `RwLock`, or similar) on the data pat
 | TLS | rustls | No OpenSSL dependency; cryptography from AWS-LC through aws-lc-rs |
 | PostgreSQL driver | sqlx | Async, compile-time query checking, migrations |
 | Serialization | serde + serde_json | Standard, zero-copy where possible |
-| Crypto (SigV4) | aws-lc-rs | HMAC-SHA256, SHA-256 and the constant-time signature compare from AWS-LC, the library rustls already uses ([ADR-0026](../adr/0026-credential-crypto-on-aws-lc.md)) |
-| Crypto (encryption) | aws-lc-rs | AES-256-GCM for credential encryption, in one module (`extenddb_storage::secret_cipher`) |
+| Crypto (SigV4) | aws-lc-rs; on wasm32, `sha2`, `hmac` and `subtle` | HMAC-SHA256, SHA-256 and the constant-time signature compare from AWS-LC, the library rustls already uses ([ADR-0026](../adr/0026-credential-crypto-on-aws-lc.md)); AWS-LC does not build for wasm32. Both backends sit in one module, `extenddb_core::crypto` (`crates/core/src/crypto.rs`) |
+| Crypto (encryption) | aws-lc-rs; on wasm32, `aes-gcm` and `getrandom` | AES-256-GCM for credential encryption, from the same `extenddb_core::crypto` module; `extenddb_storage::secret_cipher` calls it |
 | Compression | flate2 | gzip support |
 | CRC32 | crc32fast | SIMD-accelerated |
 | CLI | clap | Standard Rust CLI framework |

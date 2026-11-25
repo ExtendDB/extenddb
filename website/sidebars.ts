@@ -224,6 +224,7 @@ const sidebars: SidebarsConfig = {
             {type: 'doc', id: 'rfcs/0003-backend-acceptance-criteria', label: 'RFC 0003: Backend acceptance criteria'},
             {type: 'doc', id: 'rfcs/0000-mongodb-backend', label: 'MongoDB backend'},
             {type: 'doc', id: 'rfcs/draft-cassandra-backend', label: 'Cassandra backend (draft)'},
+            {type: 'doc', id: 'rfcs/0000-credential-encryption-key', label: 'Credential encryption key (draft)'},
           ],
         },
       ],
