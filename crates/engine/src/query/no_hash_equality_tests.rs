@@ -22,8 +22,6 @@ const TYPE_MISMATCH: &str = "One or more parameter values were invalid: Conditio
 const BEGINS_WITH_ON_N: &str = "Invalid KeyConditionExpression: Incorrect operand type for \
                                 operator or function; operator or function: begins_with, \
                                 operand type: N";
-const ONE_PER_KEY: &str = "Invalid KeyConditionExpression: KeyConditionExpressions must only \
-                           contain one condition per key";
 const NOT_SUPPORTED: &str = "Query key condition not supported";
 const MISSED_PK: &str = "Query condition missed key schema element: pk";
 const MISSED_G: &str = "Query condition missed key schema element: g";
@@ -139,19 +137,6 @@ fn begins_with_on_a_number_hash_attribute_is_reported_in_either_clause() {
         &[
             ("begins_with(pk, :n) AND sk > :x", BEGINS_WITH_ON_N),
             ("sk > :x AND begins_with(pk, :n)", BEGINS_WITH_ON_N),
-        ],
-        &schema,
-        &definitions,
-    );
-}
-
-#[test]
-fn two_conditions_on_one_attribute_are_refused_before_a_wrong_typed_value() {
-    let (schema, definitions) = string_table();
-    assert_refusals(
-        &[
-            ("pk > :x AND pk < :n", ONE_PER_KEY),
-            ("pk > :n AND pk < :m", ONE_PER_KEY),
         ],
         &schema,
         &definitions,

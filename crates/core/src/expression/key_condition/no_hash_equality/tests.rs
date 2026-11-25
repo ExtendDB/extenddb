@@ -11,8 +11,6 @@ use super::*;
 use crate::expression::{collect_key_condition_refs, parse_key_condition, tokenize};
 use crate::types::KeyType;
 
-const WANT_ONE_PER_KEY: &str = "Invalid KeyConditionExpression: KeyConditionExpressions must \
-                                only contain one condition per key";
 const MISSED_PK: &str = "Query condition missed key schema element: pk";
 const MISSED_G: &str = "Query condition missed key schema element: g";
 
@@ -125,8 +123,8 @@ fn key_conditions_with_an_equality_on_the_hash_attribute_are_not_refused() {
         "sk = :s AND pk = :p",
         "pk = :p AND begins_with(sk, :s)",
         "pk = :p AND sk BETWEEN :a AND :b",
-        // Two conditions on one key: the service refuses these; ExtendDB
-        // does not yet and this change leaves them alone.
+        // Two conditions on one key: the parse refuses these before this
+        // check runs.
         "pk = :p AND pk > :x",
         "pk > :x AND pk = :p",
         // Three clauses are outside this rule.
@@ -329,30 +327,6 @@ fn an_equality_on_a_non_key_attribute_with_a_non_key_clause_is_not_refused_here(
 }
 
 #[test]
-fn two_conditions_on_one_key_are_refused_as_such() {
-    // Rows `pk > :x AND pk < :y` and `sk > :x AND sk < :y`.
-    for expr in [
-        "pk > :x AND pk < :y",
-        "sk > :x AND sk < :y",
-        "zz >= :x AND zz <= :y",
-        "begins_with(pk, :x) AND pk > :y",
-    ] {
-        assert_eq!(refusal(expr, &table_schema()), WANT_ONE_PER_KEY, "{expr}");
-    }
-    let mut names = HashMap::new();
-    names.insert("a".to_owned(), "pk".to_owned());
-    assert_eq!(
-        refusal_with_names("#a > :x AND pk < :y", &table_schema(), &names),
-        WANT_ONE_PER_KEY
-    );
-    // The check does not depend on the schema.
-    assert_eq!(
-        refusal("h > :x AND h < :y", &multi_range_schema()),
-        WANT_ONE_PER_KEY
-    );
-}
-
-#[test]
 fn multi_attribute_index_names_the_hash_attribute_for_every_clause() {
     // Rows `3 multi-idx *` and `4 multi-idx h > :n`, measured 2026-10-23.
     let want = "HASH key attributes h must have equality conditions specified in the query";
@@ -439,25 +413,4 @@ fn operands_naming_finds_the_clause_on_an_attribute_wherever_it_is() {
     assert_eq!(operand_names("sk > :y AND #p > :n", "pk", &names), ["n"]);
     // An undefined `#name` names no attribute.
     assert!(operand_names("#q > :n", "pk", &names).is_empty());
-}
-
-#[test]
-fn two_conditions_on_one_attribute_are_refused_only_without_an_equality() {
-    let none = HashMap::new();
-    for expr in ["pk > :x AND pk < :n", "sk > :x AND sk < :y"] {
-        match parse(expr).refuse_two_conditions_on_one_attribute(&none) {
-            Err(DynamoDbError::ValidationException(msg)) => {
-                assert_eq!(msg, WANT_ONE_PER_KEY, "{expr}");
-            }
-            other => panic!("{expr}: {other:?}"),
-        }
-    }
-    for expr in ["pk > :x AND sk < :y", "pk > :x", "sk = :x AND pk > :y"] {
-        assert!(
-            parse(expr)
-                .refuse_two_conditions_on_one_attribute(&none)
-                .is_ok(),
-            "{expr}"
-        );
-    }
 }

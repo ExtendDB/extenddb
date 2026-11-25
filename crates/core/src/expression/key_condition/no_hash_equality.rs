@@ -35,17 +35,15 @@
 //! | a non-equality clause names the HASH attribute (`pk > :x`, `begins_with(pk, :x)`, `pk BETWEEN :x AND :y`, `sk = :x AND pk > :y`, `pk > :x AND zz > :y`) | one HASH attribute | `Query key condition not supported` |
 //! | no clause names the HASH attribute (`sk > :x`, `z > :x`, `sk > :x AND zz > :y`) | one HASH attribute | `Query condition missed key schema element: pk` |
 //! | any clauses (`h > :h`, `a > :x`, `z > :x`, `h1 > :x`, `r > :x`) | several key attributes | `HASH key attributes h must have equality conditions specified in the query` (every HASH attribute, comma separated) |
-//! | two non-equality clauses on one attribute (`pk > :x AND pk < :y`) | any | `Invalid KeyConditionExpression: KeyConditionExpressions must only contain one condition per key` |
 //!
-//! The service reports an undefined `#name` or `:value` first, with the
-//! `Invalid KeyConditionExpression: ` prefix; see
-//! [`KeyCondition::validate_references`]. It reports an unused value, an
-//! invalid `FilterExpression` or `ProjectionExpression` and an invalid
-//! `Select` ahead of the wording, and an `ExclusiveStartKey` or a key value
-//! size after it, so the engine calls the refusal between those. On a schema
-//! with one HASH attribute the engine also type-checks the clause on the HASH
-//! attribute, after [`KeyCondition::refuse_two_conditions_on_one_attribute`]
-//! and before the wording; see [`KeyCondition::operands_naming`].
+//! [`parse_key_condition_with_maps`](super::parse_key_condition_with_maps)
+//! refuses an undefined `#name` or `:value` and two conditions on one
+//! attribute before any clause is classified. The service reports an unused
+//! value, an invalid `FilterExpression` or `ProjectionExpression` and an
+//! invalid `Select` ahead of the wording, and an `ExclusiveStartKey` or a key
+//! value size after it, so the engine calls the refusal between those. On a
+//! schema with one HASH attribute the engine also type-checks the clause on
+//! the HASH attribute before the wording; see [`KeyCondition::operands_naming`].
 
 use std::collections::HashMap;
 
@@ -57,8 +55,6 @@ use crate::types::{KeySchemaElement, hash_key_elements, is_multipart_key_schema}
 mod tests;
 
 const NOT_SUPPORTED: &str = "Query key condition not supported";
-const ONE_CONDITION_PER_KEY: &str = "Invalid KeyConditionExpression: KeyConditionExpressions \
-     must only contain one condition per key";
 
 impl KeyCondition {
     /// The condition for one or two clauses, none of them an equality.
@@ -147,11 +143,8 @@ impl KeyCondition {
     ///
     /// Returns `Ok(())` for every other key condition. Call this after the
     /// expression validations (unused names and values, `FilterExpression`,
-    /// `ProjectionExpression`, `Select`) and the references check, and before
-    /// the storage read.
+    /// `ProjectionExpression`, `Select`), and before the storage read.
     ///
-    /// - Two clauses on one attribute: `Invalid KeyConditionExpression:
-    ///   KeyConditionExpressions must only contain one condition per key`.
     /// - A schema with several HASH or several RANGE attributes: the service
     ///   names every HASH attribute, because none has an equality condition.
     ///   Measured on 2026-10-23 on an index with HASH `h` and RANGE `a`, `b`,
@@ -178,7 +171,6 @@ impl KeyCondition {
         if !self.lacks_hash_equality(key_schema, names) {
             return Ok(());
         }
-        self.refuse_two_conditions_on_one_attribute(names)?;
         let attrs = self.clause_attrs(names)?;
 
         let hash_attrs: Vec<&str> = hash_key_elements(key_schema)
@@ -200,36 +192,6 @@ impl KeyCondition {
             format!("Query condition missed key schema element: {pk_attr}")
         };
         Err(DynamoDbError::ValidationException(message))
-    }
-
-    /// Refuse two clauses on one attribute in a condition with no equality
-    /// clause (`pk > :x AND pk < :y`), with `Invalid KeyConditionExpression:
-    /// KeyConditionExpressions must only contain one condition per key`.
-    ///
-    /// The service reports this ahead of a value whose type differs from the
-    /// attribute definition (measured 2026-11-01: `pk > :x AND pk < :n` and
-    /// `pk > :n AND pk < :m` with N values on an S key), so the engine calls
-    /// it before its type check. Returns `Ok(())` for a condition with an
-    /// equality clause.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ValidationException` for two clauses on one attribute, and
-    /// when a `#name` on a clause is not defined in `names`.
-    pub fn refuse_two_conditions_on_one_attribute(
-        &self,
-        names: &HashMap<String, String>,
-    ) -> Result<(), DynamoDbError> {
-        if !self.pk_path.is_empty() {
-            return Ok(());
-        }
-        let attrs = self.clause_attrs(names)?;
-        if attrs.len() == 2 && attrs[0] == attrs[1] {
-            return Err(DynamoDbError::ValidationException(
-                ONE_CONDITION_PER_KEY.to_owned(),
-            ));
-        }
-        Ok(())
     }
 
     /// The value operands of every clause that names `attribute`, with

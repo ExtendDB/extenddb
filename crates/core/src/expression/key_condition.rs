@@ -23,7 +23,6 @@ use crate::types::{
 };
 
 mod no_hash_equality;
-mod references;
 
 /// Parsed key condition: partition key value expression(s) and optional sort key condition.
 ///
