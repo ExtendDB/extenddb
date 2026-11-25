@@ -16,29 +16,37 @@
 //! `lock_timeout`, so a call that does queue behind the lock returns with the
 //! wait it took instead of hanging.
 //!
-//! Each test builds its own throwaway database, applies the shipped migrations
-//! to it, and drops it when it passes. A failing test leaves its database behind
-//! on purpose, named `eddb_utdw_*`, so the state that failed can be inspected.
+//! The last test pins the `READ COMMITTED` isolation `update_table` opens its
+//! transaction with: on a database whose default is `REPEATABLE READ`, an
+//! `UpdateTable` that waits for the row lock while another transaction updates
+//! the row still applies.
+//!
+//! Each test builds its own throwaway database with the shared scratch fixture,
+//! applies the shipped migrations to it, and drops it when it passes. A failing
+//! test leaves its database behind on purpose, named `eddb_sdis_*`, so the state
+//! that failed can be inspected.
 //!
 //! Requires `EXTENDDB_TEST_PG_CONNECTION_STRING`, a base URL with no database
 //! component (for example `postgresql://postgres@127.0.0.1:5432`), pointing at a
 //! server whose role may create and drop databases. Without it every test here
-//! reports a skip and passes, the same convention the wire suites use.
+//! reports a skip and passes. With `EXTENDDB_TEST_PG_REQUIRED` set to any value
+//! but `0`, the fixture's `base_conn` fails each test instead.
+
+// The fixture re-exports the types the stream disable tests need; this file
+// uses its scratch database and table input only.
+#[path = "common/stream_disable_fixture.rs"]
+#[allow(unused_imports)]
+mod fixture;
 
 use std::time::{Duration, Instant};
 
-use extenddb_core::types::{
-    AttributeDefinition, BillingMode, CreateTableInput, DeleteTableInput, KeySchemaElement,
-    KeyType, ScalarAttributeType, TableStatus, UpdateTableInput,
-};
+use extenddb_core::types::{DeleteTableInput, TableStatus, UpdateTableInput};
 use extenddb_storage::TableEngine;
 use extenddb_storage::error::StorageError;
 use extenddb_storage_postgres::{PostgresConfig, PostgresEngine};
-use sqlx::postgres::PgPoolOptions;
+use fixture::{ACCOUNT, REGION, Scratch, base_conn, scratch, table_input};
 use sqlx::{PgPool, Postgres, Transaction};
 
-const ACCOUNT: &str = "123456789012";
-const REGION: &str = "us-east-1";
 const TABLE: &str = "t_update_table_deleting_wait";
 
 /// The poller's `lock_timeout` for the data drop, which is how long it can hold
@@ -53,115 +61,11 @@ const POLLER_HOLD: Duration = Duration::from_secs(3);
 /// for a loaded runner and still six times under `POLLER_HOLD`.
 const REFUSAL_BUDGET: Duration = Duration::from_millis(500);
 
-struct Scratch {
-    engine: PostgresEngine,
-    db: PgPool,
-    admin: PgPool,
-    db_name: String,
-}
-
-impl Scratch {
-    async fn cleanup(self) {
-        let Scratch {
-            engine,
-            db,
-            admin,
-            db_name,
-        } = self;
-        drop(engine);
-        db.close().await;
-        sqlx::query(&format!(
-            "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
-        ))
-        .execute(&admin)
-        .await
-        .expect("drop the scratch database");
-        admin.close().await;
-    }
-}
-
-fn base_conn() -> Option<String> {
-    let conn = std::env::var("EXTENDDB_TEST_PG_CONNECTION_STRING").ok()?;
-    (!conn.trim().is_empty()).then(|| conn.trim_end_matches('/').to_owned())
-}
-
-/// Every `.sql` file under `migrations/` and `data_migrations/`, each directory
-/// in filename order, so a new migration is picked up here without editing this
-/// file.
-fn shipped_migrations() -> Vec<String> {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut out = Vec::new();
-    for dir in ["migrations", "data_migrations"] {
-        let mut files: Vec<_> = std::fs::read_dir(root.join(dir))
-            .expect("read the migrations directory")
-            .map(|e| e.expect("directory entry").path())
-            .filter(|p| p.extension().is_some_and(|e| e == "sql"))
-            .collect();
-        files.sort();
-        for f in files {
-            out.push(std::fs::read_to_string(&f).expect("read a migration file"));
-        }
-    }
-    out
-}
-
 fn skip(test: &str) {
     eprintln!(
         "SKIP {test}: EXTENDDB_TEST_PG_CONNECTION_STRING is not set, so there is no PostgreSQL \
          to build a scratch catalog in."
     );
-}
-
-async fn scratch() -> Scratch {
-    let base = base_conn().expect("caller checks base_conn() first");
-    let db_name = format!("eddb_utdw_{}", uuid::Uuid::new_v4().simple())[..24].to_owned();
-    let admin = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&format!("{base}/postgres"))
-        .await
-        .expect("connect to the postgres maintenance database");
-    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
-        .execute(&admin)
-        .await
-        .expect("create the scratch database");
-    let url = format!("{base}/{db_name}");
-    let db = PgPoolOptions::new()
-        .max_connections(3)
-        .connect(&url)
-        .await
-        .expect("connect to the scratch database");
-    // One scratch database stands in for both the catalog and the data
-    // database, so every shipped migration file from both directories is
-    // applied to it, in filename order.
-    for sql in shipped_migrations() {
-        sqlx::raw_sql(&sql)
-            .execute(&db)
-            .await
-            .expect("apply a shipped migration");
-    }
-    set_delay(&db, 0.0).await;
-    sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES ($1, $2)")
-        .bind(ACCOUNT)
-        .bind(format!("acct-{db_name}"))
-        .execute(&db)
-        .await
-        .expect("seed the account row");
-    let engine = PostgresEngine::new(
-        &PostgresConfig {
-            connection_string: url,
-            pool_size: 10,
-            max_item_size_bytes: 400_000,
-        },
-        REGION,
-    )
-    .await
-    .expect("open a PostgresEngine on the scratch database");
-    Scratch {
-        engine,
-        db,
-        admin,
-        db_name,
-    }
 }
 
 async fn set_delay(db: &PgPool, secs: f64) {
@@ -178,22 +82,7 @@ async fn set_delay(db: &PgPool, secs: f64) {
 /// Create `TABLE` as ACTIVE, keyed on `pk`.
 async fn active_table(s: &Scratch) {
     s.engine
-        .create_table(
-            ACCOUNT,
-            CreateTableInput {
-                table_name: TABLE.to_owned(),
-                key_schema: vec![KeySchemaElement {
-                    attribute_name: "pk".to_owned(),
-                    key_type: KeyType::Hash,
-                }],
-                attribute_definitions: vec![AttributeDefinition {
-                    attribute_name: "pk".to_owned(),
-                    attribute_type: ScalarAttributeType::S,
-                }],
-                billing_mode: Some(BillingMode::PayPerRequest),
-                ..Default::default()
-            },
-        )
+        .create_table(ACCOUNT, table_input(TABLE, false))
         .await
         .expect("create the table");
     let status = table_status(&s.db).await;
@@ -409,5 +298,92 @@ async fn update_table_on_a_missing_table_is_not_found() {
         Err(StorageError::TableNotFound(name)) => assert_eq!(name, TABLE),
         other => panic!("expected TableNotFound for a table that was never created, got {other:?}"),
     }
+    s.cleanup().await;
+}
+
+/// On a database whose default isolation is REPEATABLE READ, an `UpdateTable`
+/// that waits for the row lock while another transaction updates the row and
+/// commits still applies. The transaction is pinned to READ COMMITTED, so the
+/// locked read returns the committed version; at the database's default the
+/// locked read fails with 40001 and the request answers 500.
+#[tokio::test]
+async fn update_table_applies_after_a_concurrent_row_update_under_a_repeatable_read_default() {
+    let Some(base) = base_conn() else {
+        skip("update_table_applies_after_a_concurrent_row_update_under_a_repeatable_read_default");
+        return;
+    };
+    let s = scratch().await;
+    active_table(&s).await;
+    sqlx::query(&format!(
+        "ALTER DATABASE \"{}\" SET default_transaction_isolation = 'repeatable read'",
+        s.db_name
+    ))
+    .execute(&s.admin)
+    .await
+    .expect("set the scratch database's default isolation");
+    // A second engine, so every connection it opens starts under that default.
+    let engine = PostgresEngine::new(
+        &PostgresConfig {
+            connection_string: format!("{base}/{}", s.db_name),
+            pool_size: 10,
+            max_item_size_bytes: 400_000,
+        },
+        REGION,
+    )
+    .await
+    .expect("open an engine under the REPEATABLE READ default");
+
+    let mut holder = s.db.begin().await.expect("begin the holding transaction");
+    sqlx::query("SELECT 1 FROM tables WHERE account_id = $1 AND table_name = $2 FOR UPDATE")
+        .bind(ACCOUNT)
+        .bind(TABLE)
+        .execute(&mut *holder)
+        .await
+        .expect("hold the ACTIVE row");
+    let call = tokio::spawn(async move { engine.update_table(ACCOUNT, update_input()).await });
+    let mut queued = false;
+    for _ in 0..500 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(&s.db)
+        .await
+        .expect("read pg_stat_activity");
+        if waiting > 0 {
+            queued = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(queued, "update_table never queued on the held row lock");
+    sqlx::query(
+        "UPDATE tables SET item_count = item_count + 1 WHERE account_id = $1 AND table_name = $2",
+    )
+    .bind(ACCOUNT)
+    .bind(TABLE)
+    .execute(&mut *holder)
+    .await
+    .expect("update the held row");
+    holder
+        .commit()
+        .await
+        .expect("commit the holding transaction");
+
+    let result = call.await.expect("join the update_table call");
+    let desc = result.unwrap_or_else(|e| {
+        panic!("expected the update to apply after the concurrent update committed, got {e:?}")
+    });
+    assert_eq!(desc.table_status, TableStatus::Active);
+    let protected: bool = sqlx::query_scalar(
+        "SELECT deletion_protection_enabled FROM tables \
+         WHERE account_id = $1 AND table_name = $2",
+    )
+    .bind(ACCOUNT)
+    .bind(TABLE)
+    .fetch_one(&s.db)
+    .await
+    .expect("read deletion protection");
+    assert!(protected, "the update was applied");
     s.cleanup().await;
 }
