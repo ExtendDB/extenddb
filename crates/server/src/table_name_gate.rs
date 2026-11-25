@@ -286,8 +286,11 @@ fn check_request_items_keys(operation: &str, input: &Value) -> Result<(), Dynamo
 /// pattern, or by an ARN that the ARN rules refuse. With `list_lengths`
 /// (`TransactWriteItems`) the message lists every action's name outside the
 /// pattern and every name of a bad length, as the service does (measured
-/// 2026-11-13 and 2026-11-14). Names of a bad length alone are left to the
-/// engine, which checks them after the request is read.
+/// 2026-11-13 and 2026-11-14), up to the first ARN that the ARN rules refuse.
+/// The list ends at that ARN. The service also lists the ARN's fault and the
+/// later actions' faults (measured 2026-11-25), and this check leaves them
+/// out. Names of a bad length alone are left to the engine, which checks them
+/// after the request is read.
 fn check_transact_items(
     input: &Value,
     subs: &[&str],
