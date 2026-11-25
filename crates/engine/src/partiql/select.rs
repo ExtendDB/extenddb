@@ -133,25 +133,20 @@ pub(super) async fn run(
                 "Scan operation not supported on this index type".to_owned(),
             ));
         }
-        match ctx
-            .storage
-            .index_info_by_table_id(&key_info.table_id, index_name)
-            .await
-        {
-            Ok(info) => {
+        match common::statement_index(ctx, &key_info.table_id, index_name).await? {
+            Some(info) => {
                 common::ensure_single_attribute_keys(&info.key_schema)?;
                 (info.key_schema.clone(), Some(info))
             }
             // A projected call (`COUNT(*)`) is refused ahead of the index
             // lookup (measured 2026-11-02, with and without a WHERE).
-            Err(StorageError::IndexNotFound(_)) => {
+            None => {
                 return Err(DynamoDbError::ValidationException(
                     stmt.projection_error.clone().unwrap_or_else(|| {
                         "The table does not have the specified index".to_owned()
                     }),
                 ));
             }
-            Err(e) => return Err(storage_err_to_dynamo(e)),
         }
     } else {
         common::ensure_single_attribute_keys(&key_info.key_schema)?;

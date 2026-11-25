@@ -26,12 +26,10 @@ use extenddb_core::partiql::plan::{KeyNames, KeyRead, WhereAnalysis, read_order}
 use extenddb_core::types::{
     AttributeValue, KeySchemaElement, TableKeyInfo, is_multipart_key_schema,
 };
-use extenddb_storage::error::StorageError;
 
 use super::SingleRequest;
 use super::common::{self, bound_value};
 use super::select::MAX_DECOMPOSED_READS;
-use crate::create_table::storage_err_to_dynamo;
 use crate::{ItemAccess, ItemAuthorizer, OperationContext};
 
 pub(super) use access::written_value;
@@ -244,12 +242,12 @@ async fn each_disjunct(
 
 /// The key schema of what `stmt` reads or writes: the index's for a read of
 /// an index, the table's otherwise. `None` when the table is missing, when
-/// the index is missing or a vector index, so that the condition keys read
-/// from the key are absent.
+/// the index is missing, backfilling or a vector index, so that the condition
+/// keys read from the key are absent.
 ///
 /// # Errors
 ///
-/// A failed read of the index other than a missing index.
+/// A failed read of the index other than a missing or backfilling index.
 async fn target_schema(
     ctx: &OperationContext,
     stmt: &Statement,
@@ -272,15 +270,9 @@ async fn target_schema(
     {
         return Ok(None);
     }
-    match ctx
-        .storage
-        .index_info_by_table_id(&key_info.table_id, index)
-        .await
-    {
-        Ok(info) => Ok(Some(info.key_schema)),
-        Err(StorageError::IndexNotFound(_)) => Ok(None),
-        Err(e) => Err(storage_err_to_dynamo(e)),
-    }
+    Ok(common::statement_index(ctx, &key_info.table_id, index)
+        .await?
+        .map(|info| info.key_schema))
 }
 
 /// The key names of a key schema with one partition key and at most one sort

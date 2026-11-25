@@ -148,6 +148,10 @@ pub fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> Dynamo
         StorageError::IndexNotFound(name) => DynamoDbError::ValidationException(format!(
             "The table does not have the specified index: {name}"
         )),
+        StorageError::IndexBackfilling(name) => DynamoDbError::ValidationException(format!(
+            "{}{name}",
+            extenddb_core::types::VECTOR_INDEX_BACKFILLING_SCAN_PREFIX
+        )),
         StorageError::IndexAlreadyExists(name) => DynamoDbError::ValidationException(format!(
             "One or more parameter values were invalid: Index already exists: {name}"
         )),

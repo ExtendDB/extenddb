@@ -22,11 +22,14 @@ use extenddb_core::partiql::plan::{
     key_equality, path_tested_against_values, same_value,
 };
 use extenddb_core::types::{
-    AttributeValue, CancellationReason, KeySchemaElement, KeyType, ScalarAttributeType,
+    AttributeValue, CancellationReason, IndexInfo, KeySchemaElement, KeyType, ScalarAttributeType,
     TableKeyInfo, is_multipart_key_schema,
 };
+use extenddb_storage::error::StorageError;
 
 use super::write::{resolve_av, to_json_value};
+use crate::OperationContext;
+use crate::create_table::storage_err_to_dynamo;
 
 /// The service's refusal for any PartiQL statement whose target (table or
 /// index) has more than one HASH or more than one RANGE key attribute.
@@ -53,6 +56,26 @@ pub(super) fn ensure_single_attribute_keys(
         ));
     }
     Ok(())
+}
+
+/// The index `index` of the table `table_id`, or `None` when the table has no
+/// index of that name or the index is a GSI still backfilling. The service's
+/// answer to a PartiQL read of a backfilling index is not measured, so a
+/// statement naming one gets the answers for a missing index.
+///
+/// # Errors
+///
+/// A failed read of the catalog.
+pub(super) async fn statement_index(
+    ctx: &OperationContext,
+    table_id: &str,
+    index: &str,
+) -> Result<Option<IndexInfo>, DynamoDbError> {
+    match ctx.storage.index_info_by_table_id(table_id, index).await {
+        Ok(info) => Ok(Some(info)),
+        Err(StorageError::IndexNotFound(_) | StorageError::IndexBackfilling(_)) => Ok(None),
+        Err(e) => Err(storage_err_to_dynamo(e)),
+    }
 }
 
 /// The refusal of a key value whose type is not the one the table defines for
