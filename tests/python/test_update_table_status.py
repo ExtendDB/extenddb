@@ -34,10 +34,17 @@ KEY = {
     "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
     "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
 }
-PROVISIONED_5 = {
-    "BillingMode": "PROVISIONED",
-    "ProvisionedThroughput": {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5},
-}
+
+
+def _units(read: int, write: int) -> dict:
+    return {"ProvisionedThroughput": {"ReadCapacityUnits": read, "WriteCapacityUnits": write}}
+
+
+def _provisioned(read: int, write: int) -> dict:
+    return {"BillingMode": "PROVISIONED", **_units(read, write)}
+
+
+PROVISIONED_5 = _provisioned(5, 5)
 ON_DEMAND = {"BillingMode": "PAY_PER_REQUEST"}
 IOPS = (
     "Attempt to change a resource which is still in use: Table IOPS are currently being "
@@ -240,3 +247,72 @@ def test_deletion_protection_inside_the_window_answers_active(run, is_extenddb):
     _assert_opened_status(
         describe["response"]["Table"]["TableStatus"], is_extenddb, describe["since_update"]
     )
+
+
+# ProvisionedThroughput.LastIncreaseDateTime around capacity changes, measured
+# on 14, 16 and 19 Nov 2026: the table before, then each UpdateTable's members
+# and whether the service sent the member while the table was UPDATING (the
+# UpdateTable response and a DescribeTable right after) and once it was ACTIVE
+# again. It sent none in the DeleteTable response.
+INCREASES = {
+    "raise_twice": (
+        _provisioned(5, 7),
+        [(_units(9, 11), (True, True)), (_units(12, 13), (True, True))],
+    ),
+    "raise_read": (_provisioned(5, 7), [(_units(9, 7), (True, True))]),
+    "raise_read_lower_write": (_provisioned(5, 7), [(_units(9, 6), (True, True))]),
+    "lower": (_provisioned(5, 7), [(_units(4, 6), (False, False))]),
+    "switch_to_provisioned": (ON_DEMAND, [(_provisioned(5, 7), (True, False))]),
+}
+# The service's clock and this host's can differ by this much.
+CLOCK_SLACK_SECONDS = 5.0
+
+
+@pytest.fixture(scope="module")
+def increases(dynamodb_client):
+    """Run every row of INCREASES once and record each answer."""
+    ddb = dynamodb_client
+    answers: dict = {}
+    names: list[str] = []
+    try:
+        for row, (before, changes) in INCREASES.items():
+            name = unique_name("t1035")
+            names.append(name)
+            ddb.create_table(TableName=name, **KEY, **before)
+            wait_for_active(ddb, name)
+            steps = []
+            for members, _expected in changes:
+                sent = time.time()
+                update = ddb.update_table(TableName=name, **members)["TableDescription"]
+                describe = ddb.describe_table(TableName=name)["Table"]
+                wait_for_active(ddb, name, timeout=300)
+                settled = ddb.describe_table(TableName=name)["Table"]
+                steps.append({"sent": sent, "answers": [update, describe, settled]})
+            deleted = ddb.delete_table(TableName=name)["TableDescription"]
+            answers[row] = {"steps": steps, "deleted": deleted}
+            wait_for_deleted(ddb, name)
+        yield answers
+    finally:
+        for name in names:
+            try:
+                ddb.delete_table(TableName=name)
+                wait_for_deleted(ddb, name)
+            except ClientError:
+                pass
+
+
+@pytest.mark.parametrize("row", list(INCREASES))
+def test_last_increase_date_time_follows_the_measured_answers(increases, row):
+    """Each answer carries the member when the service's answer with the same
+    TableStatus did, as epoch seconds from the request to now. On ExtendDB a
+    window can end before an answer is built: that answer says ACTIVE and is
+    held to the answer once ACTIVE."""
+    for (_members, (updating, active)), step in zip(INCREASES[row][1], increases[row]["steps"]):
+        for answer in step["answers"]:
+            stamp = answer["ProvisionedThroughput"].get("LastIncreaseDateTime")
+            expected = updating if answer["TableStatus"] == "UPDATING" else active
+            assert (stamp is not None) == expected, answer
+            if stamp is not None:
+                at = stamp.timestamp()
+                assert step["sent"] - CLOCK_SLACK_SECONDS <= at <= time.time(), (at, step)
+    assert "LastIncreaseDateTime" not in increases[row]["deleted"]["ProvisionedThroughput"]

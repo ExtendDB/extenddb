@@ -19,11 +19,11 @@ use extenddb_core::types::{
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{
-    building_refuses, effective_attribute_definitions, enters_updating,
+    TableThroughputRecord, building_refuses, effective_attribute_definitions, enters_updating,
     warm_throughput_record_for_create, warm_throughput_record_json,
 };
 
-use crate::sqlite_util::format_timestamp;
+use crate::sqlite_util::{format_timestamp, timestamp_epoch_seconds};
 use crate::store::SqliteEngine;
 
 /// Refuse a GSI Create, or a Delete of a GSI other than the one building, while
@@ -125,9 +125,17 @@ impl SqliteEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let row: Option<(String, String, String, String, Option<String>)> = sqlx::query_as(
-            "SELECT table_status, table_id, key_schema, attribute_definitions, billing_mode \
-             FROM tables WHERE account_id = ? AND table_name = ?",
+        #[allow(clippy::type_complexity)]
+        let row: Option<(
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT table_status, table_id, key_schema, attribute_definitions, billing_mode, \
+                 provisioned_throughput FROM tables WHERE account_id = ? AND table_name = ?",
         )
         .bind(account_id)
         .bind(&input.table_name)
@@ -138,7 +146,7 @@ impl SqliteEngine {
         // `stored_billing_mode` is read once here and threaded through every
         // billing check below, so the several readers of one row cannot
         // disagree. A NULL stored value means PROVISIONED.
-        let (status, table_id, ks_json, ad_json, stored_billing_mode) =
+        let (status, table_id, ks_json, ad_json, stored_billing_mode, stored_throughput) =
             row.ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
         if status != "ACTIVE" {
             return Err(StorageError::TableNotActive(input.table_name.clone()));
@@ -223,52 +231,51 @@ impl SqliteEngine {
             }
         }
 
+        // The description parses the same value. A value it cannot parse
+        // stops the request here, before any write.
+        let stored_throughput: Option<TableThroughputRecord> = stored_throughput
+            .as_deref()
+            .map(|s| crate::table_helpers::parse_json(s, "provisioned_throughput"))
+            .transpose()?;
+
         // No-op rejection: same PROVISIONED throughput.
         if matches!(input.billing_mode, Some(BillingMode::Provisioned))
             && let Some(ref pt) = input.provisioned_throughput
         {
-            let current: Option<Option<String>> = sqlx::query_scalar(
-                "SELECT provisioned_throughput FROM tables \
-                 WHERE account_id = ? AND table_name = ?",
-            )
-            .bind(account_id)
-            .bind(&input.table_name)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-            if let Some(cur_pt) = current {
-                let is_prov = stored_billing_mode.as_deref() == Some("PROVISIONED")
-                    || stored_billing_mode.is_none();
-                let cur: serde_json::Value = cur_pt
-                    .as_deref()
-                    .and_then(|s| serde_json::from_str(s).ok())
-                    .unwrap_or_else(|| serde_json::json!({}));
-                let cur_rcu = cur
-                    .get("ReadCapacityUnits")
-                    .or_else(|| cur.get("read_capacity_units"))
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(0);
-                let cur_wcu = cur
-                    .get("WriteCapacityUnits")
-                    .or_else(|| cur.get("write_capacity_units"))
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(0);
-                if is_prov
-                    && cur_rcu == pt.read_capacity_units
-                    && cur_wcu == pt.write_capacity_units
-                {
-                    return Err(StorageError::NoOpUpdate(format!(
-                        "The provisioned throughput for the table will not change. \
-                         The requested value equals the current value. \
-                         Current ReadCapacityUnits provisioned for the table: {cur_rcu}. \
-                         Requested ReadCapacityUnits: {}. \
-                         Current WriteCapacityUnits provisioned for the table: {cur_wcu}. \
-                         Requested WriteCapacityUnits: {}.",
-                        pt.read_capacity_units, pt.write_capacity_units
-                    )));
-                }
+            let is_prov = stored_billing_mode.as_deref() == Some("PROVISIONED")
+                || stored_billing_mode.is_none();
+            let cur = stored_throughput.unwrap_or_default();
+            if is_prov
+                && cur.read_capacity_units == pt.read_capacity_units
+                && cur.write_capacity_units == pt.write_capacity_units
+            {
+                return Err(StorageError::NoOpUpdate(format!(
+                    "The provisioned throughput for the table will not change. \
+                     The requested value equals the current value. \
+                     Current ReadCapacityUnits provisioned for the table: {}. \
+                     Requested ReadCapacityUnits: {}. \
+                     Current WriteCapacityUnits provisioned for the table: {}. \
+                     Requested WriteCapacityUnits: {}.",
+                    cur.read_capacity_units,
+                    pt.read_capacity_units,
+                    cur.write_capacity_units,
+                    pt.write_capacity_units
+                )));
             }
         }
+
+        // The end of the UPDATING window this request opens, written to
+        // `status_transition_at` below.
+        let updating_until = if enters_updating(&input) {
+            let delay_secs = Self::control_plane_delay_secs(&mut tx).await?;
+            (delay_secs > 0.0).then(|| {
+                format_timestamp(
+                    time::OffsetDateTime::now_utc() + time::Duration::seconds_f64(delay_secs),
+                )
+            })
+        } else {
+            None
+        };
 
         if let Some(bm) = &input.billing_mode {
             let s = match bm {
@@ -278,7 +285,14 @@ impl SqliteEngine {
             update_col(&mut tx, account_id, &input.table_name, "billing_mode", s).await?;
         }
         if let Some(pt) = &input.provisioned_throughput {
-            let j = serde_json::to_string(pt).map_err(|e| StorageError::Internal(e.to_string()))?;
+            let record = TableThroughputRecord::for_update(
+                stored_throughput,
+                stored_billing_mode.as_deref() != Some("PAY_PER_REQUEST"),
+                pt,
+                updating_until.as_deref().map(timestamp_epoch_seconds),
+            );
+            let j = serde_json::to_string(&record)
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
             update_col(
                 &mut tx,
                 account_id,
@@ -699,21 +713,15 @@ impl SqliteEngine {
             ));
         }
 
-        if enters_updating(&input) {
-            let delay_secs = Self::control_plane_delay_secs(&mut tx).await?;
-            if delay_secs > 0.0 {
-                let at = format_timestamp(
-                    time::OffsetDateTime::now_utc() + time::Duration::seconds_f64(delay_secs),
-                );
-                update_col(
-                    &mut tx,
-                    account_id,
-                    &input.table_name,
-                    "status_transition_at",
-                    &at,
-                )
-                .await?;
-            }
+        if let Some(at) = &updating_until {
+            update_col(
+                &mut tx,
+                account_id,
+                &input.table_name,
+                "status_transition_at",
+                at,
+            )
+            .await?;
         }
 
         tx.commit()

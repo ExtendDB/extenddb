@@ -11,6 +11,7 @@ mod backup_id;
 mod catalog_version;
 mod key;
 mod shard_stream;
+mod throughput;
 mod warm_throughput;
 
 pub use arn::{
@@ -31,6 +32,7 @@ pub use key::{
     refuse_conditions_beyond_first_range, sk_column, sk_column_n, sk_info,
 };
 pub use shard_stream::shard_in_stream;
+pub use throughput::{TableThroughputRecord, table_throughput_description};
 pub use warm_throughput::{
     parse_warm_throughput_record, warm_throughput_record_for_create,
     warm_throughput_record_for_update, warm_throughput_record_json, warm_throughput_updating_until,

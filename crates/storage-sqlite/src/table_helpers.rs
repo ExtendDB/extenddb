@@ -12,7 +12,7 @@ use extenddb_core::types::{
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{
-    index_arn, parse_warm_throughput_record, reported_status, stream_arn,
+    TableThroughputRecord, index_arn, parse_warm_throughput_record, reported_status, stream_arn,
 };
 use extenddb_storage::vector_catalog::{VectorIndexCatalogRow, vector_index_descriptions};
 
@@ -119,7 +119,10 @@ pub(crate) const TABLE_COLUMNS: &str = "table_name, key_schema, attribute_defini
 pub(crate) const INDEX_COLUMNS: &str = "index_name, index_id, index_type, key_schema, \
      projection, index_status, provisioned_throughput, warm_throughput";
 
-fn parse_json<T: serde::de::DeserializeOwned>(s: &str, ctx: &str) -> Result<T, StorageError> {
+pub(crate) fn parse_json<T: serde::de::DeserializeOwned>(
+    s: &str,
+    ctx: &str,
+) -> Result<T, StorageError> {
     serde_json::from_str(s).map_err(|e| StorageError::Internal(format!("{ctx}: {e}")))
 }
 
@@ -269,13 +272,18 @@ impl SqliteEngine {
             .map(|s| parse_json(s, "stream_specification"))
             .transpose()?;
 
-        let (rcu, wcu) = match &row.provisioned_throughput {
-            Some(s) => {
-                let pt: ProvisionedThroughput = parse_json(s, "provisioned_throughput")?;
-                (pt.read_capacity_units, pt.write_capacity_units)
-            }
-            None => (0, 0),
-        };
+        // One clock read for the throughput and the status, so both compare
+        // the end of an UPDATING window with the same instant.
+        let now = time::OffsetDateTime::now_utc();
+        let provisioned_throughput = row
+            .provisioned_throughput
+            .as_deref()
+            .map(|s| parse_json::<TableThroughputRecord>(s, "provisioned_throughput"))
+            .transpose()?
+            .map(|record| {
+                record.description((now - time::OffsetDateTime::UNIX_EPOCH).as_seconds_f64())
+            })
+            .unwrap_or_default();
 
         let stored_status = match row.table_status.as_str() {
             "ACTIVE" => TableStatus::Active,
@@ -294,11 +302,7 @@ impl SqliteEngine {
             .map(parse_timestamp)
             .transpose()
             .map_err(|e| StorageError::Internal(format!("Parse status_transition_at: {e}")))?;
-        let table_status = reported_status(
-            stored_status,
-            transition_at,
-            time::OffsetDateTime::now_utc(),
-        );
+        let table_status = reported_status(stored_status, transition_at, now);
 
         let creation_epoch = parse_timestamp(&row.creation_date_time)
             .map(|dt| dt.unix_timestamp() as f64)
@@ -343,13 +347,7 @@ impl SqliteEngine {
             item_count: row.item_count,
             table_arn: row.table_arn,
             table_id: row.table_id,
-            provisioned_throughput: ProvisionedThroughputDescription {
-                read_capacity_units: rcu,
-                write_capacity_units: wcu,
-                number_of_decreases_today: 0,
-                last_increase_date_time: None,
-                last_decrease_date_time: None,
-            },
+            provisioned_throughput,
             billing_mode_summary,
             table_throughput_mode_summary: None,
             global_secondary_indexes: (!gsis.is_empty()).then_some(gsis),
@@ -551,5 +549,32 @@ mod stored_value_tests {
                 if m == "Parse status_transition_at: the 'year' component could not be parsed"),
             "{err:?}"
         );
+    }
+
+    /// A `provisioned_throughput` that does not parse refuses an UpdateTable
+    /// before it writes, as the description refuses the row.
+    #[tokio::test]
+    async fn a_provisioned_throughput_that_does_not_parse_refuses_an_update() {
+        let engine = table_with("provisioned_throughput", r#"{"x":1}"#).await;
+        let update = serde_json::from_value(json!({
+            "TableName": "t",
+            "ProvisionedThroughput": {"ReadCapacityUnits": 6, "WriteCapacityUnits": 6}
+        }))
+        .expect("update");
+        let err = engine
+            .update_table(ACCOUNT, update)
+            .await
+            .expect_err("the row is reported");
+        assert!(
+            matches!(&err, StorageError::Internal(m)
+                if m == "provisioned_throughput: missing field `ReadCapacityUnits` at line 1 column 7"),
+            "{err:?}"
+        );
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT provisioned_throughput FROM tables WHERE table_name = 't'")
+                .fetch_one(&engine.pool)
+                .await
+                .expect("the row");
+        assert_eq!(stored.as_deref(), Some(r#"{"x":1}"#));
     }
 }

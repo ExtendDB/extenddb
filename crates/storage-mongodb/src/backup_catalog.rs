@@ -127,7 +127,7 @@ fn generation_from_field(doc: &Document, key: &str) -> u64 {
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn datetime_epoch_secs(dt: bson::DateTime) -> f64 {
+pub(crate) fn datetime_epoch_secs(dt: bson::DateTime) -> f64 {
     dt.timestamp_millis() as f64 / 1000.0
 }
 

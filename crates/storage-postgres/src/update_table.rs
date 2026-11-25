@@ -8,7 +8,7 @@ use extenddb_core::types::{
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{
-    building_refuses, effective_attribute_definitions, enters_updating,
+    TableThroughputRecord, building_refuses, effective_attribute_definitions, enters_updating,
     warm_throughput_record_for_create,
 };
 
@@ -111,21 +111,25 @@ impl PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        // Lock the row and fetch table_id, key_schema, attribute_definitions and
-        // the stored billing mode.
+        // Lock the row and fetch table_id, key_schema, attribute_definitions,
+        // the stored billing mode and throughput, and NOW(), the start of this
+        // transaction on the database clock.
         //
         // `stored_billing_mode` is read once here and threaded through every
         // later check that needs it, matching the SQLite backend. Re-querying it
         // per check cost extra round trips and, because the row is already
         // locked, could never return a different answer.
+        #[allow(clippy::type_complexity)]
         let row: Option<(
             String,
             String,
             serde_json::Value,
             serde_json::Value,
             Option<String>,
+            Option<serde_json::Value>,
+            f64,
         )> = sqlx::query_as(
-            "SELECT table_status, table_id, key_schema, attribute_definitions, billing_mode FROM tables WHERE account_id = $1 AND table_name = $2 FOR UPDATE",
+            "SELECT table_status, table_id, key_schema, attribute_definitions, billing_mode, provisioned_throughput, EXTRACT(EPOCH FROM NOW())::FLOAT8 FROM tables WHERE account_id = $1 AND table_name = $2 FOR UPDATE",
         )
         .bind(account_id)
         .bind(&input.table_name)
@@ -133,7 +137,7 @@ impl PostgresEngine {
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let (status, table_id, ks_json, ad_json, stored_billing_mode) =
+        let (status, table_id, ks_json, ad_json, stored_billing_mode, stored_throughput, now) =
             row.ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
         if status != "ACTIVE" {
             return Err(StorageError::TableNotActive(input.table_name.clone()));
@@ -244,6 +248,13 @@ impl PostgresEngine {
             }
         }
 
+        // The description parses the same value. A value it cannot parse
+        // stops the request here, before any write.
+        let stored_throughput: Option<TableThroughputRecord> = stored_throughput
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
         // No-op rejection: setting same billing mode to PROVISIONED with same
         // throughput values is rejected by DynamoDB. This check runs under the
         // FOR UPDATE lock to eliminate the TOCTOU race that existed when the
@@ -251,48 +262,38 @@ impl PostgresEngine {
         if matches!(input.billing_mode, Some(BillingMode::Provisioned))
             && let Some(ref pt) = input.provisioned_throughput
         {
-            let current_row: Option<(Option<String>, Option<serde_json::Value>)> = sqlx::query_as(
-                "SELECT billing_mode, provisioned_throughput FROM tables \
-                     WHERE account_id = $1 AND table_name = $2",
-            )
-            .bind(account_id)
-            .bind(&input.table_name)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let is_provisioned = stored_billing_mode.as_deref() == Some("PROVISIONED")
+                || stored_billing_mode.is_none();
+            let current = stored_throughput.unwrap_or_default();
 
-            if let Some((current_bm, current_pt_opt)) = current_row {
-                let current_pt =
-                    current_pt_opt.unwrap_or(serde_json::Value::Object(serde_json::Map::default()));
-                let is_provisioned =
-                    current_bm.as_deref() == Some("PROVISIONED") || current_bm.is_none();
-                let current_rcu = current_pt
-                    .get("ReadCapacityUnits")
-                    .or_else(|| current_pt.get("read_capacity_units"))
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(0);
-                let current_wcu = current_pt
-                    .get("WriteCapacityUnits")
-                    .or_else(|| current_pt.get("write_capacity_units"))
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(0);
-
-                if is_provisioned
-                    && current_rcu == pt.read_capacity_units
-                    && current_wcu == pt.write_capacity_units
-                {
-                    return Err(StorageError::NoOpUpdate(format!(
-                        "The provisioned throughput for the table will not change. \
-                             The requested value equals the current value. \
-                             Current ReadCapacityUnits provisioned for the table: {}. \
-                             Requested ReadCapacityUnits: {}. \
-                             Current WriteCapacityUnits provisioned for the table: {}. \
-                             Requested WriteCapacityUnits: {}.",
-                        current_rcu, pt.read_capacity_units, current_wcu, pt.write_capacity_units
-                    )));
-                }
+            if is_provisioned
+                && current.read_capacity_units == pt.read_capacity_units
+                && current.write_capacity_units == pt.write_capacity_units
+            {
+                return Err(StorageError::NoOpUpdate(format!(
+                    "The provisioned throughput for the table will not change. \
+                         The requested value equals the current value. \
+                         Current ReadCapacityUnits provisioned for the table: {}. \
+                         Requested ReadCapacityUnits: {}. \
+                         Current WriteCapacityUnits provisioned for the table: {}. \
+                         Requested WriteCapacityUnits: {}.",
+                    current.read_capacity_units,
+                    pt.read_capacity_units,
+                    current.write_capacity_units,
+                    pt.write_capacity_units
+                )));
             }
         }
+
+        // The end of the UPDATING window this request opens, written to
+        // `status_transition_at` below. It is on the database clock, which
+        // `transition_in_secs` reads it with.
+        let updating_until = if enters_updating(&input) {
+            let delay_secs = Self::control_plane_delay_secs(&mut tx).await?;
+            (delay_secs > 0.0).then_some(now + delay_secs)
+        } else {
+            None
+        };
 
         // Apply billing mode change.
         if let Some(bm) = &input.billing_mode {
@@ -313,8 +314,14 @@ impl PostgresEngine {
 
         // Apply provisioned throughput change.
         if let Some(pt) = &input.provisioned_throughput {
+            let record = TableThroughputRecord::for_update(
+                stored_throughput,
+                stored_billing_mode.as_deref() != Some("PAY_PER_REQUEST"),
+                pt,
+                updating_until,
+            );
             let pt_json =
-                serde_json::to_value(pt).map_err(|e| StorageError::Internal(e.to_string()))?;
+                serde_json::to_value(record).map_err(|e| StorageError::Internal(e.to_string()))?;
             sqlx::query("UPDATE tables SET provisioned_throughput = $1 WHERE account_id = $2 AND table_name = $3")
                 .bind(&pt_json)
                 .bind(account_id)
@@ -380,20 +387,17 @@ impl PostgresEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
         }
 
-        if enters_updating(&input) {
-            let delay_secs = Self::control_plane_delay_secs(&mut tx).await?;
-            if delay_secs > 0.0 {
-                sqlx::query(
-                    "UPDATE tables SET status_transition_at = NOW() + make_interval(secs => $1) \
-                     WHERE account_id = $2 AND table_name = $3",
-                )
-                .bind(delay_secs)
-                .bind(account_id)
-                .bind(&input.table_name)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            }
+        if let Some(at) = updating_until {
+            sqlx::query(
+                "UPDATE tables SET status_transition_at = to_timestamp($1) \
+                 WHERE account_id = $2 AND table_name = $3",
+            )
+            .bind(at)
+            .bind(account_id)
+            .bind(&input.table_name)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
         }
 
         // WarmThroughput on the table and on updated indexes: stored as sent,

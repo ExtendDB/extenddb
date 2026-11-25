@@ -14,6 +14,7 @@ use extenddb_core::types::{
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{
     index_arn, parse_warm_throughput_record, reported_status, stream_arn,
+    table_throughput_description,
 };
 
 use crate::CassandraEngine;
@@ -114,13 +115,12 @@ impl CassandraEngine {
             .map_err(|e| StorageError::Internal(format!("Parse billing_mode: {e}")))?;
 
         let pt_str: Option<String> = table_row.get_r_by_name("provisioned_throughput").ok();
-        let (rcu, wcu) = if let Some(ref s) = pt_str {
-            let pt: extenddb_core::types::ProvisionedThroughput =
-                serde_json::from_str(s).map_err(|e| StorageError::Internal(e.to_string()))?;
-            (pt.read_capacity_units, pt.write_capacity_units)
-        } else {
-            (0, 0)
-        };
+        let provisioned_throughput = table_throughput_description(
+            pt_str
+                .map(|s| serde_json::from_str(&s))
+                .transpose()
+                .map_err(|e| StorageError::Internal(e.to_string()))?,
+        );
 
         let stream_spec_str: Option<String> = table_row.get_r_by_name("stream_specification").ok();
         let stream_specification = stream_spec_str
@@ -287,13 +287,7 @@ impl CassandraEngine {
             item_count,
             table_arn,
             table_id,
-            provisioned_throughput: ProvisionedThroughputDescription {
-                read_capacity_units: rcu,
-                write_capacity_units: wcu,
-                number_of_decreases_today: 0,
-                last_increase_date_time: None,
-                last_decrease_date_time: None,
-            },
+            provisioned_throughput,
             billing_mode_summary,
             table_throughput_mode_summary: None,
             global_secondary_indexes: if gsis.is_empty() { None } else { Some(gsis) },
