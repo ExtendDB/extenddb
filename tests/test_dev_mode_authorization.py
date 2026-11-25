@@ -51,11 +51,7 @@ _ADMIN_AUTH = (
     os.environ.get("EXTENDDB_ADMIN_USER", "admin"),
     os.environ.get("EXTENDDB_ADMIN_PASSWORD", "not-the-password"),
 )
-# A password the server does not have. The admin routes answer it with 401,
-# which shows that a request passed the host guard.
-_WRONG_ADMIN_AUTH = ("admin", "not-the-password")
 _REBIND_HOST = "rebind.example"
-# The CI dev-mode job lists this name in EXTENDDB__SERVER__DEV_ALLOWED_HOSTS.
 _LISTED_HOST = "app.test"
 _ALLOWED_HOSTS = os.environ.get("EXTENDDB__SERVER__DEV_ALLOWED_HOSTS", "").lower()
 _GUARD_MESSAGE = "Developer mode refused a request"
@@ -368,10 +364,8 @@ class TestDevModeHostGuard:
         _assert_security_headers(resp)
 
     def test_admin_get_under_the_endpoint_host_is_not_refused(self, endpoint_url):
-        resp = requests.get(
-            f"{_base(endpoint_url)}/management/accounts", auth=_WRONG_ADMIN_AUTH, timeout=10
-        )
-        assert (resp.status_code, resp.text) == (401, "Invalid credentials")
+        resp = requests.get(f"{_base(endpoint_url)}/management/accounts", timeout=10)
+        assert (resp.status_code, resp.text) == (401, "Missing Authorization header")
 
     @pytest.mark.skipif(
         _LISTED_HOST not in _ALLOWED_HOSTS.replace(" ", "").split(","),
@@ -389,10 +383,9 @@ class TestDevModeHostGuard:
         resp = requests.get(
             f"{_base(endpoint_url)}/management/accounts",
             headers={"Host": _LISTED_HOST},
-            auth=_WRONG_ADMIN_AUTH,
             timeout=10,
         )
-        assert (resp.status_code, resp.text) == (401, "Invalid credentials")
+        assert (resp.status_code, resp.text) == (401, "Missing Authorization header")
 
     def test_console_browser_request_under_a_rebinding_host_gets_the_html_403(
         self, endpoint_url
