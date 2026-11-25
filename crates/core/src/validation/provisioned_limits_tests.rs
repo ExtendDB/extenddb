@@ -6,10 +6,7 @@
 //! were both 150,000 read and 200,000 write units, holding 61 and 46.
 
 use super::*;
-use crate::types::{
-    BillingModeSummary, GsiDescription, Projection, ProjectionType,
-    ProvisionedThroughputDescription,
-};
+use crate::types::{BillingModeSummary, GsiDescription, Projection, ProjectionType};
 use serde_json::json;
 
 const REGION: &str = "us-east-1";
