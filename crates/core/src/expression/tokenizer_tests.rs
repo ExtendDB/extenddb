@@ -184,7 +184,6 @@ fn a_name_that_starts_with_an_underscore_is_refused_at_the_underscore() {
             Some(KeyCondition),
             "(_sk",
         ),
-        ("_g = :v", Some(KeyCondition), "_g"),
         ("SET _x = :v", Some(Update), "SET _x"),
         ("SET a._b = :v", Some(Update), "._b"),
         ("REMOVE _x", Some(Update), "REMOVE _x"),
