@@ -38,6 +38,8 @@ enum Csrf {
     SessionToken,
     /// A token of the same length that is not the session's.
     OtherToken,
+    /// The session's token in a JSON body, which is not a form.
+    InJson,
 }
 
 struct Row {
@@ -64,6 +66,7 @@ const ROWS: &[Row] = &[
     Row { name: "POST with the session's token", holder: Holder::IamUser, stored: StoredHash::LoginHash, method: "POST", csrf: Csrf::SessionToken, status: StatusCode::OK, location: None, body: "admin=false x=true" },
     Row { name: "POST without a token", holder: Holder::Admin, stored: StoredHash::LoginHash, method: "POST", csrf: Csrf::Absent, status: StatusCode::FORBIDDEN, location: None, body: "CSRF token mismatch" },
     Row { name: "POST with another token", holder: Holder::Admin, stored: StoredHash::LoginHash, method: "POST", csrf: Csrf::OtherToken, status: StatusCode::FORBIDDEN, location: None, body: "CSRF token mismatch" },
+    Row { name: "POST with the token in JSON", holder: Holder::Admin, stored: StoredHash::LoginHash, method: "POST", csrf: Csrf::InJson, status: StatusCode::FORBIDDEN, location: None, body: "CSRF token mismatch" },
     Row { name: "DELETE without a token", holder: Holder::Admin, stored: StoredHash::LoginHash, method: "DELETE", csrf: Csrf::Absent, status: StatusCode::FORBIDDEN, location: None, body: "CSRF token mismatch" },
     Row { name: "POST with no cookie", holder: Holder::Nobody, stored: StoredHash::LoginHash, method: "POST", csrf: Csrf::Absent, status: StatusCode::SEE_OTHER, location: LOGIN, body: "" },
     Row { name: "POST for a deleted principal", holder: Holder::Admin, stored: StoredHash::Missing, method: "POST", csrf: Csrf::SessionToken, status: StatusCode::SEE_OTHER, location: LOGIN, body: "" },
@@ -89,16 +92,18 @@ async fn the_tab_session_check_answers_for_each_session_state() {
             }
             None => None,
         };
-        let csrf = match (row.csrf, &session) {
-            (Csrf::Absent, _) => None,
-            (Csrf::SessionToken, Some((_, token))) => Some(token.clone()),
-            (Csrf::OtherToken, Some((_, token))) => Some("0".repeat(token.len())),
-            (_, None) => Some("0".repeat(64)),
-        };
-        let form = match csrf {
-            _ if row.method == "GET" => String::new(),
-            Some(token) => format!("_csrf={token}&x=1"),
-            None => "x=1".to_owned(),
+        let form_type = "application/x-www-form-urlencoded";
+        let (content_type, body) = match (row.csrf, &session) {
+            _ if row.method == "GET" => (form_type, String::new()),
+            (Csrf::SessionToken, Some((_, token))) => (form_type, format!("_csrf={token}&x=1")),
+            (Csrf::OtherToken, Some((_, token))) => {
+                (form_type, format!("_csrf={}&x=1", "0".repeat(token.len())))
+            }
+            (Csrf::InJson, Some((_, token))) => (
+                "application/json",
+                format!(r#"{{"_csrf":"{token}","x":1}}"#),
+            ),
+            _ => (form_type, "x=1".to_owned()),
         };
 
         let calls = Arc::new(AtomicUsize::new(0));
@@ -120,12 +125,12 @@ async fn the_tab_session_check_answers_for_each_session_state() {
         let mut request = Request::builder()
             .method(row.method)
             .uri("/")
-            .header(CONTENT_TYPE, "application/x-www-form-urlencoded");
+            .header(CONTENT_TYPE, content_type);
         if let Some((cookie, _)) = &session {
             request = request.header(COOKIE, format!("extenddb_session={cookie}"));
         }
         let response = page
-            .oneshot(request.body(Body::from(form)).expect("request"))
+            .oneshot(request.body(Body::from(body)).expect("request"))
             .await
             .expect("infallible");
 
