@@ -13,10 +13,10 @@ fn partition_throttle_carries_the_billing_mode() {
         (TableThroughput::on_demand(), true),
     ] {
         let mgr = ThrottleManager::new(1_000_000, 1_000_000, true);
+        // Drain the partition bucket before the table is registered, so the
+        // table bucket starts full.
+        mgr.consume_with_partition("acct", "tbl", 0.0, 1.0e9, Some("k"));
         mgr.register_table("acct", "tbl", throughput);
-        // Drain the partition bucket (PARTITION_WCU_LIMIT per second, one
-        // second of burst), leaving the table bucket full.
-        mgr.consume_with_partition("acct", "tbl", 0.0, PARTITION_WCU_LIMIT * 2.0, Some("k"));
         assert_eq!(
             mgr.check_capacity_with_partition("acct", "tbl", false, true, Some("k")),
             ThrottleResult::ThrottledWrite(ThrottleCause::Partition { on_demand }),
@@ -47,7 +47,7 @@ fn on_demand_caps_size_the_table_bucket() {
 
     let mgr = ThrottleManager::new(1_000_000, 1_000_000, true);
     mgr.register_table("acct", "tbl", capped);
-    mgr.consume("acct", "tbl", 0.0, 2.0);
+    mgr.consume("acct", "tbl", 0.0, 1.0e9);
     assert_eq!(
         mgr.check_capacity("acct", "tbl", false, true),
         ThrottleResult::ThrottledWrite(ThrottleCause::Table {
@@ -76,7 +76,7 @@ fn half_capped_table_reports_the_cap_for_its_direction_only() {
         TableThroughput::on_demand_capped(None, Some(1)),
     );
     // Drain both buckets: the write cap of 1 and the default read ceiling.
-    mgr.consume("acct", "tbl", ON_DEMAND_DEFAULT_RCU * 2.0, 2.0);
+    mgr.consume("acct", "tbl", 1.0e9, 1.0e9);
     assert_eq!(
         mgr.check_capacity("acct", "tbl", false, true),
         ThrottleResult::ThrottledWrite(ThrottleCause::Table {
@@ -103,7 +103,7 @@ fn register_table_updates_the_billing_mode() {
         "tbl",
         TableThroughput::on_demand_capped(Some(1), Some(1)),
     );
-    mgr.consume("acct", "tbl", 2.0, 0.0);
+    mgr.consume("acct", "tbl", 1.0e9, 0.0);
     assert_eq!(
         mgr.check_capacity("acct", "tbl", true, false),
         ThrottleResult::ThrottledRead(ThrottleCause::Table {
@@ -140,4 +140,39 @@ fn register_table_scales_tokens_to_the_new_cap() {
             capped: true,
         })
     );
+}
+
+/// A table in debt has its write cap raised, or removed. One write of 293
+/// units on a cap of 1 leaves a debt of 292 units, which the new rate repays
+/// in 29 ms (10,000 units a second) or 73 ms (the 4,000 default), so a write
+/// 150 ms after the change is allowed. Scaled with the rates, the debt kept
+/// its length of 292 seconds.
+#[test]
+fn raising_or_removing_a_cap_repays_a_debt_at_the_new_rate() {
+    for after in [
+        TableThroughput::on_demand_capped(None, Some(10_000)),
+        TableThroughput::on_demand_capped(None, Some(-1)),
+    ] {
+        let mgr = ThrottleManager::new(1_000_000, 1_000_000, true);
+        mgr.register_table(
+            "acct",
+            "tbl",
+            TableThroughput::on_demand_capped(None, Some(1)),
+        );
+        mgr.consume("acct", "tbl", 0.0, 293.0);
+        assert!(
+            matches!(
+                mgr.check_capacity("acct", "tbl", false, true),
+                ThrottleResult::ThrottledWrite(_)
+            ),
+            "{after:?}"
+        );
+        mgr.register_table("acct", "tbl", after);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert_eq!(
+            mgr.check_capacity("acct", "tbl", false, true),
+            ThrottleResult::Allowed,
+            "{after:?}"
+        );
+    }
 }

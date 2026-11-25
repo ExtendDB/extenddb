@@ -3,7 +3,7 @@
 
 //! `BatchGetItem` operation handler.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -178,9 +178,8 @@ pub async fn handle_batch_get_item(
     // when every key was throttled the call fails with the throttle error
     // instead (API Reference; documented, not reached in the sample).
     let mut unprocessed_keys: HashMap<String, KeysAndAttributes> = HashMap::new();
-    let mut throttled_count: usize = 0;
     let mut first_throttle: Option<DynamoDbError> = None;
-    let mut throttled_tables: Vec<String> = Vec::new();
+    let mut throttled_tables: BTreeMap<String, u32> = BTreeMap::new();
     let mut total_rcu: f64 = 0.0;
     let mut total_pre_proj_bytes: usize = 0;
     let mut returned_count: u64 = 0;
@@ -207,7 +206,9 @@ pub async fn handle_batch_get_item(
                 // error still fails the request.
                 Err(StorageError::Service(e)) if e.is_throttle() => {
                     table_unprocessed.push(key.clone());
-                    throttled_count += 1;
+                    *throttled_tables
+                        .entry(key_info.table_name.clone())
+                        .or_default() += 1;
                     if first_throttle.is_none() {
                         first_throttle = Some(e);
                     }
@@ -232,10 +233,6 @@ pub async fn handle_batch_get_item(
             }
         }
         if !table_unprocessed.is_empty() {
-            // Only a throttle leaves a key unprocessed.
-            if !throttled_tables.contains(&key_info.table_name) {
-                throttled_tables.push(key_info.table_name.clone());
-            }
             // The request's KeysAndAttributes with Keys reduced to the
             // unprocessed ones, in request order (the service's order is not
             // measured: its served and unprocessed lists came back in neither
@@ -257,14 +254,15 @@ pub async fn handle_batch_get_item(
     }
 
     // No key of any table could be read: the call fails with the first
-    // throttle error (API Reference; documented, not measured). "First" is the
-    // request map's iteration order, so with tables of different billing modes
-    // either error class can come out; the service's choice for that case is
-    // not measured (one table per request in the sample). A table whose every
-    // key was throttled beside a served table keeps an empty `Responses` list;
-    // unmeasured as well.
+    // throttle error (API Reference; measured 2026-11-24, 24 of 24
+    // all-throttled batches answered 400). "First" is the request map's
+    // iteration order, so with tables of different billing modes either error
+    // class can come out; the service's choice for that case is not measured
+    // (one table per request in the sample). A table whose every key was
+    // throttled beside a served table keeps an empty `Responses` list; the
+    // service left it out in 29 of 29 measured responses.
     if let Some(e) = first_throttle
-        && throttled_count == total_keys
+        && throttled_tables.values().sum::<u32>() as usize == total_keys
     {
         return Err(e);
     }

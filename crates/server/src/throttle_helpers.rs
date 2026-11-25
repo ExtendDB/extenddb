@@ -115,22 +115,26 @@ fn extract_throughput_from_response(
     ))
 }
 
-/// Record throttle metrics for a batch response a backend served partially.
+/// Record the throttle events of a batch whose entries a backend throttled.
 ///
-/// The server's own bucket records `ThrottledRequests` and the read or write
-/// throttle event when it refuses a request. A backend throttle that leaves
-/// requests or keys unprocessed returns a 200 and would otherwise count as no
-/// throttle at all, so this records `ThrottledRequests` and the read or write
-/// throttle event once per table the engine reports throttled
-/// (`DispatchMetrics::throttled_tables`), with the account and the table as
-/// the dimensions the bucket's own records carry. The response's
+/// A backend throttle that leaves requests or keys unprocessed returns a 200
+/// that the server's own bucket never saw. CloudWatch counts each throttled
+/// entry of a batch as a read or write throttle event, and counts the batch
+/// in `ThrottledRequests` only when every entry was throttled, which answers
+/// the throttle error (`record_error_metrics` counts that one, and the
+/// handler records the entry counts from the request for that one). So this
+/// records one data point per table in `throttled_tables`
+/// (`DispatchMetrics::throttled_tables` on a 200, `batch_entry_counts` for
+/// the error), with the number of the table's throttled entries as its value,
+/// and the account and the table as the dimensions the bucket's own records
+/// carry. The response's
 /// `UnprocessedItems` is no throttle count: it also holds requests deferred
 /// for a transient, conflict or connection failure.
 pub(crate) fn record_partial_batch_throttle(
     metrics: &extenddb_core::metrics::MetricsCollector,
     account_id: &str,
     operation: &str,
-    throttled_tables: &[String],
+    throttled_tables: &std::collections::BTreeMap<String, u32>,
 ) {
     use extenddb_core::metrics::MetricName;
     let event = match operation {
@@ -138,24 +142,41 @@ pub(crate) fn record_partial_batch_throttle(
         "BatchWriteItem" => MetricName::WriteThrottleEvents,
         _ => return,
     };
-    for table in throttled_tables {
-        metrics.record(
-            MetricName::ThrottledRequests,
-            1.0,
-            Some(account_id),
-            Some(table),
-            None,
-            Some(operation),
-        );
+    for (table, entries) in throttled_tables {
         metrics.record(
             event,
-            1.0,
+            f64::from(*entries),
             Some(account_id),
             Some(table),
             None,
             Some(operation),
         );
     }
+}
+
+/// The entries of a `BatchGetItem` or `BatchWriteItem` request per table, by
+/// the name the metrics carry (a table ARN reduced to its table name by
+/// `authz_resource::table_name_only`), and `None` for another operation or a
+/// request the engine will refuse. A batch whose every entry a
+/// backend throttled answers the throttle error alone, so its throttle events
+/// are counted from the request; the engine looked every table up before it
+/// could throttle, so each name here is a catalog name.
+pub(crate) fn batch_entry_counts(
+    operation: &str,
+    input: &Value,
+) -> Option<std::collections::BTreeMap<String, u32>> {
+    let mut counts = std::collections::BTreeMap::new();
+    for (sent, entry) in input.get("RequestItems")?.as_object()? {
+        let entries = match operation {
+            "BatchGetItem" => entry.get("Keys")?.as_array()?.len(),
+            "BatchWriteItem" => entry.as_array()?.len(),
+            _ => return None,
+        };
+        *counts
+            .entry(crate::authz_resource::table_name_only(sent))
+            .or_default() += u32::try_from(entries).ok()?;
+    }
+    Some(counts)
 }
 
 /// Extract the partition key value from a request body for per-partition throttling.
@@ -179,8 +200,6 @@ pub(crate) fn extract_partition_value(input: &Value, operation: &str) -> Option<
 
 /// The throttle error the service sends for a refusal by `cause` on a table
 /// billed as the cause says, naming `table_arn` as the throttled resource.
-/// `None` (a name no table can have) sends the class and message with no
-/// reasons list, since the service cannot name a resource that cannot exist.
 ///
 /// Measured against the service (2026-10-20 and 2026-10-24, two Regions): a
 /// provisioned table's own capacity gives `ProvisionedThroughputExceededException`
@@ -201,7 +220,7 @@ pub(crate) fn extract_partition_value(input: &Value, operation: &str) -> Option<
 pub(crate) fn throttle_error(
     cause: extenddb_core::throttle::ThrottleCause,
     read: bool,
-    table_arn: Option<String>,
+    table_arn: &str,
 ) -> DynamoDbError {
     use extenddb_core::error::{
         MAX_ON_DEMAND_THROUGHPUT_MESSAGE, PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE,
@@ -210,13 +229,10 @@ pub(crate) fn throttle_error(
     use extenddb_core::throttle::ThrottleCause;
     let op = if read { "Read" } else { "Write" };
     let reason = |limit: &str| {
-        table_arn
-            .iter()
-            .map(|resource| ThrottlingReason {
-                reason: format!("Table{op}{limit}"),
-                resource: resource.clone(),
-            })
-            .collect::<Vec<_>>()
+        vec![ThrottlingReason {
+            reason: format!("Table{op}{limit}"),
+            resource: table_arn.to_owned(),
+        }]
     };
     match cause {
         ThrottleCause::Table {
@@ -474,7 +490,7 @@ mod throttle_error_tests {
             ),
         ];
         for (cause, read, class, message, reasons) in cases {
-            let err = throttle_error(cause, read, Some(ARN.to_owned()));
+            let err = throttle_error(cause, read, ARN);
             assert_eq!(
                 parts(&err),
                 (class, message.to_owned(), reasons),
@@ -483,81 +499,133 @@ mod throttle_error_tests {
             assert_eq!(err.status_code(), 400);
         }
     }
+}
 
-    /// Without a resource (a name no table can have) every arm keeps its class
-    /// and message and sends no reasons list.
-    #[test]
-    fn no_resource_means_no_reasons_list() {
-        for cause in [
-            ThrottleCause::Table {
-                on_demand: false,
-                capped: false,
-            },
-            ThrottleCause::Partition { on_demand: true },
-            ThrottleCause::Account,
-        ] {
-            let err = throttle_error(cause, false, None);
-            assert_eq!(err.throttling_reasons(), Some(&[][..]), "{cause:?}");
-            assert!(!err.message().is_empty());
-        }
-    }
+/// The sum and the number of data points of `metric` for `account_id` and
+/// `table`, or for every table of the account with `None`.
+#[cfg(test)]
+pub(crate) fn points(
+    c: &extenddb_core::metrics::MetricsCollector,
+    account_id: &str,
+    metric: extenddb_core::metrics::MetricName,
+    table: Option<&str>,
+) -> (f64, u64) {
+    c.query(&extenddb_core::metrics::MetricsQuery {
+        account_id: Some(account_id.to_owned()),
+        table_name: table.map(str::to_owned),
+        metric: Some(metric),
+        window: Some(extenddb_core::metrics::TimeWindow::AllTime),
+        ..Default::default()
+    })
+    .iter()
+    .fold((0.0, 0), |(sum, count), s| (sum + s.sum, count + s.count))
 }
 
 #[cfg(test)]
 mod partial_batch_throttle_tests {
-    use extenddb_core::metrics::{MetricName, MetricsCollector, MetricsQuery, TimeWindow};
+    use std::collections::BTreeMap;
 
-    use super::record_partial_batch_throttle;
+    use extenddb_core::metrics::{MetricName, MetricsCollector};
+
+    use serde_json::json;
+
+    use super::{batch_entry_counts, points, record_partial_batch_throttle};
 
     const ACCOUNT: &str = "111111111111";
 
-    fn sum(c: &MetricsCollector, metric: MetricName, table: Option<&str>) -> f64 {
-        c.query(&MetricsQuery {
-            account_id: Some(ACCOUNT.to_owned()),
-            table_name: table.map(str::to_owned),
-            metric: Some(metric),
-            window: Some(TimeWindow::AllTime),
-            ..Default::default()
-        })
-        .iter()
-        .map(|s| s.sum)
-        .sum()
+    /// CloudWatch counts each throttled entry of a batch as a read or write
+    /// throttle event and leaves a partly served batch out of
+    /// `ThrottledRequests`. Each row: the operation, the throttled entries per
+    /// table, and the read and write events expected per table as (sum, data
+    /// points), one point per table carrying its entry count.
+    #[test]
+    fn a_partial_batch_records_one_throttle_event_per_throttled_entry() {
+        type Events<'a> = &'a [(&'a str, (f64, u64))];
+        type Row<'a> = (&'a str, &'a [(&'a str, u32)], Events<'a>, Events<'a>);
+        let rows: [Row; 4] = [
+            (
+                "BatchGetItem",
+                &[("T", 3), ("U", 1)],
+                &[("T", (3.0, 1)), ("U", (1.0, 1))],
+                &[],
+            ),
+            ("BatchWriteItem", &[("T", 25)], &[], &[("T", (25.0, 1))]),
+            ("BatchGetItem", &[], &[], &[]),
+            ("GetItem", &[("T", 1)], &[], &[]),
+        ];
+        for (operation, throttled, reads, writes) in rows {
+            let c = MetricsCollector::new();
+            let throttled: BTreeMap<String, u32> = throttled
+                .iter()
+                .map(|(t, n)| ((*t).to_owned(), *n))
+                .collect();
+            record_partial_batch_throttle(&c, ACCOUNT, operation, &throttled);
+            let row = format!("{operation} {throttled:?}");
+            assert_eq!(
+                points(&c, ACCOUNT, MetricName::ThrottledRequests, None),
+                (0.0, 0),
+                "{row}"
+            );
+            for (metric, expected) in [
+                (MetricName::ReadThrottleEvents, reads),
+                (MetricName::WriteThrottleEvents, writes),
+            ] {
+                let total = expected
+                    .iter()
+                    .fold((0.0, 0), |(sum, count), (_, (s, n))| (sum + s, count + n));
+                assert_eq!(points(&c, ACCOUNT, metric, None), total, "{row} {metric:?}");
+                for (table, sum_and_points) in expected {
+                    assert_eq!(
+                        points(&c, ACCOUNT, metric, Some(table)),
+                        *sum_and_points,
+                        "{row} {metric:?} {table}"
+                    );
+                }
+            }
+        }
     }
 
+    /// The entries of each table of a batch request, by the table name an ARN
+    /// names, and `None` for another operation. Each row: the operation, the
+    /// request and the expected counts.
     #[test]
-    fn a_partial_batch_get_records_a_request_and_a_read_event_per_table() {
-        let c = MetricsCollector::new();
-        record_partial_batch_throttle(
-            &c,
-            ACCOUNT,
-            "BatchGetItem",
-            &["T".to_owned(), "U".to_owned()],
-        );
-        assert_eq!(sum(&c, MetricName::ThrottledRequests, None), 2.0);
-        assert_eq!(sum(&c, MetricName::ThrottledRequests, Some("T")), 1.0);
-        assert_eq!(sum(&c, MetricName::ThrottledRequests, Some("U")), 1.0);
-        assert_eq!(sum(&c, MetricName::ReadThrottleEvents, Some("T")), 1.0);
-        assert_eq!(sum(&c, MetricName::ReadThrottleEvents, Some("U")), 1.0);
-        assert_eq!(sum(&c, MetricName::WriteThrottleEvents, None), 0.0);
-    }
-
-    #[test]
-    fn a_partial_batch_write_records_a_write_event() {
-        let c = MetricsCollector::new();
-        record_partial_batch_throttle(&c, ACCOUNT, "BatchWriteItem", &["T".to_owned()]);
-        assert_eq!(sum(&c, MetricName::ThrottledRequests, Some("T")), 1.0);
-        assert_eq!(sum(&c, MetricName::WriteThrottleEvents, Some("T")), 1.0);
-    }
-
-    /// A batch with no throttled table and a non-batch operation record
-    /// nothing.
-    #[test]
-    fn a_full_batch_or_another_operation_records_nothing() {
-        let c = MetricsCollector::new();
-        record_partial_batch_throttle(&c, ACCOUNT, "BatchGetItem", &[]);
-        record_partial_batch_throttle(&c, ACCOUNT, "BatchWriteItem", &[]);
-        record_partial_batch_throttle(&c, ACCOUNT, "GetItem", &["T".to_owned()]);
-        assert_eq!(sum(&c, MetricName::ThrottledRequests, None), 0.0);
-        assert_eq!(sum(&c, MetricName::ReadThrottleEvents, None), 0.0);
+    fn batch_entry_counts_counts_the_entries_of_each_table() {
+        let arn = "arn:aws:dynamodb:us-east-1:111111111111:table/Orders";
+        let key = json!({"pk": {"S": "k"}});
+        let put = json!({"PutRequest": {"Item": {"pk": {"S": "k"}}}});
+        let rows = [
+            (
+                "BatchGetItem",
+                json!({"RequestItems": {arn: {"Keys": [key, key, key]}}}),
+                Some(vec![("Orders", 3)]),
+            ),
+            (
+                "BatchGetItem",
+                json!({"RequestItems": {
+                    "T": {"Keys": [key, key], "ConsistentRead": true},
+                    "U": {"Keys": [key]}
+                }}),
+                Some(vec![("T", 2), ("U", 1)]),
+            ),
+            (
+                "BatchWriteItem",
+                json!({"RequestItems": {"T": [put, put], arn: [put]}}),
+                Some(vec![("Orders", 1), ("T", 2)]),
+            ),
+            (
+                "GetItem",
+                json!({"RequestItems": {"T": {"Keys": [key]}}}),
+                None,
+            ),
+        ];
+        for (operation, input, expected) in rows {
+            let expected: Option<BTreeMap<String, u32>> =
+                expected.map(|rows| rows.into_iter().map(|(t, n)| (t.to_owned(), n)).collect());
+            assert_eq!(
+                batch_entry_counts(operation, &input),
+                expected,
+                "{operation} {input}"
+            );
+        }
     }
 }

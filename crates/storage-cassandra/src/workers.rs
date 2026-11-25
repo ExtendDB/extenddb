@@ -3,6 +3,7 @@
 
 //! Cassandra-specific background workers.
 
+use crate::cassandra_util::PolicySession as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -184,36 +185,53 @@ pub(crate) async fn poll_transaction_recovery(
     }
 }
 
-/// List all account keyspaces for this engine (keyspaces matching `{prefix}_account_*`).
+/// List the account keyspaces of this engine's deployment:
+/// `<keyspace_prefix>_account_` and a 12-digit account id. A keyspace of
+/// another deployment whose prefix starts with this one's, such as
+/// `acme_account_catalog` beside the deployment `acme`, is not listed. The
+/// workers would otherwise run their statements in it.
 pub(crate) async fn list_account_keyspaces(
     engine: &CassandraEngine,
 ) -> Result<Vec<String>, extenddb_storage::error::StorageError> {
-    let prefix = format!("{}_account_", engine.keyspace_prefix);
-    let rows = engine
-        .session
-        .query("SELECT keyspace_name FROM system_schema.keyspaces")
-        .await
-        .map_err(|e| {
-            extenddb_storage::error::StorageError::Internal(format!("list keyspaces: {e}"))
-        })?
-        .response_body()
-        .map_err(|e| {
-            extenddb_storage::error::StorageError::Internal(format!("list keyspaces body: {e}"))
-        })?
-        .into_rows()
-        .unwrap_or_default();
+    let rows: Vec<cdrs_tokio::types::rows::Row> = crate::cassandra_util::system_read(
+        &engine.session,
+        "SELECT keyspace_name FROM system_schema.keyspaces",
+        cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
+        "list keyspaces",
+    )
+    .await?;
 
     use cdrs_tokio::types::IntoRustByName as _;
-    let mut keyspaces = Vec::new();
-    for row in rows {
+    let names = rows.iter().filter_map(|row| {
         let name: Result<String, _> = row.get_r_by_name("keyspace_name");
-        if let Ok(name) = name
-            && name.starts_with(&prefix)
-        {
-            keyspaces.push(name);
-        }
-    }
-    Ok(keyspaces)
+        name.ok()
+    });
+    Ok(account_keyspaces_among(names, &engine.keyspace_prefix))
+}
+
+/// [`list_account_keyspaces`], for the integration tests that check which
+/// keyspaces the workers run in.
+///
+/// # Errors
+/// Returns an error if the listing query fails.
+#[cfg(any(test, feature = "test-util"))]
+#[doc(hidden)]
+pub async fn list_account_keyspaces_for_tests(
+    engine: &CassandraEngine,
+) -> Result<Vec<String>, extenddb_storage::error::StorageError> {
+    list_account_keyspaces(engine).await
+}
+
+/// The names in `keyspaces` that are account keyspaces of the deployment of
+/// `keyspace_prefix`, in the order given.
+fn account_keyspaces_among(
+    keyspaces: impl IntoIterator<Item = String>,
+    keyspace_prefix: &str,
+) -> Vec<String> {
+    keyspaces
+        .into_iter()
+        .filter(|name| crate::migrations::is_account_keyspace(name, keyspace_prefix))
+        .collect()
 }
 
 async fn read_control_plane_delay<S: SettingsStore + ?Sized>(store: &S) -> f64 {
@@ -552,8 +570,6 @@ async fn gsi_apply_index(
         delete_index_row_multi, insert_index_row_multi, item_has_index_keys,
         project_item_for_index, same_index_row,
     };
-    use cdrs_tokio::consistency::Consistency;
-    use cdrs_tokio::query::BatchQueryBuilder;
 
     let idx = &context.index;
     let idx_table = crate::data::ddl::index_table_name(&idx.index_id);
@@ -563,7 +579,7 @@ async fn gsi_apply_index(
     // The entry's stamp is the base-row version its write committed, so a
     // later version's tombstone beats an earlier version's insert on the index
     // table even when the worker applies the entries in the other order.
-    let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+    let mut batch = crate::cassandra_util::batch();
     if let Some(stamp) = context.index_stamp {
         batch = batch.with_timestamp(stamp);
     }
@@ -621,7 +637,7 @@ async fn gsi_apply_index(
         .build()
         .map_err(|e| extenddb_storage::error::StorageError::Internal(e.to_string()))?;
     if !built.request.queries.is_empty() {
-        engine.session.batch(built).await.map_err(|e| {
+        engine.session.run_batch(built).await.map_err(|e| {
             extenddb_storage::error::StorageError::Internal(format!("gsi_apply: {e}"))
         })?;
     }

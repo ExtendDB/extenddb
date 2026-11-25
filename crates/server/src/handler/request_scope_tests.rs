@@ -146,7 +146,7 @@ async fn no_scope_on_the_task_before_the_request_or_after_the_response() {
 async fn the_scope_is_current_when_the_auth_provider_runs() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&seen);
-    let (state, _) = build_state_with(move |account_id| {
+    let (state, _) = build_state_with(None, move |account_id| {
         Arc::new(ScopeAtAuth {
             account_id,
             seen: recorded,
