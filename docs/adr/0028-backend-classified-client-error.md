@@ -7,14 +7,20 @@
 ## Context
 
 Every storage trait method returns `Result<T, StorageError>`. The engine maps a
-`StorageError` to the client-facing `DynamoDbError` at nine functions
-(`crates/engine/src/create_table.rs`, `backup.rs`, `update_table.rs`,
-`streams.rs`, `ttl.rs`, `lib.rs`), each of which names the variants it knows
-and ends in a catch-all that logs the error at error level and returns
-`InternalServerError("Internal server error")`. The catch-all is the redaction
-rule the security model documents: driver text, SQL, paths and connection
-details never reach a client (`docs/manuals/10-security-model.md`, Error
-Message Security; RFC-0003 section 9.2).
+`StorageError` to the client-facing `DynamoDbError` in ten functions. Five end
+in a catch-all that logs the error at error level and returns
+`InternalServerError("Internal server error")`: the backup mapping
+(`crates/engine/src/backup_requests.rs`), the `UpdateTable` mapping
+(`update_table.rs`), the streams and TTL mappings (`streams.rs`, `ttl.rs`) and
+`sanitize_storage_error` (`lib.rs`). The data path mapping (`create_table.rs`)
+names every variant, and it logs and redacts the faults among them the same
+way. The other four name a few variants and delegate the rest to one of those
+six: the conditional check mapping (`create_table.rs`), the create-backup and
+restore mappings (`backup.rs`) and the shard lookup mapping (`streams.rs`). The
+server's authorization read delegates to the data path mapping. The redaction
+is the rule the security model documents: driver text, SQL, paths and
+connection details never reach a client (`docs/manuals/10-security-model.md`,
+Error Message Security; RFC-0003 section 9.2).
 
 The rule has a cost for a backend that knows more than the engine does. A
 hosted database reports documented conditions with their own class and text:
@@ -43,10 +49,21 @@ do, and the operator's log counts a documented condition among storage faults.
 
 Add `StorageError::Service(DynamoDbError)`, marked `#[error(transparent)]`,
 and make every engine function that maps a `StorageError` to a client error
-return it unchanged and without the fault log line. The engine applies one
-rule of its own to the payload: for `ConditionalCheckFailedException`, the
-request's `ReturnValuesOnConditionCheckFailure` decides whether the item is
-returned, as it does for the engine's `ConditionFailed`.
+return it through one function, `create_table::service_err_to_dynamo`:
+unchanged, and without the fault log line. That function applies the one rule
+the engine keeps for the payload. A `ConditionalCheckFailedException` loses its
+item, as the engine's own `ConditionFailed` does on the generic path, and only
+the conditional check mapping returns the item, to a request that set
+`ReturnValuesOnConditionCheckFailure` to `ALL_OLD`.
+
+Two answers outside these functions depend on the error's class. In a
+`BatchExecuteStatement` response, a statement's entry carries the code that the
+API Reference lists for the class (`BatchStatementError`), and
+`InternalServerError` for `ServiceUnavailable`, which the list does not have.
+The server reads a table's key schema before the IAM decision, which needs it
+for `dynamodb:LeadingKeys`, so that read treats a `ResourceNotFoundException`
+as a missing table: a caller the IAM decision refuses gets the refusal, not the
+backend's not-found.
 
 ## Rationale
 
@@ -56,15 +73,19 @@ returned, as it does for the engine's `ConditionFailed`.
 - The status code and the body shape still come from the `DynamoDbError`
   variant through the one serializer, so a backend cannot produce a status or
   a shape outside the service's catalog through this variant.
-- The redaction rule for `Internal` and every other variant is unchanged, and
-  a test at each site keeps it so. The one new path is named in the security
-  model, the backend author manual, RFC-0003 section 9.2 and the variant's
-  doc comment, with the obligation stated the same way in each: the message
-  crosses the wire verbatim and must be service-shaped text with no driver
-  output, host names, connection strings or credentials.
-- A subscriber-based test counts error-level log events at every mapping
-  site: none for a `Service` error, one for an `Internal` error, so the
-  "not logged as a fault" half of the contract cannot regress silently.
+- The redaction rule for `Internal` and every other variant is unchanged. A
+  test checks it for `Internal` at the seven mappings the crate root can
+  reach. The one new path is named in the security model, the backend author
+  manual, RFC-0003 section 9.2 and the variant's doc comment, with the
+  obligation stated the same way in each: the message crosses the wire
+  verbatim and must be service-shaped text with no driver output, host names,
+  connection strings or credentials.
+- One set of rows, each a backend-classified error with a message the engine
+  never writes, runs through every mapping and is compared with the body the
+  client gets. At the seven mappings the crate root can reach, a subscriber
+  also counts error-level log events: none for a `Service` error, one for an
+  `Internal` error. The other three only delegate and write no log line of
+  their own, and their modules run the rows through them.
 
 ## Consequences
 
