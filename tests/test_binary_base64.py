@@ -15,9 +15,9 @@ groups ahead of it must hold base64 characters only. A last character with
 bits past the last byte is invalid, and any other value gets no message.
 An item and an expression attribute value may leave the "=" padding out or
 cut it short; a PartiQL parameter may not. Every answer below was measured
-against the service in us-east-1 on 2026-11-20 and 2026-11-21, each request
-twice. The table does not exist, so a value the service reads gets
-ResourceNotFoundException. On 2026-11-21 each value with "=" or another
+against the service in us-east-1 on 2026-11-20, 2026-11-21 and 2026-11-25,
+each request twice. The table does not exist, so a value the service reads
+gets ResourceNotFoundException. On 2026-11-21 each value with "=" or another
 byte inside, or with more "=" at the end than the padding, went out as
 PutItem both to this missing table and to a table that exists. Each got
 the same answer from both, apart from ResourceNotFoundException for a value
@@ -100,6 +100,10 @@ ROWS = [
     (put({"B": "YWF="}), LAST),
     (put({"B": "YWJjYR=="}), LAST),
     (put({"B": "YWJj===="}), LAST),
+    # Measured 2026-11-25: a "/" or a "+" as the last character ahead of the
+    # padding.
+    (put({"B": "//=="}), LAST),
+    (put({"B": "++=="}), LAST),
     (put({"B": "!!!!"}), NO_MESSAGE),
     (put({"B": "=="}), NO_MESSAGE),
     (put({"B": "!!=="}), NO_MESSAGE),

@@ -1,23 +1,24 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! `extenddb catalog-check` — integrity check for catalog and data databases.
+//! `extenddb catalog-check`: integrity check for the catalog and data databases.
 //!
-//! Detects orphaned data/GSI tables, missing data tables, and catalog
-//! inconsistencies. Refuses to run while the server is up (PID file check).
+//! Detects data relations no catalog row names, catalog rows whose data
+//! relations are gone, and catalog inconsistencies. Refuses to run while the
+//! server is up (PID file check).
 //!
-//! This command uses raw `sqlx` queries intentionally. It is a diagnostic
-//! tool that runs outside the server process and needs direct database
-//! access to cross-reference catalog metadata against physical `PostgreSQL`
-//! tables. Routing through the storage abstraction would defeat the purpose
-//! of an independent integrity check.
-
-use std::collections::HashSet;
+//! The data relations are named by the storage backend from catalog ids, so
+//! checks 1 and 2 run through the backend's `DiagnosticsStore`, which
+//! computes the expected names with the same functions the engine uses to
+//! create them. Checks 3 and 4 read the catalog with raw `sqlx` queries, as
+//! the command always has; they need direct access to cross-reference catalog
+//! rows against each other.
 
 use clap::Args;
 use sqlx::postgres::PgPoolOptions;
 
 use extenddb_config as config;
+use extenddb_storage::diagnostics::{DiagError, OrphanDrop};
 
 #[derive(Args)]
 pub struct CatalogCheckArgs {
@@ -30,9 +31,9 @@ pub struct CatalogCheckArgs {
     fix: bool,
 }
 
-// Linear sequence of 4 independent checks — splitting into helpers would scatter
-// the logic without improving readability, and each helper would need the same
-// pool/fix parameters threaded through.
+// A linear sequence of 4 independent checks. Splitting it into helpers would
+// scatter the logic without improving readability, and each helper would need
+// the same pool and fix parameters threaded through.
 #[allow(clippy::too_many_lines)]
 pub async fn run(args: CatalogCheckArgs) -> anyhow::Result<()> {
     if !std::path::Path::new(&args.config).exists() {
@@ -69,96 +70,81 @@ pub async fn run(args: CatalogCheckArgs) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Cannot connect to catalog: {e}"))?;
     println!("Connected to catalog.");
 
-    // Connect to data database.
-    let data_conn: Option<(String,)> =
-        sqlx::query_as("SELECT value FROM settings WHERE key = 'data_database_connection_string'")
-            .fetch_optional(&catalog_pool)
-            .await?;
-    let Some((data_conn_str,)) = data_conn else {
-        anyhow::bail!("No data database connection string in settings. Run `extenddb init`.");
-    };
-    let data_conn_str = data_connection_text(&catalog_pool, &app_config, data_conn_str).await?;
-    let data_pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&data_conn_str)
+    // The key that opens the data database connection string row of a
+    // catalog with a key ring: the KEK of `[auth.encryption] key_file`, read
+    // after the locked key store is set up, as `verify` reads it (RFC-0000
+    // sections 7 and 12). Without `key_file`, the catalog key, which opens no
+    // such row.
+    let key_source = crate::util::status_key_source(&app_config)?;
+
+    // The backend's own view of its data relations. It connects to the data
+    // database the catalog names, and refuses a catalog that names none, as
+    // this command always has.
+    let diag_store = extenddb_storage::diagnostics_store::create_diagnostics_store(
+        app_config.storage.connection_config(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("Cannot open the storage backend's diagnostics: {e}"))?;
+    let relations = diag_store
+        .check_storage_relations(&key_source)
         .await
-        .map_err(|e| anyhow::anyhow!("Cannot connect to data database: {e}"))?;
-    println!("Connected to data database.");
+        .map_err(|e| match e {
+            DiagError::NotConfigured(msg) => anyhow::anyhow!("{msg}"),
+            e => anyhow::anyhow!("Cannot compare data relations with the catalog: {e}"),
+        })?;
+    println!("Compared data relations with the catalog.");
     println!();
 
-    // Build expected set from catalog: base tables and GSI tables.
-    // Include CREATING tables — they have data tables even before transitioning
-    // to ACTIVE. Excluding them would flag their data tables as orphaned.
-    let catalog_tables: Vec<(String, String)> = sqlx::query_as(
-        "SELECT account_id, table_name FROM tables \
-         WHERE table_status IN ('ACTIVE', 'CREATING')",
-    )
-    .fetch_all(&catalog_pool)
-    .await?;
-
-    let catalog_indexes: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT t.account_id, t.table_name, i.index_name \
-         FROM indexes i JOIN tables t ON i.table_id = t.table_id \
-         WHERE t.table_status IN ('ACTIVE', 'CREATING')",
-    )
-    .fetch_all(&catalog_pool)
-    .await?;
-
-    let mut expected: HashSet<String> = HashSet::new();
-    for (acct, name) in &catalog_tables {
-        expected.insert(format!("_ddb_{acct}_{name}"));
-    }
-    for (acct, name, idx) in &catalog_indexes {
-        expected.insert(format!("_ddb_{acct}_{name}__gsi__{idx}"));
-    }
-
-    // Get actual tables in data database (only _ddb_ prefixed).
-    let actual_tables: Vec<(String,)> = sqlx::query_as(
-        "SELECT tablename FROM pg_tables \
-         WHERE schemaname = 'public' AND tablename LIKE '_ddb_%'",
-    )
-    .fetch_all(&data_pool)
-    .await?;
-
-    let actual: HashSet<String> = actual_tables.into_iter().map(|(n,)| n).collect();
-
-    // Check 1: Orphaned data tables (in data DB but not in catalog).
+    // Check 1: Orphaned data tables (in data DB but no catalog row names them).
     println!("--- Checking for orphaned data tables...");
-    let orphaned: Vec<&String> = actual.difference(&expected).collect();
-    if orphaned.is_empty() {
+    if relations.orphaned.is_empty() {
         println!("  OK: No orphaned tables.");
     } else {
-        println!("  FOUND: {} orphaned table(s):", orphaned.len());
-        for name in &orphaned {
+        println!("  FOUND: {} orphaned table(s):", relations.orphaned.len());
+        for name in &relations.orphaned {
             println!("    - {name}");
         }
-        errors += u32::try_from(orphaned.len()).unwrap_or(u32::MAX);
+        errors += u32::try_from(relations.orphaned.len()).unwrap_or(u32::MAX);
 
         if args.fix {
             println!("  Cleaning up orphaned tables...");
-            for name in &orphaned {
-                // Table names are from pg_tables (trusted), but quote anyway.
-                let quoted = format!("\"{}\"", name.replace('"', "\"\""));
-                let ddl = format!("DROP TABLE IF EXISTS {quoted}");
-                match sqlx::query(&ddl).execute(&data_pool).await {
-                    Ok(_) => println!("    Dropped: {name}"),
-                    Err(e) => println!("    FAILED to drop {name}: {e}"),
+            // The backend waits for the index changes in flight, checks each
+            // relation against the catalog again, and drops each one that no
+            // row names with a short lock wait of its own.
+            match diag_store
+                .drop_orphaned_relations(&key_source, relations.orphaned.clone())
+                .await
+            {
+                Ok(outcomes) => {
+                    for (name, outcome) in &outcomes {
+                        match outcome {
+                            OrphanDrop::Dropped => println!("    Dropped: {name}"),
+                            OrphanDrop::AlreadyGone => println!(
+                                "    Already gone: {name} (another session dropped it first)"
+                            ),
+                            OrphanDrop::Kept(reason) => println!("    Kept: {name} ({reason})"),
+                            OrphanDrop::Failed(e) => println!("    FAILED to drop {name}: {e}"),
+                        }
+                    }
                 }
+                Err(e) => println!("  FAILED to clean up orphaned tables: {e}"),
             }
         }
     }
 
-    // Check 2: Missing data tables (in catalog but not in data DB).
+    // Check 2: Missing data tables (a catalog row names them, data DB lacks them).
     println!("--- Checking for missing data tables...");
-    let missing: Vec<&String> = expected.difference(&actual).collect();
-    if missing.is_empty() {
+    if relations.missing.is_empty() {
         println!("  OK: All catalog tables have backing data tables.");
     } else {
-        println!("  FOUND: {} missing data table(s):", missing.len());
-        for name in &missing {
-            println!("    - {name}");
+        println!(
+            "  FOUND: {} missing data table(s):",
+            relations.missing.len()
+        );
+        for entry in &relations.missing {
+            println!("    - {} ({})", entry.relation, entry.owner);
         }
-        errors += u32::try_from(missing.len()).unwrap_or(u32::MAX);
+        errors += u32::try_from(relations.missing.len()).unwrap_or(u32::MAX);
     }
 
     // Check 3: Indexes without parent table in catalog.
@@ -214,49 +200,4 @@ pub async fn run(args: CatalogCheckArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-/// The data database connection string that the row `stored` holds: the
-/// row as it is in a catalog without a key ring; with a ring, the row
-/// decrypted under a DEK of the ring, which the KEK of `[auth.encryption]
-/// key_file` opens (RFC-0000 section 12). A row that no DEK opens is
-/// refused, plaintext included, as every reader but `switch` refuses it.
-async fn data_connection_text(
-    catalog: &sqlx::PgPool,
-    app_config: &config::AppConfig,
-    stored: String,
-) -> anyhow::Result<zeroize::Zeroizing<String>> {
-    use extenddb_storage::key_ring::{KEY_RING_SETTING, open_ring};
-    use extenddb_storage::secret_keys::CATALOG_ID_SETTING;
-    use extenddb_storage::server_components::KeySource;
-
-    let setting = async |key: &str| -> anyhow::Result<Option<String>> {
-        let row: Option<(String,)> = sqlx::query_as("SELECT value FROM settings WHERE key = $1")
-            .bind(key)
-            .fetch_optional(catalog)
-            .await?;
-        Ok(row.map(|(value,)| value))
-    };
-    let Some(ring) = setting(KEY_RING_SETTING).await? else {
-        return Ok(zeroize::Zeroizing::new(stored));
-    };
-    let KeySource::Kek(kek) = extenddb_server::key_file::key_source(&app_config.auth.encryption)
-        .map_err(anyhow::Error::msg)?
-    else {
-        anyhow::bail!(
-            "The catalog has a key ring, so its data database connection string is encrypted. \
-             Set [auth.encryption] key_file to the KEK file that the ring names"
-        );
-    };
-    let catalog_id = setting(CATALOG_ID_SETTING).await?;
-    let open = open_ring(&ring, catalog_id.as_deref(), &kek).map_err(|e| anyhow::anyhow!("{e}"))?;
-    open.deks
-        .iter()
-        .find_map(|dek| dek.decrypt_setting(&stored).ok())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "No DEK of the key ring opens the data_database_connection_string row. Run \
-                 `extenddb encryption-key status`"
-            )
-        })
 }

@@ -419,11 +419,12 @@ fn empty_map_inside_map_rejected_with_ddb_message() {
     );
 }
 
-/// The service's answer to each `B` value (measured 2026-11-20, and
+/// The service's answer to each `B` value (measured 2026-11-20,
 /// 2026-11-21 for the values with their padding left out or cut short
-/// and for the values with `=` or another character inside): the decoded
-/// bytes, or the text of the refusal, empty for no message. A `BS`
-/// member, and a value inside an `M` or an `L`, get the same text.
+/// and for the values with `=` or another character inside, and
+/// 2026-11-25 for `//==` and `++==`): the decoded bytes, or the text of
+/// the refusal, empty for no message. A `BS` member, and a value inside
+/// an `M` or an `L`, get the same text.
 #[test]
 fn a_value_that_is_not_base64_gets_the_service_text() {
     let short = || Err("Buffer is too short for base64 encoding".to_owned());
@@ -434,7 +435,7 @@ fn a_value_that_is_not_base64_gets_the_service_text() {
     };
     let last = || Err("Invalid last non-pad Base64 character dectected".to_owned());
     let none = || Err(String::new());
-    let rows: [(&str, Result<&[u8], String>); 154] = [
+    let rows: [(&str, Result<&[u8], String>); 156] = [
         ("YWJj", Ok(b"abc")),
         ("YQ==", Ok(b"a")),
         ("YWE=", Ok(b"aa")),
@@ -475,6 +476,8 @@ fn a_value_that_is_not_base64_gets_the_service_text() {
         ("A===", last()),
         ("AB==", last()),
         ("AAB=", last()),
+        ("//==", last()),
+        ("++==", last()),
         ("==", none()),
         ("!!!!", none()),
         ("!!==", none()),
