@@ -143,8 +143,11 @@ def test_update_table_with_fewer_definitions_than_keys(dynamodb_client, table, s
     ("h:S h:S", "h", None, "h"),
     ("h:S h:S", "h", "r", "h"),
     ("b:S a:S b:S a:S h:S", "h", "r", "b"),
+    ("a:S b:S b:S a:S h:S", "h", "r", "b"),
+    ("a:S b:S a:S b:S h:S", "h", "r", "a"),
     ("h:S h:N", "h", "r", "h"),
-], ids=["index_key", "and_a_missing_key", "first_repeated", "two_types"])
+], ids=["index_key", "and_a_missing_key", "first_repeated", "second_definition_first",
+        "first_definition_first", "two_types"])
 def test_update_table_refuses_a_name_defined_twice(dynamodb_client, table, spec, h, r, name):
     message = _message(_update(dynamodb_client, table, spec, ks(h, r)))
     assert message == f"Attribute Name is duplicated: {name}"
@@ -252,7 +255,10 @@ def test_create_table_reports_a_billing_fault_first(dynamodb_client, spec, table
     ("pk:S pk:S", ks("pk", "sk"), [], "pk"),
     ("pk:S g:S g:S", ks("pk"), [ks("g")], "g"),
     ("b:S a:S b:S a:S pk:S", ks("pk"), [], "b"),
-], ids=["table_key", "two_types", "and_a_missing_key", "index_key", "first_repeated"])
+    ("a:S b:S b:S a:S pk:S", ks("pk"), [], "b"),
+    ("a:S b:S a:S b:S pk:S", ks("pk"), [], "a"),
+], ids=["table_key", "two_types", "and_a_missing_key", "index_key", "first_repeated",
+        "second_definition_first", "first_definition_first"])
 def test_create_table_refuses_a_name_defined_twice(dynamodb_client, spec, table_keys, gsis, name):
     message = _message(_create(dynamodb_client, spec, table_keys, gsis))
     assert message == f"Attribute Name is duplicated: {name}"

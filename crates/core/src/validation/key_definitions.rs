@@ -205,12 +205,17 @@ mod tests {
 
     #[test]
     fn the_first_repeated_name_is_named() {
-        assert_eq!(
-            message(validate_unique_attribute_definitions(&defs(&[
-                "b", "a", "b", "a"
-            ]))),
-            "Attribute Name is duplicated: b"
-        );
+        for (names, repeated) in [
+            (&["b", "a", "b", "a"][..], "b"),
+            (&["a", "b", "b", "a"][..], "b"),
+            (&["a", "b", "a", "b"][..], "a"),
+        ] {
+            assert_eq!(
+                message(validate_unique_attribute_definitions(&defs(names))),
+                format!("Attribute Name is duplicated: {repeated}"),
+                "{names:?}"
+            );
+        }
         assert!(validate_unique_attribute_definitions(&defs(&["a", "b"])).is_ok());
     }
 
