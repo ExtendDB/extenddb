@@ -29,25 +29,12 @@ from __future__ import annotations
 
 import pytest
 
-from conftest import _is_real_dynamodb, configured_backend
+from conftest import _is_real_dynamodb
 from expression_fault_helpers import (
     NAMES, VALUES, _after_prefix, _error, _validation, chain, put, query, scan, syntax, table,
 )
 
 TOO_MANY = "The expression contains too many operators; operator count: "
-
-# On MongoDB an UpdateItem condition is compiled to a filter whose OR and AND
-# chains nest one level per operator, and a chain of 150 terms fails inside
-# MongoDB with InternalServerError. This change does not touch that compiler.
-# The backend is read as the other tests read it: EXTENDDB_TEST_BACKEND, else
-# the server's config file.
-# TODO: remove this marker once the MongoDB filter compiler flattens chains.
-XFAIL_ON_MONGODB_DEEP_OR = pytest.mark.xfail(
-    not _is_real_dynamodb() and configured_backend() == "mongodb",
-    reason="MongoDB answers InternalServerError for a condition chain of 150 terms",
-    raises=AssertionError,
-    strict=True,
-)
 
 # ExtendDB serves a KeyConditionExpression whose second clause names an
 # attribute outside the key schema, where the service refuses it. Its
@@ -138,7 +125,6 @@ class TestOperatorCount:
         )
         assert _after_prefix(msg) == f"Invalid ConditionExpression: {TOO_MANY}599"
 
-    @XFAIL_ON_MONGODB_DEEP_OR
     def test_update_item_condition_at_the_cap_is_evaluated(self, dynamodb_client, table):
         # [u03] 300 accepted (condition evaluated).
         code, _ = _error(
