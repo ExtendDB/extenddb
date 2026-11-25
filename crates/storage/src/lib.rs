@@ -194,8 +194,9 @@ pub struct VectorSearch<'a> {
     /// Every other condition of a search condition, a range, `IN`, `OR`,
     /// `NOT`, a function or a Number equality, arrives as `item_filter`.
     pub filters: &'a [(&'a str, &'a AttributeValue)],
-    /// A condition each candidate must satisfy before it is ranked, for a
-    /// search condition that `filters` cannot express. `None` means no
+    /// A condition each returned item must satisfy, for a search condition
+    /// that `filters` cannot express; the `top_k` cut applies to the items
+    /// that satisfy it. `None` means no
     /// condition beyond `hash_key` and `filters`. See [`VectorItemFilter`].
     pub item_filter: Option<std::sync::Arc<dyn VectorItemFilter>>,
 }

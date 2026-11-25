@@ -56,7 +56,8 @@ Option 2: the grammar has its own lexer, grammar and checks in
 `search-inequality-filters` Cargo feature and the `search_inequality_filters`
 runtime setting (default `all`); a condition the equality pairs cannot express
 reaches the backend as `VectorSearch::item_filter`, which the backend calls on
-each candidate; SearchVectors sets no `dynamodb:Attributes` value.
+candidates to keep the first `top_k` that match (SQLite on each candidate,
+PostgreSQL on the rows its SQL returns in score order, page by page); SearchVectors sets no `dynamodb:Attributes` value.
 
 ## Rationale
 

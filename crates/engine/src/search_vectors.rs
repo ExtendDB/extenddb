@@ -4,9 +4,11 @@
 //! `SearchVectors` operation handler.
 //!
 //! Runs a similarity search over a vector index: parses the query vector, an
-//! optional single-equality prefilter, and an optional projection, calls the
-//! storage layer for the top-k nearest neighbors, and returns each item with
-//! its similarity score.
+//! optional `SearchConditionExpression`, and an optional projection, calls
+//! the storage layer for the top-k nearest neighbors that satisfy the
+//! condition, and returns each item with its similarity score. The condition
+//! reaches the storage layer as a HASH equality, inline-filter equalities and,
+//! for the conditions those cannot express, an item filter.
 
 use std::collections::HashMap;
 

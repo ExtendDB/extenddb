@@ -274,8 +274,9 @@ impl VectorSearchEngine for SqliteEngine {
                     .map_err(|e| StorageError::Internal(format!("stored item: {e}")))?;
 
                 // Inline-filter attributes are applied here rather than in SQL,
-                // because they are item attributes rather than columns. Equality
-                // only, which is all the wire surface admits today.
+                // because they are item attributes rather than columns: the
+                // equality pairs first, then the item filter for the
+                // conditions the pairs cannot express.
                 if !filters.is_empty()
                     && !filters
                         .iter()

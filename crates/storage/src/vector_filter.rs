@@ -5,8 +5,11 @@
 //!
 //! The engine parses and validates a search condition, and a backend only
 //! evaluates it. A backend that serves vector search calls
-//! [`VectorItemFilter::matches`] on each candidate before ranking it, so the
-//! `top_k` cut applies to matching items only.
+//! [`VectorItemFilter::matches`] on candidates and keeps only the items that
+//! match, so the `top_k` cut applies to matching items only. SQLite calls it
+//! on each candidate before scoring it. PostgreSQL ranks the candidates in
+//! SQL and calls it on the rows in score order, page by page, until `top_k`
+//! rows match.
 //!
 //! The engine sets [`crate::VectorSearch::item_filter`] only for a condition
 //! that the equality pairs of [`crate::VectorSearch::filters`] cannot express.
