@@ -8,11 +8,16 @@ on a global secondary index, and every item from exactly one segment. That
 holds for every segment count, with a FilterExpression that every item
 matches, and across the pages of a segment read with a Limit (measured in
 us-east-1 on 13 and 14 Nov 2026, and with Limit 1 on 17 Nov 2026).
+
+DynamoDB refuses a start key from another segment, also after the item of the
+key is deleted, and accepts a deleted start key from the segment it scans
+(measured in us-east-1 at 09:22 UTC on 17 Nov 2026, each request sent twice).
 """
 
 from __future__ import annotations
 
 import pytest
+from botocore.exceptions import ClientError
 
 from conftest import _paginate, scoped_table, wait_for_gsi_items
 
@@ -153,3 +158,87 @@ def test_every_partition_key_comes_back_from_one_segment(
             segments_of.setdefault(item[pk_attr]["S"], set()).add(segment)
     split = {pk: sorted(segs) for pk, segs in segments_of.items() if len(segs) > 1}
     assert not split, f"{pk_attr} values came back from more than one segment: {split}"
+
+
+# The start-key check of a parallel Scan, on a table keyed on pk S HASH that
+# holds item-00 to item-19, for Segment 0 of TotalSegments 4 with ConsistentRead.
+START_KEY_ITEMS = 20
+START_KEY_TOTAL = 4
+WRONG_SEGMENT = (
+    "The provided starting key is invalid: Invalid ExclusiveStartKey. Please use "
+    "ExclusiveStartKey with correct Segment. TotalSegments: 4 Segment: 0"
+)
+
+# (segment of the start key, item deleted before the Scan, status, __type, message),
+# as DynamoDB answered. The key from another segment is the same key in the
+# first two rows. The 200 row checks the status only: the items that follow the
+# start key depend on the hash of the target.
+START_KEY_ROWS = [
+    pytest.param("other", False, 400, "ValidationException", WRONG_SEGMENT, id="other-segment"),
+    pytest.param(
+        "other", True, 400, "ValidationException", WRONG_SEGMENT, id="other-segment-deleted"
+    ),
+    pytest.param("scanned", True, 200, None, None, id="scanned-segment-deleted"),
+]
+
+
+@pytest.fixture(scope="module")
+def start_key_table(dynamodb_client):
+    """The table of the start-key rows, and the segment of each key on the target:
+    the segment whose Scan returns the item."""
+    with scoped_table(dynamodb_client) as name:
+        for i in range(START_KEY_ITEMS):
+            dynamodb_client.put_item(
+                TableName=name, Item={"pk": {"S": f"item-{i:02d}"}, "v": {"N": "1"}}
+            )
+        segment_of: dict[str, int] = {}
+        for segment in range(START_KEY_TOTAL):
+            pages = _paginate(
+                dynamodb_client,
+                "scan",
+                TableName=name,
+                Segment=segment,
+                TotalSegments=START_KEY_TOTAL,
+                ConsistentRead=True,
+            )
+            for page in pages:
+                for item in page["Items"]:
+                    segment_of[item["pk"]["S"]] = segment
+        assert len(segment_of) == START_KEY_ITEMS, segment_of
+        yield name, segment_of
+
+
+@pytest.mark.parametrize(
+    ("key_from", "deleted", "status", "error_type", "message"), START_KEY_ROWS
+)
+def test_a_start_key_must_come_from_the_scanned_segment(
+    dynamodb_client, start_key_table, key_from, deleted, status, error_type, message
+):
+    name, segment_of = start_key_table
+    if key_from == "scanned":
+        keys = sorted(pk for pk, seg in segment_of.items() if seg == 0)
+    else:
+        keys = sorted(pk for pk, seg in segment_of.items() if seg != 0)
+    assert keys, f"no item for a start key from the {key_from} segment: {segment_of}"
+    key = {"pk": {"S": keys[0]}}
+    if deleted:
+        dynamodb_client.delete_item(TableName=name, Key=key)
+    else:
+        dynamodb_client.put_item(TableName=name, Item={**key, "v": {"N": "1"}})
+
+    try:
+        resp = dynamodb_client.scan(
+            TableName=name,
+            Segment=0,
+            TotalSegments=START_KEY_TOTAL,
+            ConsistentRead=True,
+            ExclusiveStartKey=key,
+        )
+        answer = (resp["ResponseMetadata"]["HTTPStatusCode"], None, None)
+    except ClientError as e:
+        answer = (
+            e.response["ResponseMetadata"]["HTTPStatusCode"],
+            e.response["Error"]["Code"],
+            e.response["Error"]["Message"],
+        )
+    assert answer == (status, error_type, message)
