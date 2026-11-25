@@ -3,20 +3,25 @@
 
 """Key schemas whose attributes are missing from AttributeDefinitions.
 
-Amazon DynamoDB, measured on 2026-10-25 and 2026-10-26 at 01:27, 01:29,
-02:27 and 02:34 UTC (us-east-1), each request twice, on CreateTable and on
-an UpdateTable GSI Create:
+Amazon DynamoDB, measured on 2026-10-25, 2026-10-26 and 2026-11-25
+(us-east-1), each request twice, on CreateTable and on an UpdateTable GSI
+Create:
 
-- A table billing fault is reported first.
-- A name defined twice answers ``Attribute Name is duplicated: <name>``,
-  naming the first name whose second definition comes first, before a
-  missing key.
-- The table's key schema is checked first, then each LSI's, then each GSI's.
-  A schema with more keys than there are definitions answers ``Invalid
-  KeySchema: Some index key attribute have no definition``. Otherwise a key
-  with no definition answers ``Some index key attributes are not defined in
-  AttributeDefinitions`` listing every key of that schema and every
-  definition.
+- The keySchema length constraint comes before the key schema rules below,
+  and on CreateTable so does a table billing fault.
+- Then the table's key schema, or the created index's, against the
+  definitions: more keys than there are definitions answers ``Invalid
+  KeySchema: Some index key attribute have no definition``, and a HASH and a
+  RANGE element on one name answers ``Both the Hash Key and the Range Key
+  element in the KeySchema have the same name``.
+- Then a name defined twice answers ``Attribute Name is duplicated: <name>``,
+  naming the name whose second definition comes first.
+- On CreateTable each key schema follows in turn, the table's, each LSI's and
+  each GSI's: more keys than definitions answers ``Invalid KeySchema``, and a
+  key with no definition answers ``Some index key attributes are not defined
+  in AttributeDefinitions`` listing every key of that schema and every
+  definition. The service checks an index's definitions before its shape, and
+  ExtendDB checks every shape first. No row here has both faults in one index.
 
 The service orders both lists in a way that follows neither the request nor
 the alphabet, and ExtendDB lists them in request order, so these tests compare
@@ -39,7 +44,9 @@ from botocore.exceptions import ClientError
 
 from conftest import scoped_table
 
+NEVER_CREATED = "never-created-key-definitions"
 INVALID = "Invalid KeySchema: Some index key attribute have no definition"
+SAME_NAME = "Both the Hash Key and the Range Key element in the KeySchema have the same name"
 LISTED = re.compile(
     r"^One or more parameter values were invalid: Some index key attributes are not defined in "
     r"AttributeDefinitions\. Keys: \[([^\]]*)\], AttributeDefinitions: \[([^\]]*)\]$"
@@ -55,6 +62,11 @@ def ks(hash_key: str, range_key: str | None = None) -> list[dict]:
     if range_key:
         out.append({"AttributeName": range_key, "KeyType": "RANGE"})
     return out
+
+
+def keys(spec: str) -> list[dict]:
+    """A key schema in any order, as ``name:HASH name:RANGE``."""
+    return [{"AttributeName": p.split(":")[0], "KeyType": p.split(":")[1]} for p in spec.split()]
 
 
 def _message(call) -> str:
@@ -77,13 +89,13 @@ def table(dynamodb_client):
         yield name
 
 
-def _update(client, table, spec, hash_key, range_key=None):
+def _update(client, table, spec, key_schema):
     return lambda: client.update_table(
         TableName=table,
         AttributeDefinitions=defs(spec),
         GlobalSecondaryIndexUpdates=[{"Create": {
             "IndexName": "never-created",
-            "KeySchema": ks(hash_key, range_key),
+            "KeySchema": key_schema,
             "Projection": {"ProjectionType": "KEYS_ONLY"},
         }}],
     )
@@ -91,7 +103,7 @@ def _update(client, table, spec, hash_key, range_key=None):
 
 def _create(client, spec, table_keys, gsis=(), lsis=()):
     kwargs = {
-        "TableName": "never-created-key-definitions",
+        "TableName": NEVER_CREATED,
         "AttributeDefinitions": defs(spec),
         "KeySchema": table_keys,
         "BillingMode": "PAY_PER_REQUEST",
@@ -123,14 +135,14 @@ UPDATE_LISTED = [
 @pytest.mark.parametrize(("case", "spec", "h", "r", "keys", "names"), UPDATE_LISTED,
                          ids=[c[0] for c in UPDATE_LISTED])
 def test_update_table_lists_every_key_and_definition(dynamodb_client, table, case, spec, h, r, keys, names):
-    message = _message(_update(dynamodb_client, table, spec, h, r))
+    message = _message(_update(dynamodb_client, table, spec, ks(h, r)))
     assert _listed(message) == (keys, names)
 
 
 @pytest.mark.parametrize(("spec", "h", "r"), [("pk:S", "g", "r"), ("pk:S", "pk", "r")],
                          ids=["both_missing_one_def", "range_missing_one_def"])
 def test_update_table_with_fewer_definitions_than_keys(dynamodb_client, table, spec, h, r):
-    assert _message(_update(dynamodb_client, table, spec, h, r)) == INVALID
+    assert _message(_update(dynamodb_client, table, spec, ks(h, r))) == INVALID
 
 
 @pytest.mark.parametrize(("spec", "h", "r", "name"), [
@@ -140,7 +152,26 @@ def test_update_table_with_fewer_definitions_than_keys(dynamodb_client, table, s
     ("h:S h:N", "h", "r", "h"),
 ], ids=["index_key", "and_a_missing_key", "first_repeated", "two_types"])
 def test_update_table_refuses_a_name_defined_twice(dynamodb_client, table, spec, h, r, name):
-    assert _message(_update(dynamodb_client, table, spec, h, r)) == f"Attribute Name is duplicated: {name}"
+    message = _message(_update(dynamodb_client, table, spec, ks(h, r)))
+    assert message == f"Attribute Name is duplicated: {name}"
+
+
+# UpdateTable GSI Create on a table name that does not exist, where two rules
+# apply: (definitions, index key schema, message). The definition count and the
+# HASH and RANGE names come before a name defined twice.
+UPDATE_ORDER = [
+    ("count_before_duplicate", "g:S g:S", "g:HASH x:RANGE y:RANGE", INVALID),
+    ("count_before_duplicate_other_names", "a:S a:S", "a:HASH b:RANGE c:RANGE", INVALID),
+    ("same_name_before_duplicate", "g:S g:S", "g:HASH g:RANGE", SAME_NAME),
+    ("count_before_same_name", "g:S", "g:HASH g:RANGE", INVALID),
+    ("same_name", "g:S x:S", "g:HASH g:RANGE", SAME_NAME),
+]
+
+
+@pytest.mark.parametrize(("case", "spec", "key_spec", "expected"), UPDATE_ORDER,
+                         ids=[c[0] for c in UPDATE_ORDER])
+def test_update_table_checks_in_the_service_order(dynamodb_client, case, spec, key_spec, expected):
+    assert _message(_update(dynamodb_client, NEVER_CREATED, spec, keys(key_spec))) == expected
 
 
 # CreateTable: (definitions, table keys, GSIs, LSIs, keys listed or None for the
@@ -172,6 +203,42 @@ def test_create_table_checks_each_key_schema_in_turn(dynamodb_client, case, spec
         assert _listed(message) == (keys, names)
 
 
+KEY_SCHEMA_LENGTH = ("1 validation error detected: Value '[KeySchemaElement(attributeName=a, keyType={}), "
+                     "KeySchemaElement(attributeName=b, keyType={}), KeySchemaElement(attributeName=c, "
+                     "keyType=RANGE)]' at 'keySchema' failed to satisfy constraint: Member must have length "
+                     "less than or equal to 2")
+
+# CreateTable where two rules apply: (definitions, table keys, GSIs, LSIs,
+# message). The keySchema length comes first, then the definition count, then
+# the HASH and RANGE names, then a name defined twice, then the key schema
+# shapes.
+CREATE_ORDER = [
+    ("length_before_count", "a:S b:S", keys("a:HASH b:RANGE c:RANGE"), [], [],
+     KEY_SCHEMA_LENGTH.format("HASH", "RANGE")),
+    ("length_before_shape", "a:S b:S c:S", keys("a:RANGE b:HASH c:RANGE"), [], [],
+     KEY_SCHEMA_LENGTH.format("RANGE", "HASH")),
+    ("count_before_shape", "pk:S", keys("sk:RANGE pk:HASH"), [], [], INVALID),
+    ("count_before_same_name", "pk:S", keys("pk:HASH pk:RANGE"), [], [], INVALID),
+    ("same_name", "pk:S x:S", keys("pk:HASH pk:RANGE"), [], [], SAME_NAME),
+    ("same_name_before_duplicate", "pk:S pk:S", keys("pk:HASH pk:RANGE"), [], [], SAME_NAME),
+    ("duplicate_before_table_hash_first", "pk:S sk:S sk:S", keys("sk:RANGE pk:HASH"), [], [],
+     "Attribute Name is duplicated: sk"),
+    ("duplicate_before_table_range_second", "pk:S sk:S sk:S", keys("pk:HASH sk:HASH"), [], [],
+     "Attribute Name is duplicated: sk"),
+    ("duplicate_before_gsi_shape", "pk:S g:S g:S r:S", ks("pk"), [keys("r:RANGE g:HASH")], [],
+     "Attribute Name is duplicated: g"),
+    ("duplicate_before_lsi_shape", "pk:S sk:S l:S l:S", ks("pk", "sk"), [], [keys("l:RANGE pk:HASH")],
+     "Attribute Name is duplicated: l"),
+]
+
+
+@pytest.mark.parametrize(("case", "spec", "table_keys", "gsis", "lsis", "expected"), CREATE_ORDER,
+                         ids=[c[0] for c in CREATE_ORDER])
+def test_create_table_checks_in_the_service_order(dynamodb_client, case, spec, table_keys, gsis, lsis,
+                                                  expected):
+    assert _message(_create(dynamodb_client, spec, table_keys, gsis, lsis)) == expected
+
+
 BILLING = ("One or more parameter values were invalid: Neither ReadCapacityUnits nor WriteCapacityUnits "
            "can be specified when BillingMode is PAY_PER_REQUEST")
 
@@ -180,11 +247,12 @@ BILLING = ("One or more parameter values were invalid: Neither ReadCapacityUnits
     ("pk:S pk:S", ks("pk")),
     ("pk:S x:S", ks("pk", "sk")),
     ("pk:S", ks("pk", "sk")),
-], ids=["duplicate", "missing_key", "fewer_definitions"])
+    ("pk:S sk:S", keys("sk:RANGE pk:HASH")),
+], ids=["duplicate", "missing_key", "fewer_definitions", "range_first"])
 def test_create_table_reports_a_billing_fault_first(dynamodb_client, spec, table_keys):
     def call():
         dynamodb_client.create_table(
-            TableName="never-created-key-definitions", AttributeDefinitions=defs(spec), KeySchema=table_keys,
+            TableName=NEVER_CREATED, AttributeDefinitions=defs(spec), KeySchema=table_keys,
             BillingMode="PAY_PER_REQUEST", ProvisionedThroughput={"ReadCapacityUnits": 1, "WriteCapacityUnits": 1})
     assert _message(call) == BILLING
 

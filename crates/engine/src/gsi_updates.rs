@@ -244,17 +244,20 @@ pub(crate) fn validate_gsi_updates(input: &UpdateTableInput) -> Result<(), Dynam
             }
             // Every key attribute must be in AttributeDefinitions. The
             // service's sentence depends on the member's shape (measured
-            // 2026-10-25 and 2026-10-26): absent names the index; a name
-            // defined twice is refused first; then the CreateTable rules
-            // for the index's key schema (core's key_definitions.rs).
+            // 2026-10-25, 2026-10-26 and 2026-11-25): absent names the index;
+            // then come the four rules of core's key_definitions.rs, in its
+            // order: the definition count, the HASH and RANGE names, a name
+            // defined twice, then a key with no definition.
             let Some(defs) = &input.attribute_definitions else {
                 return Err(DynamoDbError::ValidationException(format!(
                     "One or more parameter values were invalid: AttributeDefinitions is not specified for index: {}",
                     create.index_name
                 )));
             };
+            extenddb_core::validation::validate_definition_count(&create.key_schema, defs)?;
+            extenddb_core::validation::validate_hash_and_range_differ(&create.key_schema)?;
             extenddb_core::validation::validate_unique_attribute_definitions(defs)?;
-            extenddb_core::validation::validate_key_schema_defined(&create.key_schema, defs)?;
+            extenddb_core::validation::validate_keys_defined(&create.key_schema, defs)?;
         }
         if let Some(delete) = &update.delete {
             validate_update_index_name(&delete.index_name, position, "delete")?;
@@ -533,12 +536,14 @@ mod tests {
     /// A created index whose key attribute is not in AttributeDefinitions is
     /// refused with the sentence the service picks by the member's shape
     /// (measured 2026-10-25, 2026-10-26 and 2026-11-25): absent names the
-    /// index, fewer definitions than the index has keys has the key schema
-    /// sentence, a name defined twice is refused, and otherwise the sentence
+    /// index, then fewer definitions than the index has keys, a HASH and a
+    /// RANGE on one name, a name defined twice, and last the sentence that
     /// lists every key of the index and every definition.
     #[test]
     fn a_created_gsi_on_an_undefined_key_attribute_is_refused_by_member_shape() {
         const FEWER: &str = "Invalid KeySchema: Some index key attribute have no definition";
+        const SAME_NAME: &str =
+            "Both the Hash Key and the Range Key element in the KeySchema have the same name";
         const LISTED: &str = "One or more parameter values were invalid: Some index key \
                               attributes are not defined in AttributeDefinitions. Keys: [r, g], \
                               AttributeDefinitions: [r, pk]";
@@ -576,6 +581,9 @@ mod tests {
             (["r", "g"], Some("r pk"), LISTED),
             (["g", "r"], Some("pk g"), LISTED_PK_G),
             (["g", "r"], Some("g g"), "Attribute Name is duplicated: g"),
+            (["g", "g"], Some("g"), FEWER),
+            (["g", "g"], Some("g g"), SAME_NAME),
+            (["g", "g"], Some("g x"), SAME_NAME),
         ];
         for (keys, defs, expected) in cases {
             assert_eq!(
