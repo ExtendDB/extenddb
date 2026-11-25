@@ -323,6 +323,37 @@ fn the_combined_size_counts_a_name_at_each_use() {
     }
 }
 
+/// A 4 MiB value used 1,024 times adds 2^32 bytes, which a 32-bit `usize`
+/// cannot hold: the sum saturates instead of wrapping to 0. The uses are ten
+/// `IN` lists of 100 operands and one of 24, inside the 4,096-byte, operator
+/// and condition limits. Runs as a native `#[test]` and, on `wasm32`, where
+/// `usize` is 32 bits, as a `wasm_bindgen_test` under Node.
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+fn the_combined_size_saturates_instead_of_wrapping() {
+    let list = |uses: usize| format!("a IN ({})", vec![":v"; uses].join(","));
+    let mut conditions = vec!["Country = :h".to_owned()];
+    conditions.extend((0..10).map(|_| list(100)));
+    conditions.push(list(24));
+    let expr = conditions.join(" AND ");
+    assert!(expr.len() <= 4_096, "{}", expr.len());
+    let values = HashMap::from([
+        (":h".to_owned(), s("US")),
+        (":v".to_owned(), s(&"x".repeat(4 << 20))),
+    ]);
+    let got = parse_search_filter(
+        &expr,
+        None,
+        Some(&values),
+        50,
+        &crate::limits::LimitsConfig::default(),
+    );
+    assert_eq!(
+        got.err().map(message),
+        Some(p("Expression size has exceeded the maximum allowed size;"))
+    );
+}
+
 /// A function given the wrong number of operands, a function an update
 /// takes, and String bounds out of order. Measured on the service in
 /// eu-north-1 on 2026-11-25, each request twice, with the HASH equality

@@ -445,13 +445,15 @@ pub(super) fn combined_bytes(src: &str, node: &Node, maps: &Maps<'_>) -> usize {
         },
         |_| {},
     );
-    let names: usize = names
+    // Saturating: on a 32-bit target a 4 MiB value used 1,024 times is 2^32
+    // bytes, which plain arithmetic would wrap to 0.
+    let names = names.into_iter().fold(0usize, |sum, (n, uses)| {
+        sum.saturating_add(maps.name(n).map_or(0, str::len).saturating_mul(uses))
+    });
+    values
         .into_iter()
-        .map(|(n, uses)| maps.name(n).map_or(0, str::len) * uses)
-        .sum();
-    let values: usize = values
-        .into_iter()
-        .map(|(v, uses)| maps.value(v).map_or(0, crate::types::attribute_value_size) * uses)
-        .sum();
-    src.len() + names + values
+        .fold(src.len().saturating_add(names), |sum, (v, uses)| {
+            let size = maps.value(v).map_or(0, crate::types::attribute_value_size);
+            sum.saturating_add(size.saturating_mul(uses))
+        })
 }
