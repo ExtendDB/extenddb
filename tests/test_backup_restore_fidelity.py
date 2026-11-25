@@ -2343,8 +2343,8 @@ def test_backup_and_table_names_are_validated(dynamodb_client):
             cases.append(("RestoreTableFromBackup", body, serialization))
         # With a TargetTableName outside the pattern, an override member of another JSON
         # kind and a BackupArn of another account are answered first, and any other
-        # override fault after the name (measured 20 Nov 2026). The SerializationException
-        # texts differ (#1012).
+        # override fault after the name (measured 20 Nov 2026, and on 25 Nov 2026 for
+        # OnDemandThroughputOverride). The SerializationException texts differ (#1012).
         denied = "Access is denied"
         for members, name, expected in (
             ({"BackupArn": foreign}, "a*", denied),
@@ -2356,6 +2356,7 @@ def test_backup_and_table_names_are_validated(dynamodb_client):
             ({"LocalSecondaryIndexOverride": {}}, "a*", serialization),
             ({"SSESpecificationOverride": 5}, "a*", serialization),
             ({"ProvisionedThroughputOverride": "x"}, "a*", serialization),
+            ({"OnDemandThroughputOverride": 5}, "a*", serialization),
             ({"BillingModeOverride": 5}, "a*", serialization),
             ({"BillingModeOverride": "PAY"}, "a*", length),
             ({"BillingModeOverride": "PROVISIONED"}, "a*", length),

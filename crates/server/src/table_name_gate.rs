@@ -691,9 +691,9 @@ mod tests {
         assert!(message("RestoreTableFromBackup", null).is_none());
     }
 
-    /// Measured on DynamoDB on 20 and 21 Nov 2026: with a target name the gate
-    /// refuses, an override member of another JSON kind is answered first, and
-    /// a `BackupArn` of another account is passed on to the cross-account
+    /// Measured on DynamoDB on 20, 21 and 25 Nov 2026: with a target name the
+    /// gate refuses, an override member of another JSON kind is answered first,
+    /// and a `BackupArn` of another account is passed on to the cross-account
     /// refusal. Any other override fault keeps the name's answer. Each body has
     /// the caller's `BackupArn` unless the row gives one. Only the type of a
     /// `SerializationException` is checked (#1012).
@@ -719,6 +719,7 @@ mod tests {
             (json!({ "LocalSecondaryIndexOverride": {} }), "a*", ser),
             (json!({ sse: 5 }), "a*", ser),
             (json!({ pt: "x" }), "a*", ser),
+            (json!({ "OnDemandThroughputOverride": 5 }), "a*", ser),
             (json!({ bm: 5 }), "a*", ser),
             (json!({ bm: "PAY", sse: 5 }), "a*", ser),
             (json!({ bm: "PAY" }), "a*", len),
