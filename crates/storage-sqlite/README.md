@@ -23,7 +23,9 @@ Key differences from the PostgreSQL backend:
 - GSI propagation via a persistent `gsi_pending` queue with a configurable delay
   (a delay of 0 applies updates synchronously on the write path); LSI
   propagation is synchronous
-- OR-expansion for pagination (SQLite lacks row-value tuple comparison)
+- The pagination cursor is the same row-value comparison as on PostgreSQL,
+  with `?` placeholders and no `COLLATE` (SQLite's default `BINARY` collation
+  already compares text by byte value)
 
 It shares the PostgreSQL backend's catalog version gate: the server refuses to
 start unless its compiled `CATALOG_VERSION` matches the stored `catalog_version`.
