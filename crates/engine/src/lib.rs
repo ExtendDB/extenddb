@@ -69,6 +69,8 @@ pub mod stream_capture;
 mod streams;
 mod streams_iterator_params;
 mod tagging;
+#[cfg(test)]
+mod test_tracing;
 mod transact_get_items;
 mod transact_write_helpers;
 mod transact_write_items;

@@ -29,8 +29,12 @@ impl<S: Subscriber> Layer<S> for Errors {
     }
 }
 
-/// Runs `f` under a fresh subscriber and returns how many error events it logged.
+/// Runs `f` with a fresh subscriber as this thread's default and returns how
+/// many error events it logged. The global default of `test_tracing` keeps
+/// `tracing` from caching a callsite that another thread met first as
+/// "never", which would hide its events from this subscriber.
 fn error_events_during(f: impl FnOnce()) -> usize {
+    crate::test_tracing::interest_in_every_callsite();
     let errors = Errors::default();
     let count = Arc::clone(&errors.0);
     let subscriber = tracing_subscriber::registry().with(errors);
@@ -152,4 +156,20 @@ fn an_internal_error_is_redacted_and_logged_once_at_every_site() {
             "{name} logged {logged} fault events for an Internal error"
         );
     }
+}
+
+/// An event reaches the counting subscriber when another thread, without a
+/// subscriber of its own, met its callsite first while the counting
+/// subscriber was the only thread default in the process. The callsite is
+/// this test's own, so no other test has met it before.
+#[test]
+fn an_event_from_a_callsite_another_thread_met_first_is_counted() {
+    fn fault() {
+        tracing::error!("a fault that two threads log");
+    }
+    let logged = error_events_during(|| {
+        std::thread::spawn(fault).join().unwrap();
+        fault();
+    });
+    assert_eq!(logged, 1);
 }
