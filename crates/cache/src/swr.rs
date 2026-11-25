@@ -10,7 +10,7 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 use futures::future::BoxFuture;
 use moka::future::Cache as MokaCache;
@@ -229,6 +229,10 @@ where
     ///
     /// The loader is invoked on a hard miss (request blocks) and from a
     /// spawned task on stale-hit refresh (request does not block).
+    ///
+    /// On wasm32-unknown-unknown this traps: building the moka map reads
+    /// `std::time::Instant::now()` inside moka, which panics on that target.
+    /// Only the server builds a non-pass-through cache.
     ///
     /// # Errors
     /// Returns `ConfigError` if `config` fails [`SwrCacheConfig::validate`].
@@ -452,6 +456,11 @@ where
     /// loader and only inserts on success if the epoch hasn't moved.
     /// Otherwise the result is discarded (closes the refresh-races-
     /// invalidate / refresh-races-fresh-write data hazards).
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "called from SwrCache::get; in the wasm build the only SwrCache is \
+                  extenddb-auth's CachedCredentialStore, which only the server constructs"
+    )]
     fn maybe_spawn_refresh(
         &self,
         inner: &MokaCache<K, Arc<Entry<V>>>,
