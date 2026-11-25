@@ -149,7 +149,7 @@ def _is_nesting_validation_error(err: dict) -> bool:
 
 
 def _is_messageless_serialization_error(err: dict) -> bool:
-    return err["__type"] == SERIALIZATION_TYPE and "message" not in err
+    return err == {"__type": SERIALIZATION_TYPE}
 
 
 def test_an_attribute_within_the_limit_is_stored(dynamodb_client, table):
