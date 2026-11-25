@@ -28,7 +28,7 @@ pub(crate) fn is_placeholder_ident(rest: &str) -> bool {
 ///
 /// `include_size_in_too_long`: the Names too-long message appends
 /// `; size of key: N`, the Values one does not (Amazon `DynamoDB` quirk).
-fn validate_placeholder_key(
+pub(crate) fn validate_placeholder_key(
     key: &str,
     prefix: char,
     field_name: &str,

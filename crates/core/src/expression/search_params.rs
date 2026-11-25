@@ -29,11 +29,9 @@
 use std::collections::{BTreeSet, HashMap};
 
 use crate::error::DynamoDbError;
-use crate::serde_helpers::is_placeholder_ident;
+use crate::expression::validate_expression_param_usage;
+use crate::serde_helpers::validate_placeholder_key;
 use crate::types::AttributeValue;
-
-/// The longest key either map takes, in bytes, prefix included.
-const MAX_KEY_BYTES: usize = 255;
 
 /// An attribute name must be shorter than this many bytes.
 const NAME_LIMIT_BYTES: usize = 65536;
@@ -48,7 +46,10 @@ fn invalid(msg: String) -> DynamoDbError {
     DynamoDbError::ValidationException(msg)
 }
 
-/// Check one map's size and keys, in the order the service checks them.
+/// Check one map's size and keys, in the order the service checks them. An
+/// empty key has its own message on this endpoint; every other key goes
+/// through the check the other operations use, with the key size in the
+/// too-long message of both maps.
 fn check_keys<'a>(
     field: &str,
     prefix: char,
@@ -63,19 +64,7 @@ fn check_keys<'a>(
                 "{field} contains invalid key: The expression attribute map contains an empty key;"
             )));
         }
-        if key.len() > MAX_KEY_BYTES {
-            return Err(invalid(format!(
-                "{field} contains invalid key: The expression attribute map contains a key that is \
-                 too long; size of key: {}",
-                key.len()
-            )));
-        }
-        if !key.strip_prefix(prefix).is_some_and(is_placeholder_ident) {
-            return Err(invalid(format!(
-                "{field} contains invalid key: Syntax error; key: \"{key}\""
-            )));
-        }
-        Ok(())
+        validate_placeholder_key(key, prefix, field, true).map_err(invalid)
     })
 }
 
@@ -115,17 +104,15 @@ pub fn check_search_maps(
     if let Some(values) = values {
         check_keys(VALUES, ':', values.keys())?;
     }
-    if names.is_some() && !has_condition && !has_projection {
-        return Err(invalid(format!(
-            "{NAMES} can only be specified when using expressions"
-        )));
-    }
-    if values.is_some() && !has_condition {
-        return Err(invalid(format!(
-            "{VALUES} can only be specified when using expressions"
-        )));
-    }
-    Ok(())
+    // Both maps are known not to be empty here, so the shared check refuses
+    // exactly a map that no expression of the request can use.
+    validate_expression_param_usage(
+        names,
+        has_condition || has_projection,
+        values,
+        has_condition,
+        &[],
+    )
 }
 
 /// Every `#name` written in `exprs`.
