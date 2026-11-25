@@ -129,6 +129,29 @@ validated the table exists and is ACTIVE. Condition expressions are evaluated
 inside the storage transaction to prevent TOCTOU races. Stream records are
 written atomically with data writes when `stream` is `Some`.
 
+`get_item`, `query` and `scan` take a `ReadOptions` value as their last
+parameter (ADR-0024). It carries `consistent_read`, always `false` for a read
+through a global secondary index, which the engine refuses to read strongly
+consistent before storage is called. The `ReadOptions` documentation in
+`crates/storage/src/lib.rs` lists the value the engine passes on each read.
+`TransactGetItems` has no flag because
+the service serves transactional reads serializable. The struct is `#[non_exhaustive]` and follows
+the `VectorSearch` parameter-struct precedent so later per-read options do not
+widen the three signatures again. The contract is what the read returns:
+with `true` the read reflects every write acknowledged before it started; with
+`false` it may miss recently acknowledged writes. A backend that serves every
+read from the copy that took the write meets both by ignoring the value, which
+the SQLite and PostgreSQL backends do today, and the MongoDB backend on a
+replica-set connection (a direct connection keeps reading a member that
+stepped down); the Cassandra backend
+reads and writes at `LOCAL_QUORUM` (#945), levels that intersect, so it meets
+both the same way (ADR-0024, Consequences). A backend with followers can serve `false`
+from a follower (a streaming replica on PostgreSQL, where section 5.3 describes
+that routing as a proposal; a `secondaryPreferred` read selected per operation
+on MongoDB); a quorum backend needs read and write levels that intersect for
+`true`. Each backend's `get_item` doc comment states what that backend does with
+the value today.
+
 **MetadataEngine** (TTL, tags, table statistics):
 - `describe_ttl`, `update_ttl`
 - `tag_resource`, `untag_resource`, `list_tags`
@@ -494,8 +517,8 @@ PostgreSQL backend in this repository serves every item read and write from `dat
 **Single-node mode (what the backend does today):** Base table and local secondary index reads are strongly consistent
 regardless of the `consistent_read` flag. This is strictly stronger than the DynamoDB spec and compatible with all
 applications. Global secondary index rows go through the propagation queue (section 6), so a read on a GSI can lag the
-base table, as on the service. The `consistent_read` parameter is accepted and correctly reflected in capacity
-calculations (eventually consistent reads consume 0.5 RCU vs 1.0 RCU for strongly consistent).
+base table, as on the service. The flag reaches the backend as `ReadOptions::consistent_read` and is reflected in
+capacity calculations (eventually consistent reads consume 0.5 RCU vs 1.0 RCU for strongly consistent).
 
 **Read replica mode (proposed, `read_replica_url` configured):** Eventually consistent reads (`consistent_read=false`)
 would be routed to a PostgreSQL streaming replica that is a few milliseconds behind the primary. Strongly consistent
@@ -512,7 +535,7 @@ DynamoDB (a read after a write without `ConsistentRead=true` returning the earli
 - All write operations: always use the primary pool
 
 In the proposal, a `read_pool()` helper on `PostgresEngine` encapsulates this routing and every read implementation
-calls it instead of `&self.data_pool` directly.
+calls `self.read_pool(opts.consistent_read)` instead of `&self.data_pool` directly.
 
 ### 5.4 Query Translation
 

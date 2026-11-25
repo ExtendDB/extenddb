@@ -1637,4 +1637,4 @@ pub mod store_identity;
 pub mod store_maintenance;
 pub mod sync;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

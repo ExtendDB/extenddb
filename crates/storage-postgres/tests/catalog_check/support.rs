@@ -14,7 +14,7 @@ use extenddb_core::types::{
     TableKeyInfo, VectorAttribute, VectorIndexSpecification,
 };
 use extenddb_storage::bootstrapper::{BootstrapConfig, Bootstrapper};
-use extenddb_storage::{DataEngine, TableEngine};
+use extenddb_storage::{DataEngine, ReadOptions, TableEngine};
 use extenddb_storage_postgres::{
     PostgresBootstrapper, PostgresCatalogStore, PostgresConfig, PostgresEngine, index_table_name,
     vector_table_name,
@@ -454,12 +454,13 @@ impl Deployment {
     }
 
     /// `GetItem` on every item written by `create_table_with_indexes`, and the
-    /// row count of each index relation.
+    /// row count of each index relation. The reads ask for the consistency
+    /// that reflects every write made before them.
     pub(crate) async fn assert_data_intact(&self, key_info: &TableKeyInfo) {
         for n in 0..3 {
             let got = self
                 .engine
-                .get_item(key_info, &key(n))
+                .get_item(key_info, &key(n), ReadOptions::new(true))
                 .await
                 .expect("get an item");
             assert_eq!(got, Some(item(n)), "item {n} after the fix");

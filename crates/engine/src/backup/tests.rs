@@ -31,8 +31,8 @@ use extenddb_storage::backup_definition::{BACKUP_DEFINITION_VERSION, BackupTable
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{
     BackupCatalog, BackupRestoreSource, BoxedFuture, BulkLoadFile, DataEngine, Finished, JobPermit,
-    LegacyBackupReader, MetadataEngine, RestoreEngine, RestoreRequest, SnapshotEngine, TableEngine,
-    TableSnapshot,
+    LegacyBackupReader, MetadataEngine, ReadOptions, RestoreEngine, RestoreRequest, SnapshotEngine,
+    TableEngine, TableSnapshot,
 };
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
@@ -58,7 +58,7 @@ fn source_arn() -> String {
 // --- double -----------------------------------------------------------------
 
 #[derive(Default)]
-struct Fake {
+pub(crate) struct Fake {
     /// Cancelled by `list_dead_restore_jobs`: a token that fires in the
     /// middle of a cycle, after its store check.
     cancel_on_list_dead: Mutex<Option<extenddb_storage::CancellationToken>>,
@@ -123,7 +123,7 @@ struct Fake {
     bounds_seen: Mutex<Vec<TimeBounds>>,
     /// The account's tables, by name, as `describe_table` reports them; a
     /// name absent is `TableNotFound`.
-    tables: Mutex<HashMap<String, TableDescription>>,
+    pub(crate) tables: Mutex<HashMap<String, TableDescription>>,
     /// The names `describe_table` was asked for.
     table_reads: Mutex<Vec<String>>,
     /// What `catalog_id` answers; `catalog-1` unless a test changes it.
@@ -477,6 +477,58 @@ struct Fake {
     /// When set, the next `holder_status` fails with it (a catalog read
     /// that failed), reading nothing.
     holder_status_error: Mutex<Option<String>>,
+    /// The tables `table_key_info` answers, by name; a name absent, or one
+    /// under another account, is `TableNotFound`.
+    pub(crate) key_infos: Mutex<HashMap<String, TableKeyInfo>>,
+    /// The indexes `index_info` and `index_info_by_table_id` answer, by name;
+    /// a name absent is `IndexNotFound`.
+    pub(crate) indexes: Mutex<Vec<IndexInfo>>,
+    /// Every `get_item`, `query` and `scan` received, with its read options.
+    pub(crate) reads: Mutex<Vec<ReadCall>>,
+    /// The pages `query` and `scan` answer, in order; once they are used up,
+    /// an empty last page.
+    pub(crate) read_pages: Mutex<std::collections::VecDeque<(Vec<Item>, Option<Item>)>>,
+    /// When set, the next `update_item` fails with it instead of being
+    /// unused.
+    pub(crate) update_error: Mutex<Option<StorageError>>,
+}
+
+/// One read that reached the `Fake`: the operation, the table, the index
+/// and the [`ReadOptions`] it carried.
+#[derive(Debug, Clone)]
+pub(crate) struct ReadCall {
+    pub(crate) op: &'static str,
+    pub(crate) table: String,
+    pub(crate) index_name: Option<String>,
+    pub(crate) opts: ReadOptions,
+}
+
+impl Fake {
+    fn record_read(
+        &self,
+        op: &'static str,
+        key_info: &TableKeyInfo,
+        index_name: Option<&str>,
+        opts: ReadOptions,
+    ) {
+        self.reads.lock().unwrap().push(ReadCall {
+            op,
+            table: key_info.table_name.clone(),
+            index_name: index_name.map(str::to_owned),
+            opts,
+        });
+    }
+
+    /// Every read received so far, in order.
+    pub(crate) fn reads(&self) -> Vec<ReadCall> {
+        self.reads.lock().unwrap().clone()
+    }
+
+    /// The next page of `read_pages`, or an empty last page.
+    fn next_read_page(&self) -> BoxedFuture<'static, extenddb_storage::QueryResult> {
+        let page = self.read_pages.lock().unwrap().pop_front();
+        Box::pin(async move { Ok(page.unwrap_or_default()) })
+    }
 }
 
 /// One in-catalog backup the `Fake`'s `items` opens.
@@ -3374,12 +3426,15 @@ impl DataEngine for Fake {
         unused()
     }
 
+    /// Records the read and finds no item.
     fn get_item(
         &self,
-        _: &TableKeyInfo,
+        key_info: &TableKeyInfo,
         _: &Item,
+        opts: ReadOptions,
     ) -> BoxedFuture<'_, Result<Option<Item>, StorageError>> {
-        unused()
+        self.record_read("GetItem", key_info, None, opts);
+        Box::pin(async { Ok(None) })
     }
 
     fn delete_item(
@@ -3394,6 +3449,7 @@ impl DataEngine for Fake {
         unused()
     }
 
+    /// Fails with `update_error` when one is set.
     fn update_item(
         &self,
         _: &TableKeyInfo,
@@ -3405,32 +3461,41 @@ impl DataEngine for Fake {
         _: &extenddb_core::expression::ExpressionMaps,
         _: Option<&extenddb_storage::StreamCapture>,
     ) -> BoxedFuture<'_, extenddb_storage::ItemPairResult> {
-        unused()
+        match self.update_error.lock().unwrap().take() {
+            Some(e) => Box::pin(async move { Err(e) }),
+            None => unused(),
+        }
     }
 
+    /// Records the read and answers the next of `read_pages`.
     fn query(
         &self,
-        _: &TableKeyInfo,
+        key_info: &TableKeyInfo,
         _: &extenddb_core::expression::KeyCondition,
         _: &extenddb_core::expression::ExpressionMaps,
         _: bool,
         _: Option<i64>,
         _: Option<&Item>,
-        _: Option<&str>,
+        index_name: Option<&str>,
+        opts: ReadOptions,
     ) -> BoxedFuture<'_, extenddb_storage::QueryResult> {
-        unused()
+        self.record_read("Query", key_info, index_name, opts);
+        self.next_read_page()
     }
 
+    /// Records the read and answers the next of `read_pages`.
     fn scan(
         &self,
-        _: &TableKeyInfo,
+        key_info: &TableKeyInfo,
         _: Option<i64>,
         _: Option<&Item>,
         _: Option<i64>,
         _: Option<i64>,
-        _: Option<&str>,
+        index_name: Option<&str>,
+        opts: ReadOptions,
     ) -> BoxedFuture<'_, extenddb_storage::QueryResult> {
-        unused()
+        self.record_read("Scan", key_info, index_name, opts);
+        self.next_read_page()
     }
 
     fn scan_key_in_segment(
@@ -3681,28 +3746,144 @@ impl TableEngine for Fake {
         unused()
     }
 
+    /// The account's table of that name in `key_infos`, or `TableNotFound`.
     fn table_key_info(
         &self,
-        _account_id: &str,
-        _table_name: &str,
+        account_id: &str,
+        table_name: &str,
     ) -> BoxedFuture<'_, Result<TableKeyInfo, StorageError>> {
-        unused()
+        let found = self
+            .key_infos
+            .lock()
+            .unwrap()
+            .get(table_name)
+            .filter(|info| info.account_id == account_id)
+            .cloned()
+            .ok_or_else(|| StorageError::TableNotFound(table_name.to_owned()));
+        Box::pin(async move { found })
     }
 
     fn index_info(
         &self,
         _account_id: &str,
         _table_name: &str,
-        _index_name: &str,
+        index_name: &str,
     ) -> BoxedFuture<'_, Result<IndexInfo, StorageError>> {
-        unused()
+        self.index_info_by_table_id("", index_name)
     }
 
+    /// The index of that name in `indexes`, or `IndexNotFound`.
     fn index_info_by_table_id(
         &self,
         _table_id: &str,
-        _index_name: &str,
+        index_name: &str,
     ) -> BoxedFuture<'_, Result<IndexInfo, StorageError>> {
+        let found = self
+            .indexes
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|idx| idx.index_name == index_name)
+            .cloned()
+            .ok_or_else(|| StorageError::IndexNotFound(index_name.to_owned()));
+        Box::pin(async move { found })
+    }
+}
+
+/// Unreached by the handlers the doubles run; every method is unused.
+impl extenddb_storage::StreamEngine for Fake {
+    fn write_stream_record(
+        &self,
+        _account_id: &str,
+        _record: &extenddb_core::types::StreamRecord,
+        _shard_id: &str,
+        _table_name: &str,
+    ) -> BoxedFuture<'_, Result<(), StorageError>> {
+        unused()
+    }
+
+    fn get_stream_records(
+        &self,
+        _account_id: &str,
+        _stream_arn: &str,
+        _shard_id: &str,
+        _after_sequence: Option<&str>,
+        _limit: i64,
+    ) -> BoxedFuture<'_, extenddb_storage::StreamRecordsResult> {
+        unused()
+    }
+
+    fn describe_stream(
+        &self,
+        _account_id: &str,
+        _input: &extenddb_core::types::DescribeStreamInput,
+    ) -> BoxedFuture<'_, Result<extenddb_core::types::StreamDescription, StorageError>> {
+        unused()
+    }
+
+    fn list_streams(
+        &self,
+        _account_id: &str,
+        _table_name: Option<&str>,
+        _limit: i64,
+        _exclusive_start_stream_arn: Option<&str>,
+    ) -> BoxedFuture<'_, extenddb_storage::StreamListResult> {
+        unused()
+    }
+
+    fn cleanup_expired_stream_records(
+        &self,
+        _retention_hours: i64,
+    ) -> BoxedFuture<'_, Result<u64, StorageError>> {
+        unused()
+    }
+
+    fn assign_shard(
+        &self,
+        _account_id: &str,
+        _table_name: &str,
+        _partition_key: &str,
+    ) -> BoxedFuture<'_, Result<String, StorageError>> {
+        unused()
+    }
+
+    fn next_sequence_number(
+        &self,
+        _shard_id: &str,
+    ) -> BoxedFuture<'_, Result<String, StorageError>> {
+        unused()
+    }
+
+    fn validate_shard(
+        &self,
+        _account_id: &str,
+        _stream_arn: &str,
+        _shard_id: &str,
+    ) -> BoxedFuture<'_, Result<(), StorageError>> {
+        unused()
+    }
+
+    fn latest_sequence_number(
+        &self,
+        _shard_id: &str,
+    ) -> BoxedFuture<'_, Result<Option<String>, StorageError>> {
+        unused()
+    }
+
+    fn first_sequence_number_at_or_after(
+        &self,
+        _shard_id: &str,
+        _at_ms: i64,
+    ) -> BoxedFuture<'_, Result<Option<String>, StorageError>> {
+        unused()
+    }
+}
+
+/// Unreached by the handlers the doubles run.
+impl extenddb_storage::WorkerStore for Fake {
+    fn process_control_plane_transitions(
+        &self,
+    ) -> BoxedFuture<'_, Result<Vec<(String, &'static str)>, StorageError>> {
         unused()
     }
 }

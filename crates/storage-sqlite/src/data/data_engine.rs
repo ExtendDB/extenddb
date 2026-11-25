@@ -11,7 +11,9 @@
 use extenddb_core::expression::{Expr, ExpressionMaps, KeyCondition, UpdateAction};
 use extenddb_core::types::{Item, ReturnValuesOnConditionCheckFailure, TableKeyInfo};
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{DataEngine, IdempotencyKey, StreamCapture, TransactGetOp, TransactWriteOp};
+use extenddb_storage::{
+    DataEngine, IdempotencyKey, ReadOptions, StreamCapture, TransactGetOp, TransactWriteOp,
+};
 use futures::future::BoxFuture;
 
 use crate::store::SqliteEngine;
@@ -50,10 +52,13 @@ impl DataEngine for SqliteEngine {
         })
     }
 
+    /// SQLite holds a single copy of the data, so `_opts.consistent_read`
+    /// selects nothing here: every read is served from that copy.
     fn get_item(
         &self,
         key_info: &TableKeyInfo,
         key: &Item,
+        _opts: ReadOptions,
     ) -> BoxFuture<'_, Result<Option<Item>, StorageError>> {
         let key_info = key_info.clone();
         let key = key.clone();
@@ -119,6 +124,7 @@ impl DataEngine for SqliteEngine {
         })
     }
 
+    /// `_opts`: see `get_item`.
     fn query(
         &self,
         key_info: &TableKeyInfo,
@@ -128,6 +134,7 @@ impl DataEngine for SqliteEngine {
         limit: Option<i64>,
         exclusive_start_key: Option<&Item>,
         index_name: Option<&str>,
+        _opts: ReadOptions,
     ) -> BoxFuture<'_, Result<(Vec<Item>, Option<Item>), StorageError>> {
         let key_info = key_info.clone();
         let key_condition = key_condition.clone();
@@ -148,6 +155,7 @@ impl DataEngine for SqliteEngine {
         })
     }
 
+    /// `_opts`: see `get_item`.
     fn scan(
         &self,
         key_info: &TableKeyInfo,
@@ -156,6 +164,7 @@ impl DataEngine for SqliteEngine {
         segment: Option<i64>,
         total_segments: Option<i64>,
         index_name: Option<&str>,
+        _opts: ReadOptions,
     ) -> BoxFuture<'_, Result<(Vec<Item>, Option<Item>), StorageError>> {
         let key_info = key_info.clone();
         let exclusive_start_key = exclusive_start_key.cloned();

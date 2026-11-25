@@ -8,7 +8,9 @@ use extenddb_core::expression::{Expr, ExpressionMaps, KeyCondition, UpdateAction
 use extenddb_core::types::AttributeValue;
 use extenddb_core::types::TableKeyInfo;
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{DataEngine, IdempotencyKey, StreamCapture, TransactGetOp, TransactWriteOp};
+use extenddb_storage::{
+    DataEngine, IdempotencyKey, ReadOptions, StreamCapture, TransactGetOp, TransactWriteOp,
+};
 use futures::future::BoxFuture;
 use std::collections::BTreeMap;
 
@@ -43,10 +45,20 @@ impl DataEngine for CassandraEngine {
         })
     }
 
+    /// `_opts.consistent_read` is accepted and not acted on. Every item read
+    /// runs at `LOCAL_QUORUM`, and the base-row writes (the plain writes, and
+    /// the commit of the OCC and put-if-absent lightweight transactions, whose
+    /// Paxos round runs at `LOCAL_SERIAL`) are acknowledged at `LOCAL_QUORUM`
+    /// (`cassandra_util::Stmt`), so, with the node and host clocks in sync
+    /// (`docs/cassandra-setup.md`), a read in the local datacenter sees every
+    /// acknowledged write and both values are met by ignoring the flag.
+    /// `false` is not stepped down to `LOCAL_ONE`; a routing change would read
+    /// `false` at `LOCAL_ONE` and keep `true` at `LOCAL_QUORUM`.
     fn get_item(
         &self,
         key_info: &TableKeyInfo,
         key: &Item,
+        _opts: ReadOptions,
     ) -> BoxFuture<'_, Result<Option<Item>, StorageError>> {
         let key_info = key_info.clone();
         let key = key.clone();
@@ -112,6 +124,7 @@ impl DataEngine for CassandraEngine {
         })
     }
 
+    /// `_opts`: see `get_item`.
     fn query(
         &self,
         key_info: &TableKeyInfo,
@@ -121,6 +134,7 @@ impl DataEngine for CassandraEngine {
         limit: Option<i64>,
         exclusive_start_key: Option<&Item>,
         index_name: Option<&str>,
+        _opts: ReadOptions,
     ) -> BoxFuture<'_, Result<(Vec<Item>, Option<Item>), StorageError>> {
         let key_info = key_info.clone();
         let key_condition = key_condition.clone();
@@ -141,6 +155,7 @@ impl DataEngine for CassandraEngine {
         })
     }
 
+    /// `_opts`: see `get_item`.
     fn scan(
         &self,
         key_info: &TableKeyInfo,
@@ -149,6 +164,7 @@ impl DataEngine for CassandraEngine {
         segment: Option<i64>,
         total_segments: Option<i64>,
         index_name: Option<&str>,
+        _opts: ReadOptions,
     ) -> BoxFuture<'_, Result<(Vec<Item>, Option<Item>), StorageError>> {
         let key_info = key_info.clone();
         let exclusive_start_key = exclusive_start_key.cloned();

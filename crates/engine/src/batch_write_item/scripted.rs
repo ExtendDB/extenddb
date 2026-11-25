@@ -13,8 +13,8 @@ use extenddb_core::types::{
     AttributeDefinition, AttributeValue, Item, KeySchemaElement, KeyType, ScalarAttributeType,
 };
 use extenddb_storage::{
-    BoxedFuture, IdempotencyKey, ItemPairResult, QueryResult, StreamCapture, TransactGetOp,
-    TransactWriteOp,
+    BoxedFuture, IdempotencyKey, ItemPairResult, QueryResult, ReadOptions, StreamCapture,
+    TransactGetOp, TransactWriteOp,
 };
 use serde_json::{Value, json};
 
@@ -87,6 +87,7 @@ impl DataEngine for Scripted {
         &self,
         _key_info: &TableKeyInfo,
         _key: &Item,
+        _opts: ReadOptions,
     ) -> BoxedFuture<'_, Result<Option<Item>, StorageError>> {
         unused()
     }
@@ -114,6 +115,7 @@ impl DataEngine for Scripted {
         _limit: Option<i64>,
         _exclusive_start_key: Option<&Item>,
         _index_name: Option<&str>,
+        _opts: ReadOptions,
     ) -> BoxedFuture<'_, QueryResult> {
         unused()
     }
@@ -126,6 +128,7 @@ impl DataEngine for Scripted {
         _segment: Option<i64>,
         _total_segments: Option<i64>,
         _index_name: Option<&str>,
+        _opts: ReadOptions,
     ) -> BoxedFuture<'_, QueryResult> {
         unused()
     }

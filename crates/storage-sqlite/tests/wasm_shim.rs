@@ -1321,7 +1321,15 @@ async fn a_scan_limit_above_u32_max_returns_every_item() {
             .expect("put");
     }
     let (items, last_key) = engine
-        .scan(&key_info, Some(4_294_967_297), None, None, None, None)
+        .scan(
+            &key_info,
+            Some(4_294_967_297),
+            None,
+            None,
+            None,
+            None,
+            extenddb_storage::ReadOptions::new(true),
+        )
         .await
         .expect("scan");
     assert_eq!(

@@ -21,8 +21,8 @@ use extenddb_storage::util::{
     composite_pk_to_text, encode_netstring_composite, pk_to_text, sk_info,
 };
 use extenddb_storage::{
-    DataEngine, IdempotencyKey, ItemPairResult, QueryResult, StreamCapture, TransactGetOp,
-    TransactWriteOp,
+    DataEngine, IdempotencyKey, ItemPairResult, QueryResult, ReadOptions, StreamCapture,
+    TransactGetOp, TransactWriteOp,
 };
 
 use crate::MongoEngine;
@@ -182,10 +182,21 @@ impl DataEngine for MongoEngine {
         })
     }
 
+    /// `_opts.consistent_read` is accepted and not acted on. On a replica-set
+    /// connection every read goes to the primary: `guarded_client_options`
+    /// (behind `connect_guarded` and `MongoEngine::new`) refuses a connection
+    /// string with a non-primary read preference. A `directConnection=true`
+    /// string pins one member instead, and the driver sends its reads with
+    /// `$readPreference: primaryPreferred`, as the server selection
+    /// specification asks for a direct connection, so a member that stepped
+    /// down keeps answering reads. A routing change would select
+    /// `secondaryPreferred` per operation on a `false` read against a replica
+    /// set; `true` stays on the primary.
     fn get_item(
         &self,
         key_info: &TableKeyInfo,
         key: &Item,
+        _opts: ReadOptions,
     ) -> BoxFuture<'_, Result<Option<Item>, StorageError>> {
         let key_info = key_info.clone();
         let key = key.clone();
@@ -251,6 +262,7 @@ impl DataEngine for MongoEngine {
         })
     }
 
+    /// `_opts`: see `get_item`.
     fn query(
         &self,
         key_info: &TableKeyInfo,
@@ -260,6 +272,7 @@ impl DataEngine for MongoEngine {
         limit: Option<i64>,
         exclusive_start_key: Option<&Item>,
         index_name: Option<&str>,
+        _opts: ReadOptions,
     ) -> BoxFuture<'_, QueryResult> {
         let key_info = key_info.clone();
         let key_condition = key_condition.clone();
@@ -280,6 +293,7 @@ impl DataEngine for MongoEngine {
         })
     }
 
+    /// `_opts`: see `get_item`.
     fn scan(
         &self,
         key_info: &TableKeyInfo,
@@ -288,6 +302,7 @@ impl DataEngine for MongoEngine {
         segment: Option<i64>,
         total_segments: Option<i64>,
         index_name: Option<&str>,
+        _opts: ReadOptions,
     ) -> BoxFuture<'_, QueryResult> {
         let key_info = key_info.clone();
         let exclusive_start_key = exclusive_start_key.cloned();

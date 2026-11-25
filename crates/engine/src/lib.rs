@@ -61,6 +61,8 @@ mod put_item;
 mod query;
 pub mod query_key_values;
 mod read_helpers;
+#[cfg(test)]
+mod read_options_tests;
 mod request_limits;
 mod scan;
 mod search_vectors;

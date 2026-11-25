@@ -195,6 +195,56 @@ pub struct VectorSearch<'a> {
     /// the service ever admits range conditions this type must widen.
     pub filters: &'a [(&'a str, &'a AttributeValue)],
 }
+
+/// Per-read options the handler forwards to storage.
+///
+/// Follows the `VectorSearch` parameter-struct precedent so later fields do
+/// not widen the read signatures again. The struct is `#[non_exhaustive]`:
+/// code outside this crate builds one with [`ReadOptions::new`] or
+/// [`ReadOptions::default`] and reads its fields, so a field added later
+/// breaks no caller as long as it is `Copy` and owns its data. A field that
+/// cannot be needs its own parameter or a major version: an owned field (a
+/// `String`) removes the `Copy` derive a backend may rely on, and a borrowed
+/// one (a `&[..]`) adds a lifetime parameter to the type.
+///
+/// The contract is stated by what the read returns. `consistent_read: true`:
+/// the read reflects every write acknowledged before it started. `false`: the
+/// read may miss recently acknowledged writes. A backend that serves every
+/// read from the copy that took the write meets both by ignoring the value,
+/// as the SQLite and PostgreSQL backends do today, and the MongoDB backend
+/// on a replica-set connection (its `get_item` comment describes a direct
+/// connection); a quorum backend needs read and write levels that intersect
+/// for `true`, which the Cassandra backend has for both values (reads and
+/// writes at `LOCAL_QUORUM`, with its clocks in sync). A backend with
+/// followers can serve `false` from a follower (a `secondaryPreferred` read
+/// on MongoDB, a streaming replica on PostgreSQL).
+///
+/// The engine passes the client's `ConsistentRead` on `GetItem`, `Query`,
+/// `Scan`, each table's own on `BatchGetItem`, and on the base-table read
+/// under a PartiQL `SELECT` from a local secondary index that does not
+/// project a selected attribute; a read through a global secondary index gets
+/// `false`, because the engine refuses `ConsistentRead: true` on one before
+/// storage is called. It passes `true` on reads that must reflect
+/// every acknowledged write: the export scan, the read that evaluates a
+/// PartiQL `UPDATE` whose value nests past the item limit, and the read that
+/// sizes the charge of a PartiQL batch write that failed at its item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct ReadOptions {
+    /// `true` for a read that must reflect every write acknowledged before it
+    /// started: the client's `ConsistentRead`, or `true` on the engine reads
+    /// listed above. `false` when absent, so [`ReadOptions::default`] is an
+    /// eventually consistent read.
+    pub consistent_read: bool,
+}
+
+impl ReadOptions {
+    /// Options for one read with the given `consistent_read`.
+    pub const fn new(consistent_read: bool) -> Self {
+        Self { consistent_read }
+    }
+}
+
 /// TTL table info: `(account_id, table_name, ttl_attribute)`.
 pub type TtlTableInfo = (String, String, String);
 /// Stream records result: records plus an optional next shard iterator.
@@ -322,10 +372,16 @@ pub trait DataEngine: Send + Sync {
     /// Read a single item by primary key.
     ///
     /// Returns `None` if the item does not exist (not an error).
+    ///
+    /// `opts.consistent_read` carries the request's `ConsistentRead`, or
+    /// `true` on an engine read that must reflect every acknowledged write;
+    /// see [`ReadOptions`] for the list and for how a backend with replicas
+    /// uses it.
     fn get_item(
         &self,
         key_info: &TableKeyInfo,
         key: &Item,
+        opts: ReadOptions,
     ) -> BoxFuture<'_, Result<Option<Item>, StorageError>>;
 
     /// Delete a single item by primary key.
@@ -385,6 +441,10 @@ pub trait DataEngine: Send + Sync {
     /// `limit` caps the number of items read (before filtering).
     /// `exclusive_start_key` enables pagination.
     /// `index_name` routes the query to a secondary index table.
+    /// `opts.consistent_read` carries the request's `ConsistentRead`; it is
+    /// always `false` for a global secondary index, which the service serves
+    /// eventually consistent, and the client's value for a local secondary
+    /// index, which the service serves strongly consistent on request.
     ///
     /// Returns `(items, last_evaluated_key)`. If `last_evaluated_key` is `Some`,
     /// there are more items to read.
@@ -398,6 +458,7 @@ pub trait DataEngine: Send + Sync {
         limit: Option<i64>,
         exclusive_start_key: Option<&Item>,
         index_name: Option<&str>,
+        opts: ReadOptions,
     ) -> BoxFuture<'_, QueryResult>;
 
     /// Scan all items in a table or index.
@@ -406,6 +467,9 @@ pub trait DataEngine: Send + Sync {
     /// (before filtering). `exclusive_start_key` enables pagination.
     /// `segment` and `total_segments` enable parallel scan.
     /// `index_name` routes the scan to a secondary index table.
+    /// `opts.consistent_read` carries the request's `ConsistentRead`, or
+    /// `true` on the export scan; it is always `false` for a global secondary
+    /// index and the client's value for a local secondary index.
     ///
     /// Returns `(items, last_evaluated_key)`.
     #[allow(clippy::too_many_arguments)]
@@ -417,6 +481,7 @@ pub trait DataEngine: Send + Sync {
         segment: Option<i64>,
         total_segments: Option<i64>,
         index_name: Option<&str>,
+        opts: ReadOptions,
     ) -> BoxFuture<'_, QueryResult>;
 
     /// Whether `key` belongs to `segment` of a `total_segments`-way parallel
@@ -474,6 +539,11 @@ pub trait DataEngine: Send + Sync {
     ///
     /// Returns one `Option<Item>` per request, in the same order as `ops`.
     /// All reads see the same database snapshot (serializable isolation).
+    /// There is no [`ReadOptions`] parameter: the service has no consistency
+    /// flag here and the reads reflect every acknowledged write, so a backend
+    /// that routes eventually consistent reads to a follower keeps these on
+    /// the copy that took the writes, and a quorum backend reads them at a
+    /// level that intersects its writes.
     ///
     /// # Errors
     ///
@@ -874,6 +944,7 @@ mod vector_opt_out_tests {
             &self,
             _key_info: &TableKeyInfo,
             _key: &Item,
+            _opts: ReadOptions,
         ) -> BoxFuture<'_, Result<Option<Item>, StorageError>> {
             Box::pin(async { Ok(None) })
         }
@@ -910,6 +981,7 @@ mod vector_opt_out_tests {
             _limit: Option<i64>,
             _exclusive_start_key: Option<&Item>,
             _index_name: Option<&str>,
+            _opts: ReadOptions,
         ) -> BoxFuture<'_, QueryResult> {
             Box::pin(async { Ok((Vec::new(), None)) })
         }
@@ -921,6 +993,7 @@ mod vector_opt_out_tests {
             _segment: Option<i64>,
             _total_segments: Option<i64>,
             _index_name: Option<&str>,
+            _opts: ReadOptions,
         ) -> BoxFuture<'_, QueryResult> {
             Box::pin(async { Ok((Vec::new(), None)) })
         }

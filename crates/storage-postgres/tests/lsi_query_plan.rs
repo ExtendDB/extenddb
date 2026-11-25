@@ -38,7 +38,7 @@ use extenddb_core::types::{
     AttributeDefinition, AttributeValue, BillingMode, CreateTableInput, Item, KeySchemaElement,
     KeyType, LsiInput, Projection, ProjectionType, ScalarAttributeType, TableKeyInfo,
 };
-use extenddb_storage::{DataEngine, TableEngine};
+use extenddb_storage::{DataEngine, ReadOptions, TableEngine};
 use extenddb_storage_postgres::PostgresEngine;
 use sqlx::{PgPool, Row};
 
@@ -305,6 +305,7 @@ async fn page(
             Some(limit),
             start,
             Some("lsi1"),
+            ReadOptions::new(true),
         )
         .await
         .expect("query a page of the LSI");

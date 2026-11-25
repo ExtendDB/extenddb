@@ -34,6 +34,7 @@ use extenddb_core::partiql::Statement;
 use extenddb_core::partiql::ast::{FromSource, Projection, SelectStatement};
 use extenddb_core::partiql::parser::parse_for_request;
 use extenddb_core::types::{Item, TableKeyInfo, item_size_bytes};
+use extenddb_storage::ReadOptions;
 use extenddb_storage::error::StorageError;
 
 use super::authorize::{Gate, Surface};
@@ -521,9 +522,11 @@ async fn failed_write_units(
         tracing::error!(internal_error = %e, "failed to read a translated PartiQL key");
         DynamoDbError::InternalServerError("Internal server error".to_owned())
     })?;
+    // The charge is sized from the item the failed write ran against, so the
+    // read reflects every acknowledged write.
     let stored = ctx
         .storage
-        .get_item(key_info, &key)
+        .get_item(key_info, &key, ReadOptions::new(true))
         .await
         .map_err(storage_err_to_dynamo)?;
     Ok(capacity_helpers::write_capacity_units(

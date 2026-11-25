@@ -279,6 +279,7 @@ async fn multi_range_gsi_query_plans_as_an_index_walk_in_both_directions() {
                         Some(limit),
                         start_key,
                         Some("gsi3"),
+                        ReadOptions::default(),
                     )
                     .await
                     .expect("query a page of the GSI");

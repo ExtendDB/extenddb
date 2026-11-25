@@ -53,7 +53,7 @@ pub(super) async fn context(authorizer: Option<Arc<dyn ItemAuthorizer>>) -> Oper
 
 /// Gives every access the same answer, and counts the accesses it is asked
 /// about.
-pub(super) struct Fixed {
+pub(crate) struct Fixed {
     answer: Result<(), DynamoDbError>,
     asked: AtomicUsize,
 }
@@ -67,7 +67,7 @@ impl Fixed {
     }
 
     /// Allows every access.
-    pub(super) fn allowing() -> Arc<Self> {
+    pub(crate) fn allowing() -> Arc<Self> {
         Self::new(Ok(()))
     }
 

@@ -23,6 +23,7 @@ use extenddb_core::partiql::ast::{SelectStatement, WhereExpr};
 use extenddb_core::types::{
     AttributeValue, IndexInfo, Item, KeySchemaElement, TableKeyInfo, extract_key, item_size_bytes,
 };
+use extenddb_storage::ReadOptions;
 
 use super::SingleRequest;
 use super::expr_bridge::ExprBridge;
@@ -128,7 +129,7 @@ impl BaseTableJoin {
             let key = extract_key(&index_row, &key_info.key_schema);
             let base = ctx
                 .storage
-                .get_item(key_info, &key)
+                .get_item(key_info, &key, ReadOptions::new(strongly_consistent))
                 .await
                 .map_err(storage_err_to_dynamo)?;
             table_units += read_capacity_units(
