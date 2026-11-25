@@ -438,6 +438,7 @@ impl CassandraEngine {
         )
         .await?;
 
+        crate::test_hooks::before_delete_lease_renewal(table_id).await;
         if let Some(lease) = *held {
             let Some(renewed) = self
                 .renew_delete_lease(account_id, table_name, table_id, lease)

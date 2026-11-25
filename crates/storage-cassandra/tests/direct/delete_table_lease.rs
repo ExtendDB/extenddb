@@ -540,3 +540,157 @@ async fn a_delete_whose_request_is_dropped_after_its_claim_still_removes_the_tab
     };
     removing_rows_after(&engine, &id, test).await;
 }
+
+/// How long a test waits for a removal to reach a pause it armed.
+#[cfg(feature = "test-hooks")]
+const PAUSE_LIMIT: Duration = Duration::from_secs(60);
+
+/// When the paused call of
+/// `a_delete_whose_row_a_sweep_took_over_stops_at_its_renewal` resumes.
+#[cfg(feature = "test-hooks")]
+#[derive(Clone, Copy, Debug)]
+enum Resume {
+    /// Once the sweep has removed the table and the name was created again
+    /// and tagged.
+    AfterTheSweepFinished,
+    /// While the sweep holds the row: it has taken the row, run its drops,
+    /// and is paused before its own renewal.
+    WhileTheSweepHoldsTheRow,
+}
+
+/// A `DeleteTable` paused between its drops and its renewal, and a sweep that
+/// takes its row over once the deadline is moved into the past. The call's
+/// renewal then does not apply, so the call stops before the tag delete and
+/// the row delete, and answers 200 with `DELETING`. Resumed after the sweep
+/// finished, it leaves the tag of the table created into the name since.
+/// Resumed while the sweep holds the row, it leaves the row and its tag to
+/// the sweep, which then finishes the removal.
+#[cfg(feature = "test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delete_whose_row_a_sweep_took_over_stops_at_its_renewal() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, &test_config().keyspace_prefix).await;
+    let id = account.account_id.clone();
+    let test = {
+        let (engine, id) = (engine.clone(), id.clone());
+        async move {
+            let cases = [
+                Resume::AfterTheSweepFinished,
+                Resume::WhileTheSweepHoldsTheRow,
+            ];
+            for (round, resume) in cases.into_iter().enumerate() {
+                let name = format!("TakenOverAtTheRenewal{round}");
+                taken_over_at_the_renewal(&engine, &id, &name, resume).await;
+            }
+        }
+    };
+    removing_rows_after(&engine, &id, test).await;
+}
+
+/// One case of `a_delete_whose_row_a_sweep_took_over_stops_at_its_renewal`.
+#[cfg(feature = "test-hooks")]
+async fn taken_over_at_the_renewal(engine: &CassandraEngine, id: &str, name: &str, resume: Resume) {
+    use extenddb_storage_cassandra::test_hooks::pause_before_delete_lease_renewal;
+
+    let first = engine
+        .create_table(id, gsi_input(name, 1))
+        .await
+        .expect("create the table");
+    activate(engine, id, name).await;
+    engine
+        .tag_resource(
+            &first.table_arn,
+            &[Tag {
+                key: "owner".to_owned(),
+                value: "first".to_owned(),
+            }],
+        )
+        .await
+        .expect("tag the table");
+    let call_pause = pause_before_delete_lease_renewal(&first.table_id);
+    let call = {
+        let (engine, id, name) = (engine.clone(), id.to_owned(), name.to_owned());
+        tokio::spawn(async move { engine.delete_table(&id, delete_input(&name)).await })
+    };
+    tokio::time::timeout(PAUSE_LIMIT, call_pause.reached())
+        .await
+        .expect("the call reaches its renewal");
+    // Armed before the deadline moves, so whichever sweep takes the row
+    // pauses there.
+    let sweep_pause = matches!(resume, Resume::WhileTheSweepHoldsTheRow)
+        .then(|| pause_before_delete_lease_renewal(&first.table_id));
+    move_deadline_into_the_past(engine, id, name).await;
+    let sweep = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.process_control_plane_transitions().await })
+    };
+
+    match sweep_pause {
+        None => {
+            wait_for_row_gone(engine, id, name).await;
+            let second = create_one(engine, id, name).await;
+            tag_second(engine, &second.table_arn).await;
+            call_pause.release();
+            let answer = call.await.expect("task").expect("DeleteTable");
+            assert_eq!(
+                answer.table_status,
+                extenddb_core::types::TableStatus::Deleting,
+                "{resume:?}: the call answers DELETING"
+            );
+            assert_eq!(
+                row_table_id(engine, id, name).await.as_deref(),
+                Some(second.table_id.as_str()),
+                "{resume:?}: the new table keeps its catalog row"
+            );
+            assert_eq!(
+                tags_of(engine, &second.table_arn).await,
+                second_tag(),
+                "{resume:?}: the new table keeps its tag"
+            );
+            engine
+                .delete_table(id, delete_input(name))
+                .await
+                .expect("remove the new table");
+        }
+        Some(sweep_pause) => {
+            tokio::time::timeout(PAUSE_LIMIT, sweep_pause.reached())
+                .await
+                .expect("the sweep reaches its renewal");
+            call_pause.release();
+            let answer = call.await.expect("task");
+            let row_after_the_call = row_table_id(engine, id, name).await;
+            let tags_after_the_call = tag_rows(engine, &first.table_arn).await;
+            // Released before the checks, so a failing check does not leave
+            // another test's sweep held at this pause.
+            sweep_pause.release();
+            assert_eq!(
+                answer.expect("DeleteTable").table_status,
+                extenddb_core::types::TableStatus::Deleting,
+                "{resume:?}: the call answers DELETING"
+            );
+            assert_eq!(
+                row_after_the_call.as_deref(),
+                Some(first.table_id.as_str()),
+                "{resume:?}: the call leaves the row to the sweep"
+            );
+            assert_eq!(
+                tags_after_the_call, 1,
+                "{resume:?}: the call runs no tag delete"
+            );
+            wait_for_row_gone(engine, id, name).await;
+            assert_eq!(
+                tag_rows(engine, &first.table_arn).await,
+                0,
+                "{resume:?}: the sweep deletes the tags"
+            );
+        }
+    }
+    sweep.await.expect("task").expect("the sweep");
+    assert!(
+        !data_table_exists(engine, id, &first.table_id).await,
+        "{resume:?}: the data table is gone"
+    );
+}
