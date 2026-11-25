@@ -69,7 +69,7 @@ Table lifecycle operations:
 | `index_info` | Fetch metadata for a specific secondary index |
 
 Key design decisions:
-- Tables have a lifecycle: CREATING → ACTIVE → DELETING → (gone). The `control_plane_delay_seconds` setting controls how long tables stay in CREATING before becoming ACTIVE.
+- Tables have a lifecycle: CREATING → ACTIVE → DELETING → (gone). The `control_plane_delay_seconds` setting controls how long tables stay in CREATING before becoming ACTIVE. It also controls how long an ACTIVE table reports UPDATING after an `update_table` for which `enters_updating` is true. For that, `update_table` keeps the stored status ACTIVE and writes the end of that time to `status_transition_at`. The description gets its status from `reported_status`. Both functions are in `extenddb_storage::util`.
 - Tables are scoped by `account_id`. Multi-tenancy is a first-class concern.
 - GSI creation can be asynchronous (CREATING → ACTIVE) with a configurable propagation delay.
 

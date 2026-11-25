@@ -262,7 +262,7 @@ ExtendDB exposes runtime settings that have no DynamoDB equivalent:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `control_plane_delay_seconds` | 5 | Simulated delay for table state transitions (CREATING → ACTIVE, DELETING → removed) |
+| `control_plane_delay_seconds` | 5 | Simulated delay for table state transitions (CREATING → ACTIVE, DELETING → removed, and UPDATING → ACTIVE after an UpdateTable that changes `ProvisionedThroughput`, `BillingMode`, `TableClass` or `StreamSpecification`) |
 | `index_propagation_delay_ms` | 10 | System-wide default propagation delay for asynchronous secondary-index maintenance (milliseconds), covering GSIs and vector indexes alike. Per-GSI overrides stored in catalog; vector indexes have no per-index override. 0 = synchronous. Accepts the pre-rename name `gsi_propagation_delay_ms` as a deprecated alias, and a catalog created before the rename keeps honouring a value stored under it. |
 | `throttling_enabled` | `true` | Enable provisioned capacity throttling (token bucket per table/partition) |
 | `limits.allow_multipart_table_keys` | `false` | Enable multi-part base table key extension |

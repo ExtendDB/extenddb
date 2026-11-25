@@ -623,15 +623,21 @@ mode (delay=0) is available for applications that need it.
 ### 6.1 Table Status Enforcement
 
 All data plane operations (PutItem, GetItem, Query, etc.) must check `table_status` before proceeding. If the table is
-not `ACTIVE`, return `StorageError::TableNotActive` (mapped to `ResourceInUseException`). Control plane operations that
-modify the table (`UpdateTable`, `DeleteTable`) must:
+not `ACTIVE`, return `StorageError::TableNotActive` (mapped to `ResourceInUseException`). `DeleteTable` must:
 
-1. Atomically set `table_status` to `UPDATING` or `DELETING` (using `UPDATE ... WHERE table_status = 'ACTIVE'` — if
- zero rows affected, the table is already being modified, return `ResourceInUseException`)
+1. Atomically set `table_status` to `DELETING` (using `UPDATE ... WHERE table_status = 'ACTIVE'`. If zero rows are
+ affected, another operation is already changing the table: return `ResourceInUseException`)
 2. Perform the operation
-3. Set `table_status` back to `ACTIVE` (or remove the row for `DeleteTable`)
+3. Remove the row (see 6.1.1)
 
 This prevents concurrent DDL operations on the same table.
+
+`UpdateTable` keeps `table_status` `ACTIVE`. A `ProvisionedThroughput`, `BillingMode`, `TableClass` or
+`StreamSpecification` change writes now plus `control_plane_delay_seconds` to `status_transition_at`, and
+`reported_status` (`crates/storage/src/util/mod.rs`) reports `UPDATING` until that instant. In that time the engine
+refuses another `ProvisionedThroughput` or `BillingMode` change with `ResourceInUseException`, and the table serves
+every other request as an `ACTIVE` table does. The engine reads the status before the backend writes the change, so two
+such changes sent at the same moment can both apply.
 
 ### 6.1.1 Async Control Plane Transitions (Phase 1c)
 
@@ -641,7 +647,8 @@ transitions to `ACTIVE` asynchronously. extenddb emulates this behavior.
 **Implementation:**
 
 - A `status_transition_at TIMESTAMPTZ` column on the `tables` table records when a pending transition should fire.
-When `NULL`, no transition is pending.
+When `NULL`, no transition is pending. On an `ACTIVE` row it holds the end of the `UPDATING` time of an `UpdateTable`
+change (6.1), and the value stays in the row after that instant.
 - `CreateTable` inserts with `table_status = 'CREATING'` and sets `status_transition_at` to
 `NOW() + control_plane_delay_seconds`. The delay is read from the settings table via a subquery in the same INSERT
 (no extra round-trip).
