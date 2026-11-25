@@ -710,7 +710,9 @@ mod tests {
     /// Measured on DynamoDB on 2026-11-22: an import of the first 18 values,
     /// one line `{"Item": {"pk": {"S": ...}, "b": <value>}}` each, imported
     /// the `YQ==` line and refused every other line. The last two rows, a
-    /// value inside an `M` and an `L`, were not measured.
+    /// value inside an `M` and an `L`, were not measured. They expect the
+    /// answer of the top-level `YQ` row, because the import's decoder
+    /// refuses `YQ` at any depth.
     #[test]
     fn import_reads_a_binary_only_in_the_canonical_form() {
         let rows: [(&str, Option<&[u8]>); 20] = [

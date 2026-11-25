@@ -69,9 +69,11 @@ impl<'de> Deserialize<'de> for AttributeValue {
 
 struct AttributeValueVisitor;
 
-const EMPTY_ATTRIBUTE_VALUE: &str =
+/// The deserializer's text for a value with no type descriptor.
+pub const EMPTY_ATTRIBUTE_VALUE: &str =
     "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes";
-const MULTI_ATTRIBUTE_VALUE: &str = "Supplied AttributeValue has more than one datatypes set, must contain exactly one of the supported datatypes";
+/// The deserializer's text for a value with more than one type descriptor.
+pub const MULTI_ATTRIBUTE_VALUE: &str = "Supplied AttributeValue has more than one datatypes set, must contain exactly one of the supported datatypes";
 
 /// The service's texts for a `B` value or a `BS` member it cannot decode
 /// (measured 2026-11-20), with its spelling. See [`decode_base64`].
@@ -790,10 +792,11 @@ mod tests {
         );
     }
 
-    /// The service's answer to each `B` value (measured 2026-11-20, and
-    /// 2026-11-21 for the values with their padding left out or cut short):
-    /// the decoded bytes, or the text of the refusal, empty for no message. A
-    /// `BS` member, and a value inside an `M` or an `L`, get the same text.
+    /// The service's answer to each `B` value (measured 2026-11-20,
+    /// 2026-11-21 for the values with their padding left out or cut short,
+    /// and 2026-11-25 for `//==` and `++==`): the decoded bytes, or the text
+    /// of the refusal, empty for no message. A `BS` member, and a value
+    /// inside an `M` or an `L`, get the same text.
     #[test]
     fn a_value_that_is_not_base64_gets_the_service_text() {
         let short = || Err("Buffer is too short for base64 encoding".to_owned());
@@ -804,7 +807,7 @@ mod tests {
         };
         let last = || Err("Invalid last non-pad Base64 character dectected".to_owned());
         let none = || Err(String::new());
-        let rows: [(&str, Result<&str, String>); 54] = [
+        let rows: [(&str, Result<&str, String>); 56] = [
             ("YWJj", Ok("abc")),
             ("YQ==", Ok("a")),
             ("YWE=", Ok("aa")),
@@ -845,6 +848,8 @@ mod tests {
             ("A===", last()),
             ("AB==", last()),
             ("AAB=", last()),
+            ("//==", last()),
+            ("++==", last()),
             ("==", none()),
             ("!!!!", none()),
             ("!!==", none()),

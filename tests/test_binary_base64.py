@@ -11,10 +11,10 @@ too short, and a length that is not a multiple of 4 is named, except for
 "=" are all base64 characters has an invalid last character, and any other
 value gets no message. An item and an expression attribute value may leave
 the "=" padding out or cut it short; a PartiQL parameter may not. Every
-answer below was measured against the service in us-east-1 on 2026-11-20
-and 2026-11-21, each request twice. The table does not exist, so a value
-that decodes gets ResourceNotFoundException. boto3 encodes a binary value
-itself, so the bodies go out as written.
+answer below was measured against the service in us-east-1 on 2026-11-20,
+2026-11-21 and 2026-11-25, each request twice. The table does not exist, so
+a value that decodes gets ResourceNotFoundException. boto3 encodes a binary
+value itself, so the bodies go out as written.
 
 Dual-target: runs against the service and against extenddb with the same
 assertions.
@@ -92,6 +92,10 @@ ROWS = [
     (put({"B": "YWF="}), LAST),
     (put({"B": "YWJjYR=="}), LAST),
     (put({"B": "YWJj===="}), LAST),
+    # Measured 2026-11-25: a "/" or a "+" as the last character ahead of the
+    # padding.
+    (put({"B": "//=="}), LAST),
+    (put({"B": "++=="}), LAST),
     (put({"B": "!!!!"}), NO_MESSAGE),
     (put({"B": "=="}), NO_MESSAGE),
     (put({"B": "!!=="}), NO_MESSAGE),
