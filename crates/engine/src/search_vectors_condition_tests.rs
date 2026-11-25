@@ -351,3 +351,104 @@ async fn a_condition_the_grammars_answer_differently_reads_the_setting() {
         );
     }
 }
+
+/// The scope, or the error message, of `expr` with `names` under `setting`,
+/// on a table with a HASH element.
+async fn searched(
+    setting: &str,
+    expr: &str,
+    names: Option<&HashMap<String, String>>,
+) -> Result<Routed, String> {
+    let storage = server(setting).await;
+    let values: HashMap<String, AttributeValue> = values()
+        .into_iter()
+        .filter(|(k, _)| expr.contains(k.as_str()))
+        .collect();
+    let schema = schema(true);
+    async {
+        let parsed = parse(
+            &storage,
+            "111111111111",
+            Some(expr),
+            names,
+            Some(&values),
+            None,
+            &LimitsConfig::default(),
+        )
+        .await?;
+        let (hash_key, filters, item_filter) = resolve(
+            &parsed,
+            Some(&schema),
+            &definitions(),
+            &storage,
+            "111111111111",
+        )
+        .await?;
+        Ok::<Routed, extenddb_core::error::DynamoDbError>((
+            hash_key.map(|(_, v)| v.clone()),
+            filters
+                .into_iter()
+                .map(|(n, v)| (n.to_owned(), v.clone()))
+                .collect(),
+            item_filter.map(|f| f.matches(&item()).unwrap()),
+        ))
+    }
+    .await
+    .map_err(|e| e.message().to_owned())
+}
+
+/// The equality-only grammar reads `(Cat)` as an attribute named `(Cat)`.
+/// With the extended grammar the backend gets the pair of the attribute in
+/// the parentheses, as for the condition without them.
+#[tokio::test]
+async fn a_parenthesised_string_or_binary_operand_reaches_the_backend_by_its_name() {
+    let k: HashMap<String, String> = [("#k".to_owned(), "Cat".to_owned())].into();
+    let h: HashMap<String, String> = [("#h".to_owned(), "Country".to_owned())].into();
+    for (expr, names, filters) in [
+        ("Country = :c AND (Cat) = :s", None, pair("Cat", ":s")),
+        ("(Country) = :c AND Cat = :s", None, pair("Cat", ":s")),
+        ("Country = :c AND (Tag) = :t", None, pair("Tag", ":t")),
+        ("(Country) = :c AND (Tag) = :t", None, pair("Tag", ":t")),
+    ] {
+        assert_eq!(
+            searched("all", expr, names).await,
+            Ok((us(), filters, None)),
+            "{expr}"
+        );
+    }
+    // The equality-only grammar refuses these, so the item filter serves
+    // them; a Number equality always goes to the item filter.
+    for (expr, names) in [
+        ("Country = :c AND (#k) = :s", Some(&k)),
+        ("(#h) = :c AND (Cat) = :s", Some(&h)),
+        ("Country = :c AND :s = (Cat)", None),
+        ("Country = :c AND (Price) = :p", None),
+    ] {
+        assert_eq!(
+            searched("all", expr, names).await,
+            Ok((us(), Vec::new(), Some(true))),
+            "{expr}"
+        );
+    }
+}
+
+/// An account the setting leaves out keeps the equality-only grammar's
+/// answer to a parenthesised operand.
+#[tokio::test]
+async fn a_parenthesised_operand_keeps_the_equality_answer_under_off() {
+    assert_eq!(
+        searched("off", "Country = :c AND (Cat) = :s", None).await,
+        Err(
+            "SearchConditionExpression must not contain any attributes that is not in \
+             SearchSchema. Invalid attribute: (Cat)"
+                .to_owned()
+        )
+    );
+    assert_eq!(
+        searched("off", "(Country) = :c AND Cat = :s", None).await,
+        Err(
+            "SearchConditionExpression must have all HASH attributes in configured SearchSchema"
+                .to_owned()
+        )
+    );
+}

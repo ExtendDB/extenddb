@@ -73,6 +73,14 @@ mod imp {
     /// A search condition parsed with the extended grammar.
     pub(crate) struct Extended(Arc<SearchFilter>);
 
+    impl Extended {
+        /// The attribute and value of each condition when the condition is
+        /// an AND of `=` comparisons and nothing else.
+        pub(crate) fn equalities(&self) -> Option<Vec<(&str, &AttributeValue)>> {
+            self.0.equalities()
+        }
+    }
+
     /// Parse a search condition with the extended grammar. A name that
     /// neither the search condition nor `projection` uses is refused once
     /// the condition parses.

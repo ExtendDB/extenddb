@@ -157,6 +157,23 @@ impl SearchFilter {
         &self.conditions
     }
 
+    /// The attribute and value of each condition, in written order, when the
+    /// condition is an AND of `=` comparisons and nothing else; `None`
+    /// otherwise. Each attribute is the one the condition names, with a
+    /// `#name` resolved and the parentheses around it read as grouping.
+    #[must_use]
+    pub fn equalities(&self) -> Option<Vec<(&str, &AttributeValue)>> {
+        self.conditions
+            .iter()
+            .map(|c| match c.values.as_slice() {
+                [value] if c.operator == rules::Operator::Eq && c.must_match => {
+                    Some((c.attribute.as_str(), value))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Check the conditions against the index search schema, and return the
     /// HASH attribute and the value that selects its partition when the
     /// schema declares a HASH element.

@@ -120,17 +120,12 @@ pub(crate) async fn resolve<'a>(
         }
         #[cfg(feature = "search-inequality-filters")]
         Parsed::Extended(extended) => {
-            extended_scope(extended, None, search_schema, attribute_definitions)
+            extended_scope(extended, false, search_schema, attribute_definitions)
         }
         #[cfg(feature = "search-inequality-filters")]
         Parsed::Either(extended, conditions) => {
             let equality = equality_scope(conditions, search_schema, attribute_definitions);
-            let extended = extended_scope(
-                extended,
-                Some(conditions),
-                search_schema,
-                attribute_definitions,
-            );
+            let extended = extended_scope(extended, true, search_schema, attribute_definitions);
             if same_scope(&equality, &extended)
                 || !crate::search_vectors_extended::enabled_for(storage, account_id).await?
             {
@@ -152,12 +147,15 @@ fn equality_scope<'a>(
     Ok((hash_key, filters, None))
 }
 
-/// The scope of an extended-grammar condition: the equality pairs of
-/// `conditions` when they give the same results, else the item filter.
+/// The scope of an extended-grammar condition: when the equality-only
+/// grammar also parsed it (`as_pairs`), the equality pairs of the attributes
+/// the extended grammar names if they give the same results, else the item
+/// filter. The equality-only grammar reads a parenthesised attribute such as
+/// `(Cat)` as an attribute named `(Cat)`, so its conditions are not used.
 #[cfg(feature = "search-inequality-filters")]
 fn extended_scope<'a>(
     extended: &'a Extended,
-    conditions: Option<&'a [SearchCondition]>,
+    as_pairs: bool,
     search_schema: Option<&'a [SearchSchemaElement]>,
     attribute_definitions: &[AttributeDefinition],
 ) -> Result<Scope<'a>, DynamoDbError> {
@@ -167,7 +165,10 @@ fn extended_scope<'a>(
         attribute_definitions,
     )?;
     Ok(
-        match conditions.and_then(|c| equality_pairs(c, search_schema)) {
+        match as_pairs
+            .then(|| equality_pairs(extended, search_schema))
+            .flatten()
+        {
             Some(filters) => (hash_key, filters, None),
             None => (hash_key, Vec::new(), Some(item_filter)),
         },
@@ -197,23 +198,24 @@ fn same_error(a: &DynamoDbError, b: &DynamoDbError) -> bool {
 /// among them.
 #[cfg(feature = "search-inequality-filters")]
 fn equality_pairs<'a>(
-    conditions: &'a [SearchCondition],
+    extended: &'a Extended,
     search_schema: Option<&[SearchSchemaElement]>,
 ) -> Option<Vec<(&'a str, &'a AttributeValue)>> {
+    let conditions = extended.equalities()?;
     let hash_attr = search_schema
         .unwrap_or_default()
         .iter()
         .find(|e| e.element_type == SearchSchemaElementType::Hash)
         .map(|e| e.attribute_name.as_str());
     let mut filters: Vec<(&str, &AttributeValue)> = Vec::with_capacity(conditions.len());
-    for c in conditions {
-        if Some(c.attribute_name.as_str()) == hash_attr {
+    for &(name, value) in &conditions {
+        if Some(name) == hash_attr {
             continue;
         }
-        if !matches!(c.value, AttributeValue::S(_) | AttributeValue::B(_)) {
+        if !matches!(value, AttributeValue::S(_) | AttributeValue::B(_)) {
             return None;
         }
-        filters.push((c.attribute_name.as_str(), &c.value));
+        filters.push((name, value));
     }
     (!conditions.is_empty()).then_some(filters)
 }

@@ -310,6 +310,30 @@ class TestLogic:
         assert "i1" not in _ids(_search(grammar_table, H + "NOT Price BETWEEN :p5 AND :p10"))
 
 
+class TestParenthesisedOperands:
+    """A parenthesised attribute in an equality is the attribute, for a String,
+    Binary or Number operand and for the HASH attribute. Measured in
+    eu-north-1 on 2026-11-25, each request twice."""
+
+    def test_a_parenthesised_string_or_binary_operand(self, grammar_table):
+        category = {"i1", "i4", "i6"}
+        assert _ids(_search(grammar_table, H + "(Category) = :a")) == category
+        assert _ids(_search(grammar_table, "(Country) = :us AND Category = :a")) == category
+        names = {"#k": "Category"}
+        assert _ids(_search(grammar_table, H + "(#k) = :a", names=names)) == category
+        assert _ids(_search(grammar_table, H + "(Tag) = :t1")) == {"i1"}
+        assert _ids(_search(grammar_table, "(Country) = :us AND (Tag) = :t1")) == {"i1"}
+
+    def test_a_parenthesised_number_operand(self, grammar_table):
+        assert _ids(_search(grammar_table, H + "(Price) = :p5")) == {"i1"}
+
+    def test_doubled_parentheses_are_redundant(self, grammar_table):
+        _refused(
+            _search(grammar_table, H + "((Category)) = :a"),
+            P + "The expression has redundant parentheses;",
+        )
+
+
 class TestRefusals:
     def test_hash_rules(self, grammar_table):
         _refused(_search(grammar_table, "Category = :a"), HASH_MISSING)
