@@ -144,19 +144,30 @@ def test_unconditional_puts_on_one_key_of_a_gsi_table_commit_or_are_shed(
     failures = _hammer(raw_clients, gsi_table, pk)
     total = WRITERS * PUTS_PER_WRITER
     committed = total - len(failures)
-    # How many of the contended puts were shed depends on the load the server
-    # is under, so the count is reported and bounded: a shed put is the only
-    # failure a caller can get, and at least nine in ten of the puts commit.
-    # A server that gives up after 50 attempts, the budget the other retry
-    # loops keep, shed 431 and 444 of the 2,016 puts in two runs at a load
-    # average of 17 to 19, and fails the second check; a server that gives up
-    # at the first conflict sheds nearly every put.
+    # How many of the contended puts are shed depends on the load on the
+    # server's host, so the count is reported and bounded: a shed put is the
+    # only failure a caller can get, and at least nine in ten of the puts
+    # (1,814 of 2,016) must commit, so at most 202 are shed. The floor does
+    # not hold the attempt budget: a server with a budget of 50 instead of
+    # 1,000 can pass it. Four of the five live tests in
+    # crates/storage-mongodb/src/data_engine_live_tests_contention.rs hold the
+    # budget, because each of them fails with a budget of 50:
+    #   live_concurrent_unconditional_puts_on_one_key_of_a_gsi_table_all_commit
+    #   live_a_single_item_write_that_reaches_the_deadline_answers_a_transient_error
+    #   live_a_transaction_that_reaches_the_deadline_answers_a_canceled_transaction
+    #   live_unconditional_put_that_spends_its_attempt_budget_gives_up_with_a_transient_error
+    floor = total * 9 // 10
     print(f"{len(failures)} of {total} puts were shed, {committed} committed")
     assert set(failures) <= {SHED}, (
         f"{len(failures)} of {total} puts failed with something other than a shed put: "
         f"{sorted(set(failures))}"
     )
-    assert committed >= total * 9 // 10, f"only {committed} of {total} puts committed"
+    assert committed >= floor, (
+        f"only {committed} of {total} puts committed, under the floor of {floor}: more "
+        "than a tenth were shed. The live tests in "
+        "crates/storage-mongodb/src/data_engine_live_tests_contention.rs hold the "
+        "attempt budget"
+    )
     final = dynamodb_client.get_item(
         TableName=gsi_table, Key={"pk": {"S": pk}}, ConsistentRead=True
     )["Item"]
