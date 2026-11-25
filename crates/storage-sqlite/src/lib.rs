@@ -171,6 +171,8 @@ mod create_table;
 mod credential_store;
 mod data;
 mod delete_table;
+#[cfg(test)]
+mod gsi_backfilling_tests;
 // `ServerRuntimeHooks`: the server's background workers, not run on wasm32.
 #[cfg(not(target_arch = "wasm32"))]
 mod hooks;

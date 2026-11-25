@@ -163,6 +163,10 @@ async fn gsi_can_be_added_to_a_table_with_no_sort_key() {
             )
         });
     wait_for_active(c, &table).await;
+    // The table is ACTIVE again before the index is: the service refuses a
+    // Query naming an index that is still CREATING, and so do the backends
+    // whose UpdateTable returns before the backfill ends.
+    wait_for_index_active(c, &table, "hashOnlyIdx").await;
 
     // The index must exist on the table description, not merely have been
     // accepted by UpdateTable.

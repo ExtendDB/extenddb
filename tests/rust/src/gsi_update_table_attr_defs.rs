@@ -16,11 +16,10 @@
 
 use crate::test_base::*;
 use aws_sdk_dynamodb::types::{
-    AttributeDefinition, CreateGlobalSecondaryIndexAction, GlobalSecondaryIndexUpdate, IndexStatus,
+    AttributeDefinition, CreateGlobalSecondaryIndexAction, GlobalSecondaryIndexUpdate,
     KeySchemaElement, KeyType, Projection, ProjectionType, ScalarAttributeType,
 };
 use std::collections::HashMap;
-use std::time::Duration;
 
 /// Items per partition. More than one is what makes a partition-only read
 /// observably wrong; a handful keeps the test fast while still failing on the
@@ -29,25 +28,6 @@ const ITEM_COUNT: usize = 8;
 
 /// Shared by every item, so the GSI's hash key alone never narrows to one row.
 const GSI_HASH_VALUE: &str = "gpk-shared";
-
-/// Poll DescribeTable until the named index reports ACTIVE (up to 60s).
-async fn wait_for_index_active(c: &aws_sdk_dynamodb::Client, table: &str, index_name: &str) {
-    for _ in 0..60 {
-        if let Ok(resp) = c.describe_table().table_name(table).send().await {
-            if let Some(t) = resp.table() {
-                let active = t.global_secondary_indexes().iter().any(|i| {
-                    i.index_name() == Some(index_name)
-                        && i.index_status() == Some(&IndexStatus::Active)
-                });
-                if active {
-                    return;
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    panic!("Index {index_name} on {table} did not become ACTIVE within 60s");
-}
 
 /// Create a composite-key table and populate one partition with `ITEM_COUNT`
 /// items whose sort keys are distinct, then add a GSI keyed on two non-key

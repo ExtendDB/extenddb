@@ -90,10 +90,12 @@ fn validate_unknown_commit_test_gate(value: &str) -> Result<(), &'static str> {
     }
 }
 
-#[cfg(feature = "mongodb-test-hooks")]
+/// The table name of a `<prefix>:<table-name>` key, when the name is one the
+/// service would accept for a table: 3 to 255 characters from `a-z`, `A-Z`,
+/// `0-9`, `.`, `_` and `-`.
 fn table_scoped_gate_table_name<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
     let table_name = key.strip_prefix(prefix)?.strip_prefix(':')?;
-    let valid = !table_name.is_empty()
+    let valid = (3..=255).contains(&table_name.len())
         && table_name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
@@ -110,6 +112,16 @@ fn is_table_scoped_backfill_gate_key(key: &str) -> bool {
 fn is_table_scoped_unknown_commit_gate_key(key: &str) -> bool {
     table_scoped_gate_table_name(key, extenddb_core::settings_keys::UNKNOWN_COMMIT_TEST_GATE)
         .is_some()
+}
+
+/// `gsi_creating_phase_delay_ms:<table-name>`, with a name the service would
+/// accept for a table.
+fn is_gsi_creating_phase_delay_key(key: &str) -> bool {
+    table_scoped_gate_table_name(
+        key,
+        extenddb_core::settings_keys::GSI_CREATING_PHASE_DELAY_MS,
+    )
+    .is_some()
 }
 
 fn validate_bool(value: &str) -> Result<(), &'static str> {
@@ -135,6 +147,26 @@ fn validate_index_propagation_delay_ms(value: &str) -> Result<(), &'static str> 
     }
 }
 
+/// The validator for a writable key: one of [`KNOWN_KEYS`], or a table's
+/// `gsi_creating_phase_delay_ms:<table-name>` hold. The management API and
+/// `extenddb settings set` both look keys up here, so they accept the same
+/// keys.
+#[must_use]
+pub fn writable_key_validator(key: &str) -> Option<Validator> {
+    KNOWN_KEYS
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, validator)| *validator)
+        // A test lever for the same reason as the vector ones above: the two
+        // CREATING phases of a GSI build last milliseconds on a test-sized table,
+        // so the measured refusal for each cannot be observed from a client unless
+        // a test can lengthen them. Scoped to one table; same bound and validator.
+        .or_else(|| {
+            is_gsi_creating_phase_delay_key(key)
+                .then_some(validate_backfill_batch_delay_ms as Validator)
+        })
+}
+
 /// Set a runtime setting with validation.
 ///
 /// Validates the key and value, then delegates the write to the
@@ -154,10 +186,7 @@ pub async fn set_setting(
         return Err(OpError::Validation(format!("Setting '{key}' is read-only")));
     }
 
-    let known = KNOWN_KEYS
-        .iter()
-        .find(|(k, _)| *k == key)
-        .map(|(_, validator)| *validator);
+    let known = writable_key_validator(key);
     #[cfg(feature = "mongodb-test-hooks")]
     let known = known
         .or_else(|| {
@@ -194,4 +223,31 @@ pub async fn set_setting(
         "settings-set: key={key}, value={value}",
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_gsi_creating_phase_delay_key;
+
+    #[test]
+    fn a_gsi_phase_hold_is_writable_for_one_valid_table_name() {
+        assert!(is_gsi_creating_phase_delay_key(
+            "gsi_creating_phase_delay_ms:orders-2026.v1_x"
+        ));
+        assert!(!is_gsi_creating_phase_delay_key(
+            "gsi_creating_phase_delay_ms"
+        ));
+        assert!(!is_gsi_creating_phase_delay_key(
+            "gsi_creating_phase_delay_ms:"
+        ));
+        assert!(!is_gsi_creating_phase_delay_key(
+            "gsi_creating_phase_delay_ms:ab"
+        ));
+        assert!(!is_gsi_creating_phase_delay_key(
+            "gsi_creating_phase_delay_ms:has space"
+        ));
+        assert!(!is_gsi_creating_phase_delay_key(
+            "gsi_creating_phase_delay_msx:orders"
+        ));
+    }
 }

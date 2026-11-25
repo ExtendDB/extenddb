@@ -81,6 +81,20 @@ async fn ensure_index_name_free(
     Ok(())
 }
 
+/// Wait out one phase of the `gsi_creating_phase_delay_ms` test hold. A zero
+/// hold, the value when the setting is unset, returns at once.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "only the server's settings API, the settings command and tests write the hold's \
+              row, and the browser build has none of them, so on wasm32 the hold is zero and \
+              this sleep never runs"
+)]
+async fn wait_creating_phase_hold(hold: std::time::Duration) {
+    if !hold.is_zero() {
+        tokio::time::sleep(hold).await;
+    }
+}
+
 impl SqliteEngine {
     pub(crate) async fn update_table_impl(
         &self,
@@ -719,6 +733,18 @@ impl SqliteEngine {
                 if let Some(create) = &update.create {
                     let idx_id = created[ci].clone();
                     ci += 1;
+                    // The row committed above as CREATING reports `Backfilling:
+                    // false` until the record below is taken, and `true` from then
+                    // until the flip to ACTIVE. The test hold lengthens each phase;
+                    // it runs under the engine write lock, so it also delays every
+                    // other write in this process while it lasts.
+                    let hold = self.gsi_creating_phase_delay(&input.table_name).await;
+                    wait_creating_phase_hold(hold).await;
+                    // The record ends with this block. A build that fails below
+                    // deletes its row. If that DELETE fails, or the flip to ACTIVE
+                    // fails, the row stays CREATING with no record and reports the
+                    // first phase until the startup reconciler rebuilds it.
+                    let _backfilling = self.gsi_backfills.start_scoped(&idx_id);
                     let result = async {
                         let mut data_tx = self
                             .pool
@@ -767,6 +793,10 @@ impl SqliteEngine {
                         .await;
                         return Err(e);
                     }
+                    // The second hold sits between the build's commit and the flip,
+                    // as on PostgreSQL, so a record that ended before the flip would
+                    // show as the first phase while it lasts.
+                    wait_creating_phase_hold(hold).await;
                     // Backfill succeeded and the data table is populated, so the
                     // index is now queryable: flip CREATING -> ACTIVE. DescribeTable
                     // reports CREATING until this point (matching DynamoDB), so a
