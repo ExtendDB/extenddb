@@ -58,7 +58,7 @@ exact path is verified would make a recall regression indistinguishable from a
 scan defect. The partition predicate and the inline filters are evaluated in SQL
 so that `LIMIT` applies after filtering rather than before.
 
-Amended with ADR-0030: the partition predicate and the inline-filter equalities
+Amended with ADR-0031: the partition predicate and the inline-filter equalities
 are still evaluated in SQL. A search condition they cannot express, a range,
 `IN`, `OR`, `NOT`, a function or a Number equality, is evaluated in ExtendDB on
 the rows the SQL returns in score order, page by page, until `top_k` rows match,

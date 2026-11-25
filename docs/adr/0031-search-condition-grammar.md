@@ -1,4 +1,4 @@
-# ADR-0030: SearchVectors serves the extended search condition grammar from its own parser, behind a feature and a setting
+# ADR-0031: SearchVectors serves the extended search condition grammar from its own parser, behind a feature and a setting
 
 - Status: Proposed
 - Date: 2026-11-25
