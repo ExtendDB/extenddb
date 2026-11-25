@@ -114,13 +114,13 @@
 //! serial level is a local quorum with no Paxos read, so the scan reads at
 //! quorum and the coordinator clock after it.
 
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use std::time::Duration;
 
-use cdrs_tokio::consistency::Consistency;
 use cdrs_tokio::error::Error as DriverError;
 use cdrs_tokio::frame::message_error::ErrorType;
-use cdrs_tokio::query::{BatchQueryBuilder, QueryValues};
-use cdrs_tokio::statement::StatementParamsBuilder;
+use cdrs_tokio::query::QueryValues;
 use cdrs_tokio::types::IntoRustByName;
 use cdrs_tokio::types::rows::Row;
 use cdrs_tokio::types::value::Value;
@@ -184,7 +184,7 @@ fn seconds_to_millis(seconds: f64) -> i64 {
 /// The coordinator's clock, in epoch milliseconds: the clock every heartbeat
 /// is stamped with, so a stale window is measured on it.
 pub(crate) async fn coordinator_now_millis(engine: &CassandraEngine) -> Result<i64, StorageError> {
-    let rows = crate::cassandra_util::query_rows::<StorageError>(
+    let rows = crate::cassandra_util::system_read::<StorageError>(
         &engine.session,
         "SELECT toTimestamp(now()) AS now FROM system.local",
         cdrs_tokio::query_values!(),
@@ -242,12 +242,7 @@ pub(crate) async fn conditional_write(
     query: &str,
     values: QueryValues,
 ) -> Result<WriteOutcome, StorageError> {
-    let params = StatementParamsBuilder::new()
-        .with_consistency(Consistency::LocalQuorum)
-        .with_serial_consistency(Consistency::LocalSerial)
-        .with_values(values)
-        .build();
-    match session.query_with_params(query, params).await {
+    match session.run(Stmt::Lwt, query, values).await {
         Ok(result) => Ok(if crate::cassandra_util::lwt_applied(&result)? {
             WriteOutcome::Matched
         } else {
@@ -463,7 +458,7 @@ impl JobClaim for CassandraBackupClaim {
                  FROM {}.backups_by_arn WHERE account_id = ? AND backup_arn = ?",
                 self.engine.catalog_keyspace()
             );
-            let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+            let rows = crate::cassandra_util::query_rows::<StorageError>(
                 &self.engine.session,
                 &query,
                 cdrs_tokio::query_values!(
@@ -502,8 +497,7 @@ impl CassandraEngine {
         if let Some(error) = crate::test_hooks::index_entry_removal_error(&row.backup_arn) {
             return Err(error);
         }
-        let batch = BatchQueryBuilder::new()
-            .with_consistency(Consistency::LocalQuorum)
+        let batch = crate::cassandra_util::batch()
             .add_query(
                 format!(
                     "DELETE FROM {catalog}.backup_index_by_status \
@@ -539,7 +533,7 @@ impl CassandraEngine {
                 ),
             );
         self.session
-            .batch(
+            .run_batch(
                 batch
                     .build()
                     .map_err(|e| StorageError::Internal(e.to_string()))?,
@@ -564,8 +558,7 @@ impl CassandraEngine {
         if let Some(error) = crate::test_hooks::index_entry_batch_error(&row.backup_arn) {
             return Err(error);
         }
-        let batch = BatchQueryBuilder::new()
-            .with_consistency(Consistency::LocalQuorum)
+        let batch = crate::cassandra_util::batch()
             .add_query(
                 format!(
                     "INSERT INTO {catalog}.backups_by_account (account_id, created_at, \
@@ -616,7 +609,7 @@ impl CassandraEngine {
                 ),
             );
         self.session
-            .batch(
+            .run_batch(
                 batch
                     .build()
                     .map_err(|e| StorageError::Internal(e.to_string()))?,
@@ -659,7 +652,7 @@ impl CassandraEngine {
             "SELECT * FROM {}.backups_by_arn WHERE account_id = ? AND backup_arn = ?",
             self.catalog_keyspace()
         );
-        let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+        let rows = crate::cassandra_util::query_rows::<StorageError>(
             &self.session,
             &query,
             cdrs_tokio::query_values!(account_id, backup_arn),
@@ -686,8 +679,7 @@ impl CassandraEngine {
         to: &str,
     ) {
         let catalog = self.catalog_keyspace();
-        let batch = BatchQueryBuilder::new()
-            .with_consistency(Consistency::LocalQuorum)
+        let batch = crate::cassandra_util::batch()
             .add_query(
                 format!(
                     "DELETE FROM {catalog}.backup_index_by_status \
@@ -711,7 +703,7 @@ impl CassandraEngine {
                 ),
             );
         let sent = match batch.build() {
-            Ok(batch) => self.session.batch(batch).await.map(|_| ()),
+            Ok(batch) => self.session.run_batch(batch).await.map(|_| ()),
             Err(error) => Err(error),
         };
         if let Err(error) = sent {
@@ -907,7 +899,7 @@ impl CassandraEngine {
              WHERE store_root = ? AND backup_status = ?",
             self.catalog_keyspace()
         );
-        let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+        let rows = crate::cassandra_util::query_rows::<StorageError>(
             &self.session,
             &query,
             cdrs_tokio::query_values!(store_root, status.as_str()),
@@ -943,7 +935,7 @@ impl CassandraEngine {
     ) -> Result<(), StorageError> {
         let catalog = self.catalog_keyspace();
         if remove {
-            crate::cassandra_util::query_rows_quorum::<StorageError>(
+            crate::cassandra_util::execute::<StorageError>(
                 &self.session,
                 &format!(
                     "DELETE FROM {catalog}.backup_index_by_status \
@@ -958,7 +950,7 @@ impl CassandraEngine {
             )
             .await?;
         } else {
-            crate::cassandra_util::query_rows_quorum::<StorageError>(
+            crate::cassandra_util::execute::<StorageError>(
                 &self.session,
                 &format!(
                     "INSERT INTO {catalog}.backup_index_by_status \
@@ -1236,7 +1228,7 @@ impl CassandraEngine {
              FROM {}.tables WHERE account_id = ? AND table_name = ?",
             self.catalog_keyspace()
         );
-        let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+        let rows = crate::cassandra_util::query_rows::<StorageError>(
             &self.session,
             &query,
             cdrs_tokio::query_values!(account_id, table_name),
@@ -1429,7 +1421,7 @@ impl JobClaim for CassandraRestoreClaim {
                  restore_failure_reason FROM {}.tables WHERE account_id = ? AND table_name = ?",
                 self.engine.catalog_keyspace()
             );
-            let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+            let rows = crate::cassandra_util::query_rows::<StorageError>(
                 &self.engine.session,
                 &query,
                 cdrs_tokio::query_values!(
@@ -1472,7 +1464,7 @@ impl BackupCatalog for CassandraEngine {
                 "SELECT value FROM {}.settings WHERE key = 'catalog_id'",
                 self.catalog_keyspace()
             );
-            let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+            let rows = crate::cassandra_util::query_rows::<StorageError>(
                 &self.session,
                 &query,
                 cdrs_tokio::query_values!(),
@@ -1815,13 +1807,9 @@ impl BackupCatalog for CassandraEngine {
                 query.push_str(" AND created_at < ?");
                 values.push(Value::from((upper * 1_000.0).ceil() as i64));
             }
-            let params = StatementParamsBuilder::new()
-                .with_consistency(Consistency::LocalQuorum)
-                .with_values(QueryValues::SimpleValues(values))
-                .build();
             let listed = self
                 .session
-                .query_with_params(&query, params)
+                .run(Stmt::Read, &query, QueryValues::SimpleValues(values))
                 .await
                 .map_err(|e| StorageError::Internal(format!("List backup index: {e}")))?
                 .response_body()
@@ -2239,7 +2227,7 @@ impl BackupCatalog for CassandraEngine {
             let scan = format!(
                 "SELECT account_id, backup_arn, active_restores FROM {catalog}.backups_by_arn"
             );
-            let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+            let rows = crate::cassandra_util::query_rows::<StorageError>(
                 &self.session,
                 &scan,
                 cdrs_tokio::query_values!(),
@@ -2418,7 +2406,7 @@ impl BackupCatalog for CassandraEngine {
                      ALLOW FILTERING",
                     self.catalog_keyspace()
                 );
-                let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+                let rows = crate::cassandra_util::query_rows::<StorageError>(
                     &self.session,
                     &query,
                     cdrs_tokio::query_values!(status),
@@ -2502,7 +2490,7 @@ impl BackupCatalog for CassandraEngine {
                  ALLOW FILTERING",
                 self.catalog_keyspace()
             );
-            let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+            let rows = crate::cassandra_util::query_rows::<StorageError>(
                 &self.session,
                 &query,
                 cdrs_tokio::query_values!(),
@@ -2672,7 +2660,7 @@ impl BackupCatalog for CassandraEngine {
                  WHERE account_id = ? AND table_name = ?",
                 self.catalog_keyspace()
             );
-            let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+            let rows = crate::cassandra_util::query_rows::<StorageError>(
                 &self.session,
                 &query,
                 cdrs_tokio::query_values!(key.account_id.as_str(), key.table_name.as_str()),
@@ -2711,7 +2699,7 @@ impl BackupCatalog for CassandraEngine {
                      ALLOW FILTERING",
                     self.catalog_keyspace()
                 );
-                let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+                let rows = crate::cassandra_util::query_rows::<StorageError>(
                     &self.session,
                     &query,
                     cdrs_tokio::query_values!(status.as_str()),
@@ -2788,7 +2776,7 @@ impl BackupCatalog for CassandraEngine {
                 BackupStatus::Deleted,
                 BackupStatus::Failed,
             ] {
-                let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+                let rows = crate::cassandra_util::query_rows::<StorageError>(
                     &self.session,
                     &query,
                     cdrs_tokio::query_values!(store_root, status.as_str()),
@@ -2854,7 +2842,7 @@ impl BackupCatalog for CassandraEngine {
                         }
                         _ => sweep.removed += 1,
                     }
-                    crate::cassandra_util::query_rows_quorum::<StorageError>(
+                    crate::cassandra_util::execute::<StorageError>(
                         &self.session,
                         &delete,
                         cdrs_tokio::query_values!(store_root, status.as_str(), backup_arn.as_str()),
@@ -2874,7 +2862,7 @@ impl BackupCatalog for CassandraEngine {
             // the kind and id they carry. Hints, not verified against the
             // rows (the trait doc).
             let catalog = self.catalog_keyspace();
-            let partitions = crate::cassandra_util::query_rows_quorum::<StorageError>(
+            let partitions = crate::cassandra_util::query_rows::<StorageError>(
                 &self.session,
                 &format!("SELECT DISTINCT store_root, backup_status FROM {catalog}.backup_index_by_status"),
                 cdrs_tokio::query_values!(),
@@ -2892,7 +2880,7 @@ impl BackupCatalog for CassandraEngine {
                 let status: String =
                     crate::cassandra_util::get_column(&partition, "backup_status", "status index")?;
                 let status = BackupStatus::parse(&status)?;
-                let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+                let rows = crate::cassandra_util::query_rows::<StorageError>(
                     &self.session,
                     &entries_query,
                     cdrs_tokio::query_values!(root.as_str(), status.as_str()),
@@ -3431,6 +3419,7 @@ mod tests {
 
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+    use cdrs_tokio::consistency::Consistency;
     use cdrs_tokio::frame::message_error::{ErrorBody, WriteTimeoutError, WriteType};
 
     use super::*;
