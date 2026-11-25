@@ -32,7 +32,10 @@ use extenddb_storage::secret_keys::SecretRow;
 pub struct AssumeRoleRequest {
     /// The ARN of the principal assuming the role.
     caller_arn: String,
-    /// Session name (identifies this particular assumed-role session).
+    /// Session name, the last part of the session's assumed-role ARN. It does
+    /// not identify the session: every call stores a new session with its own
+    /// access key, also under a session name the role already has a session
+    /// with.
     session_name: String,
     /// Optional session tags (merged with role tags; session wins on conflict).
     #[serde(default)]
@@ -338,14 +341,12 @@ async fn generate_and_store_session(
     {
         Ok(()) => {
             // Drop any negative-cached entry for this newly-issued access
-            // key (e.g. from a probe before the session existed). Also drop
-            // any cached session-data for this exact (role, session) tuple
-            // — overwriting an existing session via re-assume would
-            // otherwise serve stale policies/tags until TTL.
+            // key (e.g. from a probe before the session existed). There is
+            // no session data to drop: every call stores a new session, also
+            // when the role already has one with this session name, and the
+            // authorization cache keeps a session's data under the access key
+            // its requests are signed with, which signed nothing before now.
             auth_cache.invalidate_credential(&access_key_id).await;
-            auth_cache
-                .invalidate_session(account_id, role_name, &request.session_name)
-                .await;
             tracing::warn!(
                 target: "extenddb::audit::manage",
                 "assume-role: account={}, role={}, session={}, caller={}",

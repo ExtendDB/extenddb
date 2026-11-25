@@ -255,31 +255,26 @@ impl AuthorizationStore for CassandraCatalogStore {
 
     fn fetch_session_data(
         &self,
-        account_id: &str,
-        role_name: &str,
-        session_name: &str,
+        access_key_id: &str,
     ) -> BoxFuture<'_, OpResult<Option<SessionData>>> {
-        let account_id = account_id.to_owned();
-        let role_name = role_name.to_owned();
-        let session_name = session_name.to_owned();
+        let access_key_id = access_key_id.to_owned();
         let catalog_keyspace = self.catalog_keyspace();
         let session = self.session().clone();
 
         Box::pin(async move {
+            // The table's primary key is `session_token`, so this filters on
+            // `access_key_id`, as the session credential lookup
+            // (`lookup_session_credential`) does.
             let query = format!(
                 "SELECT session_policy, session_tags, created_at FROM {catalog_keyspace}.iam_sessions \
-                 WHERE account_id = ? AND role_name = ? AND session_name = ? ALLOW FILTERING"
+                 WHERE access_key_id = ? ALLOW FILTERING"
             );
 
             let result = session
                 .run(
                     Stmt::Read,
                     &query,
-                    cdrs_tokio::query_values!(
-                        account_id.as_str(),
-                        role_name.as_str(),
-                        session_name.as_str()
-                    ),
+                    cdrs_tokio::query_values!(access_key_id.as_str()),
                 )
                 .await
                 .map_err(|e| {

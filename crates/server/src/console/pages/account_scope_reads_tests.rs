@@ -196,7 +196,7 @@ impl AuthorizationStore for CountingStore {
         fetch_user_boundary(&str, &str) -> Option<String>;
         fetch_role_policies(&str, &str) -> Vec<String>;
         fetch_role_boundary(&str, &str) -> Option<String>;
-        fetch_session_data(&str, &str, &str) -> Option<RoleSession>;
+        fetch_session_data(&str) -> Option<RoleSession>;
         fetch_user_tags(&str, &str) -> Vec<(String, String)>;
         fetch_role_tags(&str, &str) -> Vec<(String, String)>;
         fetch_resource_tags(&str) -> Vec<(String, String)>;

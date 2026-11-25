@@ -55,12 +55,23 @@ pub trait AuthorizationStore: Send + Sync {
         role_name: &str,
     ) -> BoxFuture<'_, OpResult<Option<String>>>;
 
-    /// Fetch session data (session policy, session tags) for a role session.
+    /// Fetch the session data (session policy, session tags, issue time) of
+    /// the role session whose access key ID is `access_key_id`, or `None`
+    /// when no stored session has that key.
+    ///
+    /// `AssumeRole` stores a new session, with a new access key, for every
+    /// call, so a role can hold several sessions with one session name; the
+    /// access key is what tells them apart. The session is returned whether
+    /// or not it has expired: authentication refuses a request signed with an
+    /// expired session's key before authorization reads the session's data,
+    /// so this read does not check the expiry again. Authentication answers
+    /// `ExpiredTokenException`, or `UnrecognizedClientException` when it
+    /// finds the key in neither the credential cache nor the store (the
+    /// `MongoDB` store's TTL index on `iam_sessions.expires_at` deletes
+    /// expired sessions).
     fn fetch_session_data(
         &self,
-        account_id: &str,
-        role_name: &str,
-        session_name: &str,
+        access_key_id: &str,
     ) -> BoxFuture<'_, OpResult<Option<SessionData>>>;
 
     /// Fetch tags for a user (for condition key evaluation).

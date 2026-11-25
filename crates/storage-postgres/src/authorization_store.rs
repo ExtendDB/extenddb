@@ -139,26 +139,20 @@ impl AuthorizationStore for PostgresCatalogStore {
 
     fn fetch_session_data(
         &self,
-        account_id: &str,
-        role_name: &str,
-        session_name: &str,
+        access_key_id: &str,
     ) -> BoxFuture<'_, OpResult<Option<SessionData>>> {
-        let account_id = account_id.to_owned();
-        let role_name = role_name.to_owned();
-        let session_name = session_name.to_owned();
+        let access_key_id = access_key_id.to_owned();
         Box::pin(async move {
+            // `access_key_id` is UNIQUE, so this reads one session's row.
             let row: Option<(
                 Option<serde_json::Value>,
                 Option<serde_json::Value>,
                 time::OffsetDateTime,
             )> = sqlx::query_as(
                 "SELECT session_policy, session_tags, created_at FROM iam_sessions \
-                     WHERE account_id = $1 AND role_name = $2 AND session_name = $3 \
-                     AND expires_at > now()",
+                     WHERE access_key_id = $1",
             )
-            .bind(&account_id)
-            .bind(&role_name)
-            .bind(&session_name)
+            .bind(&access_key_id)
             .fetch_optional(self.pool())
             .await
             .map_err(|e| {

@@ -55,12 +55,14 @@ pub async fn check_authorization(
             account_id,
             role_name,
             session_name,
+            access_key_id,
         } => {
             check_role_authorization(
                 cache,
                 account_id,
                 role_name,
                 session_name,
+                access_key_id,
                 target,
                 is_scan,
                 params,
@@ -171,11 +173,17 @@ async fn check_user_authorization(
     }
 }
 
+/// The session's own data (session policy, session tags, issue time) is read
+/// by `access_key_id`, the key the request was signed with: a role can hold
+/// several sessions with one session name.
+// The fields of `AuthIdentity::RoleSession` are passed one by one.
+#[allow(clippy::too_many_arguments)]
 async fn check_role_authorization(
     cache: &CachedAuthzStore,
     account_id: &str,
     role_name: &str,
     session_name: &str,
+    access_key_id: &str,
     target: &AuthzTarget,
     is_scan: bool,
     params: RequestParams,
@@ -196,7 +204,7 @@ async fn check_role_authorization(
     ) = tokio::try_join!(
         wrap_policies(cache.fetch_role_policies(account_id, role_name)),
         wrap_boundary(cache.fetch_role_boundary(account_id, role_name)),
-        fetch_session_data_and_tags(cache, account_id, role_name, session_name),
+        fetch_session_data_and_tags_by_key(cache, account_id, role_name, access_key_id),
         wrap_tags(fetch_authz_resource_tags(cache, tag_arn.as_deref())),
         wrap_created_at(cache.fetch_role_created_at(account_id, role_name)),
     )?;
@@ -359,11 +367,13 @@ async fn wrap_created_at(
     fut.await.map_err(op_err_to_dynamo)
 }
 
-async fn fetch_session_data_and_tags(
+/// The session policy and issue time of the session whose access key is
+/// `access_key_id`, and the role's tags with that session's tags over them.
+async fn fetch_session_data_and_tags_by_key(
     cache: &CachedAuthzStore,
     account_id: &str,
     role_name: &str,
-    session_name: &str,
+    access_key_id: &str,
 ) -> Result<
     (
         Option<std::sync::Arc<extenddb_auth::policy::document::PolicyDocument>>,
@@ -377,7 +387,7 @@ async fn fetch_session_data_and_tags(
         wrap_tags(cache.fetch_role_tags(account_id, role_name)),
         async {
             cache
-                .fetch_session_data(account_id, role_name, session_name)
+                .fetch_session_data(account_id, role_name, access_key_id)
                 .await
                 .map_err(op_err_to_dynamo)
         },
@@ -565,6 +575,7 @@ mod resource_tag_tests {
             ACCOUNT,
             "r",
             "s",
+            "ASIAEXAMPLEKEY",
             &target,
             false,
             RequestParams::default(),
@@ -611,6 +622,7 @@ mod resource_tag_tests {
                 ACCOUNT,
                 "r",
                 "s",
+                "ASIAEXAMPLEKEY",
                 &AuthzTarget::new(op, arn.to_owned()),
                 false,
                 RequestParams::default(),
