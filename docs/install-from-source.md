@@ -362,7 +362,12 @@ What `init` prints, abridged (the full output also names the certificate files i
 Start the server with: extenddb serve --config extenddb.toml
 ```
 
-Save the admin password: it is shown once and cannot be retrieved. The PostgreSQL `init` also prints the default account's ID, the account you create IAM users in; on every backend `manage list-accounts` prints it ([6. Smoke test](#6-smoke-test)).
+Save the admin password: it is shown once and cannot be retrieved. The PostgreSQL `init` also prints the default account's ID, the account you create IAM users in. On PostgreSQL, SQLite and Cassandra, `manage list-accounts` prints it ([6. Smoke test](#6-smoke-test)). On MongoDB the account that `init` creates is not listed, and the server refuses access keys made under it, because its document has no `account_id` field ([#643](https://github.com/ExtendDB/extenddb/issues/643)); create an account to work in and use the `account_id` it prints:
+
+```bash
+export EXTENDDB_PASSWORD='<admin password>'
+./target/release/extenddb manage --user admin create-account --account-name dev
+```
 
 `init` refuses to run when the catalog or data database already exists. To start over, run `extenddb destroy --config extenddb.toml --yes` with the same `--pg-user` as `init` first (see [Tear down](#tear-down)). It also refuses to overwrite an existing `extenddb.toml` unless `--overwrite` is given (`Error: Config file "extenddb.toml" already exists. Use --overwrite to delete and regenerate it.`, exit 255); with `--overwrite` it loads the PostgreSQL connection defaults from the existing file and writes a new one. On Cassandra, `init` aborts if the catalog is already initialized. If an earlier `init` stopped partway, `init` finishes it, when its `--replication-factor` and `--datacenter` match the ones the earlier `init` used. If `init` stops because its `--replication-factor` is larger than the number of nodes, an `init` with the same `--replication-factor` stops the same way. To go on, see [Keyspace replication](cassandra-setup.md#keyspace-replication).
 
