@@ -141,3 +141,38 @@ fn register_table_scales_tokens_to_the_new_cap() {
         })
     );
 }
+
+/// A table in debt has its write cap raised, or removed. One write of 293
+/// units on a cap of 1 leaves a debt of 292 units, which the new rate repays
+/// in 29 ms (10,000 units a second) or 73 ms (the 4,000 default), so a write
+/// 150 ms after the change is allowed. Scaled with the rates, the debt kept
+/// its length of 292 seconds.
+#[test]
+fn raising_or_removing_a_cap_repays_a_debt_at_the_new_rate() {
+    for after in [
+        TableThroughput::on_demand_capped(None, Some(10_000)),
+        TableThroughput::on_demand_capped(None, Some(-1)),
+    ] {
+        let mgr = ThrottleManager::new(1_000_000, 1_000_000, true);
+        mgr.register_table(
+            "acct",
+            "tbl",
+            TableThroughput::on_demand_capped(None, Some(1)),
+        );
+        mgr.consume("acct", "tbl", 0.0, 293.0);
+        assert!(
+            matches!(
+                mgr.check_capacity("acct", "tbl", false, true),
+                ThrottleResult::ThrottledWrite(_)
+            ),
+            "{after:?}"
+        );
+        mgr.register_table("acct", "tbl", after);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert_eq!(
+            mgr.check_capacity("acct", "tbl", false, true),
+            ThrottleResult::Allowed,
+            "{after:?}"
+        );
+    }
+}
