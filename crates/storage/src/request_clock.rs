@@ -14,7 +14,8 @@
 //! background worker get.
 
 use std::future::Future;
-use std::time::Instant;
+
+use web_time::Instant;
 
 tokio::task_local! {
     static REQUEST_STARTED: Instant;
