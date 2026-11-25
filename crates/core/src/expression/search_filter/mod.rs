@@ -9,7 +9,8 @@
 //! one condition on one attribute. The checks run in this order, and the
 //! first failure is the answer:
 //!
-//! 1. the expression is not empty and is at most 4096 bytes;
+//! 1. the expression is not empty and is at most `max_expression_length_bytes`
+//!    of `[limits]` (4096 by default);
 //! 2. the syntax, then redundant parentheses;
 //! 3. the checks of the condition grammar, post-order (see [`walk`]);
 //! 4. at most 300 operators, then the combined size;
@@ -44,14 +45,12 @@ pub use rules::{Condition, Operator};
 
 use crate::error::DynamoDbError;
 use crate::expression::search_params::check_unused_keys;
-use crate::expression::{Expr, ExpressionMaps};
+use crate::expression::{Expr, ExpressionKind, ExpressionMaps, check_expression_size};
+use crate::limits::LimitsConfig;
 use crate::types::{AttributeDefinition, AttributeValue, Item, SearchSchemaElement};
 
 /// The condition limit the service applies by default.
 pub const DEFAULT_MAX_CONDITIONS: usize = 50;
-
-/// The most bytes an expression takes, counted before substitution.
-const MAX_EXPRESSION_BYTES: usize = 4096;
 
 const PREFIX: &str = "Invalid SearchConditionExpression: ";
 
@@ -78,15 +77,12 @@ pub fn parse_search_filter(
     names: Option<&HashMap<String, String>>,
     values: Option<&HashMap<String, AttributeValue>>,
     max_conditions: usize,
+    limits: &LimitsConfig,
 ) -> Result<SearchFilter, DynamoDbError> {
     if expr.is_empty() {
         return Err(invalid("The expression can not be empty;"));
     }
-    if expr.len() > MAX_EXPRESSION_BYTES {
-        return Err(invalid(
-            "Expression size has exceeded the maximum allowed size;",
-        ));
-    }
+    check_expression_size(expr, ExpressionKind::SearchCondition, limits)?;
     let toks = lexer::lex(expr);
     let tree = grammar::parse(expr, &toks).map_err(|body| invalid(&body))?;
     let maps = walk::Maps { names, values };

@@ -37,7 +37,13 @@ pub(crate) fn check(
     projection: Option<&str>,
     limits: &LimitsConfig,
 ) -> Result<(), DynamoDbError> {
-    check_search_maps(names, values, condition.is_some(), projection.is_some())?;
+    check_search_maps(
+        names,
+        values,
+        condition.is_some(),
+        projection.is_some(),
+        limits,
+    )?;
     if let Some(projection) = projection {
         let paths = crate::expression_helpers::parse_projection_expr(projection, limits)?;
         let names = names

@@ -118,7 +118,14 @@ fn outcome(index: &Index, expr: &str, all: &HashMap<String, AttributeValue>) -> 
     .map(|(k, v)| (k.to_owned(), v.to_owned()))
     .collect();
     let used = used_values(expr, all);
-    match parse_search_filter(expr, Some(&names), Some(&used), 50).and_then(|filter| {
+    match parse_search_filter(
+        expr,
+        Some(&names),
+        Some(&used),
+        50,
+        &crate::limits::LimitsConfig::default(),
+    )
+    .and_then(|filter| {
         filter
             .validate_against_schema(Some(&index.schema), &index.definitions)
             .map(|_| ())
@@ -342,7 +349,14 @@ fn accepted_shapes_select_the_hash_partition() {
         "Category = :s AND ((Country = :s AND ProductCount > :n) OR (Country = :other AND ProductCount < :hi))",
     ] {
         let used = used_values(expr, &values());
-        let filter = parse_search_filter(expr, None, Some(&used), 50).unwrap();
+        let filter = parse_search_filter(
+            expr,
+            None,
+            Some(&used),
+            50,
+            &crate::limits::LimitsConfig::default(),
+        )
+        .unwrap();
         let selected = filter
             .validate_against_schema(Some(&index.schema), &index.definitions)
             .unwrap_or_else(|e| panic!("{expr}: {e:?}"));
@@ -363,7 +377,14 @@ fn an_index_without_hash_searches_the_whole_index() {
         "NOT Country IN (:s, :other) AND attribute_exists(ProductCount)",
     ] {
         let used = used_values(expr, &values());
-        let filter = parse_search_filter(expr, None, Some(&used), 50).unwrap();
+        let filter = parse_search_filter(
+            expr,
+            None,
+            Some(&used),
+            50,
+            &crate::limits::LimitsConfig::default(),
+        )
+        .unwrap();
         let selected = filter
             .validate_against_schema(Some(&index.schema), &index.definitions)
             .unwrap_or_else(|e| panic!("{expr}: {e:?}"));

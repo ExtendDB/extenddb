@@ -28,7 +28,13 @@ fn assert_measured_with(values: &[(&str, AttributeValue)], cases: &[(&str, Strin
         .iter()
         .filter_map(|(expr, expected)| {
             let values = used_values(expr, &all);
-            let actual = match parse_search_filter(expr, None, Some(&values), 50) {
+            let actual = match parse_search_filter(
+                expr,
+                None,
+                Some(&values),
+                50,
+                &crate::limits::LimitsConfig::default(),
+            ) {
                 Ok(_) => OK.to_owned(),
                 Err(DynamoDbError::ValidationException(m)) => m,
                 Err(other) => format!("{other:?}"),

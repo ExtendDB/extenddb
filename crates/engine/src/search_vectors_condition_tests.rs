@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{
     AttributeDefinition, AttributeValue, Item, ScalarAttributeType, SearchSchemaElement,
     SearchSchemaElementType,
@@ -120,6 +121,7 @@ async fn routed(setting: &str, hash: bool, expr: &str, item: &Item) -> Routed {
         None,
         Some(&values),
         None,
+        &LimitsConfig::default(),
     )
     .await
     .unwrap();
@@ -292,6 +294,7 @@ async fn without_the_setting(
             names,
             Some(&values),
             None,
+            &LimitsConfig::default(),
         )
         .await?;
         let (hash_key, filters, item_filter) = resolve(

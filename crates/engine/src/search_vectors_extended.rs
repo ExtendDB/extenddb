@@ -37,6 +37,7 @@ mod imp {
         DEFAULT_MAX_CONDITIONS, SearchFilter, name_refs, parse_search_filter,
     };
     use extenddb_core::expression::search_params::with_unused_names;
+    use extenddb_core::limits::LimitsConfig;
     use extenddb_core::types::{AttributeDefinition, AttributeValue, Item, SearchSchemaElement};
     use extenddb_storage::error::StorageError;
     use extenddb_storage::{StorageEngine, VectorItemFilter};
@@ -63,9 +64,10 @@ mod imp {
         names: Option<&HashMap<String, String>>,
         values: Option<&HashMap<String, AttributeValue>>,
         projection: Option<&str>,
+        limits: &LimitsConfig,
     ) -> Result<Extended, DynamoDbError> {
         with_unused_names(
-            parse_search_filter(expr, names, values, DEFAULT_MAX_CONDITIONS),
+            parse_search_filter(expr, names, values, DEFAULT_MAX_CONDITIONS, limits),
             names,
             &name_refs(expr),
             projection.unwrap_or_default(),

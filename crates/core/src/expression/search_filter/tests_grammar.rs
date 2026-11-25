@@ -222,12 +222,17 @@ fn between_bounds_compare_numbers_exactly() {
         .iter()
         .filter_map(|(lo, hi, expected)| {
             let values = HashMap::from([(":lo".to_owned(), n(lo)), (":hi".to_owned(), n(hi))]);
-            let actual =
-                match parse_search_filter("Price BETWEEN :lo AND :hi", None, Some(&values), 50) {
-                    Ok(_) => OK.to_owned(),
-                    Err(DynamoDbError::ValidationException(m)) => m,
-                    Err(other) => format!("{other:?}"),
-                };
+            let actual = match parse_search_filter(
+                "Price BETWEEN :lo AND :hi",
+                None,
+                Some(&values),
+                50,
+                &crate::limits::LimitsConfig::default(),
+            ) {
+                Ok(_) => OK.to_owned(),
+                Err(DynamoDbError::ValidationException(m)) => m,
+                Err(other) => format!("{other:?}"),
+            };
             (&actual != expected)
                 .then(|| format!("{lo} / {hi}: expected {expected:?}, got {actual:?}"))
         })
@@ -397,7 +402,14 @@ fn the_combined_size_counts_each_substituted_name() {
         .collect::<Vec<_>>()
         .join(" AND ");
     let values: HashMap<_, _> = [(":s".to_owned(), super::tests_support::s("US"))].into();
-    let err = super::parse_search_filter(&expr, Some(&long), Some(&values), 50).unwrap_err();
+    let err = super::parse_search_filter(
+        &expr,
+        Some(&long),
+        Some(&values),
+        50,
+        &crate::limits::LimitsConfig::default(),
+    )
+    .unwrap_err();
     assert_eq!(
         super::tests_support::message(err),
         p("Expression size has exceeded the maximum allowed size;")
@@ -413,13 +425,27 @@ fn an_unused_value_is_named_without_the_prefix() {
         (":w".to_owned(), super::tests_support::s("unused")),
     ]
     .into();
-    let err = super::parse_search_filter("a > :s", None, Some(&values), 50).unwrap_err();
+    let err = super::parse_search_filter(
+        "a > :s",
+        None,
+        Some(&values),
+        50,
+        &crate::limits::LimitsConfig::default(),
+    )
+    .unwrap_err();
     assert_eq!(
         super::tests_support::message(err),
         "Value provided in ExpressionAttributeValues unused in expressions: keys: {:w, :x}"
     );
     // a parse failure answers before the unused value
-    let err = super::parse_search_filter("a > :s OR", None, Some(&values), 50).unwrap_err();
+    let err = super::parse_search_filter(
+        "a > :s OR",
+        None,
+        Some(&values),
+        50,
+        &crate::limits::LimitsConfig::default(),
+    )
+    .unwrap_err();
     assert_eq!(
         super::tests_support::message(err),
         p("Syntax error; token: \"<EOF>\", near: \"OR\"")
@@ -479,7 +505,13 @@ fn a_name_cannot_start_with_an_underscore() {
         .iter()
         .filter_map(|(expr, expected)| {
             let values = used_values(expr, &all);
-            let actual = match parse_search_filter(expr, Some(&names), Some(&values), 50) {
+            let actual = match parse_search_filter(
+                expr,
+                Some(&names),
+                Some(&values),
+                50,
+                &crate::limits::LimitsConfig::default(),
+            ) {
                 Ok(_) => OK.to_owned(),
                 Err(DynamoDbError::ValidationException(m)) => m,
                 Err(other) => format!("{other:?}"),
@@ -489,4 +521,29 @@ fn a_name_cannot_start_with_an_underscore() {
         })
         .collect();
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+/// The expression size limit is `max_expression_length_bytes` of `[limits]`,
+/// the key the other expressions read.
+#[test]
+fn the_expression_size_limit_follows_the_limits_key() {
+    use super::parse_search_filter;
+    use crate::limits::LimitsConfig;
+
+    let values = super::tests_support::all_values();
+    let expr = format!("{} = :s", "a".repeat(5_008 - " = :s".len()));
+    let raised = LimitsConfig {
+        max_expression_length_bytes: 8192,
+        ..LimitsConfig::default()
+    };
+    let used: std::collections::HashMap<_, _> =
+        values.into_iter().filter(|(k, _)| k == ":s").collect();
+    assert!(parse_search_filter(&expr, None, Some(&used), 50, &raised).is_ok());
+    let err = parse_search_filter(&expr, None, Some(&used), 50, &LimitsConfig::default())
+        .err()
+        .map(super::tests_support::message);
+    assert_eq!(
+        err.as_deref(),
+        Some(p("Expression size has exceeded the maximum allowed size;").as_str())
+    );
 }

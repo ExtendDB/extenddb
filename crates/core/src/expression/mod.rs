@@ -35,7 +35,7 @@ pub use key_condition::{
     KeyClauseOperand, KeyCondition, SortKeyCondition, key_condition_clause_operands,
     parse_key_condition,
 };
-pub use kind::ExpressionKind;
+pub use kind::{ExpressionKind, check_expression_size};
 pub use parser::{parse_condition, parse_condition_with_depth_limit};
 pub use projection::{Projection, parse_projection};
 pub use reserved_words::validate_no_reserved_words;

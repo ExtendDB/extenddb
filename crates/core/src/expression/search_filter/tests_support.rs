@@ -64,7 +64,13 @@ pub(super) fn used_values(
 
 pub(super) fn parse_with(expr: &str, max: usize) -> Result<SearchFilter, DynamoDbError> {
     let values = used_values(expr, &all_values());
-    parse_search_filter(expr, Some(&names()), Some(&values), max)
+    parse_search_filter(
+        expr,
+        Some(&names()),
+        Some(&values),
+        max,
+        &crate::limits::LimitsConfig::default(),
+    )
 }
 
 /// `Ok`, or the message of the error.

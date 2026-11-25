@@ -51,7 +51,13 @@ fn outcome_on(stack: usize, expr: &str) -> String {
     let expr = expr.to_owned();
     on_stack(stack, move || {
         let values = values_for(&expr);
-        match parse_search_filter(&expr, None, Some(&values), DEFAULT_MAX_CONDITIONS) {
+        match parse_search_filter(
+            &expr,
+            None,
+            Some(&values),
+            DEFAULT_MAX_CONDITIONS,
+            &crate::limits::LimitsConfig::default(),
+        ) {
             Ok(_) => OK.to_owned(),
             Err(DynamoDbError::ValidationException(m)) => m,
             Err(other) => format!("{other:?}"),
@@ -214,8 +220,14 @@ fn the_deepest_accepted_condition_parses_and_evaluates() {
     assert_eq!(outcome_on(WORKER_STACK, &accepted), OK);
     let matched = on_stack(WORKER_STACK, move || {
         let values = values_for(&accepted);
-        let filter = parse_search_filter(&accepted, None, Some(&values), DEFAULT_MAX_CONDITIONS)
-            .unwrap_or_else(|e| panic!("{e:?}"));
+        let filter = parse_search_filter(
+            &accepted,
+            None,
+            Some(&values),
+            DEFAULT_MAX_CONDITIONS,
+            &crate::limits::LimitsConfig::default(),
+        )
+        .unwrap_or_else(|e| panic!("{e:?}"));
         let item: Item = Item::from([("a".to_owned(), AttributeValue::S("x".to_owned()))]);
         let matched = filter.matches(&item).unwrap_or_else(|e| panic!("{e:?}"));
         drop(filter);

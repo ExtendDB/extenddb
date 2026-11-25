@@ -271,7 +271,14 @@ pub fn parse(
         })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    let filter = parse_search_filter(expr, None, Some(&used), 50).expect("parse");
+    let filter = parse_search_filter(
+        expr,
+        None,
+        Some(&used),
+        50,
+        &extenddb_core::limits::LimitsConfig::default(),
+    )
+    .expect("parse");
     let hash = filter
         .validate_against_schema(
             Some(fixture.key_info.vector_indexes[0].search_schema.as_slice()),

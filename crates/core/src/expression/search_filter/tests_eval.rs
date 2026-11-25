@@ -90,8 +90,14 @@ fn values() -> HashMap<String, AttributeValue> {
 /// The ids of the items `expr` matches, in item order.
 fn matching(expr: &str) -> Vec<String> {
     let used = used_values(expr, &values());
-    let filter = parse_search_filter(expr, None, Some(&used), 50)
-        .unwrap_or_else(|e| panic!("{expr}: {e:?}"));
+    let filter = parse_search_filter(
+        expr,
+        None,
+        Some(&used),
+        50,
+        &crate::limits::LimitsConfig::default(),
+    )
+    .unwrap_or_else(|e| panic!("{expr}: {e:?}"));
     items()
         .iter()
         .filter(|item| {
@@ -262,8 +268,14 @@ fn a_last_digit_difference_counts_only_beyond_binary64() {
         for (rest, expected) in cases {
             let expr = h(rest);
             let used = used_values(&expr, &values);
-            let filter = parse_search_filter(&expr, None, Some(&used), 50)
-                .unwrap_or_else(|e| panic!("{expr}: {e:?}"));
+            let filter = parse_search_filter(
+                &expr,
+                None,
+                Some(&used),
+                50,
+                &crate::limits::LimitsConfig::default(),
+            )
+            .unwrap_or_else(|e| panic!("{expr}: {e:?}"));
             let actual: Vec<&str> = rows
                 .iter()
                 .filter(|(_, price)| {

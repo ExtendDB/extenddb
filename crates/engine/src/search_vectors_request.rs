@@ -116,6 +116,7 @@ pub(super) async fn check<'s>(
         input.expression_attribute_names.as_ref(),
         input.expression_attribute_values.as_ref(),
         input.projection_expression.as_deref(),
+        limits,
     )
     .await?;
 

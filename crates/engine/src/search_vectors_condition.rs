@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{SearchCondition, validate_conditions_against_search_schema};
+use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{
     AttributeDefinition, AttributeValue, SearchSchemaElement, SearchSchemaElementType,
 };
@@ -72,6 +73,7 @@ pub(crate) async fn parse(
     names: Option<&HashMap<String, String>>,
     values: Option<&HashMap<String, AttributeValue>>,
     projection: Option<&str>,
+    limits: &LimitsConfig,
 ) -> Result<Parsed, DynamoDbError> {
     let Some(expr) = expr else {
         return Ok(Parsed::Equality(Vec::new()));
@@ -80,7 +82,8 @@ pub(crate) async fn parse(
         crate::search_vectors_params::equality_conditions(expr, names, values, projection);
     #[cfg(feature = "search-inequality-filters")]
     {
-        let extended = crate::search_vectors_extended::parse(expr, names, values, projection);
+        let extended =
+            crate::search_vectors_extended::parse(expr, names, values, projection, limits);
         match (extended, equality) {
             (Ok(extended), Ok(conditions)) => Ok(Parsed::Either(extended, conditions)),
             (Err(a), Err(b)) if same_error(&a, &b) => Err(a),
@@ -95,7 +98,7 @@ pub(crate) async fn parse(
     }
     #[cfg(not(feature = "search-inequality-filters"))]
     {
-        let _ = (storage, account_id);
+        let _ = (storage, account_id, limits);
         equality.map(Parsed::Equality)
     }
 }

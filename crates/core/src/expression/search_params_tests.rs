@@ -8,6 +8,8 @@ use std::collections::HashMap;
 
 use std::collections::BTreeSet;
 
+use crate::limits::LimitsConfig;
+
 use super::{check_search_maps, check_unused_keys, check_unused_names, with_unused_names};
 use crate::error::DynamoDbError;
 use crate::types::AttributeValue;
@@ -43,7 +45,13 @@ fn maps(
     n: Option<&HashMap<String, String>>,
     v: Option<&HashMap<String, AttributeValue>>,
 ) -> String {
-    refused(check_search_maps(n, v, true, false))
+    refused(check_search_maps(
+        n,
+        v,
+        true,
+        false,
+        &LimitsConfig::default(),
+    ))
 }
 
 #[test]
@@ -59,7 +67,13 @@ fn an_empty_map_is_refused_names_first() {
         "ExpressionAttributeNames must not be empty"
     );
     assert_eq!(
-        refused(check_search_maps(None, Some(&empty_v), false, false)),
+        refused(check_search_maps(
+            None,
+            Some(&empty_v),
+            false,
+            false,
+            &LimitsConfig::default()
+        )),
         "ExpressionAttributeValues must not be empty"
     );
 }
@@ -165,14 +179,31 @@ fn an_attribute_name_must_be_shorter_than_65536_bytes() {
         "Attribute name is too large, must be less than 65536 bytes for key #c"
     );
     let below = "C".repeat(65535);
-    assert!(check_search_maps(Some(&names(&[("#c", &below)])), None, true, false).is_ok());
+    assert!(
+        check_search_maps(
+            Some(&names(&[("#c", &below)])),
+            None,
+            true,
+            false,
+            &LimitsConfig::default()
+        )
+        .is_ok()
+    );
 }
 
 #[test]
 fn a_map_needs_the_expression_that_reads_it() {
     let n = names(&[("#p", "Price")]);
     let v = values(&[":us"]);
-    let without = |n, v, cond, proj| refused(check_search_maps(n, v, cond, proj));
+    let without = |n, v, cond, proj| {
+        refused(check_search_maps(
+            n,
+            v,
+            cond,
+            proj,
+            &LimitsConfig::default(),
+        ))
+    };
     assert_eq!(
         without(Some(&n), None, false, false),
         "ExpressionAttributeNames can only be specified when using expressions"
@@ -189,8 +220,8 @@ fn a_map_needs_the_expression_that_reads_it() {
         without(Some(&n), Some(&v), false, true),
         "ExpressionAttributeValues can only be specified when using expressions"
     );
-    assert!(check_search_maps(Some(&n), None, false, true).is_ok());
-    assert!(check_search_maps(Some(&n), Some(&v), true, false).is_ok());
+    assert!(check_search_maps(Some(&n), None, false, true, &LimitsConfig::default()).is_ok());
+    assert!(check_search_maps(Some(&n), Some(&v), true, false, &LimitsConfig::default()).is_ok());
 }
 
 #[test]
@@ -292,4 +323,26 @@ fn equality_grammar_names_are_the_keys_it_resolves() {
     }
     let n = names(&[("#c", "cat")]);
     assert!(check_unused_names(Some(&n), &refs, "").is_ok());
+}
+
+/// The name size limit is `max_attribute_name_bytes` of `[limits]`, the key
+/// the other operations read, with the message of this endpoint.
+#[test]
+fn the_name_size_limit_follows_the_limits_key() {
+    let n = names(&[("#c", &"C".repeat(70_000))]);
+    let raised = LimitsConfig {
+        max_attribute_name_bytes: 100_000,
+        ..LimitsConfig::default()
+    };
+    assert!(check_search_maps(Some(&n), None, true, false, &raised).is_ok());
+    assert_eq!(
+        refused(check_search_maps(
+            Some(&n),
+            None,
+            true,
+            false,
+            &LimitsConfig::default()
+        )),
+        "Attribute name is too large, must be less than 65536 bytes for key #c"
+    );
 }

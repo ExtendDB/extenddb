@@ -128,7 +128,14 @@ async fn the_partition_scopes_the_search_without_the_condition() {
     run("COSINE", ROWS, async |f: &Fixture| {
         // A condition with no HASH term, so only the partition keeps c2 out.
         let v = values(&[("p100", "100")]);
-        let filter = parse_search_filter("Price = :p100", None, Some(&v), 50).expect("parse");
+        let filter = parse_search_filter(
+            "Price = :p100",
+            None,
+            Some(&v),
+            50,
+            &extenddb_core::limits::LimitsConfig::default(),
+        )
+        .expect("parse");
         let us = AttributeValue::S("US".to_owned());
         let hits = search_with(
             f,

@@ -9,8 +9,9 @@
 //! answers ahead of a dimension mismatch, a missing table and any expression
 //! error. In order:
 //!
-//! 1. the names: an empty attribute name anywhere in the map, then a name of
-//!    65536 bytes or more, then an empty map, then each key (empty, longer than
+//! 1. the names: an empty attribute name anywhere in the map, then a name
+//!    longer than `max_attribute_name_bytes` of `[limits]` (65535 by
+//!    default), then an empty map, then each key (empty, longer than
 //!    255 bytes, not `#` followed by letters, digits or `_`);
 //! 2. the values: an empty map, then each key, as for the names with `:`;
 //! 3. names with neither a search condition nor a projection, then values
@@ -30,11 +31,10 @@ use std::collections::{BTreeSet, HashMap};
 
 use crate::error::DynamoDbError;
 use crate::expression::validate_expression_param_usage;
+use crate::limits::LimitsConfig;
 use crate::serde_helpers::validate_placeholder_key;
 use crate::types::AttributeValue;
-
-/// An attribute name must be shorter than this many bytes.
-const NAME_LIMIT_BYTES: usize = 65536;
+use crate::validation::{AttributeNameRequestForm, validate_expression_attribute_name_sizes};
 
 const NAMES: &str = "ExpressionAttributeNames";
 const VALUES: &str = "ExpressionAttributeValues";
@@ -68,20 +68,21 @@ fn check_keys<'a>(
     })
 }
 
-fn check_names(names: &HashMap<String, String>) -> Result<(), DynamoDbError> {
+fn check_names(
+    names: &HashMap<String, String>,
+    limits: &LimitsConfig,
+) -> Result<(), DynamoDbError> {
     if let Some((key, _)) = names.iter().find(|(_, name)| name.is_empty()) {
         return Err(invalid(format!(
             "{NAMES} contains invalid value: Empty attribute name for key {key}"
         )));
     }
-    if let Some((key, _)) = names
-        .iter()
-        .find(|(_, name)| name.len() >= NAME_LIMIT_BYTES)
-    {
-        return Err(invalid(format!(
-            "Attribute name is too large, must be less than {NAME_LIMIT_BYTES} bytes for key {key}"
-        )));
-    }
+    validate_expression_attribute_name_sizes(
+        Some(names),
+        None,
+        limits,
+        AttributeNameRequestForm::SearchRequest,
+    )?;
     check_keys(NAMES, '#', names.keys())
 }
 
@@ -97,9 +98,10 @@ pub fn check_search_maps(
     values: Option<&HashMap<String, AttributeValue>>,
     has_condition: bool,
     has_projection: bool,
+    limits: &LimitsConfig,
 ) -> Result<(), DynamoDbError> {
     if let Some(names) = names {
-        check_names(names)?;
+        check_names(names, limits)?;
     }
     if let Some(values) = values {
         check_keys(VALUES, ':', values.keys())?;

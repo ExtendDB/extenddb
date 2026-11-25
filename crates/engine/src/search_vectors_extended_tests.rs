@@ -69,8 +69,17 @@ async fn enabled(storage: &Arc<dyn StorageEngine>) -> Result<bool, DynamoDbError
     enabled_for(storage, CALLER).await
 }
 
+static LIMITS: std::sync::LazyLock<extenddb_core::limits::LimitsConfig> =
+    std::sync::LazyLock::new(extenddb_core::limits::LimitsConfig::default);
+
 fn parsed(expr: &str) -> Result<super::imp::Extended, DynamoDbError> {
-    parse(expr, None, Some(&values()), None)
+    parse(
+        expr,
+        None,
+        Some(&values()),
+        None,
+        &extenddb_core::limits::LimitsConfig::default(),
+    )
 }
 
 #[tokio::test]
@@ -132,7 +141,7 @@ fn the_extended_grammar_gives_its_own_messages() {
 fn a_name_neither_expression_uses_is_refused() {
     let values = values();
     let names: HashMap<String, String> = [("#u".to_owned(), "x".to_owned())].into();
-    let err = parse(INEQUALITY, Some(&names), Some(&values), None)
+    let err = parse(INEQUALITY, Some(&names), Some(&values), None, &LIMITS)
         .err()
         .expect("refused");
     assert!(
@@ -141,7 +150,7 @@ fn a_name_neither_expression_uses_is_refused() {
         "{err:?}"
     );
     let used: HashMap<String, String> = [("#u".to_owned(), "Price".to_owned())].into();
-    assert!(parse(INEQUALITY, Some(&used), Some(&values), Some("#u")).is_ok());
+    assert!(parse(INEQUALITY, Some(&used), Some(&values), Some("#u"), &LIMITS).is_ok());
 }
 
 fn item(country: &str, price: &str) -> Item {

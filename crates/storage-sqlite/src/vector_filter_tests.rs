@@ -156,7 +156,14 @@ async fn search(
         })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    let filter = parse_search_filter(expr, None, Some(&used), 50).expect("parse");
+    let filter = parse_search_filter(
+        expr,
+        None,
+        Some(&used),
+        50,
+        &extenddb_core::limits::LimitsConfig::default(),
+    )
+    .expect("parse");
     let schema = &key_info.vector_indexes[0].search_schema;
     let definitions = &key_info.attribute_definitions;
     let hash = filter
