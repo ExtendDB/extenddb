@@ -17,10 +17,16 @@
 //! end on a connection nobody reads.
 //!
 //! The cancel names the backend by process id and by the start time of the
-//! search transaction, and PostgreSQL signals it only while that backend is
-//! still inside that transaction. A transaction-pooling proxy can hand the
-//! backend to another client as soon as this one disconnects, and a process
-//! id alone would then cancel that client's statement.
+//! search transaction: it signals the backend only when `pg_stat_activity`
+//! shows that backend in that transaction. A transaction-pooling proxy can
+//! hand the backend to another client as soon as this one disconnects, and a
+//! process id alone would then cancel that client's statement. The check
+//! narrows that window and does not close it. `pg_stat_activity` is a copy
+//! of the backend status taken once per transaction of the cancelling
+//! session, and `pg_cancel_backend` signals the process id without looking
+//! at its transaction, so a backend that ends the search transaction between
+//! the copy and the signal, and starts another client's, still gets the
+//! signal.
 
 use sqlx::pool::PoolConnection;
 use sqlx::{PgConnection, PgPool, Postgres};
@@ -109,8 +115,10 @@ const XACT_OF_THIS_BACKEND: &str =
 /// transaction that started at `xact_start`. Returns whether a cancel was
 /// sent.
 ///
-/// No row matches once the backend has exited, has ended the transaction, or
-/// serves another client's transaction; then nothing is signalled.
+/// No row matches when the status copy shows the backend exited, out of the
+/// transaction, or in another client's transaction; then nothing is
+/// signalled. A backend that changes transaction after the copy is
+/// signalled all the same.
 async fn cancel_if_in_transaction(pool: PgPool, (pid, xact_start): (i32, i64)) -> bool {
     sqlx::query_scalar::<_, bool>(
         "SELECT pg_cancel_backend(pid) FROM pg_stat_activity \
