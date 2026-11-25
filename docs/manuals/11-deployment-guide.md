@@ -396,8 +396,8 @@ second holds the most buckets, 1,742, which is 111,488 bytes (109 KiB). An
 operation the account sends once a day holds two buckets. With its keys and
 map entries that is 286 to 429 bytes when the account sends 3 to 40
 operations. The cost steps up each time the account's map of operations grows.
-It is 475 bytes with 2 operations, and 810 bytes when the account sends only
-that operation. These figures come from a release build with a counting
+It is about 475 bytes with 2 operations, and about 810 bytes when the account
+sends only that operation. These figures come from a release build with a counting
 allocator and 1,000 accounts, on 24 November 2026. With the 40
 operations the server dispatches, an account that sends every operation every
 second holds about 4.46 MB (4.25 MiB) of buckets. An account that sends each
@@ -417,7 +417,9 @@ with the table count or uptime, they do not grow. With
 bucket for each distinct value of the first attribute in the `Key` or `Item`
 of a GetItem, PutItem, UpdateItem or DeleteItem. That attribute comes first in
 name order, or in the request's order on a build with the MongoDB backend. So
-it can be the sort key. It never drops a bucket. Resident memory then grows
+it can be the sort key, and on a PutItem it can be any attribute of the `Item`.
+A first value that is a map, a list, a set, a BOOL or a NULL keys its buckets
+on the empty string. It never drops a bucket. Resident memory then grows
 with the number of distinct values those requests carry.
 
 Every release through 1.0.0 kept one latency segment record per request that
