@@ -44,10 +44,13 @@ impl TableThroughputRecord {
     ///
     /// Amazon DynamoDB answers a request that raises either unit with
     /// `LastIncreaseDateTime` in whole milliseconds, and every DescribeTable
-    /// after it carries one. A request that lowers both units leaves it as it
-    /// was. After a switch from `PAY_PER_REQUEST`, whose units read as zero,
-    /// the member is sent only while the table is `UPDATING` (measured in
-    /// us-east-1 on 2026-11-14, 2026-11-16 and 2026-11-19).
+    /// after it carries one. After a switch from `PAY_PER_REQUEST`, whose
+    /// units read as zero, the member is sent only while the table is
+    /// `UPDATING` (measured in us-east-1 on 2026-11-14, 2026-11-16 and
+    /// 2026-11-19). A request that lowers both units leaves the member as it
+    /// was: the DynamoDB API reference of `ProvisionedThroughputDescription`
+    /// defines it as "the date and time of the last provisioned throughput
+    /// increase for this table".
     #[must_use]
     pub fn for_update(
         stored: Option<Self>,
@@ -121,6 +124,29 @@ mod tests {
         assert_eq!(
             (units.read_capacity_units, units.write_capacity_units),
             (5, 7)
+        );
+    }
+
+    /// A request that lowers both units keeps the instant of the last raise.
+    #[test]
+    fn a_lowering_keeps_the_instant_of_the_last_raise() {
+        let raised = TableThroughputRecord {
+            read_capacity_units: 9,
+            write_capacity_units: 11,
+            last_increase_date_time: Some(1_794_674_043.024),
+            reported_until: None,
+        };
+        let lowered = ProvisionedThroughput {
+            read_capacity_units: 4,
+            write_capacity_units: 6,
+        };
+        assert_eq!(
+            TableThroughputRecord::for_update(Some(raised), true, &lowered, None),
+            TableThroughputRecord {
+                read_capacity_units: 4,
+                write_capacity_units: 6,
+                ..raised
+            }
         );
     }
 }
