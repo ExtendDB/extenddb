@@ -582,7 +582,7 @@ mod tests {
             ),
             (deep_bool.as_str(), "BOOL value must be a boolean"),
             // A `B` value or a `BS` member the service cannot decode, with
-            // its text (measured 2026-11-20).
+            // its text (measured 2026-11-20, 2026-11-21 and 2026-11-25).
             ("[{\"B\":\"%%%\"}]", LENGTH_3),
             ("[{\"BS\":[\"%%%\"]}]", LENGTH_3),
             ("[{\"B\":\"AQ=\"}]", LENGTH_3),
