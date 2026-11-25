@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+"""Fail when a PR title is not a conventional commit subject.
+
+    devtools/check-pr-title "<title>"
+
+Squash is the only merge method, and a squash commit takes the PR title as
+its subject. The release automation tracked in #1395 will build the changelog
+from those subjects. A title passes when it has the form
+
+    type(scope)!: summary
+
+where `type` is one of TYPES, `(scope)` and `!` are optional, and the colon
+is followed by one space and the summary. A scope is lowercase letters,
+digits, `.`, `_`, `/` and `-`, and starts with a letter or a digit.
+
+Exit 0 when the title passes, 1 otherwise, with the reason on stderr.
+"""
+
+import re
+import sys
+
+TYPES = (
+    "build", "chore", "ci", "docs", "feat", "fix", "perf", "refactor", "revert", "style", "test",
+)
+SHAPE_RE = re.compile(r"^(?P<type>[^(!:\s]+)(?:\((?P<scope>[^)]*)\))?(?P<breaking>!)?:(?P<rest>.*)$")
+SCOPE_RE = re.compile(r"[a-z0-9][a-z0-9._/-]*")
+SUMMARY_RE = re.compile(r" \S")
+
+
+def check(title):
+    """Return None when the title passes, or the reason it does not."""
+    if title != title.strip():
+        return "the title starts or ends with white space"
+    if "\n" in title or "\r" in title:
+        return "the title has more than one line"
+    match = SHAPE_RE.match(title)
+    if match is None:
+        return (
+            "the title is not `type(scope): summary`; the scope and a `!` before the colon "
+            "are optional"
+        )
+    if match.group("type") not in TYPES:
+        return f"`{match.group('type')}` is not one of {', '.join(TYPES)}"
+    scope = match.group("scope")
+    if scope == "":
+        return "the parentheses hold no scope; leave them out or name a scope"
+    if scope is not None and not SCOPE_RE.fullmatch(scope):
+        return (
+            f"the scope `{scope}` is not lowercase letters, digits, `.`, `_`, `/` and `-`, "
+            "starting with a letter or a digit"
+        )
+    if not SUMMARY_RE.match(match.group("rest")):
+        return "the colon is not followed by one space and the summary"
+    return None
+
+
+def main(argv):
+    if len(argv) != 2:
+        print(__doc__.split("\n\n")[1], file=sys.stderr)
+        return 2
+    reason = check(argv[1])
+    if reason is not None:
+        print(f"FAIL: {argv[1]!r}: {reason}.", file=sys.stderr)
+        print("The title becomes the commit subject on main; see CONTRIBUTING.md.", file=sys.stderr)
+        return 1
+    print(f"ok: {argv[1]!r}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
