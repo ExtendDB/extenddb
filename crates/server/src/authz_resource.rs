@@ -822,7 +822,7 @@ fn restore_target_actions(input: &Value, region: &str, account_id: &str) -> Vec<
 }
 
 /// The bare table name from a value that may be a name or a table ARN.
-fn table_name_only(value: &str) -> String {
+pub(crate) fn table_name_only(value: &str) -> String {
     if value.starts_with("arn:")
         && let Some(rid) = parse_resource_identity(value)
     {

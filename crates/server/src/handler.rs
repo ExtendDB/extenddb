@@ -21,8 +21,9 @@ use crate::request_helpers::{
 };
 use crate::response::{error_response, record_error_metrics, success_response};
 use crate::throttle_helpers::{
-    classify_data_operation, extract_partition_value, record_partial_batch_throttle,
-    table_description_to_throughput, throttle_error, update_throttle_buckets,
+    batch_entry_counts, classify_data_operation, extract_partition_value,
+    record_partial_batch_throttle, table_description_to_throughput, throttle_error,
+    update_throttle_buckets,
 };
 
 /// Main Virtual `DynamoDB` request handler.
@@ -281,6 +282,10 @@ pub(crate) async fn handle_request(
     let throttle_us = throttle_start.elapsed().as_micros() as f64;
 
     // --- Dispatch segment ---
+    // The entries of a batch, for the throttle events of a batch whose every
+    // entry a backend throttled: the engine answers that one with the error
+    // alone (`input` moves into the dispatch).
+    let batch_entries = batch_entry_counts(&operation, &input);
     let dispatch_start = std::time::Instant::now();
     let dispatch_result =
         extenddb_engine::dispatch(&operation, input, &ctx, &state.server_addr).await;
@@ -394,6 +399,16 @@ pub(crate) async fn handle_request(
                 metric_table.as_deref(),
                 &operation,
             );
+            // A throttle error from a batch is the engine's answer to a batch
+            // whose every entry a backend throttled: each entry is a throttle
+            // event, as on a 200. A throttle the backend reports on the catalog
+            // read also comes out as the batch's throttle error and counts every
+            // entry; the service has no such failure.
+            if e.is_throttle()
+                && let Some(entries) = &batch_entries
+            {
+                record_partial_batch_throttle(&state.metrics, &ctx.account_id, &operation, entries);
+            }
             error_response(&e, &request_id)
         }
     };
