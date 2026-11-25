@@ -171,6 +171,117 @@ fn return_consumed_capacity_is_reported_ahead_of_the_parameter_mix() {
 }
 
 #[test]
+fn each_member_and_value_is_read_on_its_own_for_a_shape_fault() {
+    // Measured 2026-11-23, each body twice, with a table that does not exist.
+    // A shape fault is reported past an unknown descriptor or an empty set in
+    // another member or value, a number or an `"on"` in `ConsistentRead` is a
+    // shape fault, and a member the service reads from a JSON type the typed
+    // input refuses leaves the check's answer. Measured 2026-11-24 the same
+    // way: a null member and a null name leave the check's answer too. Each
+    // row holds the values, the other members and the answer.
+    let shape = |text: &str| {
+        (
+            "SerializationException",
+            format!("Start of structure or map found where not expected: {text}"),
+        )
+    };
+    let select_5 = shape("invalid type: integer `5`, expected a string");
+    let select_nope = (
+        "ValidationException",
+        one_error(&super::tests::SELECT_BAD.replace("'bad'", "'NOPE'")),
+    );
+    let (x1, sx) = (json!({":u": {"X": "1"}}), json!({":p": {"S": "x"}}));
+    let rows = [
+        (
+            x1.clone(),
+            json!({"Limit": 0, "Select": 5, "KeyConditionExpression": "pk = :u"}),
+            select_5.clone(),
+        ),
+        (
+            x1,
+            json!({"Limit": 0, "KeyConditionExpression": "pk = :u"}),
+            ("ValidationException", one_error(LIMIT_ZERO)),
+        ),
+        (
+            json!({":p": {"S": "x"}, ":s": {"NS": []}}),
+            json!({"Limit": 0, "Select": 5}),
+            select_5,
+        ),
+        (
+            json!({":p": {"S": "x"}, ":a": {"NS": []}, ":b": {"S": 5}}),
+            json!({"Limit": 0}),
+            shape("S value must be a string"),
+        ),
+        (
+            sx.clone(),
+            json!({"ConsistentRead": 1, "Select": "NOPE"}),
+            shape("invalid type: integer `1`, expected a boolean"),
+        ),
+        (
+            sx.clone(),
+            json!({"ConsistentRead": "true", "Select": "NOPE"}),
+            select_nope.clone(),
+        ),
+        (
+            sx.clone(),
+            json!({"ConsistentRead": "T", "Select": "NOPE"}),
+            select_nope.clone(),
+        ),
+        (
+            sx.clone(),
+            json!({"ConsistentRead": "on", "Select": "NOPE"}),
+            shape(r#"invalid type: string "on", expected a boolean"#),
+        ),
+        (
+            sx.clone(),
+            json!({"ScanIndexForward": "true", "Select": "NOPE"}),
+            select_nope.clone(),
+        ),
+        (
+            sx.clone(),
+            json!({"ScanIndexForward": "0", "Select": "NOPE"}),
+            select_nope.clone(),
+        ),
+        (
+            sx.clone(),
+            json!({"Limit": 1.5, "Select": "NOPE"}),
+            select_nope.clone(),
+        ),
+        (
+            sx.clone(),
+            json!({"ScanIndexForward": null, "Select": "NOPE"}),
+            select_nope.clone(),
+        ),
+        (
+            sx.clone(),
+            json!({"ExpressionAttributeNames": {"#a": null}, "Select": "NOPE"}),
+            select_nope,
+        ),
+        (
+            sx,
+            json!({"ExpressionAttributeNames": {"#a": null}, "ReturnConsumedCapacity": "NOPE"}),
+            (
+                "ValidationException",
+                one_error(&RCC_BAD.replace("'bad'", "'NOPE'")),
+            ),
+        ),
+    ];
+    let mismatches: Vec<String> = rows
+        .into_iter()
+        .filter_map(|(values, extra, expected)| {
+            let body = super::tests::body_with(values, extra);
+            let answer = match validate_query_request_body(&body) {
+                Err(DynamoDbError::SerializationException(msg)) => ("SerializationException", msg),
+                Err(DynamoDbError::ValidationException(msg)) => ("ValidationException", msg),
+                other => panic!("{body}: unexpected answer {other:?}"),
+            };
+            (answer != expected).then(|| format!("{body}: {answer:?}"))
+        })
+        .collect();
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+}
+
+#[test]
 fn a_shape_fault_in_another_field_is_reported_ahead_of_the_checks() {
     // Measured 2026-10-25: a field of the wrong JSON type
     // anywhere in the body answers SerializationException even when a Limit,
