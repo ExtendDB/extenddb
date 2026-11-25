@@ -83,29 +83,17 @@ pub(crate) async fn handle_request(
         Err(e) => return error_response(&e, &request_id),
     };
 
-    // --- Pre-auth operation validation ---
-    // Real DynamoDB validates the operation name before checking authentication.
-    // An unknown operation returns UnknownOperationException even without auth headers.
-    if !extenddb_engine::is_known_operation(&operation) {
-        return error_response(
-            &DynamoDbError::UnknownOperationException(String::new()),
-            &request_id,
-        );
-    }
-
-    // --- Pre-auth body validation ---
-    // Real DynamoDB validates request format (empty body, invalid JSON) before
-    // authentication. Malformed requests get 400 regardless of auth state.
-    let input: Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(e) => {
-            return error_response(
-                &DynamoDbError::SerializationException(format!(
-                    "Start of structure or map found where not expected: {e}"
-                )),
-                &request_id,
-            );
-        }
+    // --- Pre-auth request checks ---
+    // Real DynamoDB validates the operation name, then the request format
+    // (empty body, invalid JSON), before checking authentication: an unknown
+    // operation returns UnknownOperationException even without auth headers,
+    // and a malformed request gets 400 regardless of auth state.
+    // `extenddb_engine::parse_request` makes both checks, in that order; the
+    // module doc of extenddb-engine's `src/pre_dispatch.rs` says which checks
+    // belong in the engine rather than here.
+    let request = match extenddb_engine::parse_request(&operation, &body) {
+        Ok(request) => request,
+        Err(e) => return error_response(&e, &request_id),
     };
 
     // --- Auth segment ---
@@ -124,20 +112,24 @@ pub(crate) async fn handle_request(
         }
     };
 
-    // Point-in-time recovery is not in this release: a restore and an enable
-    // are refused here, for every caller and before any table is read, where
-    // the service would authorize them first.
-    if let Some(e) = extenddb_engine::refuse_point_in_time_recovery(&operation, &input) {
-        tracing::warn!(
-            request_id = %request_id,
-            operation = %operation,
-            principal = crate::authz_resource::cross_account::principal_arn(&identity),
-            "Point-in-time recovery refused"
-        );
-        record_error_metrics(&state.metrics, &e, &account_id, None, &operation);
-        state.metrics.record_request_count(&account_id, &operation);
-        return error_response(&e, &request_id);
-    }
+    // Point-in-time recovery is not in this release: `admit` refuses a restore
+    // and an enable here, for every caller and before any table is read, where
+    // the service would authorize them first. The point-in-time refusal is the
+    // only one `admit` makes, so the log line names it.
+    let input: Value = match request.admit() {
+        Ok(input) => input,
+        Err(e) => {
+            tracing::warn!(
+                request_id = %request_id,
+                operation = %operation,
+                principal = crate::authz_resource::cross_account::principal_arn(&identity),
+                "Point-in-time recovery refused"
+            );
+            record_error_metrics(&state.metrics, &e, &account_id, None, &operation);
+            state.metrics.record_request_count(&account_id, &operation);
+            return error_response(&e, &request_id);
+        }
+    };
 
     // The service checks a SearchVectors request before it authorizes it, as
     // far as the checks need no table: the body, IndexName, SearchVector,

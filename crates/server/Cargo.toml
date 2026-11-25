@@ -34,7 +34,7 @@ search-inequality-filters = ["extenddb-core/search-inequality-filters", "extendd
 extenddb-cache = { workspace = true }
 extenddb-core = { workspace = true }
 extenddb-config = { workspace = true }
-extenddb-engine = { workspace = true }
+extenddb-engine = { workspace = true, features = ["default"] }
 extenddb-storage = { workspace = true }
 extenddb-backup-store = { workspace = true }
 extenddb-auth = { workspace = true }
