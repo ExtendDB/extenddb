@@ -1010,27 +1010,6 @@ impl MongoEngine {
         self.store_warm_throughput_updates(account_id, &input)
             .await?;
 
-        if clear_provisioned_throughput {
-            let table_doc = tables_coll
-                .find_one(doc! {
-                    "_id": { "account_id": account_id, "table_name": &input.table_name },
-                })
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?
-                .ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
-            let table_id = table_doc
-                .get_str("table_id")
-                .map_err(|_| StorageError::Internal("missing table_id".to_owned()))?;
-            self.catalog_db
-                .collection::<Document>("indexes")
-                .update_many(
-                    doc! { "_id.table_id": table_id, "index_type": "GSI" },
-                    doc! { "$set": { "provisioned_throughput": bson::Bson::Null } },
-                )
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-        }
-
         // A provisioned index's new ProvisionedThroughput, in the shape the
         // create path writes. The engine has checked the units, that the
         // table is PROVISIONED before and after the request, and that the
@@ -1046,7 +1025,7 @@ impl MongoEngine {
                     .map(|pt| (&u.index_name, pt))
             })
             .collect();
-        if !throughput_updates.is_empty() {
+        if clear_provisioned_throughput || !throughput_updates.is_empty() {
             let table_doc = tables_coll
                 .find_one(doc! {
                     "_id": { "account_id": account_id, "table_name": &input.table_name },
@@ -1058,6 +1037,15 @@ impl MongoEngine {
                 .get_str("table_id")
                 .map_err(|_| StorageError::Internal("missing table_id".to_owned()))?;
             let indexes = self.catalog_db.collection::<Document>("indexes");
+            if clear_provisioned_throughput {
+                indexes
+                    .update_many(
+                        doc! { "_id.table_id": table_id, "index_type": "GSI" },
+                        doc! { "$set": { "provisioned_throughput": bson::Bson::Null } },
+                    )
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+            }
             for (index_name, pt) in throughput_updates {
                 let pt_bson =
                     bson::to_bson(&pt).map_err(|e| StorageError::Internal(e.to_string()))?;

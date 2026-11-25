@@ -14,8 +14,8 @@
 //! backfill lifecycle the service was measured to report.
 
 use extenddb_core::types::{
-    AttributeDefinition, BillingMode, KeySchemaElement, ProvisionedThroughputDescription,
-    TableDescription, UpdateTableInput, VectorIndexSpecification,
+    AttributeDefinition, BillingMode, KeySchemaElement, TableDescription, UpdateTableInput,
+    VectorIndexSpecification,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{
@@ -24,6 +24,7 @@ use extenddb_storage::util::{
 };
 
 use crate::store::SqliteEngine;
+use crate::table_helpers::gsi_throughput_json;
 
 /// Refuse a GSI Create, or a Delete of a GSI other than the one building, while
 /// a GSI on the table is `CREATING`.
@@ -67,14 +68,7 @@ async fn store_index_throughput_updates(
         let Some(pt) = update.provisioned_throughput_units() else {
             continue;
         };
-        let stored = serde_json::to_string(&ProvisionedThroughputDescription {
-            read_capacity_units: pt.read_capacity_units,
-            write_capacity_units: pt.write_capacity_units,
-            number_of_decreases_today: 0,
-            last_increase_date_time: None,
-            last_decrease_date_time: None,
-        })
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let stored = gsi_throughput_json(&pt)?;
         let written = sqlx::query(
             "UPDATE indexes SET provisioned_throughput = ? \
              WHERE table_id = ? AND index_name = ? AND index_type = 'GSI'",
@@ -419,17 +413,8 @@ impl SqliteEngine {
                     let pt = create
                         .provisioned_throughput
                         .as_ref()
-                        .map(|pt| {
-                            serde_json::to_string(&ProvisionedThroughputDescription {
-                                read_capacity_units: pt.read_capacity_units,
-                                write_capacity_units: pt.write_capacity_units,
-                                number_of_decreases_today: 0,
-                                last_increase_date_time: None,
-                                last_decrease_date_time: None,
-                            })
-                        })
-                        .transpose()
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
+                        .map(gsi_throughput_json)
+                        .transpose()?;
                     let warm = warm_throughput_record_for_create(
                         create.warm_throughput.as_ref(),
                         Self::control_plane_delay_secs(&mut tx).await?,
