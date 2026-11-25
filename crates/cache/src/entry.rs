@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::Instant;
+use web_time::Instant;
 
 /// Internal cache entry. Stored as `Arc<Entry<V>>` inside the `moka` cache so
 /// the value can be cheaply cloned out of the cache on hit and so the
