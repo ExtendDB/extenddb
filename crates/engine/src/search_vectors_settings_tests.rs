@@ -12,7 +12,6 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::search_filter::EnabledAccounts;
 use extenddb_storage::StorageEngine;
 use extenddb_storage::management_store::{OpError, OpResult, SettingsStore};
-use extenddb_storage_sqlite::SqliteEngine;
 use futures::future::BoxFuture;
 use tokio::sync::Notify;
 
@@ -91,11 +90,7 @@ impl SettingsStore for Store {
 }
 
 async fn storage() -> Arc<dyn StorageEngine> {
-    Arc::new(
-        SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
-            .await
-            .expect("an in-memory database opens"),
-    )
+    crate::test_context::memory_engine().await
 }
 
 fn is_unavailable(answer: &Result<EnabledAccounts, DynamoDbError>) -> bool {

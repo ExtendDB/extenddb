@@ -20,7 +20,6 @@ use extenddb_core::types::{
 };
 use extenddb_storage::StorageEngine;
 use extenddb_storage::management_store::{OpError, OpResult, SettingsStore};
-use extenddb_storage_sqlite::SqliteEngine;
 use futures::future::BoxFuture;
 
 use super::{Scope, parse, resolve};
@@ -43,11 +42,7 @@ impl SettingsStore for Store {
 }
 
 async fn server(setting: &str) -> Arc<dyn StorageEngine> {
-    let storage: Arc<dyn StorageEngine> = Arc::new(
-        SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
-            .await
-            .expect("an in-memory database opens"),
-    );
+    let storage = crate::test_context::memory_engine().await;
     crate::install_search_filter_settings(&storage, Arc::new(Store(Mutex::new(setting.into()))));
     storage
 }
@@ -270,11 +265,7 @@ async fn without_the_setting(
     expr: &str,
     names: Option<&HashMap<String, String>>,
 ) -> (Result<Routed, String>, usize) {
-    let storage: Arc<dyn StorageEngine> = Arc::new(
-        SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
-            .await
-            .expect("an in-memory database opens"),
-    );
+    let storage = crate::test_context::memory_engine().await;
     let store = Arc::new(Failing::default());
     crate::install_search_filter_settings(&storage, store.clone());
     let served = storage

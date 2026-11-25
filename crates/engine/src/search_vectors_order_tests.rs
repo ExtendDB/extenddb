@@ -10,18 +10,16 @@
 //! `SearchVector` on a four-dimension index; with valid maps the same
 //! requests answer ResourceNotFoundException and the dimension message.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::limits::LimitsConfig;
 use extenddb_storage::server_components::ServerComponentsOptions;
 use extenddb_storage_sqlite::SqliteConfig;
 use tempfile::TempDir;
 
-use crate::{AuthorizedKeyInfo, BackupRuntime, OperationContext};
+use crate::OperationContext;
 
 /// A context on a bootstrapped SQLite catalog in `dir`, where a table is
 /// created ACTIVE.
@@ -48,19 +46,7 @@ async fn context(dir: &TempDir) -> OperationContext {
         .set_setting("control_plane_delay_seconds", "0")
         .await
         .unwrap();
-    OperationContext {
-        storage: components.engine,
-        backup: Arc::new(BackupRuntime::new(1)),
-        limits: Arc::new(LimitsConfig::default()),
-        region: Arc::from("us-east-1"),
-        account_id: Arc::from(account_id),
-        import_paths: Arc::from(Vec::new()),
-        export_paths: Arc::from(Vec::new()),
-        authorized_key_info: AuthorizedKeyInfo::new(),
-        auth_cache: extenddb_auth::AuthCacheRegistry::default(),
-        table_key_info_lookup: None,
-        item_authorizer: None,
-    }
+    crate::test_context::context_on(components.engine, &account_id)
 }
 
 /// A table "tbl" with a four-dimension vector index "vix" whose HASH element

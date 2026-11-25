@@ -16,7 +16,6 @@ use extenddb_core::types::{
 };
 use extenddb_storage::StorageEngine;
 use extenddb_storage::management_store::{OpError, OpResult, SettingsStore};
-use extenddb_storage_sqlite::SqliteEngine;
 use futures::future::BoxFuture;
 
 use super::imp::{enabled_for, parse, resolve_scope};
@@ -45,11 +44,7 @@ impl SettingsStore for Store {
 
 /// A storage engine whose server reads `value` for the setting.
 async fn install(value: Result<Option<&str>, ()>) -> Arc<dyn StorageEngine> {
-    let storage: Arc<dyn StorageEngine> = Arc::new(
-        SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
-            .await
-            .expect("an in-memory database opens"),
-    );
+    let storage = crate::test_context::memory_engine().await;
     let value = value.map(|v| v.map(str::to_owned));
     install_search_filter_settings(&storage, Arc::new(Store(Mutex::new(value))));
     storage
@@ -114,11 +109,7 @@ async fn a_store_that_fails_answers_a_retryable_fault() {
 
 #[tokio::test]
 async fn without_an_installed_store_every_account_gets_the_grammar() {
-    let storage: Arc<dyn StorageEngine> = Arc::new(
-        SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
-            .await
-            .expect("an in-memory database opens"),
-    );
+    let storage = crate::test_context::memory_engine().await;
     assert!(enabled(&storage).await.unwrap());
 }
 

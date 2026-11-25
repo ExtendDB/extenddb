@@ -50,6 +50,8 @@ mod list_tables;
 #[cfg(feature = "partiql")]
 mod partiql;
 mod pre_dispatch;
+#[cfg(test)]
+mod test_context;
 pub use pre_dispatch::{ParsedRequest, parse_request};
 // `private_fs` creates the private directories the filesystem-backed
 // import/export use; it has no wasm32 consumer and uses unix/windows file
