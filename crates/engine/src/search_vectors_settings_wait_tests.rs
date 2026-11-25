@@ -102,3 +102,27 @@ async fn a_request_after_a_dropped_wait_waits_only_for_the_rest() {
     assert_eq!(started.elapsed(), READ_TIMEOUT * 3 / 4);
     assert_eq!(store.reads(), 1);
 }
+
+/// The admin guide and the upgrade note state the two intervals: a read is
+/// kept for one second, and a read is waited on for at most two.
+#[tokio::test(start_paused = true)]
+async fn a_read_is_kept_for_one_second_and_waited_on_for_two() {
+    let store = Store::value("all");
+    let settings = Settings::new(store.clone());
+    settings.enabled_accounts().await.unwrap();
+    tokio::time::advance(Duration::from_millis(999)).await;
+    settings.enabled_accounts().await.unwrap();
+    assert_eq!(store.reads(), 1, "the read was not kept for one second");
+    tokio::time::advance(Duration::from_millis(1)).await;
+    settings.enabled_accounts().await.unwrap();
+    assert_eq!(store.reads(), 2, "the read was kept past one second");
+
+    let settings = Settings::new(Store::new(Answer::Hang));
+    let started = Instant::now();
+    // the test's own deadline, past the documented two seconds
+    let answer = tokio::time::timeout(Duration::from_secs(3), settings.enabled_accounts())
+        .await
+        .expect("the read is waited on for at most two seconds");
+    assert!(is_unavailable(&answer));
+    assert_eq!(started.elapsed(), Duration::from_secs(2));
+}
