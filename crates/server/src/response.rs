@@ -69,7 +69,13 @@ pub(crate) fn error_response(error: &DynamoDbError, request_id: &str) -> Respons
 /// `UserErrors` carries no table name: CloudWatch reports it per account and
 /// Region only, and a 4xx is often a request whose `TableName` broke the
 /// rules. A failed condition counts in `ConditionalCheckFailedRequests` and not
-/// in `UserErrors`, as CloudWatch's metrics page says. `table_name` is the name
+/// in `UserErrors`, as CloudWatch's metrics page says. A throttle error counts
+/// in `ThrottledRequests` and not in `UserErrors`, as the page says of a
+/// throttled request. The server's own bucket records its
+/// refusals before dispatch, so a throttle error here is one a backend
+/// reported. On `BatchGetItem` and `BatchWriteItem` it answers a batch whose
+/// every entry was throttled, the one batch CloudWatch counts in
+/// `ThrottledRequests`. `table_name` is the name
 /// `request_helpers::metric_table_name` checked, used by the metrics that carry
 /// one. Every metric carries `account_id`, the account the request was
 /// authenticated for.
@@ -90,6 +96,16 @@ pub(crate) fn record_error_metrics(
         DynamoDbError::TransactionConflictException(_) => {
             metrics.record_user_error(account_id, None, operation);
             metrics.record_transaction_conflict(account_id, operation);
+        }
+        e if e.is_throttle() => {
+            metrics.record(
+                extenddb_core::metrics::MetricName::ThrottledRequests,
+                1.0,
+                Some(account_id),
+                table_name,
+                None,
+                Some(operation),
+            );
         }
         _ => {
             metrics.record_user_error(account_id, None, operation);
@@ -169,6 +185,33 @@ mod tests {
             dimensions_of(&collector, MetricName::ConditionalCheckFailedRequests).len(),
             1
         );
+    }
+
+    /// A throttle error of each class counts in `ThrottledRequests`, under the
+    /// table the request named, and not in `UserErrors`.
+    #[test]
+    fn a_throttle_error_is_a_throttled_request_and_not_a_user_error() {
+        for error in [
+            DynamoDbError::provisioned_throughput_exceeded("capacity", vec![]),
+            DynamoDbError::throttling("throughput", vec![]),
+            DynamoDbError::request_limit_exceeded("quota", vec![]),
+        ] {
+            let collector = MetricsCollector::new();
+            record_error_metrics(&collector, &error, ACCOUNT, Some("Orders"), "GetItem");
+            record_error_metrics(&collector, &error, ACCOUNT, None, "BatchGetItem");
+            assert!(
+                dimensions_of(&collector, MetricName::UserErrors).is_empty(),
+                "{error:?}"
+            );
+            let mut throttled = dimensions_of(&collector, MetricName::ThrottledRequests);
+            throttled.sort_by_key(|dims| has_table(dims));
+            assert_eq!(throttled.len(), 2, "{error:?}: {throttled:?}");
+            assert!(!has_table(&throttled[0]), "{error:?}: {throttled:?}");
+            assert!(
+                throttled[1].contains(&Dimension::TableName("Orders".to_owned())),
+                "{error:?}: {throttled:?}"
+            );
+        }
     }
 
     #[test]

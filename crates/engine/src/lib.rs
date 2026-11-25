@@ -62,11 +62,15 @@ mod read_helpers;
 mod request_limits;
 mod scan;
 mod search_vectors;
+#[cfg(test)]
+mod service_error_log_tests;
 mod start_key;
 pub mod stream_capture;
 mod streams;
 mod streams_iterator_params;
 mod tagging;
+#[cfg(test)]
+mod test_tracing;
 mod transact_get_items;
 mod transact_write_helpers;
 mod transact_write_items;
@@ -200,7 +204,13 @@ pub(crate) fn serialize_output(
 ///
 /// Use this for storage calls that don't go through `storage_err_to_dynamo`
 /// (e.g., tagging, metadata operations that return `StorageError` directly).
+/// A [`StorageError::Service`] error is the backend's own classification of
+/// the failure and reaches the client through
+/// [`create_table::service_err_to_dynamo`], without the fault log line.
 pub(crate) fn sanitize_storage_error(e: extenddb_storage::error::StorageError) -> DynamoDbError {
+    if let extenddb_storage::error::StorageError::Service(e) = e {
+        return create_table::service_err_to_dynamo(e);
+    }
     tracing::error!(internal_error = %e, "storage internal error");
     DynamoDbError::InternalServerError("Internal server error".to_owned())
 }
@@ -370,6 +380,10 @@ pub struct DispatchMetrics {
     /// GSI/LSI name when the operation targets a secondary index.
     /// Used to attribute metrics to the specific index.
     pub index_name: Option<String>,
+    /// The requests or keys a backend throttled in a batch that answered 200,
+    /// counted per table by its catalog name. The server records each count
+    /// as read or write throttle events: its own bucket never saw them.
+    pub throttled_tables: std::collections::BTreeMap<String, u32>,
 }
 
 /// Result of an engine dispatch: the JSON response body plus sideband metrics.
@@ -638,5 +652,29 @@ pub async fn dispatch(
             ),
         )),
         _ => Err(DynamoDbError::UnknownOperationException(String::new())),
+    }
+}
+
+#[cfg(test)]
+mod sanitize_storage_error_tests {
+    use super::sanitize_storage_error;
+    use extenddb_core::error::DynamoDbError;
+    use extenddb_storage::error::StorageError;
+
+    // Control: every other variant is still redacted behind the fixed string.
+    #[test]
+    fn other_variants_are_redacted() {
+        for e in [
+            StorageError::Internal("driver text".to_owned()),
+            StorageError::Connection("host unreachable".to_owned()),
+            StorageError::Transient("pool timeout".to_owned()),
+        ] {
+            match sanitize_storage_error(e) {
+                DynamoDbError::InternalServerError(msg) => {
+                    assert_eq!(msg, "Internal server error");
+                }
+                other => panic!("expected InternalServerError, got {other:?}"),
+            }
+        }
     }
 }

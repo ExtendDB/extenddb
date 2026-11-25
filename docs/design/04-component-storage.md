@@ -346,8 +346,33 @@ Storage backends write stream records atomically with data writes when `stream` 
 - `IdempotentMismatch`: idempotency token exists with a different fingerprint (the items or a Return field)
 - `IndexNotFound` — secondary index does not exist
 - `Internal(String)` — backend-specific error
+- `Service(DynamoDbError)`: a client error the backend has already classified, carrying its own message
 
-The `engine` crate maps `StorageError` to wire protocol error responses.
+The `engine` crate maps `StorageError` to wire protocol error responses. An
+`Internal` error is logged at error level and reaches the client as the fixed
+`InternalServerError` text, so backend driver messages never cross the wire.
+A `Service` error is the exception: the backend has mapped its own failure onto
+a service error class (a hosted database reporting a documented unavailability
+or capacity condition, for example), so every engine mapping site returns it
+to the client with its variant and message unchanged and does not log it as a
+storage fault (a conditional check error carries its item only when the
+request asked for `ALL_OLD`, as with the engine's own). The backend is
+responsible for the message it puts inside: it crosses the wire verbatim, so it
+must be service-shaped text with no driver output, host names, connection
+strings or credentials, and a failure the backend cannot classify stays
+`Internal`.
+
+`BatchGetItem` and `BatchWriteItem` do not return a throttle error
+(`ProvisionedThroughputExceededException`, `ThrottlingException` or
+`RequestLimitExceeded` inside `Service`) for one entry to the client at once.
+The engine puts that entry in `UnprocessedKeys` or `UnprocessedItems`, goes on
+with the other entries, and answers the first throttle error only when every
+entry of the batch was throttled. The client sends the unprocessed entries
+again. So a backend reports a throttle for a write only when the write did not
+commit, and reports a write whose commit outcome it does not know as
+`Internal`, which fails the batch with 500. If a backend reported a throttle
+for a write that had committed, the client's replay would apply the write a
+second time and write a second stream record.
 
 ## 5. PostgreSQL Backend Implementation
 

@@ -3,6 +3,8 @@
 //! The server's own throttle refusal, driven through `handle_request` against
 //! an in-memory engine: the error class, the reasons field and its casing, the
 //! reason text and the table ARN the body carries for each bucket that refuses.
+//! Also the metrics `handle_request` records for a batch a backend throttled,
+//! against the engine tests' storage double.
 
 use std::sync::Arc;
 
@@ -55,6 +57,15 @@ fn cache_cfg(name: &'static str) -> extenddb_cache::SwrCacheConfig {
 /// `dev_mode` on. Returns the state and the account id the stub answers with,
 /// so the expected ARN can be formed.
 async fn build_state() -> (Arc<AppState>, String) {
+    build_state_on(None).await
+}
+
+/// `build_state` with `storage`, when given, in place of the SQLite engine
+/// for the table and item calls. The catalog and the authorization stores
+/// stay on SQLite.
+async fn build_state_on(
+    storage: Option<Arc<dyn extenddb_storage::StorageEngine>>,
+) -> (Arc<AppState>, String) {
     let _ = extenddb_storage::set_backend(extenddb_storage_sqlite::backend());
     let config = extenddb_storage_sqlite::SqliteConfig {
         path: ":memory:".to_owned(),
@@ -84,8 +95,9 @@ async fn build_state() -> (Arc<AppState>, String) {
             session_data: cache_cfg("session_data"),
         },
     ));
+    let engine = storage.unwrap_or_else(|| components.engine.clone());
     let table_key_info_cache = Arc::new(crate::CachedTableKeyInfoStore::pass_through(
-        components.engine.clone(),
+        engine.clone(),
         cache_cfg("table_key_info"),
     ));
     let limits = Arc::new(extenddb_core::limits::LimitsConfig::default());
@@ -97,7 +109,7 @@ async fn build_state() -> (Arc<AppState>, String) {
     ));
 
     let state = Arc::new(AppState {
-        storage: components.engine,
+        storage: engine,
         backup_runtime: Arc::new(extenddb_engine::BackupRuntime::new(1)),
         auth: Arc::new(StubAuth {
             account_id: account_id.clone(),
@@ -476,4 +488,65 @@ async fn requests_with_capacity_are_served() {
     .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["Item"]["pk"], json!({"S": "k"}));
+}
+
+#[path = "../../../engine/tests/batch_partial/failing_store.rs"]
+#[allow(dead_code)]
+mod failing_store;
+
+/// The metrics of a batch a backend throttled, read from the collector after
+/// `handle_request`. On a 200, one read or write throttle event per throttled
+/// entry, one data point per table, and no `ThrottledRequests`. When every
+/// entry was throttled, the same events, `ThrottledRequests` and no
+/// `UserErrors`. Each row: the operation, the request, the status, and the
+/// (sum, data points) expected for each metric.
+#[tokio::test]
+async fn a_batch_a_backend_throttled_records_the_throttle_metrics() {
+    use extenddb_core::metrics::MetricName;
+    let puts = |pks: &[&str]| -> Value {
+        pks.iter()
+            .map(|pk| json!({"PutRequest": {"Item": {"pk": {"S": pk}}}}))
+            .collect()
+    };
+    let keys = |pks: &[&str]| -> Value { pks.iter().map(|pk| json!({"pk": {"S": pk}})).collect() };
+    let rows = [
+        (
+            "BatchGetItem",
+            json!({"RequestItems": {"T": {"Keys": keys(&["k1", "k2", "k3"])}}}),
+            200,
+            [(2.0, 1), (0.0, 0), (0.0, 0), (0.0, 0)],
+        ),
+        (
+            "BatchWriteItem",
+            json!({"RequestItems": {"T": puts(&["p1", "k2"])}}),
+            200,
+            [(0.0, 0), (1.0, 1), (0.0, 0), (0.0, 0)],
+        ),
+        (
+            "BatchGetItem",
+            json!({"RequestItems": {"T": {"Keys": keys(&["k2", "k3"])}}}),
+            400,
+            [(2.0, 1), (0.0, 0), (1.0, 1), (0.0, 0)],
+        ),
+    ];
+    for (operation, request, status, expected) in rows {
+        let store = failing_store::FailingStore::throttling()
+            .with_items(&["k1", "k2", "k3"])
+            .failing_on(&["k2", "k3"]);
+        let (state, account_id) = build_state_on(Some(Arc::new(store))).await;
+        let (got, body) = call(&state, operation, request).await;
+        assert_eq!(got, status, "{operation}: {body}");
+        for (metric, want) in [
+            MetricName::ReadThrottleEvents,
+            MetricName::WriteThrottleEvents,
+            MetricName::ThrottledRequests,
+            MetricName::UserErrors,
+        ]
+        .into_iter()
+        .zip(expected)
+        {
+            let got = crate::throttle_helpers::points(&state.metrics, &account_id, metric, None);
+            assert_eq!(got, want, "{operation} {status}: {metric:?}");
+        }
+    }
 }

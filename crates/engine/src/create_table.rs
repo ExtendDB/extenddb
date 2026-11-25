@@ -229,6 +229,26 @@ pub fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> Dynamo
             tracing::error!(internal_error = %msg, "storage internal error");
             DynamoDbError::InternalServerError("Internal server error".to_owned())
         }
+        StorageError::Service(e) => service_err_to_dynamo(e),
+    }
+}
+
+/// The client error inside a [`StorageError::Service`], as every mapping in
+/// the engine returns it. The backend already classified the failure and
+/// chose the message, so the error keeps its variant and message, and it is
+/// not logged as a storage fault. The one rule the engine keeps for itself is
+/// the item on a conditional check error: it is dropped here, as the generic
+/// path drops the item of the engine's own `ConditionFailed`, and only
+/// [`storage_err_to_dynamo_with_ccf`] returns it, to a request that set
+/// `ReturnValuesOnConditionCheckFailure` to `ALL_OLD`.
+///
+/// [`StorageError::Service`]: extenddb_storage::error::StorageError::Service
+pub(crate) fn service_err_to_dynamo(e: DynamoDbError) -> DynamoDbError {
+    match e {
+        DynamoDbError::ConditionalCheckFailedException(msg, _) => {
+            DynamoDbError::ConditionalCheckFailedException(msg, None)
+        }
+        other => other,
     }
 }
 
@@ -253,16 +273,26 @@ pub(crate) fn storage_err_to_dynamo_with_ccf(
                 return_item,
             )
         }
+        // A backend-classified conditional check error keeps its message, and
+        // its item crosses only when the caller asked for ALL_OLD, which only
+        // this mapper can see. Without ALL_OLD the generic mapping drops it.
+        StorageError::Service(DynamoDbError::ConditionalCheckFailedException(msg, item))
+            if ccf == ReturnValuesOnConditionCheckFailure::AllOld =>
+        {
+            DynamoDbError::ConditionalCheckFailedException(msg, item)
+        }
         other => storage_err_to_dynamo(other),
     }
 }
 
 #[cfg(test)]
 mod storage_error_mapping_tests {
-    use extenddb_core::error::DynamoDbError;
+    use extenddb_core::error::{DynamoDbError, error_document};
+    use extenddb_core::types::{AttributeValue, Item, ReturnValuesOnConditionCheckFailure};
     use extenddb_storage::error::StorageError;
+    use serde_json::json;
 
-    use super::storage_err_to_dynamo;
+    use super::{storage_err_to_dynamo, storage_err_to_dynamo_with_ccf};
 
     /// A snapshot the backend discarded is retryable, like a transient error.
     #[test]
@@ -271,6 +301,31 @@ mod storage_error_mapping_tests {
         assert!(
             matches!(err, DynamoDbError::ServiceUnavailable(_)),
             "{err:?}"
+        );
+    }
+
+    /// Only this mapper reads `ReturnValuesOnConditionCheckFailure`: a
+    /// backend's conditional check error reaches a request that set it to
+    /// `ALL_OLD` with its own message and its item. The mappings that drop
+    /// the item, this one without `ALL_OLD` among them, are checked in
+    /// `service_error_log_tests`.
+    #[test]
+    fn a_backend_conditional_check_error_keeps_its_item_only_under_all_old() {
+        let message = "The stored item does not match the condition.";
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), AttributeValue::S("stored".to_owned()));
+        let error = DynamoDbError::ConditionalCheckFailedException(message.to_owned(), Some(item));
+        let got = storage_err_to_dynamo_with_ccf(
+            StorageError::Service(error),
+            ReturnValuesOnConditionCheckFailure::AllOld,
+        );
+        assert_eq!(
+            error_document(&got),
+            json!({
+                "__type": "com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException",
+                "message": message,
+                "Item": {"pk": {"S": "stored"}},
+            })
         );
     }
 }
