@@ -4613,6 +4613,7 @@ async fn test_streams_contiguous_slots_concurrent_dedup_phantom_and_contention()
             record: phantom_rec,
             participant: Some(sup_part),
             dedup_key: Some("txn-superseded-phantom:0".into()),
+            created_at_ms: None,
         }]),
         ttl_mutations: None,
         token_meta: None,
@@ -10842,4 +10843,861 @@ async fn test_leased_secret_paging_and_4kb_ttl_digest_eviction() {
         ctx.engine.get_item(&ki, &big_key).await.unwrap().is_none(),
         "digested >4KiB TTL index entry must evict expired max-size composite key item"
     );
+}
+
+#[tokio::test]
+async fn test_stream_at_timestamp_millisecond_precision_fencing_and_paging() {
+    let Some(ctx) = setup_emulator_context().await else {
+        eprintln!("Skipping Bigtable test: emulator unavailable");
+        return;
+    };
+
+    let tbl = unique_name("bt_stream_at_ts");
+    ctx.engine
+        .create_table(
+            &ctx.account_id,
+            CreateTableInput {
+                table_name: tbl.clone(),
+                key_schema: vec![KeySchemaElement {
+                    attribute_name: "pk".into(),
+                    key_type: KeyType::Hash,
+                }],
+                attribute_definitions: vec![AttributeDefinition {
+                    attribute_name: "pk".into(),
+                    attribute_type: ScalarAttributeType::S,
+                }],
+                billing_mode: Some(BillingMode::PayPerRequest),
+                stream_specification: Some(StreamSpecification {
+                    stream_enabled: true,
+                    stream_view_type: Some(StreamViewType::NewAndOldImages),
+                }),
+                ..CreateTableInput::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let desc = ctx
+        .engine
+        .describe_table(
+            &ctx.account_id,
+            DescribeTableInput {
+                table_name: tbl.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let stream_arn = desc.latest_stream_arn.clone().expect("latest_stream_arn");
+    let stream_desc = ctx
+        .engine
+        .describe_stream(
+            &ctx.account_id,
+            &DescribeStreamInput {
+                stream_arn: stream_arn.clone(),
+                limit: None,
+                exclusive_start_shard_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(stream_desc.shards.len() >= 2);
+    let ki = ctx
+        .engine
+        .table_key_info(&ctx.account_id, &tbl)
+        .await
+        .unwrap();
+    let shard_id = ctx
+        .engine
+        .assign_shard(&ctx.account_id, &tbl, "k")
+        .await
+        .unwrap();
+    let other_shard_id = stream_desc
+        .shards
+        .iter()
+        .map(|s| s.shard_id.clone())
+        .find(|sid| sid != &shard_id)
+        .expect("a second shard in the same stream");
+
+    // Non-existent shard and empty open shards all resolve to `None`.
+    assert_eq!(
+        ctx.engine
+            .first_sequence_number_at_or_after("shardId-missing-0000000000000000", 0)
+            .await
+            .unwrap(),
+        None
+    );
+    for sh in &stream_desc.shards {
+        assert_eq!(
+            ctx.engine
+                .first_sequence_number_at_or_after(&sh.shard_id, 0)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    // 1. Live single-item `PutItem` and 2PC `TransactWriteItems` both capture
+    //    millisecond `created_at_ms` from the same clock read as
+    //    `ApproximateCreationDateTime` and support exact ms seeks.
+    let capture = StreamCapture {
+        view_type: StreamViewType::NewAndOldImages,
+        user_identity: None,
+        region: Arc::from("us-east-1"),
+    };
+    let (_, before_live_ms) = extenddb_storage_bigtable::streams::current_stream_clock();
+    ctx.engine
+        .put_item(
+            &ki,
+            s_item(&[("pk", "k"), ("v", "first")]),
+            false,
+            None,
+            &ExpressionMaps::default(),
+            Some(&capture),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let (_, between_1_2_ms) = extenddb_storage_bigtable::streams::current_stream_clock();
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    ctx.engine
+        .put_item(
+            &ki,
+            s_item(&[("pk", "k"), ("v", "second")]),
+            false,
+            None,
+            &ExpressionMaps::default(),
+            Some(&capture),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let (_, between_2_3_ms) = extenddb_storage_bigtable::streams::current_stream_clock();
+    tokio::time::sleep(Duration::from_millis(40)).await;
+
+    let txn_item = s_item(&[("pk", "k"), ("v", "third")]);
+    let empty_maps = ExpressionMaps::default();
+    ctx.engine
+        .transact_write_items(
+            &[TransactWriteOp::Put {
+                key_info: &ki,
+                item: &txn_item,
+                condition: None,
+                maps: &empty_maps,
+                return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+                stream: Some(capture.clone()),
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+    let (_, after_live_ms) = extenddb_storage_bigtable::streams::current_stream_clock();
+
+    let (live_recs, _) = ctx
+        .engine
+        .get_stream_records(&ctx.account_id, &stream_arn, &shard_id, None, 100)
+        .await
+        .unwrap();
+    assert_eq!(live_recs.len(), 3);
+    let seq1 = live_recs[0].dynamodb.sequence_number.clone();
+    let seq2 = live_recs[1].dynamodb.sequence_number.clone();
+    let seq3 = live_recs[2].dynamodb.sequence_number.clone();
+
+    let cat = extenddb_storage_bigtable::catalog::Catalog::new(ctx.client.as_ref());
+    let mut rec_ms = Vec::with_capacity(3);
+    for rec in &live_recs {
+        let raw = cat
+            .get(&extenddb_storage_bigtable::catalog::keys::stream_record(
+                &shard_id,
+                &rec.dynamodb.sequence_number,
+            ))
+            .await
+            .unwrap()
+            .expect("raw stream record row");
+        let (decoded, ms) = extenddb_storage_bigtable::streams::decode_stored_record(raw)
+            .expect("decode stored stream record");
+        assert_eq!(
+            ms.div_euclid(1_000),
+            decoded.dynamodb.approximate_creation_date_time,
+            "created_at_ms and ApproximateCreationDateTime must share one clock read"
+        );
+        rec_ms.push(ms);
+    }
+    assert!(rec_ms[0] >= before_live_ms && rec_ms[0] <= between_1_2_ms);
+    assert!(rec_ms[1] >= between_1_2_ms && rec_ms[1] <= between_2_3_ms);
+    assert!(rec_ms[2] >= between_2_3_ms && rec_ms[2] <= after_live_ms);
+
+    // Plant a record on a different shard at slot 1 inside the timestamp range
+    // to prove `first_sequence_number_at_or_after` stays isolated to `shard_id`.
+    let mut other_rec = live_recs[0].clone();
+    other_rec.event_id = format!("evt-other-{}", Uuid::new_v4().simple());
+    extenddb_storage_bigtable::streams::write_record_ordered_at(
+        &cat,
+        &other_shard_id,
+        &other_rec,
+        Some(rec_ms[0] + 2),
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("other shard record");
+
+    // Exact millisecond boundaries (at-or-after, +1 ms skips, past newest -> None).
+    for (at_ms, want) in [
+        (0i64, Some(seq1.as_str())),
+        (rec_ms[0] - 10_000, Some(seq1.as_str())),
+        (rec_ms[0], Some(seq1.as_str())),
+        (rec_ms[0] + 1, Some(seq2.as_str())),
+        (between_1_2_ms, Some(seq2.as_str())),
+        (rec_ms[1], Some(seq2.as_str())),
+        (rec_ms[1] + 1, Some(seq3.as_str())),
+        (between_2_3_ms, Some(seq3.as_str())),
+        (rec_ms[2], Some(seq3.as_str())),
+        (rec_ms[2] + 1, None),
+        (after_live_ms + 1, None),
+    ] {
+        assert_eq!(
+            ctx.engine
+                .first_sequence_number_at_or_after(&shard_id, at_ms)
+                .await
+                .unwrap()
+                .as_deref(),
+            want,
+            "at_ms={at_ms}"
+        );
+    }
+
+    // Engine `resolve_at_timestamp` protocol: `n - 1` inclusive seek reads from
+    // `seq2`, and post-tip fallback (`tip` captured before seek) observes a
+    // subsequent write.
+    let width = ctx.engine.sequence_number_width();
+    let after_for_seq2 = format!("{:0>width$}", seq2.parse::<u128>().unwrap() - 1);
+    let (from_seq2, _) = ctx
+        .engine
+        .get_stream_records(
+            &ctx.account_id,
+            &stream_arn,
+            &shard_id,
+            Some(&after_for_seq2),
+            100,
+        )
+        .await
+        .unwrap();
+    let from_seq2_seqs: Vec<String> = from_seq2
+        .into_iter()
+        .map(|r| r.dynamodb.sequence_number)
+        .collect();
+    assert_eq!(from_seq2_seqs, vec![seq2.clone(), seq3.clone()]);
+
+    let tip = ctx
+        .engine
+        .latest_sequence_number(&shard_id)
+        .await
+        .unwrap()
+        .expect("tip after 3 writes");
+    assert_eq!(tip, seq3);
+    ctx.engine
+        .put_item(
+            &ki,
+            s_item(&[("pk", "k"), ("v", "fourth")]),
+            false,
+            None,
+            &ExpressionMaps::default(),
+            Some(&capture),
+        )
+        .await
+        .unwrap();
+    let (after_tip, _) = ctx
+        .engine
+        .get_stream_records(&ctx.account_id, &stream_arn, &shard_id, Some(&tip), 100)
+        .await
+        .unwrap();
+    assert_eq!(after_tip.len(), 1);
+    assert_eq!(
+        after_tip[0]
+            .dynamodb
+            .new_image
+            .as_ref()
+            .and_then(|img| img.get("v")),
+        Some(&AttributeValue::S("fourth".into()))
+    );
+
+    // 2. Same-second fractional separation, out-of-order / clamped timestamps,
+    //    legacy row fallback without `created_at_ms`, and multi-page scanning.
+    let base_sec = live_recs[2].dynamodb.approximate_creation_date_time + 100;
+    let base_ms = base_sec * 1_000;
+    let make_rec = |tag: &str, approx_sec: i64| {
+        let mut r = live_recs[0].clone();
+        r.event_id = format!("evt-{tag}-{}", Uuid::new_v4().simple());
+        r.dynamodb.approximate_creation_date_time = approx_sec;
+        r
+    };
+    let seq5 = extenddb_storage_bigtable::streams::write_record_ordered_at(
+        &cat,
+        &shard_id,
+        &make_rec("s5", base_sec),
+        Some(base_ms + 50),
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("slot 5");
+    // Slot 6 has a later timestamp than slot 7 to simulate a backward clock step.
+    let seq6 = extenddb_storage_bigtable::streams::write_record_ordered_at(
+        &cat,
+        &shard_id,
+        &make_rec("s6", base_sec),
+        Some(base_ms + 700),
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("slot 6");
+    let seq7 = extenddb_storage_bigtable::streams::write_record_ordered_at(
+        &cat,
+        &shard_id,
+        &make_rec("s7", base_sec),
+        Some(base_ms + 300),
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("slot 7");
+    assert!(seq7 > seq6, "slot 7 sequence must follow slot 6");
+
+    // Slot 8: legacy row without `created_at_ms` falls back to whole seconds * 1_000.
+    let seq8 = extenddb_storage_bigtable::streams::slot_sequence_number(&shard_id, 8);
+    let mut legacy_rec = make_rec("s8", base_sec + 5);
+    legacy_rec.dynamodb.sequence_number.clone_from(&seq8);
+    cat.put(
+        &extenddb_storage_bigtable::catalog::keys::stream_record(&shard_id, &seq8),
+        &serde_json::to_value(&legacy_rec).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    // Paged seek (`page_size = 2`) exercises cursor advancement across multiple pages.
+    assert_eq!(
+        extenddb_storage_bigtable::streams::first_sequence_number_at_or_after_paged(
+            &cat, &shard_id, base_ms, 2,
+        )
+        .await
+        .unwrap()
+        .as_deref(),
+        Some(seq5.as_str())
+    );
+    assert_eq!(
+        extenddb_storage_bigtable::streams::first_sequence_number_at_or_after_paged(
+            &cat,
+            &shard_id,
+            base_ms + 51,
+            2,
+        )
+        .await
+        .unwrap()
+        .as_deref(),
+        Some(seq6.as_str())
+    );
+    assert_eq!(
+        extenddb_storage_bigtable::streams::first_sequence_number_at_or_after_paged(
+            &cat,
+            &shard_id,
+            base_ms + 300,
+            2,
+        )
+        .await
+        .unwrap()
+        .as_deref(),
+        Some(seq6.as_str()),
+        "seek under backward clock step must return MIN(sequence_number) with created_at_ms >= at_ms"
+    );
+    assert_eq!(
+        extenddb_storage_bigtable::streams::first_sequence_number_at_or_after_paged(
+            &cat,
+            &shard_id,
+            base_ms + 701,
+            2,
+        )
+        .await
+        .unwrap()
+        .as_deref(),
+        Some(seq8.as_str())
+    );
+    assert_eq!(
+        extenddb_storage_bigtable::streams::first_sequence_number_at_or_after_paged(
+            &cat,
+            &shard_id,
+            (base_sec + 5) * 1_000 + 1,
+            2,
+        )
+        .await
+        .unwrap(),
+        None
+    );
+
+    // 3. Closed-shard fencing: disable the stream, plant an uncleaned row past
+    //    `ending_sequence_number`, and confirm both `first_sequence_number_at_or_after`
+    //    and `latest_sequence_number` never expose records past `ending_sequence_number`.
+    ctx.engine
+        .update_table(
+            &ctx.account_id,
+            extenddb_core::types::UpdateTableInput {
+                table_name: tbl.clone(),
+                billing_mode: None,
+                table_throughput_mode: None,
+                provisioned_throughput: None,
+                deletion_protection_enabled: None,
+                global_secondary_index_updates: None,
+                attribute_definitions: None,
+                stream_specification: Some(StreamSpecification {
+                    stream_enabled: false,
+                    stream_view_type: None,
+                }),
+                table_class: None,
+                on_demand_throughput: None,
+                vector_index_updates: None,
+                warm_throughput: None,
+                sse_specification: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let closed_desc = ctx
+        .engine
+        .describe_stream(
+            &ctx.account_id,
+            &DescribeStreamInput {
+                stream_arn: stream_arn.clone(),
+                limit: None,
+                exclusive_start_shard_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    let ending_seq = closed_desc
+        .shards
+        .iter()
+        .find(|s| s.shard_id == shard_id)
+        .and_then(|s| s.sequence_number_range.ending_sequence_number.clone())
+        .expect("ending_sequence_number after disable");
+    let ending_slot =
+        extenddb_storage_bigtable::streams::parse_slot_from_sequence(&ending_seq).expect("slot");
+    let post_seal_seq =
+        extenddb_storage_bigtable::streams::slot_sequence_number(&shard_id, ending_slot + 1);
+    let mut post_seal_rec = make_rec("post-seal", base_sec + 500);
+    post_seal_rec
+        .dynamodb
+        .sequence_number
+        .clone_from(&post_seal_seq);
+    let mut post_seal_val = serde_json::to_value(&post_seal_rec).unwrap();
+    post_seal_val.as_object_mut().unwrap().insert(
+        "created_at_ms".into(),
+        serde_json::Value::from((base_sec + 500) * 1_000),
+    );
+    cat.put(
+        &extenddb_storage_bigtable::catalog::keys::stream_record(&shard_id, &post_seal_seq),
+        &post_seal_val,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        ctx.engine
+            .first_sequence_number_at_or_after(&shard_id, (base_sec + 100) * 1_000)
+            .await
+            .unwrap(),
+        None,
+        "first_sequence_number_at_or_after must never expose records past EndingSequenceNumber"
+    );
+    assert_eq!(
+        ctx.engine
+            .latest_sequence_number(&shard_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(ending_seq.as_str()),
+        "latest_sequence_number must never probe past EndingSequenceNumber on a closed shard"
+    );
+
+    // 4. Millisecond retention pruning: re-enable the stream to obtain a fresh
+    //    open shard while keeping `shard_id` closed, plant an expired (>24h)
+    //    record and a retained (<24h) record on the open shard plus an expired
+    //    post-seal orphan row on closed `shard_id`, sweep via
+    //    `cleanup_expired_stream_records(24)`, and confirm expired rows are
+    //    deleted while the retained row survives and closed-shard
+    //    `ShardMeta.last_sequence_number` never advances past `ending_seq`.
+    ctx.engine
+        .update_table(
+            &ctx.account_id,
+            extenddb_core::types::UpdateTableInput {
+                table_name: tbl.clone(),
+                billing_mode: None,
+                table_throughput_mode: None,
+                provisioned_throughput: None,
+                deletion_protection_enabled: None,
+                global_secondary_index_updates: None,
+                attribute_definitions: None,
+                stream_specification: Some(StreamSpecification {
+                    stream_enabled: true,
+                    stream_view_type: Some(StreamViewType::NewAndOldImages),
+                }),
+                table_class: None,
+                on_demand_throughput: None,
+                vector_index_updates: None,
+                warm_throughput: None,
+                sse_specification: None,
+            },
+        )
+        .await
+        .unwrap();
+    let open_shard_id = ctx
+        .engine
+        .assign_shard(&ctx.account_id, &tbl, "retention-k")
+        .await
+        .unwrap();
+    let (now_secs, now_ms) = extenddb_storage_bigtable::streams::current_stream_clock();
+    let expired_ms = now_ms - 24 * 3_600_000 - 2_000;
+    let retained_ms = now_ms - 24 * 3_600_000 + 5_000;
+    let expired_seq = extenddb_storage_bigtable::streams::write_record_ordered_at(
+        &cat,
+        &open_shard_id,
+        &make_rec("expired-24h", expired_ms.div_euclid(1_000)),
+        Some(expired_ms),
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("expired record slot");
+    let retained_seq = extenddb_storage_bigtable::streams::write_record_ordered_at(
+        &cat,
+        &open_shard_id,
+        &make_rec("retained-24h", retained_ms.div_euclid(1_000)),
+        Some(retained_ms),
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("retained record slot");
+
+    let expired_post_seal_seq =
+        extenddb_storage_bigtable::streams::slot_sequence_number(&shard_id, ending_slot + 2);
+    let mut expired_post_seal_rec = make_rec("expired-post-seal", now_secs - 25 * 3_600);
+    expired_post_seal_rec
+        .dynamodb
+        .sequence_number
+        .clone_from(&expired_post_seal_seq);
+    let mut expired_post_seal_val = serde_json::to_value(&expired_post_seal_rec).unwrap();
+    expired_post_seal_val.as_object_mut().unwrap().insert(
+        "created_at_ms".to_owned(),
+        serde_json::Value::from(expired_ms),
+    );
+    let expired_post_seal_rk =
+        extenddb_storage_bigtable::catalog::keys::stream_record(&shard_id, &expired_post_seal_seq);
+    cat.put(&expired_post_seal_rk, &expired_post_seal_val)
+        .await
+        .unwrap();
+
+    let pruned = ctx
+        .engine
+        .cleanup_expired_stream_records(24)
+        .await
+        .expect("cleanup_expired_stream_records(24)");
+    assert!(
+        pruned >= 2,
+        "expected expired record and expired post-seal orphan to be pruned, got {pruned}"
+    );
+    assert!(
+        cat.get(&extenddb_storage_bigtable::catalog::keys::stream_record(
+            &open_shard_id,
+            &expired_seq,
+        ))
+        .await
+        .unwrap()
+        .is_none(),
+        "expired record (>24h) must be removed by millisecond retention cleanup"
+    );
+    assert!(
+        cat.get(&extenddb_storage_bigtable::catalog::keys::stream_record(
+            &open_shard_id,
+            &retained_seq,
+        ))
+        .await
+        .unwrap()
+        .is_some(),
+        "record within 24h retention must not be removed"
+    );
+    assert!(
+        cat.get(&expired_post_seal_rk).await.unwrap().is_none(),
+        "expired post-seal orphan row must be deleted by retention cleanup"
+    );
+    let closed_meta: extenddb_storage_bigtable::streams::ShardMeta = serde_json::from_value(
+        cat.get(&extenddb_storage_bigtable::catalog::keys::stream_shard(
+            &shard_id,
+        ))
+        .await
+        .unwrap()
+        .expect("closed shard meta"),
+    )
+    .unwrap();
+    assert!(
+        closed_meta
+            .last_sequence_number
+            .as_deref()
+            .is_none_or(|last| last <= ending_seq.as_str()),
+        "retention pruning an expired post-seal orphan must not advance ShardMeta.last_sequence_number past EndingSequenceNumber"
+    );
+    assert_eq!(
+        ctx.engine
+            .latest_sequence_number(&shard_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(ending_seq.as_str()),
+        "latest_sequence_number must stay clamped at EndingSequenceNumber after pruning"
+    );
+}
+
+#[tokio::test]
+async fn test_query_begins_with_max_unicode_scalar_base_gsi_and_lsi() {
+    let Some(ctx) = setup_emulator_context().await else {
+        eprintln!("Skipping Bigtable test: emulator unavailable");
+        return;
+    };
+
+    let tbl = unique_name("bt_bw_max");
+    ctx.engine
+        .create_table(
+            &ctx.account_id,
+            CreateTableInput {
+                table_name: tbl.clone(),
+                key_schema: vec![
+                    KeySchemaElement {
+                        attribute_name: "pk".into(),
+                        key_type: KeyType::Hash,
+                    },
+                    KeySchemaElement {
+                        attribute_name: "sk".into(),
+                        key_type: KeyType::Range,
+                    },
+                ],
+                attribute_definitions: vec![
+                    AttributeDefinition {
+                        attribute_name: "pk".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "sk".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "gpk".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "gsk".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                    AttributeDefinition {
+                        attribute_name: "lsk".into(),
+                        attribute_type: ScalarAttributeType::S,
+                    },
+                ],
+                local_secondary_indexes: Some(vec![extenddb_core::types::LsiInput {
+                    index_name: "lsi-max".into(),
+                    key_schema: vec![
+                        KeySchemaElement {
+                            attribute_name: "pk".into(),
+                            key_type: KeyType::Hash,
+                        },
+                        KeySchemaElement {
+                            attribute_name: "lsk".into(),
+                            key_type: KeyType::Range,
+                        },
+                    ],
+                    projection: Projection {
+                        projection_type: ProjectionType::All,
+                        non_key_attributes: None,
+                    },
+                }]),
+                global_secondary_indexes: Some(vec![GsiInput {
+                    index_name: "gsi-max".into(),
+                    key_schema: vec![
+                        KeySchemaElement {
+                            attribute_name: "gpk".into(),
+                            key_type: KeyType::Hash,
+                        },
+                        KeySchemaElement {
+                            attribute_name: "gsk".into(),
+                            key_type: KeyType::Range,
+                        },
+                    ],
+                    projection: Projection {
+                        projection_type: ProjectionType::All,
+                        non_key_attributes: None,
+                    },
+                    provisioned_throughput: None,
+                    warm_throughput: None,
+                }]),
+                billing_mode: Some(BillingMode::PayPerRequest),
+                ..CreateTableInput::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let ki = ctx
+        .engine
+        .table_key_info(&ctx.account_id, &tbl)
+        .await
+        .unwrap();
+    let max_ch = "\u{10FFFF}";
+    let keys: Vec<String> = vec![
+        "a".into(),
+        "ab".into(),
+        "a\u{D7FF}".into(),
+        "a\u{E000}".into(),
+        "a\u{FFFF}".into(),
+        "a\u{10000}".into(),
+        format!("a{max_ch}"),
+        format!("a{max_ch}b"),
+        format!("a{max_ch}{max_ch}"),
+        "b".into(),
+        "z".into(),
+        max_ch.into(),
+        format!("{max_ch}x"),
+        format!("{max_ch}{max_ch}"),
+    ];
+    for sk in &keys {
+        ctx.engine
+            .put_item(
+                &ki,
+                s_item(&[
+                    ("pk", "p"),
+                    ("sk", sk),
+                    ("gpk", "gp"),
+                    ("gsk", sk),
+                    ("lsk", sk),
+                ]),
+                false,
+                None,
+                &ExpressionMaps::default(),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let prefixes: Vec<String> = vec![
+        "a".into(),
+        format!("a{max_ch}"),
+        format!("a{max_ch}{max_ch}"),
+        max_ch.into(),
+        format!("{max_ch}{max_ch}"),
+        "a\u{D7FF}".into(),
+        "a\u{FFFF}".into(),
+    ];
+    let kc_base =
+        parse_key_condition(&tokenize("pk = :p AND begins_with(sk, :s)").unwrap()).unwrap();
+    let kc_gsi =
+        parse_key_condition(&tokenize("gpk = :p AND begins_with(gsk, :s)").unwrap()).unwrap();
+    let kc_lsi =
+        parse_key_condition(&tokenize("pk = :p AND begins_with(lsk, :s)").unwrap()).unwrap();
+
+    for prefix in &prefixes {
+        let want: Vec<String> = keys
+            .iter()
+            .filter(|k| k.starts_with(prefix.as_str()))
+            .cloned()
+            .collect();
+        for forward in [true, false] {
+            let expected: Vec<String> = if forward {
+                want.clone()
+            } else {
+                let mut rev = want.clone();
+                rev.reverse();
+                rev
+            };
+
+            for (label, index_name, pk_val, sk_attr, kc) in [
+                ("base", None, "p", "sk", &kc_base),
+                ("gsi", Some("gsi-max"), "gp", "gsk", &kc_gsi),
+                ("lsi", Some("lsi-max"), "p", "lsk", &kc_lsi),
+            ] {
+                let mut got = Vec::new();
+                let mut esk = None;
+                loop {
+                    let mut maps = ExpressionMaps::default();
+                    maps.values
+                        .insert("p".into(), AttributeValue::S(pk_val.into()));
+                    maps.values
+                        .insert("s".into(), AttributeValue::S(prefix.clone()));
+                    let (items, lek) = ctx
+                        .engine
+                        .query(&ki, kc, &maps, forward, Some(1), esk.as_ref(), index_name)
+                        .await
+                        .unwrap();
+                    for it in items {
+                        if let Some(AttributeValue::S(s)) = it.get(sk_attr) {
+                            got.push(s.clone());
+                        }
+                    }
+                    esk = lek;
+                    if esk.is_none() {
+                        break;
+                    }
+                }
+                assert_eq!(
+                    got,
+                    expected,
+                    "{label} begins_with forward={forward} prefix={}",
+                    prefix.escape_unicode()
+                );
+            }
+        }
+    }
+
+    // BETWEEN ranges whose bounds sit next to U+10FFFF (base table, GSI, and LSI).
+    let kc_between_base =
+        parse_key_condition(&tokenize("pk = :p AND sk BETWEEN :l AND :u").unwrap()).unwrap();
+    let kc_between_gsi =
+        parse_key_condition(&tokenize("gpk = :p AND gsk BETWEEN :l AND :u").unwrap()).unwrap();
+    let kc_between_lsi =
+        parse_key_condition(&tokenize("pk = :p AND lsk BETWEEN :l AND :u").unwrap()).unwrap();
+    for (low, high) in [
+        ("a".to_owned(), format!("a{max_ch}")),
+        (format!("a{max_ch}"), "b".to_owned()),
+    ] {
+        let want: Vec<String> = keys
+            .iter()
+            .filter(|k| k.as_bytes() >= low.as_bytes() && k.as_bytes() <= high.as_bytes())
+            .cloned()
+            .collect();
+
+        for (label, index_name, pk_val, sk_attr, kc) in [
+            ("base", None, "p", "sk", &kc_between_base),
+            ("gsi", Some("gsi-max"), "gp", "gsk", &kc_between_gsi),
+            ("lsi", Some("lsi-max"), "p", "lsk", &kc_between_lsi),
+        ] {
+            let mut maps = ExpressionMaps::default();
+            maps.values
+                .insert("p".into(), AttributeValue::S(pk_val.into()));
+            maps.values
+                .insert("l".into(), AttributeValue::S(low.clone()));
+            maps.values
+                .insert("u".into(), AttributeValue::S(high.clone()));
+            let (items, _) = ctx
+                .engine
+                .query(&ki, kc, &maps, true, None, None, index_name)
+                .await
+                .unwrap();
+            let got: Vec<String> = items
+                .into_iter()
+                .filter_map(|it| match it.get(sk_attr) {
+                    Some(AttributeValue::S(s)) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(got, want, "{label} BETWEEN [{low:?}, {high:?}]");
+        }
+    }
 }

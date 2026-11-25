@@ -92,6 +92,10 @@ pub struct TxnStreamRecord {
     /// `record.event_id` across crash recovery replays.
     #[serde(default)]
     pub dedup_key: Option<String>,
+    /// Record creation timestamp in Unix epoch milliseconds captured from the
+    /// same clock read as `record.dynamodb.approximate_creation_date_time`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at_ms: Option<i64>,
 }
 
 /// Logged `__extenddb_ttl_index__` transition persisted at `COMMITTED`

@@ -42,6 +42,48 @@ pub const UNASSIGNED_SEQUENCE_NUMBER: &str = "00000000000000000000000000";
 const EVENT_SOURCE: &str = "aws:dynamodb";
 const EVENT_VERSION: &str = "1.1";
 
+/// Top-level JSON field stored alongside persisted `stream_record:*` rows so
+/// `AT_TIMESTAMP` seeks and retention cleanup compare at millisecond precision
+/// while wire `StreamRecord` deserialization ignores the extra field.
+const CREATED_AT_MS_FIELD: &str = "created_at_ms";
+
+/// Default number of `stream_record:<shard_id>:*` rows fetched per Bigtable
+/// range page during `first_sequence_number_at_or_after`.
+const AT_TIMESTAMP_SCAN_PAGE_SIZE: i64 = 512;
+
+/// Read the UTC wall clock once, returning `(epoch_secs, epoch_millis)` from
+/// the same clock read so `ApproximateCreationDateTime` and `created_at_ms`
+/// always agree (`epoch_millis.div_euclid(1_000) == epoch_secs`).
+#[must_use]
+pub fn current_stream_clock() -> (i64, i64) {
+    let now = time::OffsetDateTime::now_utc();
+    let secs = now.unix_timestamp();
+    let ms = secs
+        .saturating_mul(1_000)
+        .saturating_add(i64::from(now.millisecond()));
+    (secs, ms)
+}
+
+/// Decode a persisted `stream_record:<shard_id>:<seq_26>` JSON value into its
+/// [`StreamRecord`] and effective creation time in Unix epoch milliseconds.
+///
+/// Legacy rows written before `created_at_ms` was stored fall back to
+/// `ApproximateCreationDateTime * 1_000`.
+#[must_use]
+pub fn decode_stored_record(value: serde_json::Value) -> Option<(StreamRecord, i64)> {
+    let stored_ms = value
+        .get(CREATED_AT_MS_FIELD)
+        .and_then(serde_json::Value::as_i64);
+    let record: StreamRecord = serde_json::from_value(value).ok()?;
+    let effective_ms = stored_ms.unwrap_or_else(|| {
+        record
+            .dynamodb
+            .approximate_creation_date_time
+            .saturating_mul(1_000)
+    });
+    Some((record, effective_ms))
+}
+
 const fn default_next_seq_num() -> u64 {
     1
 }
@@ -196,11 +238,12 @@ fn view_includes_old(v: StreamViewType) -> bool {
     )
 }
 
-/// Build a `StreamRecord` describing one item mutation, honoring optional
-/// `StreamCapture` metadata (`view_type`, `region`, and TTL `user_identity`)
-/// and computing `SizeBytes` via `extenddb_core::types::item_size_bytes`.
+/// Build a `StreamRecord` and its millisecond creation timestamp from a single
+/// UTC clock read, honoring optional `StreamCapture` metadata (`view_type`,
+/// `region`, and TTL `user_identity`) and computing `SizeBytes` via
+/// `extenddb_core::types::item_size_bytes`.
 #[must_use]
-pub fn build_record(
+pub fn build_record_with_timestamp(
     spec: Option<&StreamSpecification>,
     capture: Option<&StreamCapture>,
     key_schema: &[KeySchemaElement],
@@ -208,7 +251,7 @@ pub fn build_record(
     new: Option<&Item>,
     seq: &str,
     default_region: &str,
-) -> Option<StreamRecord> {
+) -> Option<(StreamRecord, i64)> {
     let view = match (capture, spec) {
         (Some(cap), _) => cap.view_type,
         (None, Some(s)) if s.stream_enabled => s.stream_view_type?,
@@ -238,30 +281,50 @@ pub fn build_record(
         None
     };
     let size_bytes = i64::try_from(item_size_bytes(representative)).unwrap_or(i64::MAX);
-    let creation_ts = time::OffsetDateTime::now_utc().unix_timestamp();
+    let (creation_ts, created_at_ms) = current_stream_clock();
     let region = capture.map_or_else(
         || default_region.to_owned(),
         |c| c.region.as_ref().to_owned(),
     );
     let user_identity = capture.and_then(|c| c.user_identity.clone());
 
-    Some(StreamRecord {
-        event_id: uuid::Uuid::new_v4().to_string(),
-        event_name,
-        event_version: EVENT_VERSION.to_owned(),
-        event_source: EVENT_SOURCE.to_owned(),
-        aws_region: region,
-        dynamodb: StreamRecordData {
-            approximate_creation_date_time: creation_ts,
-            keys,
-            new_image,
-            old_image,
-            sequence_number: seq.to_owned(),
-            size_bytes,
-            stream_view_type: view,
+    Some((
+        StreamRecord {
+            event_id: uuid::Uuid::new_v4().to_string(),
+            event_name,
+            event_version: EVENT_VERSION.to_owned(),
+            event_source: EVENT_SOURCE.to_owned(),
+            aws_region: region,
+            dynamodb: StreamRecordData {
+                approximate_creation_date_time: creation_ts,
+                keys,
+                new_image,
+                old_image,
+                sequence_number: seq.to_owned(),
+                size_bytes,
+                stream_view_type: view,
+            },
+            user_identity,
         },
-        user_identity,
-    })
+        created_at_ms,
+    ))
+}
+
+/// Build a `StreamRecord` describing one item mutation, honoring optional
+/// `StreamCapture` metadata (`view_type`, `region`, and TTL `user_identity`)
+/// and computing `SizeBytes` via `extenddb_core::types::item_size_bytes`.
+#[must_use]
+pub fn build_record(
+    spec: Option<&StreamSpecification>,
+    capture: Option<&StreamCapture>,
+    key_schema: &[KeySchemaElement],
+    old: Option<&Item>,
+    new: Option<&Item>,
+    seq: &str,
+    default_region: &str,
+) -> Option<StreamRecord> {
+    build_record_with_timestamp(spec, capture, key_schema, old, new, seq, default_region)
+        .map(|(record, _)| record)
 }
 
 /// Persist a shard metadata row into `__extenddb_catalog__`.
@@ -313,50 +376,15 @@ pub async fn load_table_shards(
     Ok(out)
 }
 
-/// Advance `ShardMeta.next_seq_num` and `last_sequence_number` monotonically via CAS.
-async fn advance_shard_cursor_at_least(
-    cat: &Catalog<'_>,
-    shard_id: &str,
-    min_next_slot: u64,
-    committed_seq: &str,
-) -> Result<(), StorageError> {
-    let rk = keys::stream_shard(shard_id);
-    cat.mutate_json_cas(&rk, std::convert::identity, |existing| {
-        let Some(val) = existing else {
-            return Ok((CatalogJsonAction::NoOp, ()));
-        };
-        let mut meta: ShardMeta = serde_json::from_value(val)
-            .map_err(|e| StorageError::Internal(format!("decode shard meta {shard_id}: {e}")))?;
-        let mut changed = false;
-        if meta.next_seq_num < min_next_slot {
-            meta.next_seq_num = min_next_slot;
-            changed = true;
-        }
-        if meta
-            .last_sequence_number
-            .as_deref()
-            .is_none_or(|prev| committed_seq > prev)
-        {
-            meta.last_sequence_number = Some(committed_seq.to_owned());
-            changed = true;
-        }
-        if !changed {
-            return Ok((CatalogJsonAction::NoOp, ()));
-        }
-        let encoded = serde_json::to_value(&meta)
-            .map_err(|e| StorageError::Internal(format!("encode shard meta: {e}")))?;
-        Ok((CatalogJsonAction::Put(encoded), ()))
-    })
-    .await
-}
-
 /// Atomically verify `ShardMeta` has not been sealed strictly below `committed_seq`
 /// and advance `next_seq_num` / `last_sequence_number` via CAS.
 ///
 /// Returns `Ok(false)` when `ending_sequence_number` is set strictly below
 /// `committed_seq` (or the shard metadata row was removed), allowing
-/// `write_record_ordered` to delete any unexposed post-close slot record and
-/// return `Ok(None)`.
+/// `write_record_ordered_at` to delete any unexposed post-close slot record and
+/// return `Ok(None)`, and preventing `latest_sequence_for_shard` or retention
+/// pruning from advancing `ShardMeta.last_sequence_number` past
+/// `ending_sequence_number`.
 async fn advance_shard_cursor_if_open(
     cat: &Catalog<'_>,
     shard_id: &str,
@@ -401,7 +429,8 @@ async fn advance_shard_cursor_if_open(
 }
 
 /// Ensure `ShardMeta.next_seq_num` is strictly past a `stream_record:<shard_id>:<seq>`
-/// row BEFORE 24-hour retention pruning deletes the record.
+/// row BEFORE 24-hour retention pruning deletes the record, without advancing
+/// a closed shard past its `ending_sequence_number`.
 ///
 /// # Errors
 ///
@@ -417,7 +446,7 @@ pub async fn ensure_shard_past_record(
         return Ok(());
     };
     if let Some(slot) = parse_slot_from_sequence(seq) {
-        advance_shard_cursor_at_least(cat, shard_id, slot.saturating_add(1), seq).await?;
+        let _ = advance_shard_cursor_if_open(cat, shard_id, slot.saturating_add(1), seq).await?;
     }
     Ok(())
 }
@@ -495,28 +524,40 @@ async fn persist_dedup_marker(cat: &Catalog<'_>, rk: &str, seq: &str, created_at
 }
 
 /// Append a stream record into the next contiguous per-shard log slot with
-/// exact-once cross-node deduplication.
+/// exact-once cross-node deduplication and an optional explicit millisecond
+/// creation timestamp.
 ///
 /// - Never falls back to a clock-derived sequence number: `ShardMeta` is always
 ///   persisted BEFORE `latest_stream_label` becomes visible on `table_meta`.
 /// - Returns `Ok(None)` without writing when `ShardMeta.ending_sequence_number`
 ///   is already set, so a closed shard never receives records past its ending
 ///   sequence number.
+/// - When `created_at_ms` is `None` (direct `StreamEngine::write_stream_record`
+///   callers), derives milliseconds from
+///   `record.dynamodb.approximate_creation_date_time * 1_000` without taking a
+///   second clock read.
 ///
 /// # Errors
 ///
 /// Returns [`StorageError`] if catalog reads/CAS writes fail or contention exceeds the retry cap.
 // Justification: dedup check, contiguous slot claiming, post-close sealing check, and cursor CAS advance form one atomic append loop.
 #[allow(clippy::too_many_lines)]
-pub async fn write_record_ordered(
+pub async fn write_record_ordered_at(
     cat: &Catalog<'_>,
     shard_id: &str,
     record: &StreamRecord,
+    created_at_ms: Option<i64>,
     dedup_key: Option<&str>,
 ) -> Result<Option<String>, StorageError> {
     let local_lock = shard_local_mutex(shard_id);
     let _guard = local_lock.lock().await;
 
+    let effective_created_at_ms = created_at_ms.unwrap_or_else(|| {
+        record
+            .dynamodb
+            .approximate_creation_date_time
+            .saturating_mul(1_000)
+    });
     let event_dedup_rk =
         (!record.event_id.is_empty()).then(|| keys::stream_dedup(shard_id, &record.event_id));
     let extra_dedup_rk = dedup_key
@@ -574,8 +615,14 @@ pub async fn write_record_ordered(
         let rec_rk = keys::stream_record(shard_id, &cand_seq);
         let mut candidate = record.clone();
         candidate.dynamodb.sequence_number.clone_from(&cand_seq);
-        let body = serde_json::to_value(&candidate)
+        let mut body = serde_json::to_value(&candidate)
             .map_err(|e| StorageError::Internal(format!("encode stream record: {e}")))?;
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                CREATED_AT_MS_FIELD.to_owned(),
+                serde_json::Value::from(effective_created_at_ms),
+            );
+        }
 
         if cat.put_if_absent(&rec_rk, &body).await? {
             // Persist dedup markers BEFORE advancing `ShardMeta.next_seq_num` so a
@@ -675,6 +722,22 @@ pub async fn write_record_ordered(
     )))
 }
 
+/// Append a stream record into the next contiguous per-shard log slot with
+/// exact-once cross-node deduplication, deriving `created_at_ms` from
+/// `record.dynamodb.approximate_creation_date_time * 1_000`.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] if catalog reads/CAS writes fail or contention exceeds the retry cap.
+pub async fn write_record_ordered(
+    cat: &Catalog<'_>,
+    shard_id: &str,
+    record: &StreamRecord,
+    dedup_key: Option<&str>,
+) -> Result<Option<String>, StorageError> {
+    write_record_ordered_at(cat, shard_id, record, None, dedup_key).await
+}
+
 /// Append a stream record idempotently via contiguous shard slot assignment.
 ///
 /// # Errors
@@ -711,22 +774,38 @@ pub async fn latest_sequence_for_shard(
     if best.is_none() && meta.next_seq_num > 1 {
         best = Some(slot_sequence_number(shard_id, meta.next_seq_num - 1));
     }
+    if let (Some(b), Some(end_seq)) = (best.as_deref(), meta.ending_sequence_number.as_deref())
+        && b > end_seq
+    {
+        best = Some(end_seq.to_owned());
+    }
 
     // Probe at `next_seq_num` in case a writer persisted `stream_record` right
-    // before crashing prior to advancing `ShardMeta.next_seq_num`.
+    // before crashing prior to advancing `ShardMeta.next_seq_num`. Never probe
+    // or advance past a closed shard's `ending_sequence_number`.
     let mut probe_slot = meta.next_seq_num.max(1);
     for _ in 0..64 {
         let probe_seq = slot_sequence_number(shard_id, probe_slot);
+        if meta
+            .ending_sequence_number
+            .as_deref()
+            .is_some_and(|end_seq| probe_seq.as_str() > end_seq)
+        {
+            break;
+        }
         let rk = keys::stream_record(shard_id, &probe_seq);
         if cat.get(&rk).await?.is_some() {
-            best = Some(probe_seq.clone());
-            let _ = advance_shard_cursor_at_least(
+            if !advance_shard_cursor_if_open(
                 cat,
                 shard_id,
                 probe_slot.saturating_add(1),
                 &probe_seq,
             )
-            .await;
+            .await?
+            {
+                break;
+            }
+            best = Some(probe_seq);
             probe_slot = probe_slot.saturating_add(1);
         } else {
             break;
@@ -734,6 +813,93 @@ pub async fn latest_sequence_for_shard(
     }
 
     Ok(best)
+}
+
+/// Return the lowest 26-digit sequence number recorded in `shard_id` whose
+/// stored creation time (`created_at_ms`, or `ApproximateCreationDateTime * 1_000`
+/// for legacy rows) is at or after `at_ms` (Unix epoch milliseconds), or `None`
+/// when the shard is absent or holds no qualifying record.
+///
+/// Pages `stream_record:<shard_id>:*` in ascending sequence-number order,
+/// bounded by `ShardMeta.ending_sequence_number` when the shard is closed, so
+/// the first matching record is the minimum qualifying sequence number even
+/// under non-monotonic clocks.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] if reading or decoding `ShardMeta` or scanning
+/// stream records fails.
+pub async fn first_sequence_number_at_or_after(
+    cat: &Catalog<'_>,
+    shard_id: &str,
+    at_ms: i64,
+) -> Result<Option<String>, StorageError> {
+    first_sequence_number_at_or_after_paged(cat, shard_id, at_ms, AT_TIMESTAMP_SCAN_PAGE_SIZE).await
+}
+
+/// Paged implementation of [`first_sequence_number_at_or_after`] with an
+/// explicit Bigtable `rows_limit` per scan page.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] if reading or decoding `ShardMeta` or scanning
+/// stream records fails.
+pub async fn first_sequence_number_at_or_after_paged(
+    cat: &Catalog<'_>,
+    shard_id: &str,
+    at_ms: i64,
+    page_size: i64,
+) -> Result<Option<String>, StorageError> {
+    let Some(val) = cat.get(&keys::stream_shard(shard_id)).await? else {
+        return Ok(None);
+    };
+    let meta: ShardMeta = serde_json::from_value(val)
+        .map_err(|e| StorageError::Internal(format!("decode shard meta {shard_id}: {e}")))?;
+
+    let prefix = keys::stream_record_shard_prefix(shard_id);
+    let end_open = match meta.ending_sequence_number.as_deref() {
+        Some(end_seq) => format!("{prefix}{end_seq}\x00"),
+        None => format!("stream_record:{shard_id};"),
+    };
+    let page_limit = page_size.max(1);
+    let mut start_key = prefix;
+    let mut inclusive = true;
+
+    loop {
+        let rows = cat
+            .scan_str_range(&start_key, inclusive, &end_open, page_limit)
+            .await?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let batch_len = rows.len();
+        let mut last_key = None;
+        for (rk, value) in rows {
+            last_key = Some(rk);
+            let Some((record, rec_ms)) = decode_stored_record(value) else {
+                continue;
+            };
+            if meta
+                .ending_sequence_number
+                .as_deref()
+                .is_some_and(|end_seq| record.dynamodb.sequence_number.as_str() > end_seq)
+            {
+                return Ok(None);
+            }
+            if rec_ms >= at_ms {
+                return Ok(Some(record.dynamodb.sequence_number));
+            }
+        }
+        if i64::try_from(batch_len).unwrap_or(i64::MAX) < page_limit {
+            return Ok(None);
+        }
+        if let Some(last) = last_key {
+            start_key = last;
+            inclusive = false;
+        } else {
+            return Ok(None);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -816,5 +982,95 @@ mod tests {
         let uid = rec.user_identity.expect("user_identity");
         assert_eq!(uid.principal_id, "dynamodb.amazonaws.com");
         assert_eq!(uid.identity_type, "Service");
+    }
+
+    #[test]
+    fn current_stream_clock_returns_consistent_secs_and_millis() {
+        let (secs, ms) = current_stream_clock();
+        assert!(secs > 0);
+        assert_eq!(ms.div_euclid(1_000), secs);
+        let sub_ms = ms.rem_euclid(1_000);
+        assert!((0..1_000).contains(&sub_ms));
+    }
+
+    #[test]
+    fn build_record_with_timestamp_shares_clock_read_with_approximate_creation_date_time() {
+        let ks = vec![KeySchemaElement {
+            attribute_name: "pk".into(),
+            key_type: KeyType::Hash,
+        }];
+        let mut item = Item::new();
+        item.insert("pk".into(), AttributeValue::S("k1".into()));
+        let spec = StreamSpecification {
+            stream_enabled: true,
+            stream_view_type: Some(StreamViewType::NewImage),
+        };
+        let seq = next_sequence_number();
+        let (rec, created_ms) = build_record_with_timestamp(
+            Some(&spec),
+            None,
+            &ks,
+            None,
+            Some(&item),
+            &seq,
+            "us-east-1",
+        )
+        .expect("record");
+        assert_eq!(
+            created_ms.div_euclid(1_000),
+            rec.dynamodb.approximate_creation_date_time,
+            "created_at_ms and ApproximateCreationDateTime must come from the same clock read"
+        );
+    }
+
+    #[test]
+    fn decode_stored_record_preserves_created_at_ms_falls_back_and_omits_wire_field() {
+        let ks = vec![KeySchemaElement {
+            attribute_name: "pk".into(),
+            key_type: KeyType::Hash,
+        }];
+        let mut item = Item::new();
+        item.insert("pk".into(), AttributeValue::S("k1".into()));
+        let spec = StreamSpecification {
+            stream_enabled: true,
+            stream_view_type: Some(StreamViewType::NewImage),
+        };
+        let mut rec = build_record(
+            Some(&spec),
+            None,
+            &ks,
+            None,
+            Some(&item),
+            "17000000000000000000000100",
+            "us-east-1",
+        )
+        .expect("record");
+        rec.dynamodb.approximate_creation_date_time = 1_700_000_042;
+
+        // Legacy row JSON without `created_at_ms` falls back to whole seconds * 1_000.
+        let legacy_val = serde_json::to_value(&rec).expect("encode legacy");
+        let (decoded_legacy, legacy_ms) =
+            decode_stored_record(legacy_val.clone()).expect("decode legacy");
+        assert_eq!(decoded_legacy.event_id, rec.event_id);
+        assert_eq!(legacy_ms, 1_700_000_042_000);
+
+        // Modern row carrying `created_at_ms` preserves sub-second precision while
+        // wire `StreamRecord` serialization never emits the internal field.
+        let mut with_ms = legacy_val;
+        with_ms.as_object_mut().expect("json object").insert(
+            CREATED_AT_MS_FIELD.to_owned(),
+            serde_json::Value::from(1_700_000_042_789i64),
+        );
+        let (decoded_modern, modern_ms) = decode_stored_record(with_ms).expect("decode modern");
+        assert_eq!(decoded_modern.event_id, rec.event_id);
+        assert_eq!(modern_ms, 1_700_000_042_789);
+        let reencoded = serde_json::to_value(&decoded_modern).expect("reencode");
+        assert!(
+            reencoded.get(CREATED_AT_MS_FIELD).is_none(),
+            "internal created_at_ms field must not leak into wire StreamRecord"
+        );
+
+        // Non-record JSON returns None cleanly.
+        assert!(decode_stored_record(json!({"created_at_ms": 123})).is_none());
     }
 }

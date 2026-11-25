@@ -2338,21 +2338,24 @@ impl BigtableEngine {
                 .unwrap_or_else(|| op.lookup_key());
             match Self::active_stream_target_for_capture(desc, stream, representative) {
                 Ok(Some((arn, shard_id))) => {
-                    if let Some(record) = crate::streams::build_record(
-                        desc.stream_specification.as_ref(),
-                        stream,
-                        &key_info.key_schema,
-                        existing.as_ref(),
-                        post_stage.as_ref(),
-                        crate::streams::UNASSIGNED_SEQUENCE_NUMBER,
-                        &self.region,
-                    ) {
+                    if let Some((record, created_at_ms)) =
+                        crate::streams::build_record_with_timestamp(
+                            desc.stream_specification.as_ref(),
+                            stream,
+                            &key_info.key_schema,
+                            existing.as_ref(),
+                            post_stage.as_ref(),
+                            crate::streams::UNASSIGNED_SEQUENCE_NUMBER,
+                            &self.region,
+                        )
+                    {
                         log_records.push(crate::transact::TxnStreamRecord {
                             stream_arn: arn,
                             shard_id,
                             record,
                             participant: Some(participant.clone()),
                             dedup_key: Some(format!("{txn_id}:0")),
+                            created_at_ms: Some(created_at_ms),
                         });
                     }
                 }
@@ -2949,10 +2952,11 @@ impl BigtableEngine {
                     None => state.mutations.is_none() || !materialized_participants.is_empty(),
                 };
                 if should_emit {
-                    let written = crate::streams::write_record_ordered(
+                    let written = crate::streams::write_record_ordered_at(
                         &cat,
                         &r.shard_id,
                         &r.record,
+                        r.created_at_ms,
                         r.dedup_key.as_deref(),
                     )
                     .await?;
@@ -2973,10 +2977,11 @@ impl BigtableEngine {
                         )
                         && new_sid != r.shard_id
                     {
-                        let _ = crate::streams::write_record_ordered(
+                        let _ = crate::streams::write_record_ordered_at(
                             &cat,
                             &new_sid,
                             &r.record,
+                            r.created_at_ms,
                             r.dedup_key.as_deref(),
                         )
                         .await?;
@@ -3397,7 +3402,9 @@ impl BigtableEngine {
         retention_hours: i64,
         shutdown: &CancellationToken,
     ) -> Result<u64, StorageError> {
-        let cutoff = time::OffsetDateTime::now_utc().unix_timestamp() - retention_hours * 3_600;
+        let (now_secs, now_ms) = crate::streams::current_stream_clock();
+        let cutoff = now_secs.saturating_sub(retention_hours.saturating_mul(3_600));
+        let cutoff_ms = now_ms.saturating_sub(retention_hours.saturating_mul(3_600_000));
         let mut deleted = 0u64;
 
         let mut start_key = "stream_record:".to_owned();
@@ -3425,8 +3432,8 @@ impl BigtableEngine {
                     return Ok(deleted);
                 }
                 last_key = Some(k.clone());
-                if let Ok(rec) = serde_json::from_value::<StreamRecord>(value)
-                    && rec.dynamodb.approximate_creation_date_time < cutoff
+                if let Some((_rec, rec_ms)) = crate::streams::decode_stored_record(value)
+                    && rec_ms < cutoff_ms
                 {
                     let _ = crate::streams::ensure_shard_past_record(&self.cat(), &k).await;
                     if self.cat().delete(&k).await.is_ok() {
@@ -6255,21 +6262,24 @@ impl DataEngine for BigtableEngine {
                     representative,
                 ) {
                     Ok(Some((arn, shard_id))) => {
-                        if let Some(record) = crate::streams::build_record(
-                            desc.stream_specification.as_ref(),
-                            op.stream.as_ref(),
-                            &op.key_info.key_schema,
-                            existing.as_ref(),
-                            new_item.as_ref(),
-                            crate::streams::UNASSIGNED_SEQUENCE_NUMBER,
-                            &self.region,
-                        ) {
+                        if let Some((record, created_at_ms)) =
+                            crate::streams::build_record_with_timestamp(
+                                desc.stream_specification.as_ref(),
+                                op.stream.as_ref(),
+                                &op.key_info.key_schema,
+                                existing.as_ref(),
+                                new_item.as_ref(),
+                                crate::streams::UNASSIGNED_SEQUENCE_NUMBER,
+                                &self.region,
+                            )
+                        {
                             log_records.push(crate::transact::TxnStreamRecord {
                                 stream_arn: arn,
                                 shard_id,
                                 record,
                                 participant: Some(participant.clone()),
                                 dedup_key: Some(format!("{txn_id}:{idx}")),
+                                created_at_ms: Some(created_at_ms),
                             });
                         }
                     }
@@ -6811,7 +6821,7 @@ impl StreamEngine for BigtableEngine {
 
             let mut records: Vec<StreamRecord> = Vec::with_capacity(rows.len());
             for (_key, value) in rows {
-                if let Ok(record) = serde_json::from_value::<StreamRecord>(value) {
+                if let Some((record, _)) = crate::streams::decode_stored_record(value) {
                     if shard_meta
                         .ending_sequence_number
                         .as_deref()
@@ -7013,6 +7023,17 @@ impl StreamEngine for BigtableEngine {
         Box::pin(
             async move { crate::streams::latest_sequence_for_shard(&self.cat(), &shard).await },
         )
+    }
+
+    fn first_sequence_number_at_or_after(
+        &self,
+        shard_id: &str,
+        at_ms: i64,
+    ) -> BoxFuture<'_, Result<Option<String>, StorageError>> {
+        let shard = shard_id.to_owned();
+        Box::pin(async move {
+            crate::streams::first_sequence_number_at_or_after(&self.cat(), &shard, at_ms).await
+        })
     }
 }
 

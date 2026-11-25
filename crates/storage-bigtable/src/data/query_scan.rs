@@ -1483,4 +1483,281 @@ mod tests {
             StorageError::Validation(ref m) if m == "The provided starting key is invalid"
         ));
     }
+
+    #[test]
+    fn begins_with_string_sort_key_near_max_unicode_scalar_base_and_gsi() {
+        use extenddb_core::expression::{parse_key_condition, tokenize};
+
+        let keys = [
+            "",
+            "a",
+            "a\0",
+            "a\0\0",
+            "a\x01",
+            "ab",
+            "a\u{D7FF}",
+            "a\u{E000}",
+            "a\u{FFFF}",
+            "a\u{10000}",
+            "a\u{10FFFF}",
+            "a\u{10FFFF}b",
+            "a\u{10FFFF}\u{10FFFF}",
+            "b",
+            "z",
+            "\u{10FFFF}",
+            "\u{10FFFF}x",
+            "\u{10FFFF}\u{10FFFF}",
+        ];
+        let prefixes = [
+            "a",
+            "a\0",
+            "a\u{D7FF}",
+            "a\u{FFFF}",
+            "a\u{10FFFF}",
+            "a\u{10FFFF}\u{10FFFF}",
+            "\u{10FFFF}",
+            "\u{10FFFF}\u{10FFFF}",
+            "",
+        ];
+
+        let base_ks = vec![
+            KeySchemaElement {
+                attribute_name: "pk".into(),
+                key_type: KeyType::Hash,
+            },
+            KeySchemaElement {
+                attribute_name: "sk".into(),
+                key_type: KeyType::Range,
+            },
+        ];
+        let base_rows: Vec<(&str, Vec<u8>)> = keys
+            .iter()
+            .map(|&sk| {
+                let mut item = BTreeMap::new();
+                item.insert("pk".into(), AttributeValue::S("p".into()));
+                item.insert("sk".into(), AttributeValue::S(sk.into()));
+                (sk, row_key::encode_key(&item, &base_ks).unwrap())
+            })
+            .collect();
+
+        let gsi_ks = vec![
+            KeySchemaElement {
+                attribute_name: "gpk".into(),
+                key_type: KeyType::Hash,
+            },
+            KeySchemaElement {
+                attribute_name: "gsk".into(),
+                key_type: KeyType::Range,
+            },
+        ];
+        let gsi_rows: Vec<(&str, Vec<u8>)> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, &sk)| {
+                let mut item = BTreeMap::new();
+                item.insert("pk".into(), AttributeValue::S(format!("b{i}")));
+                item.insert("sk".into(), AttributeValue::S("s".into()));
+                item.insert("gpk".into(), AttributeValue::S("gp".into()));
+                item.insert("gsk".into(), AttributeValue::S(sk.into()));
+                (
+                    sk,
+                    crate::gsi::shadow_row_key_for_item(&item, &gsi_ks, &base_ks)
+                        .unwrap()
+                        .unwrap(),
+                )
+            })
+            .collect();
+
+        for prefix in prefixes {
+            let expected: Vec<&str> = keys
+                .iter()
+                .copied()
+                .filter(|k| k.starts_with(prefix))
+                .collect();
+
+            let mut maps = ExpressionMaps::default();
+            maps.values
+                .insert("p".into(), AttributeValue::S("p".into()));
+            maps.values
+                .insert("s".into(), AttributeValue::S(prefix.into()));
+            let kc =
+                parse_key_condition(&tokenize("pk = :p AND begins_with(sk, :s)").unwrap()).unwrap();
+            let pk_val = maps.values.get("p").unwrap();
+            let (_, start, end, end_open) =
+                build_base_range_for_query(pk_val, kc.sk_condition.as_ref(), &maps).unwrap();
+            let got_base: Vec<&str> = base_rows
+                .iter()
+                .filter(|(_, rk)| {
+                    rk.as_slice() >= start.as_slice()
+                        && if end_open {
+                            rk.as_slice() < end.as_slice()
+                        } else {
+                            rk.as_slice() <= end.as_slice()
+                        }
+                })
+                .map(|(sk, _)| *sk)
+                .collect();
+            assert_eq!(
+                got_base,
+                expected,
+                "base begins_with mismatch for prefix {}",
+                prefix.escape_unicode()
+            );
+
+            let mut gmaps = ExpressionMaps::default();
+            gmaps
+                .values
+                .insert("p".into(), AttributeValue::S("gp".into()));
+            gmaps
+                .values
+                .insert("s".into(), AttributeValue::S(prefix.into()));
+            let gkc = parse_key_condition(&tokenize("gpk = :p AND begins_with(gsk, :s)").unwrap())
+                .unwrap();
+            let ((_, gstart, gend, gend_open), _) =
+                build_gsi_range_for_query(&gsi_ks, &gkc, &gmaps).unwrap();
+            let got_gsi: Vec<&str> = gsi_rows
+                .iter()
+                .filter(|(_, rk)| {
+                    rk.as_slice() >= gstart.as_slice()
+                        && if gend_open {
+                            rk.as_slice() < gend.as_slice()
+                        } else {
+                            rk.as_slice() <= gend.as_slice()
+                        }
+                })
+                .map(|(sk, _)| *sk)
+                .collect();
+            assert_eq!(
+                got_gsi,
+                expected,
+                "gsi begins_with mismatch for prefix {}",
+                prefix.escape_unicode()
+            );
+        }
+    }
+
+    #[test]
+    fn begins_with_binary_sort_key_all_0xff_and_embedded_nul_base_and_gsi() {
+        use extenddb_core::expression::{parse_key_condition, tokenize};
+
+        let keys: &[&[u8]] = &[
+            b"\x00",
+            b"\x00\x00",
+            b"\x00\xff",
+            b"\x00\xff\x01",
+            b"a",
+            b"a\xff",
+            b"a\xff\xff",
+            b"b",
+            b"\xff",
+            b"\xff\x00",
+            b"\xff\xff",
+        ];
+        let prefixes: &[&[u8]] = &[b"", b"\x00", b"\x00\xff", b"a\xff", b"\xff", b"\xff\xff"];
+
+        let base_ks = vec![
+            KeySchemaElement {
+                attribute_name: "pk".into(),
+                key_type: KeyType::Hash,
+            },
+            KeySchemaElement {
+                attribute_name: "sk".into(),
+                key_type: KeyType::Range,
+            },
+        ];
+        let base_rows: Vec<(&[u8], Vec<u8>)> = keys
+            .iter()
+            .map(|&sk| {
+                let mut item = BTreeMap::new();
+                item.insert("pk".into(), AttributeValue::S("p".into()));
+                item.insert("sk".into(), AttributeValue::B(sk.to_vec()));
+                (sk, row_key::encode_key(&item, &base_ks).unwrap())
+            })
+            .collect();
+
+        let gsi_ks = vec![
+            KeySchemaElement {
+                attribute_name: "gpk".into(),
+                key_type: KeyType::Hash,
+            },
+            KeySchemaElement {
+                attribute_name: "gsk".into(),
+                key_type: KeyType::Range,
+            },
+        ];
+        let gsi_rows: Vec<(&[u8], Vec<u8>)> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, &sk)| {
+                let mut item = BTreeMap::new();
+                item.insert("pk".into(), AttributeValue::S(format!("b{i}")));
+                item.insert("sk".into(), AttributeValue::B(b"s".to_vec()));
+                item.insert("gpk".into(), AttributeValue::S("gp".into()));
+                item.insert("gsk".into(), AttributeValue::B(sk.to_vec()));
+                (
+                    sk,
+                    crate::gsi::shadow_row_key_for_item(&item, &gsi_ks, &base_ks)
+                        .unwrap()
+                        .unwrap(),
+                )
+            })
+            .collect();
+
+        for &prefix in prefixes {
+            let expected: Vec<&[u8]> = keys
+                .iter()
+                .copied()
+                .filter(|k| k.starts_with(prefix))
+                .collect();
+
+            let mut maps = ExpressionMaps::default();
+            maps.values
+                .insert("p".into(), AttributeValue::S("p".into()));
+            maps.values
+                .insert("s".into(), AttributeValue::B(prefix.to_vec()));
+            let kc =
+                parse_key_condition(&tokenize("pk = :p AND begins_with(sk, :s)").unwrap()).unwrap();
+            let pk_val = maps.values.get("p").unwrap();
+            let (_, start, end, end_open) =
+                build_base_range_for_query(pk_val, kc.sk_condition.as_ref(), &maps).unwrap();
+            let got_base: Vec<&[u8]> = base_rows
+                .iter()
+                .filter(|(_, rk)| {
+                    rk.as_slice() >= start.as_slice()
+                        && if end_open {
+                            rk.as_slice() < end.as_slice()
+                        } else {
+                            rk.as_slice() <= end.as_slice()
+                        }
+                })
+                .map(|(sk, _)| *sk)
+                .collect();
+            assert_eq!(got_base, expected, "base binary begins_with {prefix:02x?}");
+
+            let mut gmaps = ExpressionMaps::default();
+            gmaps
+                .values
+                .insert("p".into(), AttributeValue::S("gp".into()));
+            gmaps
+                .values
+                .insert("s".into(), AttributeValue::B(prefix.to_vec()));
+            let gkc = parse_key_condition(&tokenize("gpk = :p AND begins_with(gsk, :s)").unwrap())
+                .unwrap();
+            let ((_, gstart, gend, gend_open), _) =
+                build_gsi_range_for_query(&gsi_ks, &gkc, &gmaps).unwrap();
+            let got_gsi: Vec<&[u8]> = gsi_rows
+                .iter()
+                .filter(|(_, rk)| {
+                    rk.as_slice() >= gstart.as_slice()
+                        && if gend_open {
+                            rk.as_slice() < gend.as_slice()
+                        } else {
+                            rk.as_slice() <= gend.as_slice()
+                        }
+                })
+                .map(|(sk, _)| *sk)
+                .collect();
+            assert_eq!(got_gsi, expected, "gsi binary begins_with {prefix:02x?}");
+        }
+    }
 }
