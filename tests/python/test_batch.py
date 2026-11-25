@@ -21,16 +21,13 @@ from helpers import unique_name
 # the tables of RequestItems. Each test gives the path and the bound. In every
 # answer measured on 2026-11-20, DynamoDB listed the table count clause first
 # when it was over the limit, then the table clauses in an order that changed
-# from one send to the next, at most MAX_CLAUSES in all. On 2026-11-14 and
-# 2026-11-16 it also quoted the request map in a message that holds
-# QUOTED_MAP, so the test accepts that from DynamoDB.
+# from one send to the next, at most MAX_CLAUSES in all. In some BatchWriteItem
+# answers of 2026-11-14 and 2026-11-16, and in every one of 2026-11-25, it
+# quoted the request map instead, in a message that holds QUOTED. The
+# BatchWriteItem test accepts that from DynamoDB.
 CLAUSE = "Value at '{}' failed to satisfy constraint: Member must have length {}"
 MAX_CLAUSES = 10
-QUOTED_MAP = (
-    "' at 'requestItems' failed to satisfy constraint: Map value must satisfy "
-    "constraint: [Member must have length less than or equal to 25, "
-    "Member must have length greater than or equal to 1]"
-)
+QUOTED = "' at 'requestItems' failed to satisfy constraint: "
 
 
 def _assert_clauses(message: str, clauses: list[str], count: str | None = None) -> None:
@@ -58,6 +55,10 @@ def _counts(n: int, empty: range | set[int], big: int | None = None, over: int =
 def _writes(n: int, empty: range | set[int], big: int | None = None) -> list[tuple]:
     """n tables of one put, except none at `empty` and 26 at `big`."""
     return [("tbl", _puts(c)) for c in _counts(n, empty, big, 26)]
+
+
+# The start of a table ARN in an account that is not the caller's.
+OTHER_ACCOUNT = "arn:aws:dynamodb:us-east-1:000000000000:table/"
 
 
 def _raw_batch(client, operation: str, request_items: dict):
@@ -183,6 +184,14 @@ class TestBatchWriteItem:
             pytest.param(_writes(26, range(1, 10)), range(1, 10), id="26_tables_9_none"),
             pytest.param(_writes(26, range(1, 11)), range(1, 11), id="26_tables_10_none"),
             pytest.param(_writes(26, {5}, 9), [5, 9], id="26_tables_1_none_1_of_26"),
+            pytest.param(
+                [
+                    (OTHER_ACCOUNT + p if i == 13 else p, r)
+                    for i, (p, r) in enumerate(_writes(26, {5}))
+                ],
+                [5],
+                id="26_tables_1_none_1_arn_of_another_account",
+            ),
         ],
     )
     def test_batch_write_too_many_items(
@@ -203,7 +212,7 @@ class TestBatchWriteItem:
             )
         error = exc.value.response["Error"]
         assert error["Code"] == "ValidationException"
-        if not is_extenddb and QUOTED_MAP in error["Message"]:
+        if not is_extenddb and QUOTED in error["Message"]:
             return
         clauses = [
             CLAUSE.format(

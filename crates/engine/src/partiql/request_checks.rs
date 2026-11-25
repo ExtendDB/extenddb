@@ -31,6 +31,9 @@ use serde_json::Value;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::partiql::statement_length_refusal;
 
+use crate::int32_member;
+use crate::request_limits::validation_refusal;
+
 use echo::{Echo, echo_list, write_batch_member, write_transaction_member};
 
 mod echo;
@@ -46,8 +49,6 @@ const MAX_CLIENT_REQUEST_TOKEN: usize = 36;
 
 /// The longest `NextToken`, in code points.
 const MAX_NEXT_TOKEN: usize = 32768;
-
-use crate::request_limits::MAX_PARTS;
 
 /// The constraint an empty statement or list fails.
 const AT_LEAST_ONE: &str = "Member must have length greater than or equal to 1";
@@ -104,10 +105,11 @@ pub(super) fn is_blank_statement(statement: &str) -> bool {
 ///
 /// Returns the service's refusal naming every failed constraint.
 pub(super) fn check_execute_statement(body: &Value) -> Result<(), DynamoDbError> {
+    let limit = int32_member::read(body.get("Limit"))?;
     let mut found = Found::default();
     found.on_failure(body, "returnValuesOnConditionCheckFailure");
     found.length(body.get("NextToken"), "nextToken", MAX_NEXT_TOKEN);
-    if let Some(limit) = body.get("Limit").and_then(Value::as_i64)
+    if let Some(limit) = limit
         && limit < 1
     {
         found.add(
@@ -298,19 +300,12 @@ impl Found {
         }
     }
 
-    /// The refusal, listing the first [`MAX_PARTS`] failed constraints.
-    fn into_result(mut self) -> Result<(), DynamoDbError> {
-        self.0.truncate(MAX_PARTS);
-        let message = match self.0.as_slice() {
-            [] => return Ok(()),
-            [part] => format!("1 validation error detected: {part}"),
-            parts => format!(
-                "{} validation errors detected: {}",
-                parts.len(),
-                parts.join("; ")
-            ),
-        };
-        Err(DynamoDbError::ValidationException(message))
+    /// The [`validation_refusal`] of the failed constraints, if any.
+    fn into_result(self) -> Result<(), DynamoDbError> {
+        if self.0.is_empty() {
+            return Ok(());
+        }
+        Err(validation_refusal(self.0))
     }
 }
 
@@ -326,5 +321,7 @@ fn constraint_of(refusal: &str) -> String {
         )
 }
 
+#[cfg(test)]
+mod limit_tests;
 #[cfg(test)]
 mod tests;
