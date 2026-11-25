@@ -7,9 +7,12 @@
 # This replaces the runbook's manual `docker buildx imagetools create` step
 # with a two-person action: the operator who verified the candidate dispatches
 # with the digest they verified, and a DIFFERENT maintainer approves the
-# `dockerhub` environment gate (prevent-self-review). The registry credential
-# never leaves the protected environment, so promotion no longer depends on
-# any individual holding the token locally.
+# `dockerhub` environment gate (prevent-self-review). When
+# release-publish.yml calls it, the run's actor is the maintainer who
+# dispatched release-publish.yml, and prevent-self-review excludes that
+# maintainer in the same way. The registry credential never leaves the
+# protected environment, so promotion no longer depends on any individual
+# holding the token locally.
 #
 # The release flow this slots into:
 #
@@ -22,6 +25,10 @@
 #      ECR mirror
 #   4. signing           per runbook
 #   5. promote-image     THIS workflow: verified digest -> `X.Y.Z` + `latest`
+#
+# release-publish.yml runs this flow from one dispatch, with a verify job in
+# place of the manual test (packaging/README.md, "Publishing with
+# release-publish.yml").
 #
 # The digest input is the contract with step 2: this job refuses to promote
 # anything but the digest the tester verified, even if the candidate tag has
@@ -44,7 +51,8 @@
 #     the ECR role's OIDC trust includes this environment.
 # All legs run the promote-registry composite action — one implementation of
 # signature-first, no-overwrite, and forward-only latest (judged against
-# each destination's own tags). The image is an allowlisted choice input.
+# each destination's own tags). The image is an allowlisted choice input
+# when dispatched and a string checked by the same allowlist when called.
 
 name: promote-image
 
@@ -75,6 +83,29 @@ on:
           - extenddb-mongodb
           - extenddb-cassandra
         default: extenddb-postgres
+  # release-publish.yml calls this workflow with the digest that
+  # release-image returned and its verify job checked. The image is a string
+  # here (workflow_call has no choice type); the gate's allowlist enforces
+  # it. Any public repository can call a public reusable workflow, so the
+  # promote job's first step, after the dockerhub approval and before any
+  # other step, refuses to run outside ExtendDB/extenddb.
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: true
+      candidate_tag:
+        type: string
+        required: true
+      expected_digest:
+        type: string
+        required: true
+      move_latest:
+        type: boolean
+        required: true
+      image:
+        type: string
+        required: true
 
 permissions:
   contents: read
@@ -85,7 +116,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # inputs.image is a closed choice list; no free text reaches these paths.
+  # inputs.image is a closed choice list when dispatched. Called, it is a
+  # string, and the gate's allowlist runs before any step that uses these
+  # paths; promote-mirrors needs promote.
   IMAGE_REPO: docker.io/extenddb/${{ inputs.image }}
   GHCR_REPO: ghcr.io/extenddb/${{ inputs.image }}
   ECR_REPO: public.ecr.aws/extenddb/${{ inputs.image }}
@@ -105,6 +138,15 @@ jobs:
       contents: read
       id-token: write   # OIDC: read the Docker Hub credential from Secrets Manager
     steps:
+      - name: Gate - the run is in ExtendDB/extenddb
+        # A call from another repository runs this file there, with that
+        # repository's checkout. Every later job needs this one.
+        run: |
+          if [[ "$GITHUB_REPOSITORY" != "ExtendDB/extenddb" ]]; then
+            echo "::error::this workflow publishes ExtendDB only, not from ${GITHUB_REPOSITORY}"
+            exit 1
+          fi
+
       - name: Check out main (ancestry and version gates need history)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
