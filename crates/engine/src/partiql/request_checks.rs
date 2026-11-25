@@ -31,6 +31,8 @@ use serde_json::Value;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::partiql::statement_length_refusal;
 
+use crate::int32_member;
+
 use echo::{Echo, echo_list, write_batch_member, write_transaction_member};
 
 mod echo;
@@ -104,10 +106,11 @@ pub(super) fn is_blank_statement(statement: &str) -> bool {
 ///
 /// Returns the service's refusal naming every failed constraint.
 pub(super) fn check_execute_statement(body: &Value) -> Result<(), DynamoDbError> {
+    let limit = int32_member::read(body.get("Limit"))?;
     let mut found = Found::default();
     found.on_failure(body, "returnValuesOnConditionCheckFailure");
     found.length(body.get("NextToken"), "nextToken", MAX_NEXT_TOKEN);
-    if let Some(limit) = body.get("Limit").and_then(Value::as_i64)
+    if let Some(limit) = limit
         && limit < 1
     {
         found.add(
@@ -326,5 +329,7 @@ fn constraint_of(refusal: &str) -> String {
         )
 }
 
+#[cfg(test)]
+mod limit_tests;
 #[cfg(test)]
 mod tests;
