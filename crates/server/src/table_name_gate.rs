@@ -63,13 +63,18 @@
 //!   `ProvisionedThroughputOverride` list of two integers and a
 //!   `BillingModeOverride` object of one key, which the service refuses
 //!   before the name (#1106).
-//! - A RestoreTableFromBackup `TargetTableName` that is neither a string nor
-//!   null: `SerializationException`, before the checks of the value of
-//!   `BackupArn` and of the overrides (measured 2026-11-20). A member of
-//!   another JSON type written before it is answered first by the service,
-//!   which this check does not follow. The text is the one the restore's
-//!   other members of another JSON type get. The service's texts and its
-//!   member order are #1012.
+//! - A RestoreTableFromBackup `TargetTableName` or `BackupArn`, a
+//!   DescribeBackup or DeleteBackup `BackupArn` and a
+//!   DescribeContinuousBackups or UpdateContinuousBackups `TableName` that
+//!   is neither a string nor null: `SerializationException`, before every
+//!   check of a value (measured 2026-11-20 and 2026-11-21). On a restore
+//!   this answer comes before the checks of the target name and of the
+//!   overrides, and before the answer to a missing target. The server
+//!   refuses an UpdateContinuousBackups that enables recovery before this
+//!   check. A member of another JSON type written before it is answered
+//!   first by the service, which this check does not follow. The text is
+//!   the one the restore's other members of another JSON type get. The
+//!   service's texts and its member order are #1012.
 //!
 //! The service reads `SourceTableName`, `TargetTableName` (both restores),
 //! `TableCreationParameters.TableName` (`ImportTable`),
@@ -100,9 +105,9 @@ const LIST_STREAMS_NAME: &str =
 
 /// Refuse a table name outside the service's character pattern, in any field
 /// the operation carries one, before the name is used in any lookup. A
-/// missing, non-string or empty name passes, except a RestoreTableFromBackup
-/// `TargetTableName` that is neither a string nor null. `account_id` is the
-/// caller's account, which the control-plane ARN rules compare with the ARN's.
+/// missing, non-string or empty name passes, except a member that
+/// `string_member` refuses for its JSON type. `account_id` is the caller's
+/// account, which the control-plane ARN rules compare with the ARN's.
 pub(crate) fn check_table_name_chars(
     operation: &str,
     input: &Value,
@@ -121,16 +126,17 @@ pub(crate) fn check_table_name_chars(
             with_str(input, "StreamArn", arn_gate::check_stream_arn)
         }
         "DescribeBackup" | "DeleteBackup" => {
+            string_member(input, "BackupArn")?;
             with_str(input, "BackupArn", arn_gate::check_backup_arn)
+        }
+        "DescribeContinuousBackups" | "UpdateContinuousBackups" => {
+            string_member(input, "TableName")?;
+            check_name(input.get("TableName"), "tableName", operation, account_id)
         }
         "RestoreTableFromBackup" => {
             let target = input.get("TargetTableName");
-            if target.is_some_and(|v| !v.is_string() && !v.is_null()) {
-                return Err(DynamoDbError::SerializationException(
-                    "Start of structure or map found where not expected: TargetTableName"
-                        .to_owned(),
-                ));
-            }
+            string_member(input, "TargetTableName")?;
+            string_member(input, "BackupArn")?;
             with_str(input, "BackupArn", arn_gate::check_backup_arn)?;
             // A target name refused here gets the restore's own answer, its
             // length text before the member constraints, with the model's
@@ -195,6 +201,17 @@ pub(crate) fn check_table_name_chars(
             }
         }
         _ => check_name(input.get("TableName"), "tableName", operation, account_id),
+    }
+}
+
+/// A member the service reads as a string: one that is neither a string nor
+/// null is refused before any value is checked.
+fn string_member(input: &Value, member: &str) -> Result<(), DynamoDbError> {
+    match input.get(member) {
+        None | Some(Value::Null | Value::String(_)) => Ok(()),
+        Some(_) => Err(DynamoDbError::SerializationException(format!(
+            "Start of structure or map found where not expected: {member}"
+        ))),
     }
 }
 
@@ -668,27 +685,56 @@ mod tests {
         }
     }
 
-    /// Measured on DynamoDB on 20 Nov 2026: a restore's `TargetTableName`
-    /// that is neither a string nor null is answered before the checks of the
-    /// value of `BackupArn`, and a null is an absent member. The text is
-    /// ExtendDB's (DynamoDB's texts are #1012).
+    /// Measured on DynamoDB on 20 and 21 Nov 2026 (see the module docs). The
+    /// `SerializationException` text names the member and is ExtendDB's
+    /// (DynamoDB's texts are #1012).
     #[test]
-    fn a_restore_target_name_of_another_json_type_is_refused_before_the_backup_arn_value_checks() {
+    fn a_member_of_another_json_type_is_refused_before_its_value_is_checked() {
         let own =
             "arn:aws:dynamodb:us-east-1:123456789012:table/t367name/backup/01700000000000-abcdef12";
         let refused_arn = format!("{ARN}/backup/01700000000000-abcdef12");
-        for target in [json!(5), json!(true), json!({}), json!([])] {
-            let input = json!({ "BackupArn": refused_arn, "TargetTableName": target });
-            match check_table_name_chars("RestoreTableFromBackup", &input, "123456789012") {
-                Err(DynamoDbError::SerializationException(m)) => assert_eq!(
-                    m, "Start of structure or map found where not expected: TargetTableName",
-                    "{input}"
-                ),
-                other => panic!("{input}: {other:?}"),
-            }
+        let (arn, target, name) = ("BackupArn", "TargetTableName", "t367name");
+        let disable = json!({ "PointInTimeRecoveryEnabled": false });
+        let (restore, pitr) = ("RestoreTableFromBackup", "DescribeContinuousBackups");
+        // (operation, body, the member refused, or `None` when the gate passes)
+        let mut rows = vec![
+            (restore, json!({ arn: 5, target: "a*" }), Some(arn)),
+            (restore, json!({ arn: null, target: name }), None),
+            (restore, json!({ arn: own, target: null }), None),
+            (pitr, json!({ "TableName": null }), None),
+            (pitr, json!({ "TableName": name }), None),
+        ];
+        let values = [
+            json!(5),
+            json!(true),
+            json!({}),
+            json!([]),
+            json!(["a"]),
+            json!(5.5),
+        ];
+        for value in values {
+            rows.push((restore, json!({ arn: value, target: name }), Some(arn)));
+            rows.push((
+                restore,
+                json!({ arn: refused_arn, target: value }),
+                Some(target),
+            ));
+            rows.push((pitr, json!({ "TableName": value }), Some("TableName")));
+            let body = json!({ "TableName": value, "PointInTimeRecoverySpecification": disable });
+            rows.push(("UpdateContinuousBackups", body, Some("TableName")));
+            rows.push(("DescribeBackup", json!({ arn: value }), Some(arn)));
+            rows.push(("DeleteBackup", json!({ arn: value }), Some(arn)));
         }
-        let null = json!({ "BackupArn": own, "TargetTableName": null });
-        assert!(message("RestoreTableFromBackup", null).is_none());
+        for (op, input, refused) in rows {
+            let answer = match check_table_name_chars(op, &input, "123456789012") {
+                Ok(()) => None,
+                Err(DynamoDbError::SerializationException(m)) => Some(m),
+                Err(other) => panic!("{op} {input}: unexpected error {other:?}"),
+            };
+            let expected =
+                refused.map(|m| format!("Start of structure or map found where not expected: {m}"));
+            assert_eq!(answer, expected, "{op} {input}");
+        }
     }
 
     /// Measured on DynamoDB on 20, 21 and 25 Nov 2026: with a target name the
