@@ -462,3 +462,59 @@ async fn the_newer_arn_with_a_legacy_shard_of_the_closed_stream_is_not_found() {
         .expect("the new stream reads under its own ARN");
     assert_eq!(records.len(), 1);
 }
+
+/// A record with the `created_at` the write path stores: the clock read in
+/// milliseconds, in the column's fixed-width shape.
+async fn write_record_at(engine: &SqliteEngine, shard_id: &str, table_id: &str, seq: u64, ms: i64) {
+    sqlx::query(
+        "INSERT INTO stream_records (sequence_number, shard_id, table_id, event_name, \
+         record_data, created_at) VALUES (?, ?, ?, 'Insert', ?, ?)",
+    )
+    .bind(format!("{seq:021}"))
+    .bind(shard_id)
+    .bind(table_id)
+    .bind(record_json(seq))
+    .bind(crate::sqlite_util::format_epoch_millis(ms))
+    .execute(&engine.pool)
+    .await
+    .expect("record");
+}
+
+/// The `AT_TIMESTAMP` seek answers the first record created at or after the
+/// millisecond asked for: a record's own millisecond returns it, the next one
+/// does not, and another shard's records do not count. The other shard's
+/// record has the lowest sequence number and a `created_at` inside the table's
+/// range, so without the shard filter it is the answer to the first five rows.
+#[tokio::test]
+async fn at_timestamp_seek_is_at_or_after_the_records_millisecond() {
+    let engine = engine().await;
+    let table_id = stream_table(&engine, ACCOUNT, "t", "2026-01-01T00:00:00.000").await;
+    let own = shard(&table_id, 0);
+    let other = shard(&table_id, 1);
+    let base = 1_700_000_000_250;
+    write_record_at(&engine, &own, &table_id, 5, base).await;
+    write_record_at(&engine, &own, &table_id, 6, base + 1).await;
+    write_record_at(&engine, &own, &table_id, 7, base + 750).await;
+    write_record_at(&engine, &other, &table_id, 4, base + 2).await;
+
+    let cases: &[(i64, Option<u64>)] = &[
+        (0, Some(5)),
+        (base - 1, Some(5)),
+        (base, Some(5)),
+        (base + 1, Some(6)),
+        (base + 2, Some(7)),
+        (base + 750, Some(7)),
+        (base + 751, None),
+    ];
+    for (at_ms, expected) in cases {
+        let got = engine
+            .first_sequence_number_at_or_after(&own, *at_ms)
+            .await
+            .expect("seek");
+        assert_eq!(
+            got,
+            expected.map(|seq| format!("{seq:021}")),
+            "at_ms={at_ms}"
+        );
+    }
+}
