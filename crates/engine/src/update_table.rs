@@ -106,15 +106,6 @@ pub async fn handle_update_table(
         ));
     }
 
-    // Validate: enabling streams requires a view type.
-    if let Some(spec) = &input.stream_specification
-        && spec.stream_enabled
-        && spec.stream_view_type.is_none()
-    {
-        return Err(DynamoDbError::ValidationException(
-            "StreamViewType must be specified when StreamEnabled is true".to_owned(),
-        ));
-    }
     // A disable carries no view type (measured 2026-10-24 on a never-streamed
     // table and on an enabled one alike; checked before the no-stream rule).
     if let Some(spec) = &input.stream_specification
@@ -131,7 +122,7 @@ pub async fn handle_update_table(
         && input.provisioned_throughput.is_none()
     {
         return Err(DynamoDbError::ValidationException(
-            "One or more parameter values were invalid: ProvisionedThroughput must be specified when changing BillingMode to PROVISIONED".to_owned(),
+            "One or more parameter values were invalid: ProvisionedThroughput must be specified when BillingMode is PROVISIONED".to_owned(),
         ));
     }
 
@@ -153,13 +144,17 @@ pub async fn handle_update_table(
             ));
     }
 
+    crate::gsi_updates::validate_gsi_updates(&input)?;
+    validate_stream_specification(&input)?;
+
     // A table-level WarmThroughput stands alone in its request, with the
     // measured per-companion sentences (measured 2026-10-23). Checked before
     // the value rules, as the service does: it fired on requests whose values
     // were otherwise valid. GlobalSecondaryIndexUpdates is accepted beside it.
+    // The index rules and the view type check above come first: the service
+    // answers their sentences beside WarmThroughput, with or without
+    // DeletionProtectionEnabled or BillingMode (measured 2026-11-25).
     extenddb_core::validation::validate_warm_throughput_is_only_operation(&input)?;
-
-    crate::gsi_updates::validate_gsi_updates(&input)?;
 
     // A stream change travels alone. Measured 2026-10-24: beside BillingMode or
     // ProvisionedThroughput the service refuses with the IOPS sentence, beside
@@ -286,6 +281,26 @@ pub async fn handle_update_table(
         table_description: desc,
     };
     serialize_output(&output)
+}
+
+/// Enabling a stream requires a view type. The sentence is the service's
+/// ([`extenddb_storage::stream_lineage::STREAM_VIEW_TYPE_REQUIRED`]). The
+/// service reports a defective index Create and a missing
+/// ProvisionedThroughput before this, and this before the warm throughput
+/// rule and the table lookup (measured 2026-10-25 and 2026-11-25), so the call
+/// sits after the billing and index rules and before the warm rule and the
+/// backend call, where it also precedes the already-enabled refusal. The
+/// `CreateTable` form has its own sentence.
+fn validate_stream_specification(input: &UpdateTableInput) -> Result<(), DynamoDbError> {
+    if let Some(spec) = &input.stream_specification
+        && spec.stream_enabled
+        && spec.stream_view_type.is_none()
+    {
+        return Err(DynamoDbError::ValidationException(
+            extenddb_storage::stream_lineage::STREAM_VIEW_TYPE_REQUIRED.to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// The sentence the service refuses a stream change with when the same

@@ -80,6 +80,19 @@ fn the_two_refusals_are_the_measured_sentences() {
 }
 
 #[test]
+fn an_enable_without_a_view_type_is_the_measured_sentence() {
+    for current in [None, Some(spec(false, None))] {
+        match stream_change("t", current.as_ref(), &spec(true, None)) {
+            Err(StorageError::Validation(m)) => assert_eq!(
+                m,
+                "One or more parameter values were invalid: If stream is being enabled then UpdateViewType is required"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+#[test]
 fn a_refused_disable_of_a_disabled_stream_closes_the_current_label_first() {
     let label = "2026-10-20T10:00:00.000";
     let disabled = spec(false, Some(StreamViewType::NewImage));
