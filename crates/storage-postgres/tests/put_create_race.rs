@@ -21,6 +21,9 @@
 //! server whose role may create and drop databases. Without it every test here
 //! reports a skip and passes, the same convention the wire suites use.
 
+#[path = "common/insert_gate.rs"]
+mod insert_gate;
+
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -33,8 +36,12 @@ use extenddb_core::types::{
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{DataEngine, StreamCapture, TableEngine, TransactWriteOp};
 use extenddb_storage_postgres::{PostgresConfig, PostgresEngine};
+use insert_gate::{
+    BYPASS_GATE, close_gate, connect, install_gate, open_gate, open_gate_fully,
+    wait_until_blocked_by,
+};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{Connection, PgConnection, PgPool, Postgres, Transaction};
+use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 
 const ACCOUNT: &str = "123456789012";
 const REGION: &str = "us-east-1";
@@ -262,31 +269,6 @@ async fn create_in_flight(
     (creator, pid)
 }
 
-/// Wait until a backend waits for a lock of kind `event` (`transactionid` or
-/// `advisory`) that the backend `blocker` holds. Fails after 5 s, so the caller
-/// can report what the put did instead.
-async fn wait_until_blocked_by(db: &PgPool, blocker: i32, event: &str) -> Result<(), String> {
-    for _ in 0..500 {
-        let waiting: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_stat_activity \
-             WHERE datname = current_database() AND wait_event_type = 'Lock' \
-             AND wait_event = $2 AND $1 = ANY(pg_blocking_pids(pid))",
-        )
-        .bind(blocker)
-        .bind(event)
-        .fetch_one(db)
-        .await
-        .expect("read pg_stat_activity");
-        if waiting > 0 {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    Err(format!(
-        "no backend waited on the {event} lock of backend {blocker}"
-    ))
-}
-
 /// Run `put` (ReturnValues ALL_OLD) while the winner's create is in flight,
 /// commit the create once the put waits on it, and return the put's result.
 async fn put_after_winner(
@@ -414,46 +396,10 @@ async fn a_lost_create_race_fails_a_condition_the_winner_breaks() {
 // not make an insert wait. The put's locking re-read then waits on the locker,
 // which deletes the winner and commits, so the re-read returns no row.
 
-/// The advisory lock key of the gate.
-const GATE: i64 = 0x5075_7452;
-
-/// Open a connection to the scratch database outside its pools. Returns it and
-/// its backend pid.
-async fn connect(s: &Scratch) -> (PgConnection, i32) {
-    let base = base_conn().expect("caller checks base_conn() first");
-    let mut conn = PgConnection::connect(&format!("{base}/{}", s.db_name))
-        .await
-        .expect("connect to the scratch database");
-    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut conn)
-        .await
-        .expect("read the backend pid");
-    (conn, pid)
-}
-
-/// Make every insert into `table` pass the gate first, unless its transaction
-/// sets `test.bypass_gate`. Passing takes the gate shared and releases it, so
-/// an insert parks while a session holds the gate exclusively.
-async fn install_gate(s: &Scratch, table: &str) {
-    sqlx::raw_sql(&format!(
-        "CREATE FUNCTION pass_gate() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
-           IF current_setting('test.bypass_gate', true) = 'on' THEN RETURN NEW; END IF; \
-           PERFORM pg_advisory_lock_shared({GATE}); \
-           PERFORM pg_advisory_unlock_shared({GATE}); \
-           RETURN NEW; \
-         END $$; \
-         CREATE TRIGGER pass_gate BEFORE INSERT ON {table} \
-           FOR EACH ROW EXECUTE FUNCTION pass_gate();"
-    ))
-    .execute(&s.db)
-    .await
-    .expect("install the gate trigger");
-}
-
 /// Commit the item with `v` as its value, past the gate.
 async fn commit_winner(s: &Scratch, table: &str, range: bool, v: &str) {
     let mut tx = s.db.begin().await.expect("begin the winner");
-    sqlx::query("SET LOCAL test.bypass_gate = 'on'")
+    sqlx::query(BYPASS_GATE)
         .execute(&mut *tx)
         .await
         .expect("bypass the gate");
@@ -482,7 +428,7 @@ async fn lose_to_a_vanishing_winner(
     rearm: bool,
 ) -> Result<(), String> {
     commit_winner(s, table, range, v).await;
-    let (mut locker, locker_pid) = connect(s).await;
+    let (mut locker, locker_pid) = connect(&s.db).await;
     sqlx::query("BEGIN")
         .execute(&mut locker)
         .await
@@ -494,19 +440,7 @@ async fn lose_to_a_vanishing_winner(
     .await
     .expect("lock the winner");
     assert!(locked.is_some(), "the locker holds the committed winner");
-    sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(GATE)
-        .execute(&mut *gate)
-        .await
-        .expect("open the gate");
-    if rearm {
-        // Granted only after the parked insert has passed the gate.
-        sqlx::query("SELECT pg_advisory_lock($1)")
-            .bind(GATE)
-            .execute(&mut *gate)
-            .await
-            .expect("close the gate again");
-    }
+    open_gate(gate, rearm).await;
     wait_until_blocked_by(&s.db, locker_pid, "transactionid").await?;
     sqlx::query(&format!("DELETE FROM {table} WHERE pk = 'c'"))
         .execute(&mut locker)
@@ -525,23 +459,9 @@ async fn lose_to_a_vanishing_winner(
 async fn gated_table(s: &Scratch, range: bool) -> (TableKeyInfo, String, PgConnection, i32) {
     let key_info = table(s, range).await;
     let data = data_table(&s.db).await;
-    install_gate(s, &data).await;
-    let (mut gate, gate_pid) = connect(s).await;
-    sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(GATE)
-        .execute(&mut gate)
-        .await
-        .expect("close the gate");
+    install_gate(&s.db, &data).await;
+    let (gate, gate_pid) = close_gate(&s.db).await;
     (key_info, data, gate, gate_pid)
-}
-
-/// Release every advisory lock `gate` holds. A driver that stops early calls
-/// this, so that a parked insert goes on and the put can report its result.
-async fn open_gate_fully(gate: &mut PgConnection) {
-    sqlx::query("SELECT pg_advisory_unlock_all()")
-        .execute(gate)
-        .await
-        .expect("open the gate");
 }
 
 async fn deleted_winner_is_retried(test: &str, range: bool) {

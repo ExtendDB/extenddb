@@ -413,6 +413,7 @@ async fn a_server_starts_on_a_switched_catalog_with_its_kek() {
         connection_string: s.catalog_url(),
         pool_size: 10,
         catalog_pool_size: None,
+        ..Default::default()
     };
     let start = |key_source: KeySource| {
         let mut options = extenddb_storage::server_components::ServerComponentsOptions::default();
