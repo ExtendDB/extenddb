@@ -87,7 +87,10 @@ pub(super) async fn check(
             // their index dimension, as the service publishes
             // Read/WriteThrottleEvents per table and per global secondary
             // index; ThrottledRequests is published per table and operation
-            // only, so a count by table sees an index refusal too.
+            // only, so a count by table sees an index refusal too. A write an
+            // index refused is a throttled event of the table as well: the
+            // service publishes WriteThrottleEvents for both series then, and
+            // for an index read refusal the index series only.
             let refused_index = cause.index_name().map(str::to_owned);
             let metric = if throttled_read {
                 extenddb_core::metrics::MetricName::ReadThrottleEvents
@@ -102,6 +105,16 @@ pub(super) async fn check(
                 refused_index.as_deref(),
                 Some(operation),
             );
+            if refused_index.is_some() && !throttled_read {
+                state.metrics.record(
+                    metric,
+                    1.0,
+                    Some(&ctx.account_id),
+                    metric_table,
+                    None,
+                    Some(operation),
+                );
+            }
             state.metrics.record(
                 extenddb_core::metrics::MetricName::ThrottledRequests,
                 1.0,

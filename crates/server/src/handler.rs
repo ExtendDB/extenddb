@@ -19,8 +19,8 @@ use crate::request_helpers::{
 };
 use crate::response::{error_response, record_error_metrics, success_response};
 use crate::throttle_helpers::{
-    batch_entry_counts, extract_index_name, extract_partition_value,
-    record_partial_batch_throttle, update_throttle_buckets,
+    batch_entry_counts, extract_index_name, extract_partition_value, record_partial_batch_throttle,
+    update_throttle_buckets,
 };
 
 mod throttle_segment;
@@ -254,6 +254,9 @@ pub(crate) async fn handle_request(
                     partition_value.as_deref(),
                     index_name.as_deref(),
                 );
+                state
+                    .throttle
+                    .consume_index_writes(&account_id, tn, &m.index_write_units);
             }
 
             succeeded = true;

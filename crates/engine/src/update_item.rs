@@ -298,8 +298,11 @@ pub(crate) async fn handle_update_item_with(
         region: ctx.region.clone(),
     });
     let need_old_for_stream = stream.is_some();
-    let need_old_for_capacity =
-        input.return_consumed_capacity != extenddb_core::types::ReturnConsumedCapacity::None;
+    // The server charges a write to each global secondary index the write
+    // touched, which the old item decides as much as the new one.
+    let need_old_for_capacity = input.return_consumed_capacity
+        != extenddb_core::types::ReturnConsumedCapacity::None
+        || !key_info.global_secondary_indexes.is_empty();
 
     let (old_item, new_item) = ctx
         .storage
@@ -338,6 +341,9 @@ pub(crate) async fn handle_update_item_with(
         false,
         &key_info,
     );
+    let index_write_units =
+        capacity_helpers::index_write_units(old_item.as_ref(), new_item.as_ref(), false, &key_info)
+            .0;
 
     // Select the appropriate return value.
     // UPDATED_OLD and UPDATED_NEW return only the attributes that were
@@ -369,6 +375,7 @@ pub(crate) async fn handle_update_item_with(
         body,
         metrics: DispatchMetrics {
             write_capacity_units: wcu,
+            index_write_units,
             ..Default::default()
         },
     })

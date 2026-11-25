@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The buckets of a table's provisioned global secondary indexes: the set a
 //! registration replaces, the read a named index serves, the write every index
-//! holds back, and their removal with the table.
+//! holds back, the write charged to the indexes it touched, and their removal
+//! with the table.
 
 use super::*;
 
@@ -52,6 +53,11 @@ fn write(mgr: &ThrottleManager) -> ThrottleResult {
 
 fn consume_read(mgr: &ThrottleManager, units: f64, index_name: Option<&str>) {
     mgr.consume_with_partition("acct", "tbl", units, 0.0, None, index_name);
+}
+
+fn consume_index_writes(mgr: &ThrottleManager, writes: &[(&str, f64)]) {
+    let writes = writes.iter().map(|(n, u)| ((*n).to_owned(), *u)).collect();
+    mgr.consume_index_writes("acct", "tbl", &writes);
 }
 
 /// A read naming a registered index is refused by the index's read bucket,
@@ -114,6 +120,7 @@ fn a_write_is_refused_by_the_first_exhausted_index_in_order() {
     // Every index is charged the two units: "second" and "third" go below
     // zero, "roomy" and the table stay positive.
     mgr.consume("acct", "tbl", 0.0, 2.0);
+    consume_index_writes(&mgr, &[("roomy", 2.0), ("second", 2.0), ("third", 2.0)]);
     assert_eq!(write(&mgr), index_write("second"));
 }
 
@@ -123,18 +130,30 @@ fn a_write_is_refused_by_the_first_exhausted_index_in_order() {
 fn the_table_write_bucket_refuses_before_the_indexes() {
     let mgr = manager(1, 1, vec![index("gsi", 1, 1)]);
     mgr.consume("acct", "tbl", 0.0, 2.0);
+    consume_index_writes(&mgr, &[("gsi", 2.0)]);
     assert_eq!(write(&mgr), ThrottleResult::ThrottledWrite(table_cause()));
 }
 
-/// A write charges every index's write bucket, not only the first: after
-/// one write drains both indexes, reordering the set shows the other one
-/// empty too.
+/// A write charges the write bucket of each index it names, by its units,
+/// and no other index: a table write that names none leaves every index
+/// full, and after "b" is charged two units and "c" half of one, "b" refuses
+/// while "a" and "c" do not, in either order.
 #[test]
-fn a_write_charges_every_index_write_bucket() {
-    let mgr = manager(1_000, 1_000, vec![index("a", 1, 1), index("b", 1, 1)]);
+fn a_write_charges_only_the_indexes_it_names() {
+    let mgr = manager(
+        1_000,
+        1_000,
+        vec![index("a", 1, 1), index("b", 1, 1), index("c", 1, 1)],
+    );
     mgr.consume("acct", "tbl", 0.0, 2.0);
-    assert_eq!(write(&mgr), index_write("a"));
-    mgr.register_indexes("acct", "tbl", vec![index("b", 1, 1), index("a", 1, 1)]);
+    assert_eq!(write(&mgr), ThrottleResult::Allowed);
+    consume_index_writes(&mgr, &[("b", 2.0), ("c", 0.5)]);
+    assert_eq!(write(&mgr), index_write("b"));
+    mgr.register_indexes(
+        "acct",
+        "tbl",
+        vec![index("c", 1, 1), index("a", 1, 1), index("b", 1, 1)],
+    );
     assert_eq!(write(&mgr), index_write("b"));
 }
 
@@ -185,7 +204,7 @@ fn a_kept_index_takes_the_new_rate() {
     mgr.register_indexes("acct", "tbl", vec![index("gsi", 1_000, 1_000)]);
     consume_read(&mgr, 500.0, Some("gsi"));
     assert_eq!(read(&mgr, Some("gsi")), ThrottleResult::Allowed);
-    mgr.consume("acct", "tbl", 0.0, 500.0);
+    consume_index_writes(&mgr, &[("gsi", 500.0)]);
     assert_eq!(write(&mgr), ThrottleResult::Allowed);
 }
 
@@ -194,7 +213,7 @@ fn a_kept_index_takes_the_new_rate() {
 #[test]
 fn remove_table_drops_the_index_buckets() {
     let mgr = manager(1_000, 1_000, vec![index("gsi", 1, 1)]);
-    mgr.consume("acct", "tbl", 0.0, 2.0);
+    consume_index_writes(&mgr, &[("gsi", 2.0)]);
     assert_eq!(write(&mgr), index_write("gsi"));
     mgr.remove_table("acct", "tbl");
     mgr.register_table("acct", "tbl", TableThroughput::provisioned(1_000, 1_000));
@@ -208,6 +227,7 @@ fn a_disabled_manager_allows_and_charges_nothing() {
     let mgr = manager(1, 1, vec![index("gsi", 1, 1)]);
     mgr.set_enabled(false);
     mgr.consume_with_partition("acct", "tbl", 2.0, 2.0, None, Some("gsi"));
+    consume_index_writes(&mgr, &[("gsi", 2.0)]);
     assert_eq!(read(&mgr, Some("gsi")), ThrottleResult::Allowed);
     assert_eq!(write(&mgr), ThrottleResult::Allowed);
     mgr.set_enabled(true);

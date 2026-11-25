@@ -3,7 +3,8 @@
 //! The server's refusal on a provisioned global secondary index's own
 //! capacity, driven through `handle_request` against an in-memory engine: the
 //! two measured bodies and the metric records they leave, the index ARN they
-//! name, the local secondary index served from the table's buckets, the index
+//! name, the write charged to an index only when its item carries the index
+//! key, the local secondary index served from the table's buckets, the index
 //! deleted by `UpdateTable`, the index set kept across a table throughput
 //! update, the index read that does not consult the table's read bucket, and
 //! the registration of the indexes on the first request after a restart.
@@ -21,6 +22,12 @@ use crate::AppState;
 
 const GSI: &str = "by-g";
 const LSI: &str = "by-l";
+
+/// The units a test drains a 1-unit bucket by: a debt of 999 seconds at that
+/// rate, so no delay in a run refills it before the request under test, and
+/// far less than one second of the account's aggregate, which a read drain
+/// is charged to as well.
+const DRAIN: f64 = 1_000.0;
 
 /// A provisioned table with a sort key, one global secondary index at
 /// `index_rcu` and `index_wcu`, and one local secondary index.
@@ -133,11 +140,11 @@ async fn index_read_throttle_names_the_index_arn_with_the_table_message() {
         .expect("IndexArn")
         .to_owned();
     assert_eq!(described_arn, index_arn(&account_id, table, GSI));
-    // One second of burst at 1 RCU; drained directly so the test does not
-    // depend on timing.
+    // Drained directly, by far more than the index's one second of burst at
+    // 1 RCU (see `DRAIN`).
     state
         .throttle
-        .consume_with_partition(&account_id, table, 2.0, 0.0, None, Some(GSI));
+        .consume_with_partition(&account_id, table, DRAIN, 0.0, None, Some(GSI));
     let (status, body) = call(&state, "Query", query(table, GSI, "g")).await;
     assert_eq!(status, 400, "{body}");
     assert_eq!(
@@ -164,7 +171,7 @@ async fn index_read_throttle_names_the_index_arn_with_the_table_message() {
         "IndexReadProvisionedThroughputExceeded"
     );
     // The throttle event carries the index as its dimension; the request
-    // count carries the table and operation only.
+    // count carries the account, the table and the operation, and no index.
     let t = |op: &str| {
         vec![
             Dimension::AccountId(account_id.clone()),
@@ -198,11 +205,9 @@ async fn index_write_throttle_names_the_index_message_and_arn() {
     let (state, account_id) = build_state().await;
     let table = "index-writes";
     create_indexed_table(&state, table, 1000, 1000, 1, 1).await;
-    // A write is charged to the table and to every index; the table at 1000
-    // WCU keeps capacity while the index's one second of burst is gone.
-    state
-        .throttle
-        .consume_with_partition(&account_id, table, 0.0, 2.0, None, None);
+    // The index's write bucket drained directly (see `DRAIN`); the table at
+    // 1000 WCU keeps capacity.
+    drain_index_writes(&state, &account_id, table);
     // The segment throttles a request with a top-level `TableName`; a
     // `BatchWriteItem` or `TransactWriteItems` names its tables per item and
     // is not checked here, as before this change.
@@ -239,19 +244,81 @@ async fn index_write_throttle_names_the_index_message_and_arn() {
         !INDEX_WRITE_PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE.ends_with('.'),
         "the index write message carries no trailing period"
     );
-    let records = throttle_records(&state, table);
-    assert_eq!(records.len(), 6, "{records:?}");
-    for (metric, dimensions, sum) in &records {
-        assert_eq!(*sum, 1.0, "{metric:?} {dimensions:?}");
-        let has_index = dimensions
-            .iter()
-            .any(|d| matches!(d, Dimension::GlobalSecondaryIndexName(n) if n == GSI));
-        match metric {
-            MetricName::WriteThrottleEvents => assert!(has_index, "{dimensions:?}"),
-            MetricName::ThrottledRequests => assert!(!has_index, "{dimensions:?}"),
-            other => panic!("unexpected {other:?}"),
-        }
+    // Each refusal is a throttle event of the index and of the table: the
+    // service publishes WriteThrottleEvents for both series on an index write
+    // refusal. The request count carries no index.
+    let t = |op: &str| {
+        vec![
+            Dimension::AccountId(account_id.clone()),
+            Dimension::TableName(table.to_owned()),
+            Dimension::Operation(op.to_owned()),
+        ]
+    };
+    let g = |op: &str| {
+        vec![
+            Dimension::AccountId(account_id.clone()),
+            Dimension::TableName(table.to_owned()),
+            Dimension::GlobalSecondaryIndexName(GSI.to_owned()),
+            Dimension::Operation(op.to_owned()),
+        ]
+    };
+    let mut expected = Vec::new();
+    for op in ["PutItem", "UpdateItem", "DeleteItem"] {
+        expected.push((MetricName::WriteThrottleEvents, g(op), 1.0));
+        expected.push((MetricName::WriteThrottleEvents, t(op), 1.0));
+        expected.push((MetricName::ThrottledRequests, t(op), 1.0));
     }
+    expected.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+    assert_eq!(throttle_records(&state, table), expected);
+}
+
+/// A write is charged to an index only when its item carries the index's
+/// key, as the service charges it. Each row: an item and the reason of the
+/// first refusal. On a table at 3 WCU with the index at 1 WCU, 2 KB items
+/// without the index key are served until the table's capacity is gone and
+/// then refused with the table reason; the same items with the key drain the
+/// index on the first write and the second is refused with the index reason.
+#[tokio::test]
+async fn a_write_is_charged_to_an_index_only_when_its_item_carries_the_index_key() {
+    let (state, account_id) = build_state().await;
+    let mut without_key = item(2_000);
+    without_key["sk"] = json!({"S": "s"});
+    let mut with_key = without_key.clone();
+    with_key["g"] = json!({"S": "k"});
+    let rows = [
+        (
+            "no-index-key",
+            without_key,
+            2,
+            "TableWriteProvisionedThroughputExceeded",
+        ),
+        (
+            "index-key",
+            with_key,
+            1,
+            "IndexWriteProvisionedThroughputExceeded",
+        ),
+    ];
+    for (table, item, served, reason) in rows {
+        create_indexed_table(&state, table, 1000, 3, 1000, 1).await;
+        let put = json!({"TableName": table, "Item": item});
+        for _ in 0..served {
+            let (status, body) = call(&state, "PutItem", put.clone()).await;
+            assert_eq!(status, 200, "{table}: {body}");
+        }
+        let (status, body) = call(&state, "PutItem", put).await;
+        assert_eq!(status, 400, "{table}: {body}");
+        assert_eq!(body["ThrottlingReasons"][0]["reason"], reason, "{table}");
+    }
+}
+
+/// Drain the index's write bucket by `DRAIN`, as a served write that carries
+/// the index key is charged.
+fn drain_index_writes(state: &AppState, account_id: &str, table: &str) {
+    let writes = [(GSI.to_owned(), DRAIN)].into_iter().collect();
+    state
+        .throttle
+        .consume_index_writes(account_id, table, &writes);
 }
 
 /// A local secondary index shares the table's capacity: a `Query` naming it
@@ -261,7 +328,7 @@ async fn lsi_read_throttle_is_the_table_body() {
     let (state, account_id) = build_state().await;
     let table = "lsi-reads";
     create_indexed_table(&state, table, 1, 1000, 1000, 1000).await;
-    state.throttle.consume(&account_id, table, 2.0, 0.0);
+    state.throttle.consume(&account_id, table, DRAIN, 0.0);
     let (status, body) = call(&state, "Query", query(table, LSI, "pk")).await;
     assert_eq!(status, 400, "{body}");
     assert_eq!(
@@ -280,9 +347,7 @@ async fn deleting_the_index_stops_its_write_refusals() {
     let (state, account_id) = build_state().await;
     let table = "index-deleted";
     create_indexed_table(&state, table, 1000, 1000, 1, 1).await;
-    state
-        .throttle
-        .consume_with_partition(&account_id, table, 0.0, 2.0, None, None);
+    drain_index_writes(&state, &account_id, table);
     let put = json!({"TableName": table, "Item": indexed_item()});
     let (status, body) = call(&state, "PutItem", put.clone()).await;
     assert_eq!(status, 400, "{body}");
@@ -312,7 +377,7 @@ async fn index_read_does_not_consult_the_table_read_bucket() {
     let (state, account_id) = build_state().await;
     let table = "index-apart";
     create_indexed_table(&state, table, 1, 1000, 1000, 1000).await;
-    state.throttle.consume(&account_id, table, 2.0, 0.0);
+    state.throttle.consume(&account_id, table, DRAIN, 0.0);
     let (status, body) = call(&state, "Scan", json!({"TableName": table})).await;
     assert_eq!(status, 400, "{body}");
     assert_eq!(
@@ -331,9 +396,7 @@ async fn a_table_throughput_update_keeps_the_index_buckets() {
     let (state, account_id) = build_state().await;
     let table = "index-kept";
     create_indexed_table(&state, table, 1000, 1000, 1, 1).await;
-    state
-        .throttle
-        .consume_with_partition(&account_id, table, 0.0, 2.0, None, None);
+    drain_index_writes(&state, &account_id, table);
     let (status, body) = call(
         &state,
         "UpdateTable",
@@ -377,7 +440,7 @@ async fn the_lazy_registration_path_registers_the_indexes() {
     assert!(state.throttle.is_registered(&account_id, table));
     state
         .throttle
-        .consume_with_partition(&account_id, table, 2.0, 0.0, None, Some(GSI));
+        .consume_with_partition(&account_id, table, DRAIN, 0.0, None, Some(GSI));
     let (status, body) = call(&state, "Query", query(table, GSI, "g")).await;
     assert_eq!(status, 400, "{body}");
     assert_eq!(

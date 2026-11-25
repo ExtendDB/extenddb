@@ -476,9 +476,9 @@ impl ThrottleManager {
 
     /// Consume capacity after a successful operation.
     ///
-    /// Deducts tokens from per-table and per-account buckets, and charges a
-    /// write to the table's provisioned global secondary indexes as
-    /// [`Self::consume_with_partition`] does.
+    /// Deducts tokens from per-table and per-account buckets. A write's charge
+    /// to the table's provisioned global secondary indexes is
+    /// [`Self::consume_index_writes`].
     pub fn consume(&self, account_id: &str, table_name: &str, read_units: f64, write_units: f64) {
         self.consume_with_partition(account_id, table_name, read_units, write_units, None, None);
     }
@@ -487,10 +487,8 @@ impl ThrottleManager {
     ///
     /// A read whose `index_name` names a registered provisioned global
     /// secondary index is charged to the index's read bucket, not the table's.
-    /// A write is charged to the table's write bucket and to every registered
-    /// index's write bucket, each by `write_units`. The service charges an
-    /// index only for an item that carries the index's key attributes; this
-    /// layer does not see the item, so every index is charged.
+    /// A write is charged to the table's write bucket here and to the indexes
+    /// it touched by [`Self::consume_index_writes`].
     pub fn consume_with_partition(
         &self,
         account_id: &str,
@@ -511,11 +509,12 @@ impl ThrottleManager {
         };
 
         let mut index_read = false;
-        if ((read_units > 0.0 && index_name.is_some()) || write_units > 0.0)
+        if read_units > 0.0
+            && index_name.is_some()
             && let Ok(mut indexes) = self.indexes.write()
             && let Some(set) = indexes.get_mut(&key)
         {
-            index_read = index::charge(set, index_name, read_units, write_units, now);
+            index_read = index::charge_read(set, index_name, read_units, now);
         }
 
         if let Ok(mut tables) = self.tables.write()
@@ -568,6 +567,31 @@ impl ThrottleManager {
             if write_units > 0.0 {
                 acct.write.consume(write_units, now);
             }
+        }
+    }
+
+    /// Charge a served write to the table's provisioned global secondary
+    /// indexes: each registered index that `index_writes` names, by its
+    /// units. The service charges an index only for a write whose old or new
+    /// item carries the index's key attributes, so an index the write did
+    /// not touch is not named and keeps its capacity.
+    pub fn consume_index_writes(
+        &self,
+        account_id: &str,
+        table_name: &str,
+        index_writes: &HashMap<String, f64>,
+    ) {
+        if index_writes.is_empty() || !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        let key = TableKey {
+            account_id: account_id.to_owned(),
+            table_name: table_name.to_owned(),
+        };
+        if let Ok(mut indexes) = self.indexes.write()
+            && let Some(set) = indexes.get_mut(&key)
+        {
+            index::charge_writes(set, index_writes, Instant::now());
         }
     }
 }

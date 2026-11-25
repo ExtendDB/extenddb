@@ -10,6 +10,8 @@
 //! 2026-10-25). A local secondary index shares the table's capacity and has
 //! no buckets here.
 
+use std::collections::HashMap;
+
 use web_time::Instant;
 
 use super::bucket::TokenBucket;
@@ -95,26 +97,33 @@ pub(super) fn first_write_exhausted(set: &mut [IndexBuckets], now: Instant) -> O
     None
 }
 
-/// Charge a served request to the index buckets: `read_units` to the read
-/// bucket of the index `index_name` names when it is in `set`, `write_units`
-/// to every index's write bucket. Returns whether a read was charged to an
-/// index, in which case the table's read bucket is not charged.
-pub(super) fn charge(
+/// Charge a served read to the read bucket of the index `index_name` names,
+/// when it is in `set`. Returns whether it was charged, in which case the
+/// table's read bucket is not charged.
+pub(super) fn charge_read(
     set: &mut [IndexBuckets],
     index_name: Option<&str>,
     read_units: f64,
-    write_units: f64,
     now: Instant,
 ) -> bool {
-    let mut index_read = false;
-    for buckets in set.iter_mut() {
-        if read_units > 0.0 && index_name == Some(buckets.index_name.as_str()) {
+    match set
+        .iter_mut()
+        .find(|b| index_name == Some(b.index_name.as_str()))
+    {
+        Some(buckets) => {
             buckets.read.consume(read_units, now);
-            index_read = true;
+            true
         }
-        if write_units > 0.0 {
-            buckets.write.consume(write_units, now);
+        None => false,
+    }
+}
+
+/// Charge a served write to the write bucket of each index in `set` that
+/// `writes` names, by its units.
+pub(super) fn charge_writes(set: &mut [IndexBuckets], writes: &HashMap<String, f64>, now: Instant) {
+    for buckets in set.iter_mut() {
+        if let Some(units) = writes.get(&buckets.index_name) {
+            buckets.write.consume(*units, now);
         }
     }
-    index_read
 }
