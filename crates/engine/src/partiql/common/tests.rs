@@ -183,6 +183,52 @@ fn an_error_of_the_item_operation_names_the_batch_table() {
     }
 }
 
+/// An error of the item operation keeps its class as the code the API
+/// Reference lists for a batch statement's error (BatchStatementError), with
+/// its message and the statement's table: a backend throttle or fault on one
+/// statement is not a validation error.
+#[test]
+fn an_error_of_the_item_operation_keeps_the_listed_code_of_its_class() {
+    for (error, code) in [
+        (
+            DynamoDbError::provisioned_throughput_exceeded(
+                "The level of configured provisioned throughput for the table was exceeded.",
+                vec![],
+            ),
+            "ProvisionedThroughputExceeded",
+        ),
+        (
+            DynamoDbError::throttling("Throughput exceeds the current capacity.", vec![]),
+            "ThrottlingError",
+        ),
+        (
+            DynamoDbError::request_limit_exceeded("Throughput exceeds the account quota.", vec![]),
+            "RequestLimitExceeded",
+        ),
+        (
+            DynamoDbError::ItemCollectionSizeLimitExceededException(
+                "Item collection size limit exceeded.".to_owned(),
+            ),
+            "ItemCollectionSizeLimitExceeded",
+        ),
+        (
+            DynamoDbError::InternalServerError(
+                "The server encountered an internal error.".to_owned(),
+            ),
+            "InternalServerError",
+        ),
+    ] {
+        assert_eq!(
+            StatementError::from_item_error(&error).into_entry(Some("t")),
+            json!({
+                "Error": { "Code": code, "Message": error.message() },
+                "TableName": "t",
+            }),
+            "{error:?}"
+        );
+    }
+}
+
 #[test]
 fn a_conditional_failure_without_an_item_has_none() {
     let err = DynamoDbError::ConditionalCheckFailedException(

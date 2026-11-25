@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Main `DynamoDB` request handler with per-segment latency instrumentation.
-//!
-//! Extracted from `lib.rs` to keep both files under the 500-line limit.
 
 use std::sync::Arc;
 
@@ -21,8 +19,9 @@ use crate::request_helpers::{
 };
 use crate::response::{error_response, record_error_metrics, success_response};
 use crate::throttle_helpers::{
-    classify_data_operation, extract_partition_value, record_partial_batch_throttle,
-    table_description_to_throughput, throttle_error, update_throttle_buckets,
+    batch_entry_counts, classify_data_operation, extract_partition_value,
+    record_partial_batch_throttle, table_description_to_throughput, throttle_error,
+    update_throttle_buckets,
 };
 
 /// Main Virtual `DynamoDB` request handler.
@@ -90,29 +89,17 @@ pub(crate) async fn handle_request(
         Err(e) => return error_response(&e, &request_id),
     };
 
-    // --- Pre-auth operation validation ---
-    // Real DynamoDB validates the operation name before checking authentication.
-    // An unknown operation returns UnknownOperationException even without auth headers.
-    if !extenddb_engine::is_known_operation(&operation) {
-        return error_response(
-            &DynamoDbError::UnknownOperationException(String::new()),
-            &request_id,
-        );
-    }
-
-    // --- Pre-auth body validation ---
-    // Real DynamoDB validates request format (empty body, invalid JSON) before
-    // authentication. Malformed requests get 400 regardless of auth state.
-    let input: Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(e) => {
-            return error_response(
-                &DynamoDbError::SerializationException(format!(
-                    "Start of structure or map found where not expected: {e}"
-                )),
-                &request_id,
-            );
-        }
+    // --- Pre-auth request checks ---
+    // Real DynamoDB validates the operation name, then the request format
+    // (empty body, invalid JSON), before checking authentication: an unknown
+    // operation returns UnknownOperationException even without auth headers,
+    // and a malformed request gets 400 regardless of auth state.
+    // `extenddb_engine::parse_request` makes both checks, in that order; the
+    // module doc of extenddb-engine's `src/pre_dispatch.rs` says which checks
+    // belong in the engine rather than here.
+    let request = match extenddb_engine::parse_request(&operation, &body) {
+        Ok(request) => request,
+        Err(e) => return error_response(&e, &request_id),
     };
 
     // --- Authentication through dispatch, inside the request scope ---
@@ -135,7 +122,7 @@ pub(crate) async fn handle_request(
             record: Some(crate::extensions::RequestRecord {
                 request_id: request_id.clone(),
                 operation: operation.clone(),
-                table_name: extract_table_name(&input),
+                table_name: extract_table_name(request.body()),
                 account_id: None,
                 status: 0,
                 error_type: None,
@@ -155,7 +142,7 @@ pub(crate) async fn handle_request(
             peer_addr,
             &request_id,
             &operation,
-            input,
+            request,
         ),
     )
     .await;
@@ -165,6 +152,7 @@ pub(crate) async fn handle_request(
         table_name,
         metric_table,
         partition_value,
+        batch_entries,
         dispatch_result,
         auth_us,
         authz_us,
@@ -276,6 +264,16 @@ pub(crate) async fn handle_request(
                 metric_table.as_deref(),
                 &operation,
             );
+            // A throttle error from a batch is the engine's answer to a batch
+            // whose every entry a backend throttled: each entry is a throttle
+            // event, as on a 200. A throttle the backend reports on the catalog
+            // read also comes out as the batch's throttle error and counts every
+            // entry; the service has no such failure.
+            if e.is_throttle()
+                && let Some(entries) = &batch_entries
+            {
+                record_partial_batch_throttle(&state.metrics, &account_id, &operation, entries);
+            }
             if observing {
                 record_error_type = Some(e.error_type().to_owned());
             }
@@ -389,6 +387,9 @@ struct Served {
     table_name: Option<String>,
     metric_table: Option<String>,
     partition_value: Option<String>,
+    /// The entries of a batch by table, for the throttle events of a batch
+    /// whose every entry a backend throttled; `None` for any other request.
+    batch_entries: Option<std::collections::BTreeMap<String, u32>>,
     dispatch_result: Result<extenddb_engine::DispatchResult, DynamoDbError>,
     auth_us: f64,
     authz_us: f64,
@@ -410,7 +411,7 @@ async fn serve_request(
     peer_addr: std::net::SocketAddr,
     request_id: &str,
     operation: &str,
-    input: Value,
+    request: extenddb_engine::ParsedRequest<'_>,
 ) -> Result<Served, Refused> {
     // --- Auth segment ---
     let auth_start = std::time::Instant::now();
@@ -432,23 +433,27 @@ async fn serve_request(
         }
     };
 
-    // Point-in-time recovery is not in this release: a restore and an enable
-    // are refused here, for every caller and before any table is read, where
-    // the service would authorize them first.
-    if let Some(e) = extenddb_engine::refuse_point_in_time_recovery(operation, &input) {
-        tracing::warn!(
-            request_id = %request_id,
-            operation = %operation,
-            principal = crate::authz_resource::cross_account::principal_arn(&identity),
-            "Point-in-time recovery refused"
-        );
-        record_error_metrics(&state.metrics, &e, &account_id, None, operation);
-        state.metrics.record_request_count(&account_id, operation);
-        return Err(Refused {
-            error: e,
-            account_id: Some(account_id.to_string()),
-        });
-    }
+    // Point-in-time recovery is not in this release: `admit` refuses a restore
+    // and an enable here, for every caller and before any table is read, where
+    // the service would authorize them first. The point-in-time refusal is the
+    // only one `admit` makes, so the log line names it.
+    let input: Value = match request.admit() {
+        Ok(input) => input,
+        Err(e) => {
+            tracing::warn!(
+                request_id = %request_id,
+                operation = %operation,
+                principal = crate::authz_resource::cross_account::principal_arn(&identity),
+                "Point-in-time recovery refused"
+            );
+            record_error_metrics(&state.metrics, &e, &account_id, None, operation);
+            state.metrics.record_request_count(&account_id, operation);
+            return Err(Refused {
+                error: e,
+                account_id: Some(account_id.to_string()),
+            });
+        }
+    };
 
     // --- Authz segment ---
     let authz_start = std::time::Instant::now();
@@ -521,8 +526,17 @@ async fn serve_request(
     let throttle_start = std::time::Instant::now();
     let (is_read_op, is_write_op) = classify_data_operation(operation);
     let partition_value = extract_partition_value(&input, operation);
+    // A name the table name rules refuse (length or pattern), and the ARN of
+    // a table in another Region, are not throttled: the engine answers them
+    // as it does with capacity left. The service refuses such a name before
+    // any throttle (measured 2026-11-25 with GetItem and PutItem on `ab`, an
+    // empty name, 256 characters and the ARN of a table in another Region).
+    // The ARN of a table in this account and Region is checked by the name it
+    // carries, and a throttle refusal names that table.
     if let Some(ref tn) = table_name
         && (is_read_op || is_write_op)
+        && let name = crate::authz_resource::key_lookup_name(tn, &state.region, &ctx.account_id)
+        && extenddb_core::validation::validate_table_name(&name, &state.limits).is_ok()
     {
         if !state.throttle.is_registered(&ctx.account_id, tn)
             && let Ok(desc) = ctx
@@ -578,16 +592,11 @@ async fn serve_request(
             // throttle: one reason with the table ARN, the same string
             // DescribeTable returns as TableArn. The error class, the message
             // and the limit follow the bucket that refused and the table's
-            // billing mode. The account bucket can refuse before the engine
-            // has seen the name, so an ARN naming a table in this account is
-            // reduced to the bare name first, and a name the engine would
-            // refuse gets no resource at all.
-            let name = crate::authz_resource::key_lookup_name(tn, &state.region, &ctx.account_id);
-            let table_arn = extenddb_core::validation::validate_table_name_chars(&name)
-                .is_ok()
-                .then(|| extenddb_storage::util::table_arn(&state.region, &ctx.account_id, &name));
+            // billing mode.
+            let table_arn =
+                extenddb_storage::util::table_arn(&state.region, &ctx.account_id, &name);
             return Err(Refused {
-                error: throttle_error(cause, throttled_read, table_arn),
+                error: throttle_error(cause, throttled_read, &table_arn),
                 account_id: Some(ctx.account_id.to_string()),
             });
         }
@@ -596,6 +605,10 @@ async fn serve_request(
     let throttle_us = throttle_start.elapsed().as_micros() as f64;
 
     // --- Dispatch segment ---
+    // The entries of a batch, for the throttle events of a batch whose every
+    // entry a backend throttled: the engine answers that one with the error
+    // alone (`input` moves into the dispatch).
+    let batch_entries = batch_entry_counts(operation, &input);
     let dispatch_start = std::time::Instant::now();
     let dispatch_result =
         extenddb_engine::dispatch(operation, input, &ctx, &state.server_addr).await;
@@ -631,6 +644,7 @@ async fn serve_request(
         table_name,
         metric_table,
         partition_value,
+        batch_entries,
         dispatch_result,
         auth_us,
         authz_us,
@@ -662,7 +676,9 @@ fn request_scope_for(
 const MAX_SDK_HEADER_LEN: usize = 256;
 
 /// The value of header `name` as an owned string, or `None` when the header is
-/// absent, is not visible ASCII, or is longer than [`MAX_SDK_HEADER_LEN`].
+/// absent, holds a byte outside printable ASCII (space through tilde) and tab,
+/// or is longer than [`MAX_SDK_HEADER_LEN`]. A header value cannot hold CR or
+/// LF, so a value that reads as present cannot split a log line.
 fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get(name)

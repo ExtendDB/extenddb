@@ -350,7 +350,7 @@ pub struct MetricsQuery {
 #[derive(Debug, Clone)]
 pub struct FlushBucket {
     /// Minute-aligned wall-clock timestamp.
-    pub bucket: std::time::SystemTime,
+    pub bucket: web_time::SystemTime,
     /// Which metric this bucket aggregates.
     pub metric: MetricName,
     /// Account dimension (empty string for a metric of the whole deployment).

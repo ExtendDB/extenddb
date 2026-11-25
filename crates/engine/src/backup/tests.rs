@@ -39,6 +39,7 @@ use futures::{StreamExt, TryStreamExt};
 use serde_json::{Value, json};
 
 use super::*;
+use crate::backup_requests::{BACKUP_ARN_NOT_VALID, list_backups};
 
 mod migrate_legacy;
 
@@ -234,6 +235,9 @@ pub(crate) struct Fake {
     /// When set, `claim_restore` takes this long before it registers (a
     /// registration held behind the catalog's lock or pool).
     claim_restore_delay: Mutex<Option<Duration>>,
+    /// When set, `claim_restore` waits for one permit before it registers,
+    /// so a test can hold a registration in flight for as long as it needs.
+    claim_restore_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     /// What `finish_restore` answers when its conditions hold: ACTIVE, or
     /// DONE with the backfill pending (MongoDB).
     finish_pending: std::sync::atomic::AtomicBool,
@@ -1822,6 +1826,35 @@ fn runtime_on(mem: &Arc<MemStore>, identity: StoreIdentity) -> BackupRuntime {
     ))
 }
 
+/// A `RestoreTableFromBackup` whose backup row is AVAILABLE on the configured
+/// store, and whose store refuses every read under the backup's prefix: the
+/// request's read of the manifest's sidecar fails. The catalog, the runtime
+/// and the request body.
+pub(crate) fn restore_from_an_unreadable_store() -> (Arc<Fake>, BackupRuntime, Value) {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let arn = arn(ACCOUNT);
+    seed_rows(&fake, &[row(&arn, BackupStatus::Available)]);
+    *mem.fail_gets_under.lock().unwrap() = Some(prefix_of(&arn));
+    (fake, runtime, restore_body(json!({})))
+}
+
+/// A `DeleteBackup` of a backup whose row is AVAILABLE on the configured
+/// store, run against a catalog whose id cannot be read, so the deletion
+/// fence fails before the DELETING write: the client's error.
+pub(crate) async fn delete_backup_with_an_unreadable_catalog() -> DynamoDbError {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let arn = arn(ACCOUNT);
+    seed_rows(&fake, &[row(&arn, BackupStatus::Available)]);
+    *fake.catalog_id_error.lock().unwrap() = true;
+    delete_backup(&*fake, &runtime, ACCOUNT, REGION, &own(&arn))
+        .await
+        .unwrap_err()
+}
+
 /// A runtime whose configured store (`store()`'s kind and root) failed its
 /// startup check with `problem`: the id is unknown.
 fn runtime_unhealthy(mem: &Arc<MemStore>, problem: StoreProblem) -> BackupRuntime {
@@ -2121,10 +2154,12 @@ impl BackupCatalog for Fake {
             return Box::pin(async move { Err(e) });
         }
         let delay = *self.claim_restore_delay.lock().unwrap();
+        let gate = self.claim_restore_gate.lock().unwrap().clone();
         Box::pin(async move {
             if let Some(delay) = delay {
                 tokio::time::sleep(delay).await;
             }
+            pass(gate.as_deref()).await;
             self.register_restore(account_id, input, registration)
         })
     }
@@ -3078,12 +3113,7 @@ impl RestoreEngine for Fake {
             self.bulk_loads_started
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             let gate = self.bulk_load_gate.lock().unwrap().clone();
-            if let Some(gate) = gate {
-                gate.acquire()
-                    .await
-                    .expect("the gate is never closed")
-                    .forget();
-            }
+            pass(gate.as_deref()).await;
             let mut call = BulkLoadCall {
                 table_id: target.table_id.clone(),
                 file,
@@ -3094,12 +3124,7 @@ impl RestoreEngine for Fake {
             let mut failed = None;
             let item_gate = self.bulk_load_item_gate.lock().unwrap().clone();
             loop {
-                if let Some(gate) = &item_gate {
-                    gate.acquire()
-                        .await
-                        .expect("the gate is never closed")
-                        .forget();
-                }
+                pass(item_gate.as_deref()).await;
                 let Some(next) = items.next().await else {
                     break;
                 };
@@ -3257,15 +3282,10 @@ impl RestoreEngine for Fake {
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let gate = self.count_gate.lock().unwrap().clone();
         Box::pin(async move {
-            if let Some(gate) = gate {
-                gate.acquire()
-                    .await
-                    .expect("the gate is never closed")
-                    .forget();
-            }
+            pass(gate.as_deref()).await;
             // Take one error from the budget, if any is left: a
             // compare-exchange loop, since `fetch_update` is deprecated on
-            // current stable and its replacement is not on 1.88.
+            // current stable and its replacement is unstable on 1.91.1.
             let mut left = self.count_errors.load(std::sync::atomic::Ordering::Acquire);
             while let Some(next) = left.checked_sub(1) {
                 match self.count_errors.compare_exchange(
@@ -3520,12 +3540,7 @@ impl SnapshotEngine for Fake {
                 (items.into_iter(), gate),
                 |(mut items, gate)| async move {
                     let next = items.next()?;
-                    if let Some(gate) = &gate {
-                        gate.acquire()
-                            .await
-                            .expect("the gate is never closed")
-                            .forget();
-                    }
+                    pass(gate.as_deref()).await;
                     Some((next, (items, gate)))
                 },
             )),
@@ -6970,7 +6985,7 @@ async fn describe_backup_survives_a_definition_that_does_not_read() {
         let fake = fake_with_backup("AVAILABLE", source(Some(definition("PROVISIONED"))));
         *fake.source_error.lock().unwrap() = Some(err);
         // The backup operations' mapping reports both as a 500
-        // (`storage_err_to_dynamo` in backup.rs), which SDKs retry.
+        // (`storage_err_to_dynamo` in backup_requests.rs), which SDKs retry.
         match describe_backup(&*fake, ACCOUNT, REGION, &own(&arn_text)).await {
             Err(DynamoDbError::InternalServerError(_)) => {}
             other => panic!("{what} must reach the client as an error: {other:?}"),
@@ -12111,6 +12126,16 @@ fn closed_gate() -> Arc<tokio::sync::Semaphore> {
     Arc::new(tokio::sync::Semaphore::new(0))
 }
 
+/// Wait for one permit of `gate`, when there is one, and keep it.
+async fn pass(gate: Option<&tokio::sync::Semaphore>) {
+    if let Some(gate) = gate {
+        gate.acquire()
+            .await
+            .expect("the gate is never closed")
+            .forget();
+    }
+}
+
 /// The settings the job tests run with: small files, a short heartbeat.
 fn job_settings() -> JobSettings {
     JobSettings {
@@ -13141,48 +13166,11 @@ async fn a_second_create_over_the_job_bound_is_limit_exceeded() {
 #[derive(Clone, Default)]
 struct LogLines(Arc<Mutex<Vec<(tracing::Level, String)>>>);
 
-/// The process's global `tracing` subscriber while these tests run:
-/// interested in every callsite and enabled for none. `tracing` caches each
-/// callsite's interest the first time any thread reaches it; while exactly
-/// one scoped subscriber is registered in the process, that cache is
-/// computed from the default of the thread that got there first. A test
-/// without a subscriber running beside a `LogLines` test on another thread
-/// would so cache the job's log callsites as "never", and the `LogLines`
-/// test would then see no line from them (tokio-rs/tracing#2743). With this
-/// global default the cache reads "sometimes" instead, and each event asks
-/// the thread's own default, the `LogLines` where one is set.
-struct InterestedInEveryCallsite;
-
-impl tracing::Subscriber for InterestedInEveryCallsite {
-    fn register_callsite(
-        &self,
-        _: &'static tracing::Metadata<'static>,
-    ) -> tracing::subscriber::Interest {
-        tracing::subscriber::Interest::sometimes()
-    }
-    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-        false
-    }
-    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(1)
-    }
-    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-    fn event(&self, _: &tracing::Event<'_>) {}
-    fn enter(&self, _: &tracing::span::Id) {}
-    fn exit(&self, _: &tracing::span::Id) {}
-}
-
 impl LogLines {
     /// A fresh `LogLines` set as this thread's `tracing` default until the
     /// guard drops, with the process's global default installed once.
     fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
-        static GLOBAL: std::sync::Once = std::sync::Once::new();
-        GLOBAL.call_once(|| {
-            // Another global may already be set by a test outside this
-            // module; then its interest rule applies and this one is moot.
-            let _ = tracing::subscriber::set_global_default(InterestedInEveryCallsite);
-        });
+        crate::test_tracing::interest_in_every_callsite();
         let lines = Self::default();
         let guard = tracing::subscriber::set_default(lines.clone());
         (lines, guard)
@@ -13215,9 +13203,9 @@ struct MessageVisitor<'a>(&'a mut String);
 
 /// A callsite met first by a thread without a scoped subscriber is still
 /// seen by a `LogLines` on another thread (the global default's interest
-/// rule; the doc of `InterestedInEveryCallsite`). Without that default the
-/// callsite's interest is cached as "never" whenever this is the only
-/// `LogLines` alive in the process, and nothing is captured.
+/// rule; the doc of `test_tracing::InterestedInEveryCallsite`). Without that
+/// default the callsite's interest is cached as "never" whenever this is the
+/// only `LogLines` alive in the process, and nothing is captured.
 #[test]
 fn a_callsite_first_met_on_another_thread_still_reaches_the_lines() {
     fn shared_callsite(n: u32) {
@@ -14605,7 +14593,7 @@ fn songs_from(from: usize, n: usize) -> Vec<Item> {
 }
 
 /// A healthy runtime on `mem` with a spool at `spool` (an S3 store's shape),
-/// the job settings and a collector.
+/// the job settings at a 1 s heartbeat, and a collector.
 fn spooled_runtime(mem: &Arc<MemStore>, spool: &std::path::Path) -> BackupRuntime {
     runtime()
         .with_store(
@@ -14625,7 +14613,16 @@ fn spooled_runtime(mem: &Arc<MemStore>, spool: &std::path::Path) -> BackupRuntim
             )
             .with_manifest_names("bucket".to_owned(), "prefix/".to_owned()),
         )
-        .with_job_settings(job_settings())
+        // A 1 s heartbeat, not the 50 ms of `job_settings`: the claim window is
+        // two periods, and a spooled job's first claim check comes after its
+        // first beat (a resume's is the takeover's return inside the reconciler
+        // cycle), the spool entry's open, its fsynced document writes and the
+        // test's own steps, which a loaded host can stretch past 100 ms and end
+        // the job as a lost claim before its first download.
+        .with_job_settings(JobSettings {
+            heartbeat_interval: Duration::from_secs(1),
+            ..job_settings()
+        })
         .with_metrics(Arc::new(extenddb_core::metrics::MetricsCollector::new()))
 }
 
@@ -16065,8 +16062,9 @@ async fn an_s3_restore_spools_every_file_and_removes_its_entry_at_the_end() {
 /// A resumed job skips the files and items the record and the progress rows
 /// account for: the first open file is loaded from its `start_at` with
 /// `reapplying`, the rest from 0 without it, and the count covers the whole
-/// manifest.
-#[tokio::test]
+/// manifest. The clock is paused so a loaded host cannot age the job's
+/// last beat past its two-period claim window before the DONE write.
+#[tokio::test(start_paused = true)]
 async fn a_resume_loads_from_the_recorded_progress() {
     let mem = Arc::new(MemStore::default());
     mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
@@ -19949,9 +19947,14 @@ async fn the_reconciler_fails_a_dead_restore_whose_target_has_no_tables() {
 /// target or being refused; a restore of another backup into the same name
 /// while that registration is in flight is `TableInUseException` (the 60 s
 /// registration bound equals botocore's default read timeout, so a client
-/// retries while the first registration still holds the lock).
+/// retries while the first registration still holds the lock). The
+/// registration is held by a gate the test opens only once both requests
+/// have met it: the in-flight entry ends with the retry's answer, so a
+/// request sent after the retry answered would meet the committed target
+/// at the name check (`check_restore_target_name`) instead (#951).
 #[tokio::test]
 async fn a_retry_waits_on_its_registration_and_another_backup_is_refused() {
+    let (lines, _guard) = LogLines::capture();
     let mem = Arc::new(MemStore::default());
     mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
     let fake = Arc::new(Fake::default());
@@ -19968,8 +19971,9 @@ async fn a_retry_waits_on_its_registration_and_another_backup_is_refused() {
     seed_manifest_backup(&fake, &mem, &arn_b, music_source_table(), &[songs(2)], true);
     let runtime = Arc::new(job_runtime(&mem));
     // Hold the first registration mid-flight so the target is not yet
-    // created when the retry's name check runs.
-    *fake.claim_restore_delay.lock().unwrap() = Some(Duration::from_millis(400));
+    // created while the other two requests run.
+    let gate = closed_gate();
+    *fake.claim_restore_gate.lock().unwrap() = Some(Arc::clone(&gate));
 
     let first = {
         let fake = Arc::clone(&fake);
@@ -19986,18 +19990,8 @@ async fn a_retry_waits_on_its_registration_and_another_backup_is_refused() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
-    // The retry of the same request waits and is answered CREATING.
-    let retry = restore_on(&fake, &runtime, &restore_body(json!({})))
-        .await
-        .unwrap();
-    assert_eq!(retry["TableDescription"]["TableStatus"], "CREATING");
-    assert_eq!(
-        retry["TableDescription"]["RestoreSummary"]["SourceBackupArn"],
-        arn(ACCOUNT)
-    );
-
     // A different backup into the same name is refused while the first is in
-    // flight.
+    // flight, without a registration of its own.
     let other = restore_on(
         &fake,
         &runtime,
@@ -20008,6 +20002,33 @@ async fn a_retry_waits_on_its_registration_and_another_backup_is_refused() {
     assert!(
         matches!(other, DynamoDbError::TableInUseException(_)),
         "{other:?}"
+    );
+    assert_eq!(fake.restore_claims.lock().unwrap().len(), 1);
+
+    // The retry of the same request waits and is answered CREATING once the
+    // registration returns.
+    let retry = {
+        let fake = Arc::clone(&fake);
+        let runtime = Arc::clone(&runtime);
+        tokio::spawn(async move { restore_on(&fake, &runtime, &restore_body(json!({}))).await })
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while lines
+        .containing("a registration of this request is in flight")
+        .is_empty()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the retry never met the registration in flight"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    gate.add_permits(1);
+    let retry = retry.await.unwrap().unwrap();
+    assert_eq!(retry["TableDescription"]["TableStatus"], "CREATING");
+    assert_eq!(
+        retry["TableDescription"]["RestoreSummary"]["SourceBackupArn"],
+        arn(ACCOUNT)
     );
 
     let first = first.await.unwrap().unwrap();

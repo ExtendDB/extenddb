@@ -26,6 +26,7 @@
 //! | `ExportTableToPointInTime` | same | the `TableArn` |
 //! | `ImportTable` | same | the new table ARN |
 //! | `Query`/`Scan` (with `IndexName`) | same | `table/<T>/index/<I>` |
+//! | `SearchVectors` | same | `table/<T>/index/<I>` |
 //! | `ListTables` | `ListTables` | `table/*` |
 //! | item/table ops | same | the table ARN (from `TableName`, name or ARN) |
 //!
@@ -294,8 +295,10 @@ fn tag_resource_arn(arn: &str, region: &str, account_id: &str) -> String {
 
 /// Messages DynamoDB returns, before the IAM decision, for a request field
 /// whose ARN is not a valid resource ARN of the kind the field requires
-/// (measured live, `live-r2/arn-kinds-live.json`).
-const INVALID_STREAM_ARN_MESSAGE: &str = "Invalid StreamArn";
+/// (measured live, `live-r2/arn-kinds-live.json`). The stream text is the
+/// core constant, which the `GetShardIterator` handler also answers for an
+/// absent `StreamArn`.
+const INVALID_STREAM_ARN_MESSAGE: &str = extenddb_core::error::INVALID_STREAM_ARN;
 const INVALID_BACKUP_ARN_MESSAGE: &str = "Invalid Backup ARN";
 const INVALID_EXPORT_TABLE_ARN_MESSAGE: &str =
     "One or more parameter values were invalid: tableArn is not a valid ARN";
@@ -760,12 +763,14 @@ pub(crate) fn authz_targets(
             v.extend(restore);
             v
         }
-        // Query and Scan on an index authorize the index ARN. With a table ARN
-        // in TableName the denial names that ARN with the index appended; any
-        // other ARN in TableName (an index ARN, a malformed resource) names
-        // the canonical index ARN, so the denial never names a resource the
-        // caller did not write.
-        "Query" | "Scan" => {
+        // Query and Scan on an index, and SearchVectors, authorize the index
+        // ARN. The service documents `table/<T>/index/<I>` as the resource for
+        // dynamodb:SearchVectors. A request that names no index (IndexName
+        // missing or empty) authorizes the table, as Query and Scan do. With a table ARN in TableName the denial
+        // names that ARN with the index appended; any other ARN in TableName
+        // (an index ARN, a malformed resource) names the canonical index ARN,
+        // so the denial never names a resource the caller did not write.
+        "Query" | "Scan" | "SearchVectors" => {
             let base = table_resource_arn(&table_name, region, account_id);
             match str_field(input, "IndexName") {
                 Some(idx) if !idx.is_empty() => {
@@ -817,7 +822,7 @@ fn restore_target_actions(input: &Value, region: &str, account_id: &str) -> Vec<
 }
 
 /// The bare table name from a value that may be a name or a table ARN.
-fn table_name_only(value: &str) -> String {
+pub(crate) fn table_name_only(value: &str) -> String {
     if value.starts_with("arn:")
         && let Some(rid) = parse_resource_identity(value)
     {
@@ -1543,3 +1548,7 @@ mod supplied_resource_tests;
 /// A point-in-time restore authorizes its target before its source (issue #446).
 #[cfg(test)]
 mod restore_order_tests;
+
+/// SearchVectors authorizes the vector index it searches.
+#[cfg(test)]
+mod search_vectors_tests;

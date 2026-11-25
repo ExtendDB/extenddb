@@ -13,22 +13,24 @@
 //! unprocessed map is present as `{}`. A batch whose every entry was throttled
 //! fails with the throttle error per the API Reference; that case and the
 //! echo of `ExpressionAttributeNames` and `AttributesToGet` were not reached
-//! in the samples. The order of the unprocessed lists, which the samples
-//! returned in neither request nor sorted order, is not asserted. The storage
-//! double throttles a chosen set of partition key values and records which
-//! writes it applied.
+//! in the samples. The samples returned the service's lists in neither
+//! request nor sorted order; the engine keeps request order in `Responses`
+//! and in the unprocessed lists, and the tests compare in that order. Each
+//! throttle test runs for the three throttle errors a backend can report.
+//! The storage double throttles a chosen set of partition key values and
+//! records which writes it applied.
 
 #[path = "batch_partial/failing_store.rs"]
 mod failing_store;
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
 
 use extenddb_auth::AuthCacheRegistry;
-use extenddb_core::error::{DynamoDbError, PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE};
+use extenddb_core::error::{DynamoDbError, error_document};
 use extenddb_core::limits::LimitsConfig;
 use extenddb_engine::{
     BackupRuntime, DispatchResult, OperationContext, handle_batch_get_item, handle_batch_write_item,
@@ -37,6 +39,12 @@ use extenddb_engine::{
 use failing_store::*;
 
 fn ctx(store: Arc<FailingStore>) -> OperationContext {
+    ctx_naming(store, &[])
+}
+
+/// A context whose authorization step resolved each request name (a table
+/// ARN, say) to the key info of the catalog table it names.
+fn ctx_naming(store: Arc<FailingStore>, names: &[(&str, &str)]) -> OperationContext {
     OperationContext {
         storage: store,
         backup: Arc::new(BackupRuntime::new(1)),
@@ -45,7 +53,10 @@ fn ctx(store: Arc<FailingStore>) -> OperationContext {
         account_id: Arc::from(ACCOUNT),
         import_paths: Arc::from(Vec::<Arc<PathBuf>>::new()),
         export_paths: Arc::from(Vec::<Arc<PathBuf>>::new()),
-        authorized_key_info: extenddb_engine::AuthorizedKeyInfo::new(),
+        authorized_key_info: names
+            .iter()
+            .map(|(sent, table)| ((*sent).to_owned(), Some(key_info(table, false))))
+            .collect(),
         auth_cache: AuthCacheRegistry::empty(),
         table_key_info_lookup: None,
         item_authorizer: None,
@@ -56,13 +67,18 @@ fn keys_json(pks: &[&str]) -> Value {
     Value::Array(pks.iter().map(|p| json!({"pk": {"S": p}})).collect())
 }
 
-/// Partition key values of a JSON list of keys or items.
-fn pks(list: &Value) -> BTreeSet<String> {
+/// Partition key values of a JSON list of keys or items, in list order.
+fn pks(list: &Value) -> Vec<&str> {
     list.as_array()
         .expect("list")
         .iter()
-        .map(|k| k["pk"]["S"].as_str().expect("pk").to_owned())
+        .map(|k| k["pk"]["S"].as_str().expect("pk"))
         .collect()
+}
+
+/// The throttled entry count per table the engine hands the server.
+fn counts(rows: &[(&str, u32)]) -> BTreeMap<String, u32> {
+    rows.iter().map(|(t, n)| ((*t).to_owned(), *n)).collect()
 }
 
 /// The error of a handler result, or a panic naming the body that came back.
@@ -73,13 +89,22 @@ fn err_of(result: Result<DispatchResult, DynamoDbError>) -> DynamoDbError {
     }
 }
 
-fn assert_throttle(err: &DynamoDbError, reason: &str) {
-    assert_eq!(err.status_code(), 400);
-    assert_eq!(err.error_type(), "ProvisionedThroughputExceededException");
-    assert_eq!(err.message(), PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE);
-    let reasons = err.throttling_reasons().expect("reasons");
-    assert_eq!(reasons.len(), 1);
-    assert_eq!(reasons[0].reason, reason);
+/// The error is `expected`: the same status and the same body, so the same
+/// class, message and reasons list.
+fn assert_error(err: &DynamoDbError, expected: &DynamoDbError) {
+    assert_eq!(err.status_code(), expected.status_code(), "{err:?}");
+    assert_eq!(error_document(err), error_document(expected));
+}
+
+/// Keys or puts of table T, each failing with a different throttle error,
+/// rotated so that each error comes first once.
+fn rotations(reason: &str) -> impl Iterator<Item = Vec<DynamoDbError>> {
+    let errors = throttle_errors(reason);
+    (0..errors.len()).map(move |first| {
+        let mut row = errors.to_vec();
+        row.rotate_left(first);
+        row
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -90,67 +115,61 @@ fn assert_throttle(err: &DynamoDbError, reason: &str) {
 /// `UnprocessedKeys[<table>]` beside the request's `ConsistentRead` and
 /// `ProjectionExpression`, sets disjoint and complete, `ConsumedCapacity` for
 /// the served items only. `ExpressionAttributeNames` is echoed per the API
-/// Reference; the sample sent none.
+/// Reference; the sample sent none. Both lists keep request order.
 #[tokio::test]
 async fn batch_get_partial_echoes_request_fields_and_charges_served_only() {
-    let store = Arc::new(
-        FailingStore::throttling()
-            .with_items(&["k1", "k2", "k3", "k4", "k5"])
-            .failing_on(&["k2", "k4"]),
-    );
-    let body = json!({
-        "RequestItems": {
-            "T": {
-                "Keys": keys_json(&["k1", "k2", "k3", "k4", "k5"]),
-                "ConsistentRead": true,
-                "ProjectionExpression": "#p",
-                "ExpressionAttributeNames": {"#p": "pk"}
-            }
-        },
-        "ReturnConsumedCapacity": "TOTAL"
-    });
+    for error in throttle_errors("TableReadProvisionedThroughputExceeded") {
+        let store = Arc::new(
+            FailingStore::new(error.clone())
+                .with_items(&["k1", "k2", "k3", "k4", "k5"])
+                .failing_on(&["k2", "k4"]),
+        );
+        let body = json!({
+            "RequestItems": {
+                "T": {
+                    "Keys": keys_json(&["k1", "k2", "k3", "k4", "k5"]),
+                    "ConsistentRead": true,
+                    "ProjectionExpression": "#p",
+                    "ExpressionAttributeNames": {"#p": "pk"}
+                }
+            },
+            "ReturnConsumedCapacity": "TOTAL"
+        });
 
-    let result = handle_batch_get_item(body, &ctx(store))
-        .await
-        .expect("partial success is a 200");
+        let result = handle_batch_get_item(body, &ctx(store))
+            .await
+            .unwrap_or_else(|e| panic!("partial success is a 200, {error:?} gave {e:?}"));
 
-    let served = pks(&result.body["Responses"]["T"]);
-    assert_eq!(served, ["k1", "k3", "k5"].map(str::to_owned).into());
-    for it in result.body["Responses"]["T"].as_array().expect("items") {
-        assert!(it.get("v").is_none(), "projection applied to served items");
+        assert_eq!(
+            pks(&result.body["Responses"]["T"]),
+            ["k1", "k3", "k5"],
+            "{error:?}"
+        );
+        for it in result.body["Responses"]["T"].as_array().expect("items") {
+            assert!(it.get("v").is_none(), "projection applied to served items");
+        }
+
+        let unprocessed = &result.body["UnprocessedKeys"]["T"];
+        assert_eq!(pks(&unprocessed["Keys"]), ["k2", "k4"], "{error:?}");
+        assert_eq!(unprocessed["ConsistentRead"], json!(true));
+        assert_eq!(unprocessed["ProjectionExpression"], json!("#p"));
+        assert_eq!(unprocessed["ExpressionAttributeNames"], json!({"#p": "pk"}));
+        assert!(unprocessed.get("AttributesToGet").is_none());
+        assert_eq!(
+            unprocessed.as_object().expect("map").len(),
+            4,
+            "Keys plus the three request fields that were sent"
+        );
+
+        // Three consistent reads under 4 KB: 1 unit each, nothing for k2 and k4.
+        assert_eq!(
+            result.body["ConsumedCapacity"],
+            json!([{"TableName": "T", "CapacityUnits": 3.0}])
+        );
+        assert_eq!(result.metrics.read_capacity_units, 3.0);
+        assert_eq!(result.metrics.returned_item_count, 3);
+        assert_eq!(result.metrics.throttled_tables, counts(&[("T", 2)]));
     }
-
-    let unprocessed = &result.body["UnprocessedKeys"]["T"];
-    assert_eq!(
-        pks(&unprocessed["Keys"]),
-        ["k2", "k4"].map(str::to_owned).into()
-    );
-    assert_eq!(unprocessed["ConsistentRead"], json!(true));
-    assert_eq!(unprocessed["ProjectionExpression"], json!("#p"));
-    assert_eq!(unprocessed["ExpressionAttributeNames"], json!({"#p": "pk"}));
-    assert!(unprocessed.get("AttributesToGet").is_none());
-    assert_eq!(
-        unprocessed.as_object().expect("map").len(),
-        4,
-        "Keys plus the three request fields that were sent"
-    );
-
-    // Disjoint and complete.
-    let unread = pks(&unprocessed["Keys"]);
-    assert!(served.is_disjoint(&unread));
-    let all: BTreeSet<String> = served.union(&unread).cloned().collect();
-    assert_eq!(
-        all,
-        ["k1", "k2", "k3", "k4", "k5"].map(str::to_owned).into()
-    );
-
-    // Three consistent reads under 4 KB: 1 unit each, nothing for k2 and k4.
-    assert_eq!(
-        result.body["ConsumedCapacity"],
-        json!([{"TableName": "T", "CapacityUnits": 3.0}])
-    );
-    assert_eq!(result.metrics.read_capacity_units, 3.0);
-    assert_eq!(result.metrics.returned_item_count, 3);
 }
 
 /// Two tables: one throttled on every key, the other fully served. The
@@ -177,47 +196,84 @@ async fn batch_get_one_table_throttled_beside_a_served_table() {
 
     let unprocessed = result.body["UnprocessedKeys"].as_object().expect("map");
     assert_eq!(unprocessed.len(), 1);
-    assert_eq!(
-        pks(&unprocessed["T"]["Keys"]),
-        ["t1", "t2"].map(str::to_owned).into()
-    );
+    assert_eq!(pks(&unprocessed["T"]["Keys"]), ["t1", "t2"]);
     assert!(unprocessed["T"].get("ConsistentRead").is_none());
-    // The fully throttled table keeps an empty list under Responses (the
-    // branch's own contract; the service's shape for this case is unmeasured).
+    // The fully throttled table keeps an empty list under Responses; the
+    // service left it out in 29 of 29 measured responses (2026-11-24).
     let responses = result.body["Responses"].as_object().expect("map");
     assert_eq!(responses.len(), 2);
     assert_eq!(responses["T"], json!([]));
-    assert_eq!(
-        pks(&result.body["Responses"]["U"]),
-        ["u1", "u2"].map(str::to_owned).into()
-    );
+    assert_eq!(pks(&result.body["Responses"]["U"]), ["u1", "u2"]);
     // Eventually consistent reads under 4 KB: 0.5 each; nothing for T.
     assert_eq!(
         result.body["ConsumedCapacity"],
         json!([{"TableName": "U", "CapacityUnits": 1.0}])
     );
     assert_eq!(result.metrics.read_capacity_units, 1.0);
-    assert_eq!(result.metrics.throttled_tables, ["T"]);
+    assert_eq!(result.metrics.throttled_tables, counts(&[("T", 2)]));
+}
+
+/// A request that names its table by ARN is answered under the ARN, and the
+/// server is handed the catalog name, which its metrics carry.
+#[tokio::test]
+async fn batch_get_by_arn_answers_under_the_arn_and_counts_the_catalog_table() {
+    let arn = table_arn("T");
+    let store = Arc::new(
+        FailingStore::throttling()
+            .with_items(&["k1", "k2"])
+            .failing_on(&["k2"]),
+    );
+    let mut items = serde_json::Map::new();
+    items.insert(arn.clone(), json!({"Keys": keys_json(&["k1", "k2"])}));
+    let body = json!({"RequestItems": items});
+
+    let result = handle_batch_get_item(body, &ctx_naming(store, &[(&arn, "T")]))
+        .await
+        .expect("one key served is a 200");
+    assert_eq!(pks(&result.body["Responses"][&arn]), ["k1"]);
+    assert_eq!(pks(&result.body["UnprocessedKeys"][&arn]["Keys"]), ["k2"]);
+    assert_eq!(result.metrics.throttled_tables, counts(&[("T", 1)]));
 }
 
 /// Every key of every table throttled: the call fails with the throttle
-/// error (API Reference; documented, not measured).
+/// error (API Reference; measured 2026-11-24, 24 of 24 BatchGetItem and 3 of 3
+/// BatchWriteItem all-throttled batches answered 400).
 #[tokio::test]
 async fn batch_get_every_key_throttled_fails_with_the_throttle_error() {
-    let store = Arc::new(
-        FailingStore::throttling()
-            .with_items(&["t1", "u1"])
-            .failing_on(&["t1", "u1"]),
-    );
-    let body = json!({
-        "RequestItems": {
-            "T": {"Keys": keys_json(&["t1"])},
-            "U": {"Keys": keys_json(&["u1"])}
-        }
-    });
+    for error in throttle_errors("TableReadProvisionedThroughputExceeded") {
+        let store = Arc::new(
+            FailingStore::new(error.clone())
+                .with_items(&["t1", "u1"])
+                .failing_on(&["t1", "u1"]),
+        );
+        let body = json!({
+            "RequestItems": {
+                "T": {"Keys": keys_json(&["t1"])},
+                "U": {"Keys": keys_json(&["u1"])}
+            }
+        });
 
-    let err = err_of(handle_batch_get_item(body, &ctx(store)).await);
-    assert_throttle(&err, "TableReadProvisionedThroughputExceeded");
+        let err = err_of(handle_batch_get_item(body, &ctx(store)).await);
+        assert_error(&err, &error);
+    }
+}
+
+/// Keys of one table throttled with different errors: the call fails with
+/// the error of the first key in request order.
+#[tokio::test]
+async fn batch_get_every_key_throttled_fails_with_the_first_throttle_error() {
+    for errors in rotations("TableReadProvisionedThroughputExceeded") {
+        let store = Arc::new(
+            FailingStore::throttling()
+                .failing_with("k1", errors[0].clone())
+                .failing_with("k2", errors[1].clone())
+                .failing_with("k3", errors[2].clone()),
+        );
+        let body = json!({"RequestItems": {"T": {"Keys": keys_json(&["k1", "k2", "k3"])}}});
+
+        let err = err_of(handle_batch_get_item(body, &ctx(store)).await);
+        assert_error(&err, &errors[0]);
+    }
 }
 
 /// The boundary of the all-throttled rule: with one key served and every
@@ -237,13 +293,10 @@ async fn batch_get_one_served_key_is_a_partial_success() {
     let result = handle_batch_get_item(body, &ctx(store))
         .await
         .expect("one key served is a 200");
-    assert_eq!(
-        pks(&result.body["Responses"]["T"]),
-        ["k3".to_owned()].into()
-    );
+    assert_eq!(pks(&result.body["Responses"]["T"]), ["k3"]);
     assert_eq!(
         pks(&result.body["UnprocessedKeys"]["T"]["Keys"]),
-        ["k1", "k2"].map(str::to_owned).into()
+        ["k1", "k2"]
     );
     assert_eq!(
         result.body["ConsumedCapacity"],
@@ -271,7 +324,7 @@ async fn batch_get_partial_echoes_attributes_to_get() {
         .expect("map");
     assert_eq!(t.len(), 2, "{t:?}");
     assert_eq!(t["AttributesToGet"], json!(["pk"]));
-    assert_eq!(pks(&t["Keys"]), ["k2".to_owned()].into());
+    assert_eq!(pks(&t["Keys"]), ["k2"]);
 }
 
 /// Capacity for a served item follows its size: a consistent read of an item
@@ -315,10 +368,7 @@ async fn batch_get_nothing_throttled_serializes_empty_unprocessed_keys() {
         serialized.contains(r#""UnprocessedKeys":{}"#),
         "body: {serialized}"
     );
-    assert_eq!(
-        pks(&result.body["Responses"]["T"]),
-        ["k1"].map(str::to_owned).into()
-    );
+    assert_eq!(pks(&result.body["Responses"]["T"]), ["k1"]);
 }
 
 /// A storage `Service` error that is not a throttle still fails the request.
@@ -345,91 +395,134 @@ async fn batch_get_non_throttle_service_error_fails_the_request() {
 // ---------------------------------------------------------------------------
 
 /// Puts and deletes, some throttled: 200, the throttled entries echoed as
-/// sent under `UnprocessedItems[<table>]`, `ConsumedCapacity` and
-/// `ItemCollectionMetrics` for the applied entries only, and the backend saw
-/// exactly the applied writes.
+/// sent under `UnprocessedItems[<table>]` in request order, `ConsumedCapacity`
+/// and `ItemCollectionMetrics` for the applied entries only, and the backend
+/// saw exactly the applied writes.
 #[tokio::test]
 async fn batch_write_partial_echoes_entries_and_charges_applied_only() {
-    let store = Arc::new(FailingStore::throttling_writes().failing_on(&["p2", "d2"]));
-    let body = json!({
-        "RequestItems": {
-            "T": [
-                {"PutRequest": {"Item": {"pk": {"S": "p1"}, "v": {"N": "1"}}}},
+    for error in throttle_errors("TableWriteProvisionedThroughputExceeded") {
+        let store = Arc::new(FailingStore::new(error.clone()).failing_on(&["p2", "d2"]));
+        let body = json!({
+            "RequestItems": {
+                "T": [
+                    {"PutRequest": {"Item": {"pk": {"S": "p1"}, "v": {"N": "1"}}}},
+                    {"PutRequest": {"Item": {"pk": {"S": "p2"}, "v": {"N": "2"}}}},
+                    {"DeleteRequest": {"Key": {"pk": {"S": "d1"}}}},
+                    {"DeleteRequest": {"Key": {"pk": {"S": "d2"}}}}
+                ]
+            },
+            "ReturnConsumedCapacity": "TOTAL",
+            "ReturnItemCollectionMetrics": "SIZE"
+        });
+
+        let result = handle_batch_write_item(body, &ctx(Arc::clone(&store)))
+            .await
+            .unwrap_or_else(|e| panic!("partial success is a 200, {error:?} gave {e:?}"));
+
+        assert_eq!(
+            result.body["UnprocessedItems"],
+            json!({"T": [
                 {"PutRequest": {"Item": {"pk": {"S": "p2"}, "v": {"N": "2"}}}},
-                {"DeleteRequest": {"Key": {"pk": {"S": "d1"}}}},
                 {"DeleteRequest": {"Key": {"pk": {"S": "d2"}}}}
+            ]}),
+            "{error:?}"
+        );
+
+        // Two applied writes under 1 KB: 1 unit each.
+        assert_eq!(
+            result.body["ConsumedCapacity"],
+            json!([{"TableName": "T", "CapacityUnits": 2.0}])
+        );
+        assert_eq!(result.metrics.write_capacity_units, 2.0);
+
+        let icm: Vec<&str> = result.body["ItemCollectionMetrics"]["T"]
+            .as_array()
+            .expect("metrics list")
+            .iter()
+            .map(|m| m["ItemCollectionKey"]["pk"]["S"].as_str().expect("pk"))
+            .collect();
+        assert_eq!(icm, ["p1", "d1"]);
+
+        assert_eq!(
+            store.applied(),
+            vec![
+                Applied::Put("p1".to_owned()),
+                Applied::Delete("d1".to_owned())
             ]
-        },
-        "ReturnConsumedCapacity": "TOTAL",
-        "ReturnItemCollectionMetrics": "SIZE"
-    });
-
-    let result = handle_batch_write_item(body, &ctx(Arc::clone(&store)))
-        .await
-        .expect("partial success is a 200");
-
-    let unprocessed = result.body["UnprocessedItems"]["T"]
-        .as_array()
-        .expect("list");
-    assert_eq!(unprocessed.len(), 2);
-    assert!(unprocessed.contains(&json!({
-        "PutRequest": {"Item": {"pk": {"S": "p2"}, "v": {"N": "2"}}}
-    })));
-    assert!(unprocessed.contains(&json!({
-        "DeleteRequest": {"Key": {"pk": {"S": "d2"}}}
-    })));
-    assert_eq!(
-        result.body["UnprocessedItems"]
-            .as_object()
-            .expect("map")
-            .len(),
-        1
-    );
-
-    // Two applied writes under 1 KB: 1 unit each.
-    assert_eq!(
-        result.body["ConsumedCapacity"],
-        json!([{"TableName": "T", "CapacityUnits": 2.0}])
-    );
-    assert_eq!(result.metrics.write_capacity_units, 2.0);
-
-    let icm: BTreeSet<String> = result.body["ItemCollectionMetrics"]["T"]
-        .as_array()
-        .expect("metrics list")
-        .iter()
-        .map(|m| {
-            m["ItemCollectionKey"]["pk"]["S"]
-                .as_str()
-                .expect("pk")
-                .to_owned()
-        })
-        .collect();
-    assert_eq!(icm, ["p1", "d1"].map(str::to_owned).into());
-
-    assert_eq!(
-        store.applied(),
-        vec![
-            Applied::Put("p1".to_owned()),
-            Applied::Delete("d1".to_owned())
-        ]
-    );
+        );
+        assert_eq!(result.metrics.throttled_tables, counts(&[("T", 2)]));
+    }
 }
 
 /// Every entry throttled: the call fails with the throttle error and nothing
 /// was applied.
 #[tokio::test]
 async fn batch_write_every_entry_throttled_fails_with_the_throttle_error() {
-    let store = Arc::new(FailingStore::throttling_writes().failing_on(&["p1", "d1"]));
-    let body = json!({
-        "RequestItems": {
-            "T": [{"PutRequest": {"Item": {"pk": {"S": "p1"}}}}],
-            "U": [{"DeleteRequest": {"Key": {"pk": {"S": "d1"}}}}]
-        }
-    });
+    for error in throttle_errors("TableWriteProvisionedThroughputExceeded") {
+        let store = Arc::new(FailingStore::new(error.clone()).failing_on(&["p1", "d1"]));
+        let body = json!({
+            "RequestItems": {
+                "T": [{"PutRequest": {"Item": {"pk": {"S": "p1"}}}}],
+                "U": [{"DeleteRequest": {"Key": {"pk": {"S": "d1"}}}}]
+            }
+        });
 
-    let err = err_of(handle_batch_write_item(body, &ctx(Arc::clone(&store))).await);
-    assert_throttle(&err, "TableWriteProvisionedThroughputExceeded");
-    assert!(store.applied().is_empty());
+        let err = err_of(handle_batch_write_item(body, &ctx(Arc::clone(&store))).await);
+        assert_error(&err, &error);
+        assert!(store.applied().is_empty());
+    }
+}
+
+/// Requests of one table throttled with different errors: the call fails
+/// with the error of the first request in request order.
+#[tokio::test]
+async fn batch_write_every_entry_throttled_fails_with_the_first_throttle_error() {
+    for errors in rotations("TableWriteProvisionedThroughputExceeded") {
+        let store = Arc::new(
+            FailingStore::throttling_writes()
+                .failing_with("p1", errors[0].clone())
+                .failing_with("p2", errors[1].clone())
+                .failing_with("p3", errors[2].clone()),
+        );
+        let body = json!({
+            "RequestItems": {
+                "T": [
+                    {"PutRequest": {"Item": {"pk": {"S": "p1"}}}},
+                    {"PutRequest": {"Item": {"pk": {"S": "p2"}}}},
+                    {"PutRequest": {"Item": {"pk": {"S": "p3"}}}}
+                ]
+            }
+        });
+
+        let err = err_of(handle_batch_write_item(body, &ctx(store)).await);
+        assert_error(&err, &errors[0]);
+    }
+}
+
+/// A request that names its table by ARN is answered under the ARN, and the
+/// server is handed the catalog name, which its metrics carry.
+#[tokio::test]
+async fn batch_write_by_arn_answers_under_the_arn_and_counts_the_catalog_table() {
+    let arn = table_arn("T");
+    let store = Arc::new(FailingStore::throttling_writes().failing_on(&["p2"]));
+    let mut items = serde_json::Map::new();
+    items.insert(
+        arn.clone(),
+        json!([
+            {"PutRequest": {"Item": {"pk": {"S": "p1"}}}},
+            {"PutRequest": {"Item": {"pk": {"S": "p2"}}}}
+        ]),
+    );
+    let body = json!({"RequestItems": items});
+
+    let result = handle_batch_write_item(body, &ctx_naming(store, &[(&arn, "T")]))
+        .await
+        .expect("one entry applied is a 200");
+    assert_eq!(
+        result.body["UnprocessedItems"],
+        json!({arn: [{"PutRequest": {"Item": {"pk": {"S": "p2"}}}}]})
+    );
+    assert_eq!(result.metrics.throttled_tables, counts(&[("T", 1)]));
 }
 
 /// The boundary of the all-throttled rule on writes: one entry applied and
@@ -452,15 +545,18 @@ async fn batch_write_one_applied_entry_is_a_partial_success() {
         .await
         .expect("one entry applied is a 200");
     assert_eq!(store.applied(), vec![Applied::Put("p3".to_owned())]);
-    let unprocessed = result.body["UnprocessedItems"]["T"]
-        .as_array()
-        .expect("list");
-    assert_eq!(unprocessed.len(), 2);
+    assert_eq!(
+        result.body["UnprocessedItems"],
+        json!({"T": [
+            {"PutRequest": {"Item": {"pk": {"S": "p1"}}}},
+            {"PutRequest": {"Item": {"pk": {"S": "p2"}}}}
+        ]})
+    );
     assert_eq!(
         result.body["ConsumedCapacity"],
         json!([{"TableName": "T", "CapacityUnits": 1.0}])
     );
-    assert_eq!(result.metrics.throttled_tables, ["T"]);
+    assert_eq!(result.metrics.throttled_tables, counts(&[("T", 2)]));
 }
 
 /// Nothing throttled: `UnprocessedItems` is present as `{}` (13 of 13 fully

@@ -44,6 +44,8 @@ use extenddb_storage::stream_lineage::{
 };
 
 use crate::CassandraEngine;
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use crate::cassandra_util::query_rows;
 use crate::stream_util::ZERO_SEQUENCE;
 
@@ -352,10 +354,17 @@ impl CassandraEngine {
             ));
         }
         let batch = format!("BEGIN BATCH\n{}\nAPPLY BATCH", statements.join(";\n"));
-        self.session.query(&batch).await.map_err(|e| {
-            tracing::error!("insert_stream_shards batch: {e}");
-            StorageError::Internal(format!("Failed to initialize stream shards: {e}"))
-        })?;
+        self.session
+            .run(
+                Stmt::Write,
+                &batch,
+                cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!("insert_stream_shards batch: {e}");
+                StorageError::Internal(format!("Failed to initialize stream shards: {e}"))
+            })?;
         Ok(())
     }
 
@@ -430,7 +439,9 @@ impl CassandraEngine {
                 .last_sequence_in(account_ks, &range)
                 .await?
                 .unwrap_or(row.starting_sequence_number);
-            crate::cassandra_util::execute::<StorageError>(
+            // Not applied when an earlier close already set the ending number;
+            // that close's number stays.
+            let _closed_now = crate::cassandra_util::apply_lwt::<StorageError>(
                 &self.session,
                 &format!(
                     "UPDATE {account_ks}.stream_shards SET ending_sequence_number = ? \

@@ -5,7 +5,7 @@
 //!
 //! Owns the command-line interface (`serve`, `init`, `destroy`, `backup`,
 //! `verify`, `migrate`, `status`, `stop`, `settings`, `manage`,
-//! `catalog-check`, `healthcheck`) and the
+//! `catalog-check`, `encryption-key`, `healthcheck`) and the
 //! subcommand dispatch. It is backend-agnostic: a backend's thin `main`
 //! installs its backend with
 //! [`set_backend`](extenddb_storage::set_backend) and then calls [`run`]:
@@ -39,6 +39,7 @@
 mod cmd_backup;
 mod cmd_catalog_check;
 mod cmd_destroy;
+mod cmd_encryption_key;
 mod cmd_healthcheck;
 mod cmd_init;
 mod cmd_manage;
@@ -121,6 +122,10 @@ enum Command {
     Manage(cmd_manage::ManageArgs),
     /// Check catalog and data database integrity
     CatalogCheck(cmd_catalog_check::CatalogCheckArgs),
+    /// Show or change the key that encrypts stored secrets: status, switch, rewrap, rotate,
+    /// reset, set-data-connection (exit 0 done or previewed, 1 refused, 3 to 5 the catalog's
+    /// migrations are not current, 6 the catalog stayed locked)
+    EncryptionKey(cmd_encryption_key::EncryptionKeyArgs),
     /// Probe the local /health endpoint over HTTPS (exit 0 healthy, 1 not)
     Healthcheck(cmd_healthcheck::HealthcheckArgs),
     /// Print version, catalog version, git commit, and build timestamp
@@ -209,6 +214,13 @@ pub fn run_with(build: BuildInfo, extensions: Extensions) -> anyhow::Result<()> 
         Command::Settings(args) => run_interactive(cmd_settings::run(args)),
         Command::Manage(args) => run_interactive(cmd_manage::run(args)),
         Command::CatalogCheck(args) => run_interactive(cmd_catalog_check::run(args)),
+        Command::EncryptionKey(args) => {
+            let code = run_interactive(cmd_encryption_key::run(args))?;
+            if code != 0 {
+                std::process::exit(i32::from(code));
+            }
+            Ok(())
+        }
         Command::Healthcheck(args) => match cmd_healthcheck::run(&args) {
             Ok(()) => Ok(()),
             Err(e) => {
