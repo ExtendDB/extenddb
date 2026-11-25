@@ -12,13 +12,22 @@ The TableClass and SSESpecification rows were measured on 13, 14 and 18 Nov
   path and the set in its own order.
 - A member of the wrong JSON type answers ``SerializationException`` first.
   Its text there, such as "Unexpected field type", is not the text ExtendDB
-  sends, so these rows check the exception only.
+  sends, so these rows check the exception only. The UpdateTable
+  SSESpecification rows check the text too.
 - A TableClass outside its set gets the service's own sentence. A member of
   the wrong JSON type and a table name of a bad length answer ahead of it.
   It answers ahead of every member fault.
 - CreateTable refuses an SSEType outside its set and a KMSMasterKeyId of
   more than 2048 characters with the other member faults. After them it
   refuses an SSESpecification whose members do not go together.
+- On a table created without an SSESpecification or with KMS, UpdateTable
+  refuses the SSESpecification rows below with the sentences CreateTable
+  uses. A specification without Enabled that names SSEType or
+  KMSMasterKeyId is read as one with Enabled true. An Enabled written as a
+  string is read as false when it is "false" and as true otherwise.
+  Enabled false on a table created without an SSESpecification gets a
+  sentence of its own, after the table lookup. The table keeps its
+  SSEDescription.
 - UpdateTable refuses before it looks up the table. After a refused
   CreateTable no table exists. After a refused UpdateTable the table has no
   stream, and the same UpdateTable with ``NEW_IMAGE`` enables one.
@@ -39,6 +48,7 @@ from raw_signed_request import signed_post
 
 REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 SERIALIZATION = "SerializationException"
+NOT_FOUND = "ResourceNotFoundException"
 PROJECTION_SET = "[ALL, INCLUDE, KEYS_ONLY]"
 VIEW_SET = "[OLD_IMAGE, KEYS_ONLY, NEW_AND_OLD_IMAGES, NEW_IMAGE]"
 SSE_SET = "[AES256, KMS]"
@@ -242,6 +252,77 @@ ROWS += [
      {"TableClass": "BOGUS", "AttributeDefinitions": "x"}, SERIALIZATION),
 ]
 
+ROWS += [
+    # An Enabled of "yes" reads as true, so the table lookup answers
+    # (measured 2026-11-25).
+    ("ut-sse-enabled-yes-kms", "UpdateTable",
+     {"SSESpecification": {"Enabled": "yes", "SSEType": "KMS"}}, NOT_FOUND),
+    # The SSE faults come ahead of the stream view type and the index faults,
+    # also when the body sends the index first (measured 2026-11-25).
+    ("ut-sse-bogus-stream-bogus", "UpdateTable",
+     {"StreamSpecification": _stream(True, "BOGUS"),
+      "SSESpecification": {"Enabled": True, "SSEType": "BOGUS"}},
+     _both(SSE_BOGUS, _view("BOGUS"))),
+    ("ut-gsi-bogus-sse-bogus", "UpdateTable",
+     {"GlobalSecondaryIndexUpdates": [{"Create": _index("gsi1", "g", "BOGUS")}],
+      "AttributeDefinitions": _defs("g"),
+      "SSESpecification": {"Enabled": True, "SSEType": "BOGUS"}},
+     _both(SSE_BOGUS, _projection("BOGUS", "globalSecondaryIndexUpdates.1.member.create"))),
+]
+
+# UpdateTable of an existing table keyed on pk alone, created without an
+# SSESpecification or with KMS: (id, the table's SSESpecification, the
+# request's, the answer's message). <account> is the table's account.
+KMS = {"Enabled": True, "SSEType": "KMS"}
+KEY_ARN = "arn:aws:kms:eu-west-1:<account>:key/11111111-2222-3333-4444-555555555555"
+SSE_UPDATE_ROWS = [
+    ("aes256", None, {"Enabled": True, "SSEType": "AES256"},
+     _invalid("SSEType AES256 is not supported")),
+    ("bogus", None, {"Enabled": True, "SSEType": "BOGUS"}, SSE_BOGUS),
+    ("type-disabled", None, {"Enabled": False, "SSEType": "KMS"},
+     _invalid("SSEType can not be specified if Enabled is false")),
+    ("key-alias", None, {"Enabled": True, "KMSMasterKeyId": "alias/no-such-key"}, KMS_REQUIRED),
+    ("key-id", None, {"Enabled": True, "KMSMasterKeyId": "11111111-2222-3333-4444-555555555555"},
+     KMS_REQUIRED),
+    ("key-arn", None, {"Enabled": True, "KMSMasterKeyId": KEY_ARN}, KMS_REQUIRED),
+    ("bogus-key-2049", None, {"Enabled": True, "SSEType": "BOGUS", "KMSMasterKeyId": KEY_2049},
+     _both(KEY_FAULT, SSE_BOGUS)),
+    ("kms-aes256", KMS, {"Enabled": True, "SSEType": "AES256"},
+     _invalid("SSEType AES256 is not supported")),
+    ("kms-bogus", KMS, {"Enabled": True, "SSEType": "BOGUS"}, SSE_BOGUS),
+    ("kms-aes256-without-enabled", KMS, {"SSEType": "AES256"},
+     _invalid("SSEType AES256 is not supported")),
+    ("kms-key-without-enabled", KMS, {"KMSMasterKeyId": "alias/no-such-key"}, KMS_REQUIRED),
+    ("default-disabled", None, {"Enabled": False},
+     _invalid("Table is already encrypted by default")),
+    ("default-empty", None, {}, _invalid("Table is already encrypted by default")),
+    # Measured on a table that does not exist on 2026-11-25. Each answer
+    # comes before the table lookup.
+    ("enabled-true-string", None, {"Enabled": "true", "SSEType": "AES256"},
+     _invalid("SSEType AES256 is not supported")),
+    ("enabled-yes-string", None, {"Enabled": "yes", "SSEType": "AES256"},
+     _invalid("SSEType AES256 is not supported")),
+    ("kms-enabled-false-string", KMS, {"Enabled": "false", "SSEType": "KMS"},
+     _invalid("SSEType can not be specified if Enabled is false")),
+    ("kms-specification-string", KMS, "x", (SERIALIZATION, "Unexpected field type")),
+    ("sse-type-number", None, {"Enabled": True, "SSEType": 5},
+     (SERIALIZATION, "NUMBER_VALUE cannot be converted to String")),
+]
+
+# KMS beside a stream change and a billing change, on a table created without
+# an SSESpecification. A stream change beside ProvisionedThroughput answers its
+# own sentence ahead of the SSESpecification one (measured 2026-11-18).
+SSE_COMPANION_ROWS = [
+    ("stream-billing", {"StreamSpecification": _stream(True, "NEW_IMAGE"),
+                        "BillingMode": "PAY_PER_REQUEST"},
+     _invalid("Server-Side Encryption modification must be the only operation in the request")),
+    ("stream-throughput", {"StreamSpecification": _stream(True, "NEW_IMAGE"),
+                           "BillingMode": "PROVISIONED",
+                           "ProvisionedThroughput": {"ReadCapacityUnits": 5,
+                                                     "WriteCapacityUnits": 5}},
+     _invalid("You cannot modify stream status while updating table IOPS")),
+]
+
 
 @pytest.fixture(scope="module")
 def post(endpoint_url):
@@ -256,15 +337,20 @@ def post(endpoint_url):
     return _post
 
 
-def _assert_answer(resp, expected: str) -> None:
+def _assert_answer(resp, expected) -> None:
+    """``expected`` is the text of a ValidationException, SERIALIZATION or
+    NOT_FOUND for that exception with any text, or a pair of an exception and
+    its text."""
     assert resp.status_code == 400, resp.text
     payload = resp.json()
     kind = payload.get("__type", "").rsplit("#", 1)[-1]
-    if expected == SERIALIZATION:
-        assert kind == SERIALIZATION, payload
+    if expected in (SERIALIZATION, NOT_FOUND):
+        assert kind == expected, payload
         return
-    assert kind == "ValidationException", payload
-    assert payload.get("message", payload.get("Message")) == expected
+    if not isinstance(expected, tuple):
+        expected = ("ValidationException", expected)
+    assert kind == expected[0], payload
+    assert payload.get("message", payload.get("Message")) == expected[1]
 
 
 def _streams(endpoint_url, name: str) -> list:
@@ -288,6 +374,42 @@ def test_refused_request(dynamodb_client, unique_table_name, post, operation, me
     _assert_answer(resp, expected)
     with pytest.raises(dynamodb_client.exceptions.ResourceNotFoundException):
         dynamodb_client.describe_table(TableName=unique_table_name)
+
+
+@pytest.mark.parametrize(
+    ("created", "spec", "expected"),
+    [pytest.param(created, spec, expected, id=row_id)
+     for row_id, created, spec, expected in SSE_UPDATE_ROWS],
+)
+def test_refused_sse_update_keeps_the_table(create_and_cleanup_table, dynamodb_client,
+                                            unique_table_name, post, created, spec, expected):
+    table = create_and_cleanup_table(**({"SSESpecification": created} if created else {}))
+    account = table["TableDescription"]["TableArn"].split(":")[4]
+    if isinstance(spec, dict):
+        spec = {k: v.replace("<account>", account) if isinstance(v, str) else v
+                for k, v in spec.items()}
+    before = dynamodb_client.describe_table(TableName=unique_table_name)["Table"]
+    resp = post("UpdateTable", {"TableName": unique_table_name, "SSESpecification": spec})
+    _assert_answer(resp, expected)
+    after = dynamodb_client.describe_table(TableName=unique_table_name)["Table"]
+    assert after.get("SSEDescription") == before.get("SSEDescription"), after
+
+
+@pytest.mark.parametrize(
+    ("members", "expected"),
+    [pytest.param(members, expected, id=row_id)
+     for row_id, members, expected in SSE_COMPANION_ROWS],
+)
+def test_refused_sse_beside_a_stream_change(create_and_cleanup_table, dynamodb_client,
+                                            unique_table_name, post, members, expected):
+    create_and_cleanup_table()
+    before = dynamodb_client.describe_table(TableName=unique_table_name)["Table"]
+    resp = post("UpdateTable", {"TableName": unique_table_name, "SSESpecification": KMS,
+                                **members})
+    _assert_answer(resp, expected)
+    after = dynamodb_client.describe_table(TableName=unique_table_name)["Table"]
+    for key in ("SSEDescription", "StreamSpecification", "BillingModeSummary"):
+        assert after.get(key) == before.get(key), after
 
 
 def test_refused_update_leaves_existing_table_without_stream(

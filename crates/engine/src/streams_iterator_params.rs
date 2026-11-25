@@ -35,17 +35,27 @@ pub(crate) const SHARD_ITERATOR_TYPE_ENUM_CLAUSE: &str = "Value at 'shardIterato
 /// order stands in; it is the order the SDKs send.
 const TYPED_MEMBERS: &[(&str, &str)] = &[("SequenceNumber", "String"), ("Timestamp", "Date")];
 
-/// Refuse the first member whose JSON type does not fit with the text the
-/// service's deserializer renders for it (measured 2026-10-23 and 2026-11-20):
-/// `STRING_VALUE`, `NUMBER_VALUE`, `TRUE_VALUE` or `FALSE_VALUE` `cannot be
-/// converted to <type>`, an object the structure message, an array a
-/// `SerializationException` with no message. Null passes through to the
-/// parameter rules, which treat it as absent. The service runs this before
-/// every constraint and parameter check, the `ShardIteratorType` ones and
-/// the `StreamArn` presence (measured 2026-11-23) included.
+/// Refuse the first member of [`TYPED_MEMBERS`] whose JSON type does not fit,
+/// as [`check_member_types`] says. The service runs this before every
+/// constraint and parameter check, the `ShardIteratorType` ones and the
+/// `StreamArn` presence (measured 2026-11-23) included.
 pub(crate) fn check_member_shapes(body: &serde_json::Value) -> Result<(), DynamoDbError> {
+    check_member_types(body, TYPED_MEMBERS)
+}
+
+/// Refuse the first of `members`, each a member name and the type name of
+/// the service's texts, whose JSON type in `body` does not fit, with the text
+/// the service's deserializer renders for it (measured 2026-10-23 and
+/// 2026-11-20): `STRING_VALUE`, `NUMBER_VALUE`, `TRUE_VALUE` or `FALSE_VALUE`
+/// `cannot be converted to <type>`, an object the structure message, an
+/// array a `SerializationException` with no message. Null passes through to
+/// the later checks, which treat it as absent.
+pub(crate) fn check_member_types(
+    body: &serde_json::Value,
+    members: &[(&str, &str)],
+) -> Result<(), DynamoDbError> {
     use serde_json::Value;
-    for (member, kind) in TYPED_MEMBERS {
+    for (member, kind) in members {
         let Some(v) = body.get(member) else {
             continue;
         };

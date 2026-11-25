@@ -350,6 +350,88 @@ fn rows() -> Vec<((&'static str, Value), Option<String>)> {
             refused(sse_type, SSE_TYPE, SSE_SET),
         ));
     }
+    // UpdateTable lists the SSE faults ahead of the stream view type and the
+    // index faults (measured 2026-11-25).
+    rows.extend([
+        (
+            update(with(
+                stream(true, "BOGUS"),
+                json!({"SSESpecification": {"Enabled": true, "SSEType": "BOGUS"}}),
+            )),
+            both(sse_bogus.clone(), refused("BOGUS", VIEW, VIEW_SET)),
+        ),
+        (
+            update(json!({
+                "GlobalSecondaryIndexUpdates": [{"Create": index("gsi1", "g", "BOGUS")}],
+                "AttributeDefinitions": defs(&["g"]),
+                "SSESpecification": {"Enabled": true, "SSEType": "BOGUS"},
+            })),
+            both(
+                sse_bogus.clone(),
+                projection("BOGUS", "globalSecondaryIndexUpdates.1.member.create"),
+            ),
+        ),
+    ]);
+    for (spec, expected) in [
+        (
+            json!({"Enabled": true, "SSEType": "AES256"}),
+            invalid("SSEType AES256 is not supported"),
+        ),
+        (json!({"Enabled": true, "SSEType": "BOGUS"}), sse_bogus),
+        (
+            kms_key("alias/no-such-key"),
+            invalid("SSEType KMS is required if KMSMasterKeyId is specified"),
+        ),
+        // Without Enabled, an SSEType or a KMSMasterKeyId reads as Enabled
+        // true.
+        (
+            json!({"SSEType": "AES256"}),
+            invalid("SSEType AES256 is not supported"),
+        ),
+        (
+            json!({"KMSMasterKeyId": "alias/no-such-key"}),
+            invalid("SSEType KMS is required if KMSMasterKeyId is specified"),
+        ),
+        // An Enabled written as a string reads as false when it is "false",
+        // and as true otherwise (measured 2026-11-25).
+        (
+            json!({"Enabled": "true", "SSEType": "AES256"}),
+            invalid("SSEType AES256 is not supported"),
+        ),
+        (
+            json!({"Enabled": "yes", "SSEType": "AES256"}),
+            invalid("SSEType AES256 is not supported"),
+        ),
+        (
+            json!({"Enabled": "false", "SSEType": "KMS"}),
+            invalid("SSEType can not be specified if Enabled is false"),
+        ),
+        // A specification of the wrong JSON type (measured 2026-11-25).
+        (json!("x"), None),
+        (json!({"Enabled": true, "SSEType": 5}), None),
+    ] {
+        rows.push((update(json!({"SSESpecification": spec})), expected));
+    }
+    // The service refuses a specification beside another change.
+    let only =
+        invalid("Server-Side Encryption modification must be the only operation in the request");
+    let units = json!({"ReadCapacityUnits": 5, "WriteCapacityUnits": 5});
+    for companion in [
+        json!({"DeletionProtectionEnabled": false}),
+        json!({"TableClass": "STANDARD_INFREQUENT_ACCESS"}),
+        stream(true, "NEW_IMAGE"),
+        json!({
+            "AttributeDefinitions": defs(&["pk"]),
+            "GlobalSecondaryIndexUpdates": [{"Create": index("gsi1", "pk", "ALL")}],
+        }),
+        json!({"ProvisionedThroughput": units}),
+        json!({"OnDemandThroughput": {"MaxReadRequestUnits": 100}}),
+        json!({"BillingMode": "PROVISIONED", "ProvisionedThroughput": units}),
+        json!({"BillingMode": "PAY_PER_REQUEST"}),
+    ] {
+        let kms = json!({"SSESpecification": {"Enabled": true, "SSEType": "KMS"}});
+        rows.push((update(with(companion, kms)), only.clone()));
+    }
     rows
 }
 

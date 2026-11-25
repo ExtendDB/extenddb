@@ -302,6 +302,17 @@ impl SqliteEngine {
         if let Some(tc) = &input.table_class {
             update_col(&mut tx, account_id, &input.table_name, "table_class", tc).await?;
         }
+        if let Some(spec) = &input.sse_specification {
+            let spec = spec.to_string();
+            update_col(
+                &mut tx,
+                account_id,
+                &input.table_name,
+                "sse_specification",
+                &spec,
+            )
+            .await?;
+        }
         if let Some(odt) = &input.on_demand_throughput {
             let j =
                 serde_json::to_string(odt).map_err(|e| StorageError::Internal(e.to_string()))?;

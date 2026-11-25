@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The `ProjectionType` of each index and the `StreamViewType` of a
-//! `CreateTable` or `UpdateTable` body, and the `SSEType` and
-//! `KMSMasterKeyId` of a `CreateTable` body, which
-//! [`crate::validate_enum_fields`] does not reach. Also the `TableClass` of
-//! both, which the service refuses with its own sentence.
+//! `CreateTable` or `UpdateTable` body, and its `SSEType` and
+//! `KMSMasterKeyId`, which [`crate::validate_enum_fields`] does not reach.
+//! Also the `TableClass` of both, which the service refuses with its own
+//! sentence.
 //!
 //! The typed read refuses a value outside its enum with a
 //! `SerializationException`. The service answers a `ValidationException`
@@ -61,6 +61,7 @@ impl EnumFaults {
 
     pub(crate) fn update_table(body: &mut Value) -> Self {
         let mut faults = Self::default();
+        faults.sse_specification(body);
         faults.projections(body, "GlobalSecondaryIndexUpdates", true);
         faults.stream_view_type(body);
         faults

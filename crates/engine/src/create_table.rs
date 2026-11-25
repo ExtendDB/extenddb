@@ -127,7 +127,7 @@ pub async fn handle_create_table(
 /// The service's refusals of an `SSESpecification` whose members do not go
 /// together. They come after the member faults. An `Enabled` that is neither
 /// a boolean nor a string is not checked.
-fn check_sse_specification(spec: Option<&Value>) -> Result<(), DynamoDbError> {
+pub(crate) fn check_sse_specification(spec: Option<&Value>) -> Result<(), DynamoDbError> {
     let Some(spec) = spec else {
         return Ok(());
     };
@@ -150,7 +150,7 @@ fn check_sse_specification(spec: Option<&Value>) -> Result<(), DynamoDbError> {
 /// The `Enabled` of an `SSESpecification`. The service reads the string
 /// `"false"` as false and any other string as true (measured on UpdateTable,
 /// 2026-11-25).
-fn sse_enabled(spec: &Value) -> Option<bool> {
+pub(crate) fn sse_enabled(spec: &Value) -> Option<bool> {
     match spec.get("Enabled")? {
         Value::Bool(enabled) => Some(*enabled),
         Value::String(enabled) => Some(enabled != "false"),

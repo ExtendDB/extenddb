@@ -1209,9 +1209,9 @@ pub struct UpdateTableInput {
     pub vector_index_updates: Option<Vec<VectorIndexUpdate>>,
     #[serde(rename = "WarmThroughput", default)]
     pub warm_throughput: Option<super::WarmThroughput>,
-    /// Accepted so that a request carrying it is recognised: `UpdateTable`
-    /// does not act on it (as before), but a table-level `WarmThroughput`
-    /// beside it is refused with the service's sentence.
+    /// The table's new encryption settings, which the backends record as
+    /// `CreateTable` records them. A table-level `WarmThroughput` beside it is
+    /// refused with the service's sentence.
     #[serde(rename = "SSESpecification", default)]
     pub sse_specification: Option<serde_json::Value>,
     /// Read so that a value that is not a list of objects is refused, as the
