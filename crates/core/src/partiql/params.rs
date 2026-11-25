@@ -49,7 +49,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use super::number::{check_number, parameter_message};
-use crate::types::{AttributeValue, decode_base64};
+use crate::types::{AttributeValue, decode_padded_base64};
 use crate::validation::MAX_ITEM_NESTING_DEPTH;
 pub use crate::validation::number::NUMBER_SET_DUPLICATES;
 use crate::validation::number::has_equal_numbers;
@@ -107,7 +107,7 @@ fn check_types(value: &Value) -> Result<(), String> {
     for (tag, payload) in typed_members(members) {
         match (tag, payload) {
             ("S" | "N", Value::String(_)) | ("NULL" | "BOOL", Value::Bool(_)) => {}
-            ("B", Value::String(text)) => drop(decode_base64(text)?),
+            ("B", Value::String(text)) => drop(decode_padded_base64(text)?),
             ("SS" | "NS", Value::Array(items)) => {
                 if items
                     .iter()
@@ -119,7 +119,7 @@ fn check_types(value: &Value) -> Result<(), String> {
             ("BS", Value::Array(items)) => {
                 for item in items {
                     match item {
-                        Value::String(text) => drop(decode_base64(text)?),
+                        Value::String(text) => drop(decode_padded_base64(text)?),
                         Value::Null => {}
                         _ => return Err("BS member must be a base64 string".to_owned()),
                     }
@@ -582,10 +582,16 @@ mod tests {
             ),
             (deep_bool.as_str(), "BOOL value must be a boolean"),
             // A `B` value or a `BS` member the service cannot decode, with
-            // its text (measured 2026-11-20, 2026-11-21 and 2026-11-25).
+            // its text (measured 2026-11-20, 2026-11-21 and 2026-11-25). A
+            // parameter must carry its `=` padding, where an item may leave
+            // it out (measured 2026-11-21).
             ("[{\"B\":\"%%%\"}]", LENGTH_3),
             ("[{\"BS\":[\"%%%\"]}]", LENGTH_3),
             ("[{\"B\":\"AQ=\"}]", LENGTH_3),
+            (
+                "[{\"B\":\"YWJjZA\"}]",
+                "Base64 encoded length is expected a multiple of 4 bytes but found: 6",
+            ),
             ("[{\"B\":\"!!!!\"}]", ""),
         ] {
             assert_eq!(

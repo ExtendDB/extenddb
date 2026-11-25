@@ -9,10 +9,12 @@ lookup. The text depends on the value's length in UTF-8 bytes. One byte is
 too short, and a length that is not a multiple of 4 is named, except for
 "==", which gets no message. A value whose bytes ahead of its closing run of
 "=" are all base64 characters has an invalid last character, and any other
-value gets no message. Every answer below was measured against the service
-in us-east-1 on 2026-11-20 and 2026-11-25, each request twice. The table
-does not exist, so a value that decodes gets ResourceNotFoundException.
-boto3 encodes a binary value itself, so the bodies go out as written.
+value gets no message. An item and an expression attribute value may leave
+the "=" padding out or cut it short; a PartiQL parameter may not. Every
+answer below was measured against the service in us-east-1 on 2026-11-20,
+2026-11-21 and 2026-11-25, each request twice. The table does not exist, so
+a value that decodes gets ResourceNotFoundException. boto3 encodes a binary
+value itself, so the bodies go out as written.
 
 Dual-target: runs against the service and against extenddb with the same
 assertions.
@@ -66,6 +68,13 @@ ROWS = [
     (put({"B": "YWJj"}), NOT_FOUND),
     (put({"B": "YQ=="}), NOT_FOUND),
     (put({"B": "YWE="}), NOT_FOUND),
+    (put({"B": "YQ"}), NOT_FOUND),
+    (put({"B": "YQ="}), NOT_FOUND),
+    (put({"B": "YWJjZA"}), NOT_FOUND),
+    (put({"B": "YWJjZA="}), NOT_FOUND),
+    (put({"B": "YWJ"}), length(3)),
+    (query({"B": "YQ"}), NOT_FOUND),
+    (statement({"B": "YQ"}), length(2)),
     (put({"B": "a"}), SHORT),
     (put({"B": "Y"}), SHORT),
     (put({"B": "!"}), SHORT),

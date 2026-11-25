@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 use serde::de::{self, MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -82,10 +83,28 @@ const BASE64_TEXTS: [&str; 3] = [
     "Invalid last non-pad Base64 character dectected",
 ];
 
-/// Decode the text of a `B` value or a `BS` member.
+/// The decoder of a `B` value or a `BS` member outside a PartiQL parameter.
+const UNPADDED: GeneralPurpose = GeneralPurpose::new(
+    &base64::alphabet::STANDARD,
+    GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
+);
+
+/// Decode the text of a `B` value or a `BS` member. Measured 2026-11-21: the
+/// service reads it with its `=` padding left out or cut short, in an item
+/// and in an expression attribute value.
 pub fn decode_base64(text: &str) -> Result<Vec<u8>, String> {
+    decode_with(&UNPADDED, text)
+}
+
+/// Decode the text of a `B` value or a `BS` member of a PartiQL parameter,
+/// which must carry its `=` padding (measured 2026-11-21).
+pub fn decode_padded_base64(text: &str) -> Result<Vec<u8>, String> {
+    decode_with(&BASE64, text)
+}
+
+fn decode_with(engine: &GeneralPurpose, text: &str) -> Result<Vec<u8>, String> {
     let [too_short, length, last_character] = BASE64_TEXTS;
-    BASE64.decode(text).map_err(|_| match text.len() {
+    engine.decode(text).map_err(|_| match text.len() {
         1 => too_short.to_owned(),
         2 if text == "==" => String::new(),
         n if n % 4 != 0 => format!("{length}{n}"),
@@ -105,6 +124,41 @@ pub fn decode_base64(text: &str) -> Result<Vec<u8>, String> {
 #[must_use]
 pub fn is_base64_refusal(message: &str) -> bool {
     message.is_empty() || BASE64_TEXTS.iter().any(|text| message.starts_with(text))
+}
+
+/// Check every `B` text and `BS` member of a wire value with `decode`, at
+/// any depth. An operation whose decoder is not the deserializer's calls it
+/// on the raw JSON ahead of deserializing. Matching member names is safe: a
+/// value that deserializes holds attribute values there, and any other value
+/// is refused. A `B` or `BS` payload of another shape, such as the requests
+/// of a table of that name, is walked. `serde_json` caps the depth at 128.
+///
+/// # Errors
+///
+/// The refusal of the first text `decode` refuses.
+pub fn check_binaries<E>(
+    value: &serde_json::Value,
+    decode: fn(&str) -> Result<Vec<u8>, E>,
+) -> Result<(), E> {
+    use serde_json::Value;
+    match value {
+        Value::Object(members) => {
+            members
+                .iter()
+                .try_for_each(|(tag, payload)| match (tag.as_str(), payload) {
+                    ("B", Value::String(text)) => decode(text).map(drop),
+                    ("BS", Value::Array(set)) => set.iter().try_for_each(|member| match member {
+                        Value::String(text) => decode(text).map(drop),
+                        other => check_binaries(other, decode),
+                    }),
+                    _ => check_binaries(payload, decode),
+                })
+        }
+        Value::Array(items) => items
+            .iter()
+            .try_for_each(|item| check_binaries(item, decode)),
+        _ => Ok(()),
+    }
 }
 
 impl<'de> Visitor<'de> for AttributeValueVisitor {
@@ -738,10 +792,11 @@ mod tests {
         );
     }
 
-    /// The service's answer to each `B` value (measured 2026-11-20, and
-    /// 2026-11-25 for `//==` and `++==`): the decoded bytes, or the text of
-    /// the refusal, empty for no message. A `BS` member, and a value inside
-    /// an `M` or an `L`, get the same text.
+    /// The service's answer to each `B` value (measured 2026-11-20,
+    /// 2026-11-21 for the values with their padding left out or cut short,
+    /// and 2026-11-25 for `//==` and `++==`): the decoded bytes, or the text
+    /// of the refusal, empty for no message. A `BS` member, and a value
+    /// inside an `M` or an `L`, get the same text.
     #[test]
     fn a_value_that_is_not_base64_gets_the_service_text() {
         let short = || Err("Buffer is too short for base64 encoding".to_owned());
@@ -752,12 +807,17 @@ mod tests {
         };
         let last = || Err("Invalid last non-pad Base64 character dectected".to_owned());
         let none = || Err(String::new());
-        let rows: [(&str, Result<&str, String>); 50] = [
+        let rows: [(&str, Result<&str, String>); 56] = [
             ("YWJj", Ok("abc")),
             ("YQ==", Ok("a")),
             ("YWE=", Ok("aa")),
             ("AA==", Ok("\0")),
             ("AAA=", Ok("\0\0")),
+            ("YQ", Ok("a")),
+            ("YQ=", Ok("a")),
+            ("YWJjZA", Ok("abcd")),
+            ("YWJjZA=", Ok("abcd")),
+            ("YWI", Ok("ab")),
             ("a", short()),
             ("Y", short()),
             ("!", short()),
@@ -770,6 +830,7 @@ mod tests {
             ("===", length(3)),
             ("A==", length(3)),
             ("YR=", length(3)),
+            ("YWJ", length(3)),
             ("YQ==\n", length(5)),
             ("Y Q==", length(5)),
             ("abcde", length(5)),
