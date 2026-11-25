@@ -45,7 +45,7 @@ async fn fresh_catalog(session: &Arc<CassandraSession>, prefix: &str) {
         .expect("the settings table");
 }
 
-/// A catalog as a release before 1.0 left it: the tables migration 1
+/// A catalog as a release before 0.1.15 left it: the tables migration 1
 /// converges and no ledger, `catalog_version` 0.0.4 and the resource-tag
 /// marker, one account with its keyspace, and a policy holding a
 /// `dynamodb:ResourceTag` key in each of the six places migration 2
@@ -387,8 +387,9 @@ async fn an_upgrade_stopped_inside_migrations_1_and_2_finishes_on_the_next_run()
         2,
         // Before migration 1's ledger row in the catalog keyspace, which is
         // written in one batch with the version row: as two writes, a stop
-        // between them left the row beside the 0.1.x version row, and the
-        // next run refused the catalog as one an older release wrote to.
+        // between them left the row beside the dotted version row of 0.1.14
+        // or earlier, and the next run refused the catalog as one an older
+        // release wrote to.
         catalog_1 - 1,
         // Between two statements of migration 1's account file.
         catalog_1 + 2,
@@ -720,7 +721,7 @@ async fn the_status_read_under_the_lock_keeps_it_through_a_long_scan() {
 /// Both forms on one key with different values, which migration 2 refuses.
 const COLLIDING: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"dynamodb:*","Resource":"*","Condition":{"StringEquals":{"dynamodb:ResourceTag/env":"prod","aws:ResourceTag/env":"dev"}}}]}"#;
 
-/// From 1.0 on a `dynamodb:ResourceTag` key written through the API has no
+/// From 0.1.15 on a `dynamodb:ResourceTag` key written through the API has no
 /// effect, as on the service. Migration 2 is not convergent, so a reconverge
 /// leaves the policies written after it, in each place a policy is stored,
 /// with the text they were written with, one that names both forms of a key
@@ -767,7 +768,7 @@ async fn a_reconverge_leaves_policies_written_after_migration_2_as_they_are() {
         6,
         "{before}"
     );
-    // What a release before 1.0 leaves when it writes to a migrated catalog.
+    // What a release before 0.1.15 leaves when it writes to a migrated catalog.
     cql(
         &session,
         &format!(
