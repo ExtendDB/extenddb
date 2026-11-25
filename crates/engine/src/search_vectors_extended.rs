@@ -109,7 +109,7 @@ mod imp {
     ///
     /// # Errors
     ///
-    /// Returns `ServiceUnavailableException` when the setting cannot be read
+    /// Returns `ServiceUnavailable` when the setting cannot be read
     /// and no earlier read answered.
     pub(crate) async fn enabled_for(
         storage: &Arc<dyn StorageEngine>,

@@ -15,7 +15,7 @@
 //! [`search_filter_settings_changed`]. When a read fails or outlasts
 //! [`READ_TIMEOUT`], the server uses the value of its last read that
 //! answered, a change through the management API notwithstanding. Before any
-//! read has answered, such a read answers `ServiceUnavailableException`, as
+//! read has answered, such a read answers `ServiceUnavailable`, as
 //! other transient storage faults do. A fault never changes which grammar an
 //! account gets.
 //!
@@ -48,7 +48,7 @@ use extenddb_storage::management_store::{OpResult, SettingsStore};
 pub(crate) const REFRESH: Duration = Duration::from_secs(1);
 
 /// How long a read of the setting may take before the request is answered
-/// with `ServiceUnavailableException`.
+/// with `ServiceUnavailable`.
 pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Each storage engine of this process with the settings of its server.
@@ -83,7 +83,7 @@ pub fn search_filter_settings_changed() {
 ///
 /// # Errors
 ///
-/// Returns `ServiceUnavailableException` when the setting cannot be read.
+/// Returns `ServiceUnavailable` when the setting cannot be read.
 pub(crate) async fn enabled_accounts(
     storage: &Arc<dyn StorageEngine>,
 ) -> Result<EnabledAccounts, DynamoDbError> {

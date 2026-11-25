@@ -60,7 +60,7 @@ pub(crate) type Scope<'a> = (
 /// # Errors
 ///
 /// Returns the `ValidationException` of the first failed check, and
-/// `ServiceUnavailableException` when the answer depends on the setting and
+/// `ServiceUnavailable` when the answer depends on the setting and
 /// the setting cannot be read.
 pub(crate) async fn parse(
     storage: &Arc<dyn StorageEngine>,
@@ -104,7 +104,7 @@ pub(crate) async fn parse(
 /// # Errors
 ///
 /// Returns the `ValidationException` of the first failed schema check, and
-/// `ServiceUnavailableException` when the answer depends on the setting and
+/// `ServiceUnavailable` when the answer depends on the setting and
 /// the setting cannot be read.
 pub(crate) async fn resolve<'a>(
     parsed: &'a Parsed,
