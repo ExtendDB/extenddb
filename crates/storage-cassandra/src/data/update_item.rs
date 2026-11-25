@@ -3,8 +3,7 @@
 
 //! `update_item` implementation for the Cassandra backend.
 
-use cdrs_tokio::consistency::Consistency;
-use cdrs_tokio::query::BatchQueryBuilder;
+use crate::cassandra_util::PolicySession as _;
 use extenddb_core::expression::{self, Expr, ExpressionMaps, UpdateAction};
 use extenddb_core::types::{Item, KeyType, TableKeyInfo};
 use extenddb_core::validation;
@@ -15,6 +14,7 @@ use extenddb_storage::util::{parse_sk, pk_to_text, sk_column};
 use super::ddl::data_table_name;
 use super::{json_to_item, query_with_pk_sk};
 use crate::CassandraEngine;
+use crate::cassandra_util::{Stmt, batch};
 use crate::stream_util::stream_record_statement;
 
 // 400 KB limit from DynamoDB specification
@@ -284,7 +284,7 @@ impl CassandraEngine {
             let q = format!(
                 "SELECT item_data, version, prepared_txn_id FROM {data_keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ?"
             );
-            let result = query_with_pk_sk(&self.session, &q, pk_text, sk).await?;
+            let result = query_with_pk_sk(&self.session, &q, Stmt::Read, pk_text, sk).await?;
             result
                 .response_body()
                 .map_err(|e| StorageError::Internal(format!("occ_read response_body: {e}")))?
@@ -427,7 +427,7 @@ impl CassandraEngine {
             // Preserve f997485's Paxos linearization for ordinary writes.
             let result = self
                 .session
-                .query_with_values(&lwt_cql, lwt_qv)
+                .run(Stmt::Lwt, &lwt_cql, lwt_qv)
                 .await
                 .map_err(|e| StorageError::Internal(format!("occ_write lwt: {e}")))?;
             if !crate::cassandra_util::lwt_applied(&result)? {
@@ -448,7 +448,7 @@ impl CassandraEngine {
         // index statements carry the version that LWT stored, so index rows
         // resolve in base-row commit order, and its queue rows and stream
         // record keep Cassandra's timestamp (`data::version`).
-        let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+        let mut batch = batch();
         if let Some(timestamp) = mutation_timestamp {
             batch = batch.with_timestamp(timestamp);
         }
@@ -544,7 +544,7 @@ impl CassandraEngine {
             .build()
             .map_err(|error| StorageError::Internal(error.to_string()))?;
         self.session
-            .batch(built)
+            .run_batch(built)
             .await
             .map_err(|error| StorageError::Internal(format!("occ_write batch: {error}")))?;
 
