@@ -201,7 +201,7 @@ pub mod string_coerce {
         _target: PhantomData<T>,
     }
 
-    impl<'de, T> Visitor<'de> for Scalar<T>
+    impl<T> Visitor<'_> for Scalar<T>
     where
         T: std::str::FromStr,
         <T as std::str::FromStr>::Err: std::fmt::Display,
