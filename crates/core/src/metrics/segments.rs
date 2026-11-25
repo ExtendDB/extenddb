@@ -30,7 +30,8 @@
 //! A query without the filter sums every account's buckets per operation.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::time::Instant;
+
+use web_time::Instant;
 
 use super::types::{LatencySegments, OperationSegments, TimeWindow};
 
