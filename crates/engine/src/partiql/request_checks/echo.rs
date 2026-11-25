@@ -4,8 +4,6 @@
 //! The echo of a statement list past its limit: the service prints its
 //! request objects with every field (measured 2026-11-02).
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::{Map, Value};
 
 /// The longest echo of a statement list, in bytes. Every echo measured is
@@ -127,7 +125,7 @@ fn write_flag(echo: &mut Echo, value: Option<&Value>) {
 fn write_binary(echo: &mut Echo, value: Option<&Value>) {
     match value
         .and_then(Value::as_str)
-        .map(|text| BASE64.decode(text))
+        .map(extenddb_core::types::decode_padded_base64)
     {
         Some(Ok(bytes)) => echo.push(&format!(
             "java.nio.HeapByteBuffer[pos=0 lim={0} cap={0}]",

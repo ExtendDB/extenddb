@@ -245,4 +245,27 @@ fn a_binary_is_echoed_as_the_buffer_of_its_bytes() {
     );
     assert_eq!(binary(Some(&json!("not base64!"))), "null");
     assert_eq!(binary(None), "null");
+    // A first parameter that only the second base64 reading reads, in a
+    // batch and in a transaction past its limit (measured 2026-11-21).
+    let parameters = format!(
+        "[{}]",
+        av(&[("b", "java.nio.HeapByteBuffer[pos=0 lim=2 cap=2]")])
+    );
+    let batch = format!(
+        "BatchStatementRequest(statement=s, parameters={parameters}, consistentRead=null, \
+         returnValuesOnConditionCheckFailure=null)"
+    );
+    let transaction = format!(
+        "ParameterizedStatement(statement=s, parameters={parameters}, \
+         returnValuesOnConditionCheckFailure=null)"
+    );
+    for value in ["Y=Q=", "=YQ="] {
+        let member = json!({ "Statement": "s", "Parameters": [{ "B": value }] });
+        assert_eq!(written(write_batch_member, &member), batch, "{value}");
+        assert_eq!(
+            written(write_transaction_member, &member),
+            transaction,
+            "{value}"
+        );
+    }
 }

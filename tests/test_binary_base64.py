@@ -1,20 +1,28 @@
 # Copyright 2026 ExtendDB contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""A B value that does not decode as base64: a B, a BS member, a value in an
-M or an L, a key, an ExpressionAttributeValues entry and a PartiQL parameter.
+"""A B value that the standard base64 decoder refuses: a B, a BS member, a
+value in an M or an L, a key, an ExpressionAttributeValues entry and a
+PartiQL parameter.
 
-The service refuses it with a SerializationException ahead of the table
-lookup. The text depends on the value's length in UTF-8 bytes. One byte is
-too short, and a length that is not a multiple of 4 is named, except for
-"==", which gets no message. A value whose bytes ahead of its closing run of
-"=" are all base64 characters has an invalid last character, and any other
-value gets no message. An item and an expression attribute value may leave
-the "=" padding out or cut it short; a PartiQL parameter may not. Every
-answer below was measured against the service in us-east-1 on 2026-11-20,
-2026-11-21 and 2026-11-25, each request twice. The table does not exist, so
-a value that decodes gets ResourceNotFoundException. boto3 encodes a binary
-value itself, so the bodies go out as written.
+The service reads such a value a second time, ahead of the table lookup,
+and refuses it with a SerializationException or reads bytes from it. One
+byte is too short, and a length in UTF-8 bytes that is not a multiple of 4
+is named, except for "==", which gets no message. Up to two "=" at the end
+are the padding. In the last group of four, a byte from "(" to DEL outside
+the alphabet reads as all bits set, so Y=Q= is the bytes FF F4, and the
+groups ahead of it must hold base64 characters only. A last character with
+bits past the last byte is invalid, and any other value gets no message.
+An item and an expression attribute value may leave the "=" padding out or
+cut it short; a PartiQL parameter may not. Every answer below was measured
+against the service in us-east-1 on 2026-11-20, 2026-11-21 and 2026-11-25,
+each request twice. The table does not exist, so a value the service reads
+gets ResourceNotFoundException. On 2026-11-21 each value with "=" or another
+byte inside, or with more "=" at the end than the padding, went out as
+PutItem both to this missing table and to a table that exists. Each got
+the same answer from both, apart from ResourceNotFoundException for a value
+the service reads. boto3 encodes a binary value itself, so the bodies go
+out as written.
 
 Dual-target: runs against the service and against extenddb with the same
 assertions.
@@ -121,6 +129,111 @@ ROWS = [
     (query({"N": "bob", "B": "!!"}), length(2)),
     (statement({"B": "!!"}), length(2)),
     (statement({"B": "!!!!"}), NO_MESSAGE),
+    # Measured 2026-11-21: "=" or another byte outside the alphabet inside a
+    # value.
+    (query({"B": "Y=Q="}), NOT_FOUND),
+    (statement({"B": "Y=Q="}), NOT_FOUND),
+    (put({"B": "=YQ="}), NOT_FOUND),
+    (put({"B": ",YQ="}), NOT_FOUND),
+    (put({"B": "@YQ="}), NOT_FOUND),
+    (put({"B": "`YQ="}), NOT_FOUND),
+    (put({"B": "=A=="}), NOT_FOUND),
+    (put({"B": "=AA="}), NOT_FOUND),
+    (put({"B": "Y=Q="}), NOT_FOUND),
+    (put({"B": "A=Q="}), NOT_FOUND),
+    (put({"B": "==Q="}), NOT_FOUND),
+    (put({"B": "Y(Q="}), NOT_FOUND),
+    (put({"B": "Y)Q="}), NOT_FOUND),
+    (put({"B": "Y*Q="}), NOT_FOUND),
+    (put({"B": "Y,Q="}), NOT_FOUND),
+    (put({"B": "Y-Q="}), NOT_FOUND),
+    (put({"B": "Y.Q="}), NOT_FOUND),
+    (put({"B": "Y:Q="}), NOT_FOUND),
+    (put({"B": "Y;Q="}), NOT_FOUND),
+    (put({"B": "Y<Q="}), NOT_FOUND),
+    (put({"B": "Y>Q="}), NOT_FOUND),
+    (put({"B": "Y?Q="}), NOT_FOUND),
+    (put({"B": "Y@Q="}), NOT_FOUND),
+    (put({"B": "Y[Q="}), NOT_FOUND),
+    (put({"B": "Y\\Q="}), NOT_FOUND),
+    (put({"B": "Y]Q="}), NOT_FOUND),
+    (put({"B": "Y^Q="}), NOT_FOUND),
+    (put({"B": "Y_Q="}), NOT_FOUND),
+    (put({"B": "Y`Q="}), NOT_FOUND),
+    (put({"B": "Y{Q="}), NOT_FOUND),
+    (put({"B": "Y|Q="}), NOT_FOUND),
+    (put({"B": "Y}Q="}), NOT_FOUND),
+    (put({"B": "Y~Q="}), NOT_FOUND),
+    (put({"B": "Y\x7fQ="}), NOT_FOUND),
+    (put({"B": "A=A="}), NOT_FOUND),
+    (put({"B": "/=A="}), NOT_FOUND),
+    (put({"B": "==A="}), NOT_FOUND),
+    (put({"B": "YWJj=YQ="}), NOT_FOUND),
+    (put({"B": "YWJj,YQ="}), NOT_FOUND),
+    (put({"B": "YWJjY=Q="}), NOT_FOUND),
+    (put({"B": "YWJjY-Q="}), NOT_FOUND),
+    (put({"B": "YWJjYWJjY=Q="}), NOT_FOUND),
+    (put({"B": "=Y"}), length(2)),
+    (put({"B": "Y-"}), length(2)),
+    (put({"B": "=YQ"}), length(3)),
+    (put({"B": "Y=Q"}), length(3)),
+    (put({"B": "Y-Q"}), length(3)),
+    (put({"B": "YW=Jj"}), length(5)),
+    (put({"B": "Y=Q=\n"}), length(5)),
+    (put({"B": "\u00e9YQ="}), length(5)),
+    (put({"B": "YWJjY="}), length(6)),
+    (put({"B": "YWJj=YQ"}), length(7)),
+    (put({"B": "YWJjY=Q"}), length(7)),
+    (put({"B": "=Y=="}), LAST),
+    (put({"B": "YW=="}), LAST),
+    (put({"B": "A=B="}), LAST),
+    (put({"B": "Y=R="}), LAST),
+    (put({"B": "Y,=="}), LAST),
+    (put({"B": "A,=="}), LAST),
+    (put({"B": "A@=="}), LAST),
+    (put({"B": "YQ,="}), LAST),
+    (put({"B": "YQ@="}), LAST),
+    (put({"B": "=YQA"}), NO_MESSAGE),
+    (put({"B": "=AAA"}), NO_MESSAGE),
+    (put({"B": "=///"}), NO_MESSAGE),
+    (put({"B": "Y=QA"}), NO_MESSAGE),
+    (put({"B": "A=AA"}), NO_MESSAGE),
+    (put({"B": "A=//"}), NO_MESSAGE),
+    (put({"B": "==QA"}), NO_MESSAGE),
+    (put({"B": "==AA"}), NO_MESSAGE),
+    (put({"B": "YQ=Q"}), NO_MESSAGE),
+    (put({"B": "AA=A"}), NO_MESSAGE),
+    (put({"B": "Y,QA"}), NO_MESSAGE),
+    (put({"B": "YW-j"}), NO_MESSAGE),
+    (put({"B": "Y=QAYWJj"}), NO_MESSAGE),
+    (put({"B": "=YQAYWJj"}), NO_MESSAGE),
+    (put({"B": "Y=QA=YQ="}), NO_MESSAGE),
+    (put({"B": "YWJjY=QA"}), NO_MESSAGE),
+    (put({"B": "YWJj=YQA"}), NO_MESSAGE),
+    (put({"B": "Y=Q=YWJj"}), NO_MESSAGE),
+    (put({"B": "Y-QAYWJj"}), NO_MESSAGE),
+    (put({"B": "YWJjY,QA"}), NO_MESSAGE),
+    (put({"B": "Y Q="}), NO_MESSAGE),
+    (put({"B": "Y!Q="}), NO_MESSAGE),
+    (put({"B": "Y\"Q="}), NO_MESSAGE),
+    (put({"B": "Y#Q="}), NO_MESSAGE),
+    (put({"B": "Y$Q="}), NO_MESSAGE),
+    (put({"B": "Y%Q="}), NO_MESSAGE),
+    (put({"B": "Y&Q="}), NO_MESSAGE),
+    (put({"B": "Y'Q="}), NO_MESSAGE),
+    (put({"B": "!YQ="}), NO_MESSAGE),
+    (put({"B": "Y\x00Q="}), NO_MESSAGE),
+    (put({"B": "Y\tQ="}), NO_MESSAGE),
+    (put({"B": "Y\nQ="}), NO_MESSAGE),
+    (put({"B": "Y\u00e9="}), NO_MESSAGE),
+    # Measured 2026-11-21: more "=" at the end than the padding.
+    (put({"B": "YQ======"}), NO_MESSAGE),
+    (put({"B": "========"}), NO_MESSAGE),
+    (put({"B": "YWJjYQ======"}), NO_MESSAGE),
+    (put({"B": "Y======="}), NO_MESSAGE),
+    (put({"B": "AAAA===="}), LAST),
+    (put({"B": "YWJjYWJj===="}), LAST),
+    (put({"B": "YQ====="}), length(7)),
 ]
 
 
