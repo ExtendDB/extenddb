@@ -581,7 +581,10 @@ async fn forget_clears_an_unreleased_id_and_migrate_applies_it_again() {
     let migrations = MongoMigrations::open(&d.target, Some(&held))
         .await
         .expect("open");
+    // The runner is given a released bound of 0, so migration 1 is one it
+    // may forget whatever bound this binary carries.
     Runner::new(&migrations, "test")
+        .with_released_through(0)
         .forget(1)
         .await
         .expect("forget 1");

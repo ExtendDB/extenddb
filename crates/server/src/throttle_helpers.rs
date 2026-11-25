@@ -179,8 +179,6 @@ pub(crate) fn extract_partition_value(input: &Value, operation: &str) -> Option<
 
 /// The throttle error the service sends for a refusal by `cause` on a table
 /// billed as the cause says, naming `table_arn` as the throttled resource.
-/// `None` (a name no table can have) sends the class and message with no
-/// reasons list, since the service cannot name a resource that cannot exist.
 ///
 /// Measured against the service (2026-10-20 and 2026-10-24, two Regions): a
 /// provisioned table's own capacity gives `ProvisionedThroughputExceededException`
@@ -201,7 +199,7 @@ pub(crate) fn extract_partition_value(input: &Value, operation: &str) -> Option<
 pub(crate) fn throttle_error(
     cause: extenddb_core::throttle::ThrottleCause,
     read: bool,
-    table_arn: Option<String>,
+    table_arn: &str,
 ) -> DynamoDbError {
     use extenddb_core::error::{
         MAX_ON_DEMAND_THROUGHPUT_MESSAGE, PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE,
@@ -210,13 +208,10 @@ pub(crate) fn throttle_error(
     use extenddb_core::throttle::ThrottleCause;
     let op = if read { "Read" } else { "Write" };
     let reason = |limit: &str| {
-        table_arn
-            .iter()
-            .map(|resource| ThrottlingReason {
-                reason: format!("Table{op}{limit}"),
-                resource: resource.clone(),
-            })
-            .collect::<Vec<_>>()
+        vec![ThrottlingReason {
+            reason: format!("Table{op}{limit}"),
+            resource: table_arn.to_owned(),
+        }]
     };
     match cause {
         ThrottleCause::Table {
@@ -474,31 +469,13 @@ mod throttle_error_tests {
             ),
         ];
         for (cause, read, class, message, reasons) in cases {
-            let err = throttle_error(cause, read, Some(ARN.to_owned()));
+            let err = throttle_error(cause, read, ARN);
             assert_eq!(
                 parts(&err),
                 (class, message.to_owned(), reasons),
                 "{cause:?} read={read}"
             );
             assert_eq!(err.status_code(), 400);
-        }
-    }
-
-    /// Without a resource (a name no table can have) every arm keeps its class
-    /// and message and sends no reasons list.
-    #[test]
-    fn no_resource_means_no_reasons_list() {
-        for cause in [
-            ThrottleCause::Table {
-                on_demand: false,
-                capped: false,
-            },
-            ThrottleCause::Partition { on_demand: true },
-            ThrottleCause::Account,
-        ] {
-            let err = throttle_error(cause, false, None);
-            assert_eq!(err.throttling_reasons(), Some(&[][..]), "{cause:?}");
-            assert!(!err.message().is_empty());
         }
     }
 }

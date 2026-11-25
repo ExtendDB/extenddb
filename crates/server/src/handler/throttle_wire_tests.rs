@@ -199,9 +199,9 @@ async fn provisioned_write_throttle_names_the_table_arn() {
         json!({"ProvisionedThroughput": {"ReadCapacityUnits": 1, "WriteCapacityUnits": 1}}),
     )
     .await;
-    // The first write consumes the burst; the manager is drained directly
-    // rather than by many writes so the test does not depend on timing.
-    state.throttle.consume(&account_id, table, 0.0, 2.0);
+    // The manager is drained directly, far past the one second of burst,
+    // rather than by many writes, so the test does not depend on timing.
+    state.throttle.consume(&account_id, table, 0.0, 1.0e9);
     let (status, body) = call(
         &state,
         "PutItem",
@@ -233,7 +233,7 @@ async fn provisioned_read_throttle_names_the_read_reason() {
         json!({"ProvisionedThroughput": {"ReadCapacityUnits": 1, "WriteCapacityUnits": 1}}),
     )
     .await;
-    state.throttle.consume(&account_id, table, 2.0, 0.0);
+    state.throttle.consume(&account_id, table, 1.0e9, 0.0);
     let (status, body) = call(
         &state,
         "GetItem",
@@ -261,12 +261,14 @@ async fn on_demand_hot_key_write_names_the_key_range_and_read_carries_no_reasons
     let (state, account_id) = build_state().await;
     let table = "hot-key";
     create_table(&state, table, json!({"BillingMode": "PAY_PER_REQUEST"})).await;
-    // Drain the partition bucket for key "k" in both directions (its limits
-    // are 3,000 RCU and 1,000 WCU per second with one second of burst),
-    // leaving the table bucket at the default on-demand ceilings full.
+    // Drain the partition bucket for key "k" in both directions and leave
+    // the table bucket full: the drain runs while the table is not
+    // registered, and the request registers it again from DescribeTable, as
+    // after a restart.
+    state.throttle.remove_table(&account_id, table);
     state
         .throttle
-        .consume_with_partition(&account_id, table, 6_000.0, 2_000.0, Some("k"));
+        .consume_with_partition(&account_id, table, 1.0e9, 1.0e9, Some("k"));
     let (status, body) = call(
         &state,
         "PutItem",
@@ -316,7 +318,7 @@ async fn on_demand_caps_throttle_names_the_max_on_demand_limit() {
         }),
     )
     .await;
-    state.throttle.consume(&account_id, table, 2.0, 2.0);
+    state.throttle.consume(&account_id, table, 1.0e9, 1.0e9);
     for (operation, body, reason) in [
         (
             "Query",
@@ -366,7 +368,7 @@ async fn half_capped_table_reports_the_cap_for_its_direction_only() {
     )
     .await;
     // Drain the write cap of 1 and the default read ceiling of 12,000.
-    state.throttle.consume(&account_id, table, 24_000.0, 2.0);
+    state.throttle.consume(&account_id, table, 1.0e9, 1.0e9);
     let (status, body) = call(
         &state,
         "PutItem",
@@ -394,19 +396,17 @@ async fn half_capped_table_reports_the_cap_for_its_direction_only() {
 }
 
 /// The account bucket can refuse a request whose table the engine has never
-/// seen. An ARN naming a table in this account is reduced to the bare name
-/// before the resource is formed. A name outside the table name pattern is
-/// refused before the throttle, so it never carries a reasons list.
+/// seen. A `TableName` that is the ARN of a table in this account and Region
+/// names that table in the reasons list.
 #[tokio::test]
-async fn account_throttle_reduces_an_arn_name_and_omits_an_invalid_one() {
+async fn account_throttle_reason_names_the_table_of_an_arn() {
     let (state, account_id) = build_state().await;
     // Drain the account aggregate (its limits are the per-account maxima).
     state.throttle.consume(&account_id, "any", 1.0e9, 1.0e9);
-    let key = json!({"pk": {"S": "k"}});
     let (status, body) = call(
         &state,
         "GetItem",
-        json!({"TableName": arn(&account_id, "absent"), "Key": key}),
+        json!({"TableName": arn(&account_id, "absent"), "Key": {"pk": {"S": "k"}}}),
     )
     .await;
     assert_eq!(status, 400, "{body}");
@@ -418,19 +418,35 @@ async fn account_throttle_reduces_an_arn_name_and_omits_an_invalid_one() {
         body["ThrottlingReasons"],
         json!([{"reason": "TableReadAccountLimitExceeded", "resource": arn(&account_id, "absent")}])
     );
-    let (status, body) = call(
-        &state,
-        "GetItem",
-        json!({"TableName": "bad name!", "Key": key}),
-    )
-    .await;
-    assert_eq!(status, 400, "{body}");
-    // The table name check refuses this name before the throttle segment.
-    assert_eq!(
-        body["__type"],
-        "com.amazon.coral.validate#ValidationException"
-    );
-    assert!(body.get("ThrottlingReasons").is_none(), "{body}");
+}
+
+/// A `TableName` outside the table name rules is not throttled: with the
+/// account bucket drained, the server answers it as it did with capacity
+/// left, and with no reasons list. The service refuses such a name before
+/// any throttle (measured 2026-11-25 with GetItem and PutItem, twice each).
+#[tokio::test]
+async fn names_outside_the_table_name_rules_are_not_throttled() {
+    let (state, account_id) = build_state().await;
+    let long = "a".repeat(256);
+    let other_region = format!("arn:aws:dynamodb:eu-west-1:{account_id}:table/absent");
+    let mut requests = Vec::new();
+    for name in ["ab", "", long.as_str(), other_region.as_str()] {
+        requests.push((
+            "GetItem",
+            json!({"TableName": name, "Key": {"pk": {"S": "k"}}}),
+        ));
+        requests.push(("PutItem", json!({"TableName": name, "Item": item(16)})));
+    }
+    let mut with_capacity = Vec::new();
+    for (operation, request) in &requests {
+        with_capacity.push(call(&state, operation, request.clone()).await);
+    }
+    state.throttle.consume(&account_id, "any", 1.0e9, 1.0e9);
+    for ((operation, request), before) in requests.iter().zip(&with_capacity) {
+        let drained = call(&state, operation, request.clone()).await;
+        assert_eq!(&drained, before, "{operation} {request}");
+        assert_eq!(drained.0, 400, "{operation} {request}");
+    }
 }
 
 /// With capacity available the same requests succeed, so the refusals above

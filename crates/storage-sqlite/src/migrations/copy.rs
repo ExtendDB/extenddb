@@ -29,7 +29,8 @@
 //!
 //! The copy is created owner-only (0600) before SQLite writes to it,
 //! whatever the database's mode: the database holds the encryption key, and
-//! a catalog that 0.1.x `init` created and no server opened is 0644.
+//! a catalog that the `init` of 0.1.14 or earlier created and no server
+//! opened is 0644.
 //!
 //! Every copy's name carries the UTC time the run took it,
 //! `<db>.pre-migration-<from>-to-<to>-<YYYYMMDDTHHMMSSZ>`, and a name that
