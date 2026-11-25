@@ -56,6 +56,14 @@ pub(super) fn row_item(row: &Row, context: &str) -> Result<Option<Item>, Storage
     item_data.map(json_to_item).transpose()
 }
 
+/// The items `rows` hold, in order, without the rows that hold no item.
+pub(super) fn row_items(rows: &[Row], context: &str) -> Result<Vec<Item>, StorageError> {
+    rows.iter()
+        .map(|row| row_item(row, context))
+        .filter_map(Result::transpose)
+        .collect()
+}
+
 /// The position of a base-table row, to read on after it: its partition key
 /// text, and its sort key as a clustering predicate when the row has one. A
 /// static-only row has no sort key, and neither does a hash-only table's row.

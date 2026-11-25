@@ -30,7 +30,7 @@ use super::query_helpers::{
     query_with_pk_sks,
 };
 use super::resolve_expr_to_av;
-use super::rows::{RUN_READ_ROWS, read_halving, row_item, row_sort_key, rows_of};
+use super::rows::{RUN_READ_ROWS, read_halving, row_items, row_sort_key, rows_of};
 use super::sk_range::SkRange;
 use crate::CassandraEngine;
 use crate::cassandra_util;
@@ -685,11 +685,7 @@ impl CassandraEngine {
                 (Some(sk_type), Some(row)) if full => Some((sk_type, row_sort_key(row, sk_type)?)),
                 _ => None,
             };
-            let items = rows
-                .iter()
-                .map(|row| row_item(row, "query"))
-                .filter_map(Result::transpose)
-                .collect::<Result<Vec<_>, _>>()?;
+            let items = row_items(&rows, "query")?;
             // A static-only row has no sort key: its partition holds no
             // other row, so nothing follows it.
             let Some((sk_type, Some(after))) = resume.filter(|_| items.is_empty()) else {
