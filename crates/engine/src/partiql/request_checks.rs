@@ -32,6 +32,7 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::partiql::statement_length_refusal;
 
 use crate::int32_member;
+use crate::request_limits::{AT_LEAST_ONE, MAX_CLIENT_REQUEST_TOKEN, length_constraint};
 
 use echo::{Echo, echo_list, write_batch_member, write_transaction_member};
 
@@ -43,18 +44,12 @@ const MAX_BATCH_STATEMENTS: usize = 25;
 /// The most statements an `ExecuteTransaction` holds.
 const MAX_TRANSACTION_STATEMENTS: usize = 100;
 
-/// The longest `ClientRequestToken`, in code points.
-pub(crate) const MAX_CLIENT_REQUEST_TOKEN: usize = 36;
-
 /// The longest `NextToken`, in code points.
 const MAX_NEXT_TOKEN: usize = 32768;
 
 /// The most failed constraints one refusal lists; its count then says 10 too
 /// (measured 2026-11-02).
 const MAX_PARTS: usize = 10;
-
-/// The constraint an empty statement or list fails.
-const AT_LEAST_ONE: &str = "Member must have length greater than or equal to 1";
 
 /// The constraint a member the request does not carry fails.
 const NOT_NULL: &str = "Member must not be null";
@@ -164,21 +159,6 @@ pub(super) fn check_execute_transaction(body: &Value) -> Result<(), DynamoDbErro
     );
     found.consumed_capacity(body);
     found.into_result()
-}
-
-/// The constraint a value of 1 to `max` code points fails, if any. The
-/// `TransactWriteItems` token check shares it.
-pub(crate) fn length_constraint(value: &str, max: usize) -> Option<String> {
-    let length = value.chars().count();
-    if length == 0 {
-        Some(AT_LEAST_ONE.to_owned())
-    } else if length > max {
-        Some(format!(
-            "Member must have length less than or equal to {max}"
-        ))
-    } else {
-        None
-    }
 }
 
 /// The failed constraints of one request, each worded as the service words

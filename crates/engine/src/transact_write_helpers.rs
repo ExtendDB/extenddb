@@ -18,7 +18,7 @@ use serde_json::Value;
 use sha2::Sha256;
 
 use crate::capacity_helpers;
-use crate::partiql::request_checks::{MAX_CLIENT_REQUEST_TOKEN, length_constraint};
+use crate::request_limits::{MAX_CLIENT_REQUEST_TOKEN, length_constraint};
 
 /// Pre-processed write operation with parsed expressions and resolved table info.
 pub(crate) enum PreparedOp {
