@@ -9,13 +9,14 @@
 //! messages carry no expression prefix.
 
 use super::rules::{Condition, Operator};
+use crate::expression::search_condition::{
+    HASH_ATTRIBUTES_MISSING as HASH_MISSING, not_in_search_schema,
+};
 use crate::types::{
     AttributeDefinition, AttributeValue, ScalarAttributeType, SearchSchemaElement,
     SearchSchemaElementType,
 };
 
-const HASH_MISSING: &str =
-    "SearchConditionExpression must have all HASH attributes in configured SearchSchema";
 const HASH_MORE_THAN_ONCE: &str = "SearchConditionExpression must contain only one condition \
                                    on the HASH attribute; to search more than one HASH value, \
                                    make one SearchVectors call for each value";
@@ -84,11 +85,7 @@ pub(super) fn validate<'a>(
             .iter()
             .find(|e| e.attribute_name == condition.attribute)
         else {
-            return Err(format!(
-                "SearchConditionExpression must not contain any attributes that is not in \
-                 SearchSchema. Invalid attribute: {}",
-                condition.attribute
-            ));
+            return Err(not_in_search_schema(&condition.attribute));
         };
         let Some(declared) = definitions
             .iter()
