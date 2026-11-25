@@ -141,8 +141,9 @@ impl CassandraEngine {
                 )));
             }
         };
-        let transition_at: Option<i64> =
-            table_row.get_by_name("status_transition_at").ok().flatten();
+        let transition_at: Option<i64> = table_row
+            .get_by_name("status_transition_at")
+            .map_err(|e| StorageError::Internal(format!("Parse status_transition_at: {e}")))?;
         let table_status = reported_status(
             stored_status,
             transition_at,
