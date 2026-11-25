@@ -87,12 +87,12 @@ jobs:
     # rather than "latest" because ubuntu-latest migrates to 26.04 in Oct–Nov
     # 2026 and this compiles Rust; move to 26 deliberately.
     runs-on: extenddb_ubuntu-2404_4-core
-    # On #911's CI (run 42637473269) the three shards took 16 min 52 s to
-    # 18 min 14 s. Of that, 3 min 14 s to 3 min 32 s went to the backup store
-    # and job suites and their S3 mock, which run-integration-backup now runs
-    # once per run, so a shard should take 13 min 38 s to 14 min 44 s. 70 is
-    # the bound of the unsharded job (39 min 49 s on #740's CI, 48 min 4 s
-    # with the PartiQL wire tests on #411's) and leaves room for a slow runner.
+    # On main's 25 Integration push runs of 18 to 25 Nov 2026, the 74
+    # successful shard jobs took 20.0 to 27.9 minutes. 7.3 to 9.1 minutes of
+    # each went to the backup store and job suites, which
+    # run-integration-backup now runs once per run. 70 is the bound of the
+    # unsharded job (39 min 49 s on #740's CI, 48 min 4 s with the PartiQL
+    # wire tests on #411's) and leaves room for a slow runner.
     timeout-minutes: 70
     needs: build-postgres
     # Three shards by test file (devtools/test-shards); the integration job
@@ -276,11 +276,11 @@ jobs:
   # files on the SQLite build.
   run-integration-backup:
     runs-on: extenddb_ubuntu-2404_4-core
-    # On each shard of #911's CI (run 42637473269) the suites took 2 min 52 s
-    # to 3 min 8 s and the S3 mock 22 to 28 s. With about 30 s of job setup,
-    # the PostgreSQL container's start, checkout, download and pip install,
-    # the job should take about 4 min. 15 leaves room for a slow runner.
-    timeout-minutes: 15
+    # On main's 25 Integration push runs of 18 to 25 Nov 2026, the suites
+    # took 7.3 to 9.1 minutes on each PostgreSQL shard. The steps before them
+    # took 61 s in this job on run 42691010109. 25 leaves room for a slow
+    # runner.
+    timeout-minutes: 25
     needs: build-postgres
     services:
       postgres:
@@ -345,14 +345,13 @@ jobs:
 
   run-integration-sqlite:
     runs-on: extenddb_ubuntu-2404_4-core
-    # On #911's CI (run 42637473269) the three shards took 20 min 6 s to
-    # 21 min 52 s. Of that, 4 min 28 s to 4 min 30 s went to the backup store
-    # and job suites run by name, 2 min 45 s to 2 min 46 s to run-tests' run
-    # of the store configuration suite, and 25 to 28 s to the S3 mock it
-    # used. The shards now run neither file (run-integration-sqlite-s3 runs
-    # both), so a shard should take 12 min 26 s to 14 min 7 s. 60 is the
-    # bound of the unsharded job (40 min 31 s on #740's CI, 43 min 27 s with
-    # the PartiQL wire tests on #411's) and leaves room for a slow runner.
+    # On main's 25 Integration push runs of 18 to 25 Nov 2026, the 75 shard
+    # jobs took 20.6 to 29.3 minutes. 5.9 to 7.5 minutes of each went to the
+    # backup store and job suites run by name, and run-tests ran the store
+    # configuration suite once more. The shards now run neither file
+    # (run-integration-sqlite-s3 runs both). 60 is the bound of the unsharded
+    # job (40 min 31 s on #740's CI, 43 min 27 s with the PartiQL wire tests
+    # on #411's) and leaves room for a slow runner.
     timeout-minutes: 60
     needs: build-sqlite
     strategy:
