@@ -19,8 +19,8 @@ to the same server fails while this test runs. ``devtools/run-tests
 files' requests inside this window, so the test only runs when
 ``EXTENDDB_TEST_BACKEND_FAULT=1`` is set:
 
-    EXTENDDB_TEST_BACKEND_FAULT=1 devtools/run-mongodb-tests \\
-        --filter backend_unreachable
+    EXTENDDB_TEST_BACKEND_FAULT=1 devtools/run-mongodb-tests -- \\
+        --pytest --filter backend_unreachable
 
 The credential cache and the key-info cache share one hard TTL of 60 seconds.
 One request before the fault leaves the access key cached, so authentication is
@@ -41,7 +41,7 @@ import uuid
 
 import pytest
 
-from conftest import wait_for_active, wait_for_deleted
+from conftest import scoped_table
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("EXTENDDB_TEST_BACKEND_FAULT", "") != "1",
@@ -112,56 +112,46 @@ def _status_and_code(client, call) -> tuple[int, str]:
 
 
 def test_backend_unreachable_is_service_unavailable(
-    dynamodb_client, no_retry_client, unique_table_name, mongodb_container
+    dynamodb_client, no_retry_client, mongodb_container
 ):
     """GetItem, PutItem and Query answer 503 while the backend is unreachable."""
-    dynamodb_client.create_table(
-        TableName=unique_table_name,
-        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
-        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
-        BillingMode="PAY_PER_REQUEST",
-    )
-    wait_for_active(dynamodb_client, unique_table_name)
+    # scoped_table deletes the table on exit, a failed assertion included; the
+    # container is back by then, because the inner finally restarts it.
+    with scoped_table(dynamodb_client) as table_name:
+        # Leaves the access key in the credential cache, so the faulted
+        # requests below fail on the key-info lookup rather than on
+        # authentication.
+        no_retry_client.get_item(TableName=table_name, Key={"pk": {"S": "warmup"}})
 
-    # Leaves the access key in the credential cache, so the faulted requests
-    # below fail on the key-info lookup rather than on authentication.
-    no_retry_client.get_item(TableName=unique_table_name, Key={"pk": {"S": "warmup"}})
+        cold = f"extenddb-cold-{uuid.uuid4().hex[:12]}"
+        calls = {
+            "GetItem": lambda: no_retry_client.get_item(
+                TableName=f"{cold}-g", Key={"pk": {"S": "a"}}
+            ),
+            "PutItem": lambda: no_retry_client.put_item(
+                TableName=f"{cold}-p", Item={"pk": {"S": "a"}}
+            ),
+            "Query": lambda: no_retry_client.query(
+                TableName=f"{cold}-q",
+                KeyConditionExpression="pk = :p",
+                ExpressionAttributeValues={":p": {"S": "a"}},
+            ),
+        }
 
-    cold = f"extenddb-cold-{uuid.uuid4().hex[:12]}"
-    calls = {
-        "GetItem": lambda: no_retry_client.get_item(
-            TableName=f"{cold}-g", Key={"pk": {"S": "a"}}
-        ),
-        "PutItem": lambda: no_retry_client.put_item(
-            TableName=f"{cold}-p", Item={"pk": {"S": "a"}}
-        ),
-        "Query": lambda: no_retry_client.query(
-            TableName=f"{cold}-q",
-            KeyConditionExpression="pk = :p",
-            ExpressionAttributeValues={":p": {"S": "a"}},
-        ),
-    }
+        try:
+            _docker(mongodb_container, "stop")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(calls)) as pool:
+                futures = {
+                    name: pool.submit(_status_and_code, no_retry_client, call)
+                    for name, call in calls.items()
+                }
+                observed = {name: future.result() for name, future in futures.items()}
+        finally:
+            _docker(mongodb_container, "start")
+            _wait_primary(mongodb_container)
 
-    try:
-        _docker(mongodb_container, "stop")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(calls)) as pool:
-            futures = {
-                name: pool.submit(_status_and_code, no_retry_client, call)
-                for name, call in calls.items()
-            }
-            observed = {name: future.result() for name, future in futures.items()}
-    finally:
-        _docker(mongodb_container, "start")
-        _wait_primary(mongodb_container)
-
-    for name, (status, code) in observed.items():
-        assert (status, code) == (503, "ServiceUnavailable"), (
-            f"{name} answered {status} {code} while the backend was unreachable; "
-            "a transient backend fault must be a retryable ServiceUnavailable"
-        )
-
-    try:
-        dynamodb_client.delete_table(TableName=unique_table_name)
-        wait_for_deleted(dynamodb_client, unique_table_name)
-    except dynamodb_client.exceptions.ResourceNotFoundException:
-        pass
+        for name, (status, code) in observed.items():
+            assert (status, code) == (503, "ServiceUnavailable"), (
+                f"{name} answered {status} {code} while the backend was unreachable; "
+                "a transient backend fault must be a retryable ServiceUnavailable"
+            )
