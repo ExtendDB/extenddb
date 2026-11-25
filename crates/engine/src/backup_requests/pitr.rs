@@ -73,7 +73,7 @@ const NAME_PATTERN_CONSTRAINT: &str =
     "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+";
 
 /// The member's string value, or the service's missing-table-name refusal.
-pub(super) fn table_name_member<'a>(
+pub(crate) fn table_name_member<'a>(
     body: &'a Value,
     member: &str,
 ) -> Result<&'a str, DynamoDbError> {

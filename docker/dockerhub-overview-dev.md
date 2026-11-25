@@ -44,7 +44,7 @@ Every published image is signed with Sigstore cosign, with a Rekor transparency-
 cosign verify --key extenddb-signing.pub.pem docker.io/extenddb/extenddb-dev:X.Y.Z
 ```
 
-From the first release after the keyless migration (named in the release notes), signatures are keyless, bound to the workflow that signed the image:
+From 0.1.15, signatures are keyless, bound to the workflow that signed the image:
 
 ```console
 cosign verify \
