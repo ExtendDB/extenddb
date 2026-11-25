@@ -83,6 +83,34 @@ pub(crate) const UNAUTHENTICATED_PARSE_DEPTH: usize = 127;
 /// [`crate::serve`] or [`crate::start_server`] must do the same.
 pub const REQUEST_WORKER_STACK_SIZE: usize = 32 * 1024 * 1024;
 
+/// Whether each byte of a JSON text, read in order, is outside every string
+/// literal. An escaped quote does not end a literal.
+#[derive(Default)]
+struct StringScan {
+    in_string: bool,
+    escaped: bool,
+}
+
+impl StringScan {
+    /// Whether `b`, the next byte, is outside every string literal. The quotes
+    /// that open and close a literal count as inside it.
+    #[inline]
+    fn outside(&mut self, b: u8) -> bool {
+        if self.in_string {
+            if self.escaped {
+                self.escaped = false;
+            } else if b == b'\\' {
+                self.escaped = true;
+            } else if b == b'"' {
+                self.in_string = false;
+            }
+            return false;
+        }
+        self.in_string = b == b'"';
+        !self.in_string
+    }
+}
+
 /// The deepest structural nesting in `body`: `{` and `[` openers on one path,
 /// counted outside string literals (an escaped quote does not end a literal).
 /// Counting stops one level past [`MAX_REQUEST_JSON_DEPTH`], so the result
@@ -91,21 +119,12 @@ pub const REQUEST_WORKER_STACK_SIZE: usize = 32 * 1024 * 1024;
 pub(crate) fn nesting_depth(body: &[u8]) -> usize {
     let mut depth: usize = 0;
     let mut deepest: usize = 0;
-    let mut in_string = false;
-    let mut escaped = false;
+    let mut strings = StringScan::default();
     for &b in body {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if b == b'\\' {
-                escaped = true;
-            } else if b == b'"' {
-                in_string = false;
-            }
+        if !strings.outside(b) {
             continue;
         }
         match b {
-            b'"' => in_string = true,
             b'{' | b'[' => {
                 depth += 1;
                 if depth > MAX_REQUEST_JSON_DEPTH {
@@ -122,18 +141,63 @@ pub(crate) fn nesting_depth(body: &[u8]) -> usize {
 
 /// Parse a request body whose [`nesting_depth`] is `depth` into a JSON
 /// [`Value`], matching `serde_json::from_slice` for everything within the depth
-/// ceiling and refusing a body nested past it.
+/// ceiling except a number written with leading zeros (see [`read_json`]), and
+/// refusing a body nested past the ceiling.
 pub(crate) fn parse_request_value(body: &[u8], depth: usize) -> Result<Value, DynamoDbError> {
     if depth > MAX_REQUEST_JSON_DEPTH {
         return Err(serialization_refusal());
     }
     // The depth ceiling above keeps the disabled recursion limit from letting a
-    // deep body overflow the stack.
-    let mut de = serde_json::Deserializer::from_slice(body);
-    de.disable_recursion_limit();
-    let value = Value::deserialize(&mut de).map_err(|_| serialization_refusal())?;
-    de.end().map_err(|_| serialization_refusal())?;
-    Ok(value)
+    // deep body overflow the stack. It bounds the body without leading zeros
+    // too, whose nesting is the same.
+    read_json(body, |body| {
+        let mut de = serde_json::Deserializer::from_slice(body);
+        de.disable_recursion_limit();
+        let value = Value::deserialize(&mut de)?;
+        de.end()?;
+        Ok(value)
+    })
+}
+
+/// Run `read` on `body`. When it fails and a number in `body` is written with
+/// leading zeros, run it again on the body without them, since the service
+/// reads such a number as the decimal number it spells and `serde_json`
+/// refuses it (measured 2026-11-21, us-east-1: `00`, `-01`, `-010` and
+/// `01000001` are read as 0, -1, -10 and 1000001, and `00.5` and `0001` are
+/// accepted). A body that `read` accepts takes one pass, as before.
+fn read_json<T>(
+    body: &[u8],
+    read: impl Fn(&[u8]) -> serde_json::Result<T>,
+) -> Result<T, DynamoDbError> {
+    read(body)
+        .or_else(|e| without_leading_zeros(body).map_or(Err(e), |body| read(&body)))
+        .map_err(|_| serialization_refusal())
+}
+
+/// `body` with the leading zeros of each number outside a string removed, or
+/// `None` when no number has one. The `-` stays, and so does one `0` before a
+/// `.`, an exponent or the end of the number. Only `0` bytes outside strings
+/// are removed, so the bytes of every string and the structural nesting are
+/// unchanged. The pass never recurses.
+fn without_leading_zeros(body: &[u8]) -> Option<Vec<u8>> {
+    let mut out: Option<Vec<u8>> = None;
+    let mut strings = StringScan::default();
+    // Whether the next byte starts a number's integer part: the byte before
+    // it is not part of a number, or is the number's `-` or a removed zero.
+    let mut at_start = true;
+    for (i, &b) in body.iter().enumerate() {
+        let outside = strings.outside(b);
+        if outside && at_start && b == b'0' && body.get(i + 1).is_some_and(u8::is_ascii_digit) {
+            out.get_or_insert_with(|| body[..i].to_vec());
+            continue;
+        }
+        if let Some(out) = out.as_mut() {
+            out.push(b);
+        }
+        let number = outside && crate::request_syntax::number_byte(b);
+        at_start = !number || (at_start && b == b'-');
+    }
+    out
 }
 
 /// Check the JSON syntax of a request body without building it, so the handler
@@ -379,51 +443,77 @@ mod tests {
     fn a_body_with_a_syntax_fault_is_refused_with_no_message() {
         // Rows: a body that parses, a fault the parse meets, a fault within
         // the ceiling that only the check meets before authentication, a
-        // fault past the ceiling, seven faults in the leaf of a 200 wrapper
-        // body, and four in the leaf at 63 and at 20000 wrappers, each with
-        // whether the server reads it. The service sends no message field for
-        // a signed body with a syntax fault (measured 2026-11-19 and
-        // 2026-11-20, us-east-1) and refuses each leaf fault before
-        // authentication (measured in us-east-1: the control byte and the
-        // unknown escape in a string on 2026-11-20, unsigned, badly signed and
-        // signed; the `\u` before the closing quote, SOH before a value,
-        // `tru`, the missing colon and the missing comma on 2026-11-24,
-        // unsigned and badly signed; a number that starts with `+` or `.`,
-        // and `/` and `h`, the bytes on either side of the range the service
-        // takes after `\u`, on 2026-11-25, unsigned and badly signed). The
-        // parse and the check give each row the same answer. The parse
-        // recurses, so the rows run on a worker-sized stack.
+        // fault past the ceiling, bodies with numbers written with leading
+        // zeros, seven faults in the leaf of a 200 wrapper body, and four in
+        // the leaf at 63 and at 20000 wrappers, each with the body that
+        // spells the value the server reads, or `None` when it refuses the
+        // body. The service sends no message field for a signed body with a
+        // syntax fault (measured 2026-11-19 and 2026-11-20, us-east-1) and
+        // refuses each leaf fault before authentication (measured in
+        // us-east-1: the control byte and the unknown escape in a string on
+        // 2026-11-20, unsigned, badly signed and signed; the `\u` before the
+        // closing quote, SOH before a value, `tru`, the missing colon and the
+        // missing comma on 2026-11-24, unsigned and badly signed; a number
+        // that starts with `+` or `.`, and `/` and `h`, the bytes on either
+        // side of the range the service takes after `\u`, on 2026-11-25,
+        // unsigned and badly signed). It reads a number written with leading
+        // zeros as the decimal number it spells (measured 2026-11-21,
+        // us-east-1), so such a body is read at every depth, with the bytes of
+        // its strings as sent. The parse and the check give each row the same
+        // answer. The parse recurses, so the rows run on a worker-sized stack.
+        let nested = |leaf: &[u8]| {
+            let levels = UNAUTHENTICATED_PARSE_DEPTH + 1000;
+            [b"[".repeat(levels), leaf.to_vec(), b"]".repeat(levels)].concat()
+        };
+        let named = br#"{"TableName": "t"}"#.to_vec();
         let rows = [
-            (br#"{"TableName": "t"}"#.to_vec(), true),
-            (b"".to_vec(), false),
-            (truncated_body(200), false),
-            (truncated_body(20000), false),
-            (deep_body_with_leaf(200, br#"{"S":"le\u"}"#), false),
-            (deep_body_with_leaf(200, b"{\"S\":\x01\"leaf\"}"), false),
-            (deep_body_with_leaf(200, br#"{"S":tru}"#), false),
-            (deep_body_with_leaf(200, br#"{"S" "leaf"}"#), false),
-            (deep_body_with_leaf(200, br#"{"S":"leaf" "T":"x"}"#), false),
-            (deep_body_with_leaf(200, b"{\"S\":\"le\x01af\"}"), false),
-            (deep_body_with_leaf(200, br#"{"S":"le\qaf"}"#), false),
-            (deep_body_with_leaf(63, br#"{"S":+1}"#), false),
-            (deep_body_with_leaf(20000, br#"{"S":+1}"#), false),
-            (deep_body_with_leaf(63, br#"{"S":.5}"#), false),
-            (deep_body_with_leaf(20000, br#"{"S":.5}"#), false),
-            (deep_body_with_leaf(63, br#"{"S":"le\u000/af"}"#), false),
-            (deep_body_with_leaf(20000, br#"{"S":"le\u000/af"}"#), false),
-            (deep_body_with_leaf(63, br#"{"S":"le\u000haf"}"#), false),
-            (deep_body_with_leaf(20000, br#"{"S":"le\u000haf"}"#), false),
+            (named.clone(), Some(named)),
+            (b"".to_vec(), None),
+            (truncated_body(200), None),
+            (truncated_body(20000), None),
+            (
+                br#"{"x": 01, "a": [00, -01, 01.5, 00.5, 01e1, 0001, -00, -010], "m": {"y": 01}}"#
+                    .to_vec(),
+                Some(
+                    br#"{"x": 1, "a": [0, -1, 1.5, 0.5, 10.0, 1, -0.0, -10], "m": {"y": 1}}"#
+                        .to_vec(),
+                ),
+            ),
+            (
+                br#"{"k\"01": "a\"01", "N": "007", "x": [01, 0, 0.05, 1e-05, 100]}"#.to_vec(),
+                Some(br#"{"k\"01": "a\"01", "N": "007", "x": [1, 0, 0.05, 1e-05, 100]}"#.to_vec()),
+            ),
+            (nested(b"01"), Some(nested(b"1"))),
+            (br#"{"x": 01,}"#.to_vec(), None),
+            (deep_body_with_leaf(200, br#"{"S":"le\u"}"#), None),
+            (deep_body_with_leaf(200, b"{\"S\":\x01\"leaf\"}"), None),
+            (deep_body_with_leaf(200, br#"{"S":tru}"#), None),
+            (deep_body_with_leaf(200, br#"{"S" "leaf"}"#), None),
+            (deep_body_with_leaf(200, br#"{"S":"leaf" "T":"x"}"#), None),
+            (deep_body_with_leaf(200, b"{\"S\":\"le\x01af\"}"), None),
+            (deep_body_with_leaf(200, br#"{"S":"le\qaf"}"#), None),
+            (deep_body_with_leaf(63, br#"{"S":+1}"#), None),
+            (deep_body_with_leaf(20000, br#"{"S":+1}"#), None),
+            (deep_body_with_leaf(63, br#"{"S":.5}"#), None),
+            (deep_body_with_leaf(20000, br#"{"S":.5}"#), None),
+            (deep_body_with_leaf(63, br#"{"S":"le\u000/af"}"#), None),
+            (deep_body_with_leaf(20000, br#"{"S":"le\u000/af"}"#), None),
+            (deep_body_with_leaf(63, br#"{"S":"le\u000haf"}"#), None),
+            (deep_body_with_leaf(20000, br#"{"S":"le\u000haf"}"#), None),
         ];
         std::thread::Builder::new()
             .stack_size(REQUEST_WORKER_STACK_SIZE)
             .spawn(move || {
-                for (row, (body, read)) in rows.iter().enumerate() {
-                    let parsed = parse(body).map(drop);
-                    for answer in [parsed, check_request_syntax(body)] {
+                for (row, (body, reads_as)) in rows.iter().enumerate() {
+                    let parsed = parse(body);
+                    if let (Ok(value), Some(spelled)) = (&parsed, reads_as) {
+                        assert_eq!(*value, parse(spelled).unwrap(), "row {row}");
+                    }
+                    for answer in [parsed.map(drop), check_request_syntax(body)] {
                         match answer {
-                            Ok(()) => assert!(*read, "row {row} must be refused"),
+                            Ok(()) => assert!(reads_as.is_some(), "row {row} must be refused"),
                             Err(DynamoDbError::SerializationException(m)) => {
-                                assert!(!*read && m.is_empty(), "row {row}: {m:?}");
+                                assert!(reads_as.is_none() && m.is_empty(), "row {row}: {m:?}");
                             }
                             Err(e) => panic!("row {row}: {e:?}"),
                         }

@@ -9,7 +9,9 @@ Amazon DynamoDB answers each body below that it does not read with HTTP 400 and
 the two bodies that are one object, with or without white space after it, and
 answers them with ResourceNotFoundException, since the table named does not
 exist. Each body was sent twice, signed, in us-east-1 on 2026-11-20, with the
-same answer both times.
+same answer both times. It also reads a body with a number written with
+leading zeros, as the decimal number the digits spell (the ``leading-zero``
+rows, measured the same way on 2026-11-21).
 
 Dual-target: runs against the service and against ExtendDB.
 """
@@ -51,6 +53,18 @@ ROWS = {
     "bracket-for-brace-10": ("PutItem", TRUNCATED_10 + b"]", False),
     "bad-escape": ("PutItem", _item(b"a\\qb"), False),
     "control-byte-in-item": ("PutItem", _item(b"a\x01b"), False),
+    "leading-zero": ("DescribeTable", NAMED[:-1] + b', "x": 01}', True),
+    "leading-zero-zero": ("DescribeTable", NAMED[:-1] + b', "x": 00}', True),
+    "leading-zero-negative": ("DescribeTable", NAMED[:-1] + b', "x": -01}', True),
+    "leading-zero-fraction": ("DescribeTable", NAMED[:-1] + b', "x": 01.5}', True),
+    "leading-zero-zero-fraction": ("DescribeTable", NAMED[:-1] + b', "x": 00.5}', True),
+    "leading-zero-exponent": ("DescribeTable", NAMED[:-1] + b', "x": 01e1}', True),
+    "leading-zero-three": ("DescribeTable", NAMED[:-1] + b', "x": 0001}', True),
+    "leading-zero-negative-zero": ("DescribeTable", NAMED[:-1] + b', "x": -00}', True),
+    "leading-zero-list": ("DescribeTable", NAMED[:-1] + b', "x": [01, 02]}', True),
+    "leading-zero-map": ("DescribeTable", NAMED[:-1] + b', "x": {"y": 01}}', True),
+    "leading-zero-first": ("DescribeTable", b'{"x": 01, ' + NAMED[1:], True),
+    "leading-zero-limit": ("Scan", NAMED[:-1] + b', "Limit": 01}', True),
 }
 
 
