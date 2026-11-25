@@ -2016,6 +2016,7 @@ dependencies = [
  "dashmap",
  "extenddb-auth",
  "extenddb-core",
+ "extenddb-engine",
  "extenddb-storage",
  "extenddb-storage-mongodb",
  "futures",

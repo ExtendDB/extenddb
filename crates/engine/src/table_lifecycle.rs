@@ -1,0 +1,48 @@
+// Copyright 2026 ExtendDB contributors
+// SPDX-License-Identifier: Apache-2.0
+
+//! The catalog's lifecycle status for a table, for handlers that decide on it.
+//!
+//! `TableKeyInfo` carries no status, and the key-info read reports a `DELETING`
+//! row as not found on MongoDB and Cassandra, so a handler that has to tell a
+//! `DELETING` table from a missing one cannot get the answer from it. The
+//! description carries the status on every backend, and the table's latest
+//! stream ARN, which the tag path checks a stream ARN against in the window.
+//! The callers (the two TTL handlers and the tag path) are control-plane
+//! calls, so the read is not on a data-plane path.
+//!
+//! The read is `describe_table`: four catalog queries on PostgreSQL and SQLite
+//! (`tables`, `indexes`, `vector_indexes`, `table_restores`) and two on MongoDB
+//! and Cassandra (`tables`, `indexes`). `DescribeTimeToLive`,
+//! `UpdateTimeToLive`, `TagResource`, `UntagResource` and `ListTagsOfResource`
+//! each make it once per call. `DescribeTimeToLive` on an `ACTIVE` table sends
+//! five and three, where it sent one. `UpdateTimeToLive` sends the four or two
+//! more, after its write, and on a `DELETING` table it skips the TTL read after
+//! the write and the index statements.
+
+use extenddb_core::types::{DescribeTableInput, TableDescription};
+use extenddb_storage::error::StorageError;
+
+use crate::OperationContext;
+
+/// Read `table_name`'s catalog description, for its `table_status` and its
+/// `latest_stream_arn`.
+///
+/// # Errors
+///
+/// Returns [`StorageError::TableNotFound`] when no catalog row exists, and
+/// whatever the backend raised otherwise. The caller maps it, so each operation
+/// keeps the message it already answers for a missing table.
+pub(crate) async fn read_table_description(
+    table_name: &str,
+    ctx: &OperationContext,
+) -> Result<TableDescription, StorageError> {
+    ctx.storage
+        .describe_table(
+            &ctx.account_id,
+            DescribeTableInput {
+                table_name: table_name.to_owned(),
+            },
+        )
+        .await
+}

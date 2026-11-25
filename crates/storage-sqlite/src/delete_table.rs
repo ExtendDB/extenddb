@@ -202,9 +202,9 @@ impl SqliteEngine {
 #[cfg(test)]
 mod deleting_window_tests {
     use crate::SqliteEngine;
-    use extenddb_core::types::{DeleteTableInput, UpdateTableInput};
-    use extenddb_storage::TableEngine;
+    use extenddb_core::types::{DeleteTableInput, TimeToLiveStatus, UpdateTableInput};
     use extenddb_storage::error::StorageError;
+    use extenddb_storage::{MetadataEngine, TableEngine};
     use serde_json::json;
 
     const ACCOUNT: &str = "000000000000";
@@ -314,5 +314,83 @@ mod deleting_window_tests {
             matches!(&err, StorageError::TableNotActive(name) if name == "t"),
             "expected TableNotActive(\"t\"), got {err:?}"
         );
+    }
+
+    /// UpdateTimeToLive by the status of `t`'s catalog row, each row on a fresh
+    /// engine. DELETING is admitted beside ACTIVE in both directions, the way
+    /// the service runs its ordinary TTL rules in the window (measured
+    /// 2026-10-25), and the write leaves the status alone. A CREATING table
+    /// keeps `TableNotActive` and a missing one `TableNotFound`, ExtendDB's
+    /// current answers: the service answers `ResourceNotFoundException` for a
+    /// CREATING table (measured 2026-11-20).
+    #[tokio::test]
+    async fn update_ttl_by_table_status() {
+        // (status of `t`, table named, the calls' `enabled` in order, the TTL
+        // description after them or the last call's error)
+        type Row = (
+            &'static str,
+            &'static str,
+            &'static [bool],
+            Result<(TimeToLiveStatus, Option<&'static str>), &'static str>,
+        );
+        let rows: [Row; 4] = [
+            (
+                "DELETING",
+                "t",
+                &[true],
+                Ok((TimeToLiveStatus::Enabled, Some("ttl"))),
+            ),
+            (
+                "DELETING",
+                "t",
+                &[true, false],
+                Ok((TimeToLiveStatus::Disabled, None)),
+            ),
+            ("CREATING", "t", &[true], Err("TableNotActive(\"t\")")),
+            (
+                "DELETING",
+                "absent",
+                &[true],
+                Err("TableNotFound(\"absent\")"),
+            ),
+        ];
+        for (status, table, calls, expected) in rows {
+            let row = format!("{status} {table} {calls:?}");
+            let engine = engine_with_deleting_table().await;
+            sqlx::query("UPDATE tables SET table_status = ? WHERE table_name = 't'")
+                .bind(status)
+                .execute(&engine.pool)
+                .await
+                .expect("set the status");
+            let (last, earlier) = calls.split_last().expect("one call at least");
+            for &enabled in earlier {
+                engine
+                    .update_ttl(ACCOUNT, table, "ttl", enabled)
+                    .await
+                    .unwrap_or_else(|e| panic!("{row}: an earlier call failed: {e:?}"));
+            }
+            let result = engine.update_ttl(ACCOUNT, table, "ttl", *last).await;
+            match expected {
+                Ok(described) => {
+                    result.unwrap_or_else(|e| panic!("{row}: {e:?}"));
+                    let desc = engine
+                        .describe_ttl(ACCOUNT, table)
+                        .await
+                        .expect("the TTL description");
+                    assert_eq!(
+                        (desc.time_to_live_status, desc.attribute_name.as_deref()),
+                        described,
+                        "{row}"
+                    );
+                }
+                Err(error) => assert_eq!(format!("{:?}", result.expect_err(&row)), error, "{row}"),
+            }
+            let after: String =
+                sqlx::query_scalar("SELECT table_status FROM tables WHERE table_name = 't'")
+                    .fetch_one(&engine.pool)
+                    .await
+                    .expect("row still present");
+            assert_eq!(after, status, "{row}: the write must not change the status");
+        }
     }
 }

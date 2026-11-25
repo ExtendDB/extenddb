@@ -21,6 +21,8 @@
 
 #[path = "deleting_window_finish_tests.rs"]
 mod finish;
+#[path = "deleting_window_ttl_tests.rs"]
+mod ttl;
 
 use std::sync::Arc;
 

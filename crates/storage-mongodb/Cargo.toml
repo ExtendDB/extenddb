@@ -83,3 +83,6 @@ extenddb-storage = { path = "../storage", features = ["test-util"] }
 # need `test-util`; a dev-dependency on itself turns both on for test builds
 # only.
 extenddb-storage-mongodb = { path = ".", features = ["snapshot-test-hooks", "test-util"] }
+# The DELETING-window rows call the engine's tag and TTL handlers over a
+# MongoEngine (crates/storage-mongodb/src/deleting_window_tests.rs).
+extenddb-engine = { path = "../engine" }

@@ -5,7 +5,7 @@
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::types::{
-    DescribeTimeToLiveInput, DescribeTimeToLiveOutput, TimeToLiveSpecificationOutput,
+    DescribeTimeToLiveInput, DescribeTimeToLiveOutput, TableStatus, TimeToLiveSpecificationOutput,
     TimeToLiveStatus, UpdateTimeToLiveInput, UpdateTimeToLiveOutput,
 };
 use extenddb_core::validation::validate_table_name;
@@ -15,10 +15,34 @@ use serde_json::Value;
 use crate::OperationContext;
 use crate::serialize_output;
 
+/// Gate a `DescribeTimeToLive` request on the table's catalog status.
+///
+/// The service refuses the call while the table is `CREATING` or `DELETING`,
+/// with one sentence that names the state, and serves it while the table is
+/// `ACTIVE` or `UPDATING`. Measured: `DELETING` on 2026-10-25 on three tables,
+/// the refusal coming back before and after an `UpdateTimeToLive` inside the
+/// same window; `CREATING` and `UPDATING` on 2026-10-26, five calls each.
+/// `UpdateTimeToLive` has no equivalent refusal, so the gate is on this path
+/// only.
+fn check_describe_status(status: TableStatus) -> Result<(), DynamoDbError> {
+    let state = match status {
+        TableStatus::Creating => "CREATING",
+        TableStatus::Deleting => "DELETING",
+        TableStatus::Active | TableStatus::Updating => return Ok(()),
+    };
+    Err(DynamoDbError::ValidationException(
+        extenddb_core::error::error_message(
+            extenddb_core::error::ErrorMessageKey::DescribeTtlInState,
+            &[state],
+        ),
+    ))
+}
+
 /// Handle `DescribeTimeToLive` — return TTL configuration for a table.
 ///
 /// # Errors
 ///
+/// Returns `ValidationException` if the table is `CREATING` or `DELETING`.
 /// Returns `ResourceNotFoundException` if the table does not exist.
 /// Returns `InternalServerError` on storage failures.
 pub async fn handle_describe_time_to_live(
@@ -29,6 +53,15 @@ pub async fn handle_describe_time_to_live(
         serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
     validate_table_name(&input.table_name, &ctx.limits)?;
+
+    // The TTL columns live on the catalog row, which outlives the status
+    // change, so the read below answers for a DELETING table too: the status
+    // is what decides, and the key-info read cannot supply it.
+    let status = crate::table_lifecycle::read_table_description(&input.table_name, ctx)
+        .await
+        .map_err(storage_to_dynamo)?
+        .table_status;
+    check_describe_status(status)?;
 
     let desc = ctx
         .storage
@@ -126,7 +159,34 @@ pub async fn handle_update_time_to_live(
         .await
         .map_err(storage_to_dynamo)?;
 
-    if input.time_to_live_specification.enabled {
+    // The status decides whether the index work below runs at all. It is read
+    // after the write, so a delete that marked the row at any point before
+    // this read is seen here. A mark that lands after this read and before the
+    // index statements is not: that work then runs on a DELETING table. A
+    // missing row means the delete finished after the write and removed the
+    // row the write landed on, so there is no index left to change. A failed
+    // read skips the index work too, with a warning, as a failed index
+    // statement below does: the write is made, and the TTL worker's
+    // pending-index pass builds an enabled table's index later.
+    let skip_index_ddl =
+        match crate::table_lifecycle::read_table_description(&input.table_name, ctx).await {
+            Ok(desc) => desc.table_status == TableStatus::Deleting,
+            Err(StorageError::TableNotFound(_)) => true,
+            Err(e) => {
+                tracing::warn!("TTL index work skipped for {}: {e}", input.table_name);
+                true
+            }
+        };
+
+    if skip_index_ddl {
+        // No index DDL for a table being deleted: the delete removes its data
+        // table or collection with the index, so the catalog write above is
+        // the whole change. If it ran, a PostgreSQL DROP INDEX would wait, with
+        // no lock timeout, behind whatever holds the data table, and the
+        // table's data-plane requests would queue behind it; a MongoDB
+        // create_index on the dropped collection would create the collection
+        // again, and no catalog document would be left to name it.
+    } else if input.time_to_live_specification.enabled {
         // Backends that report ENABLING (Cassandra, PostgreSQL) get the
         // backfill kicked off in the background: it is a full table scan, and
         // awaiting it made the API call take as long as the table is large.
@@ -266,6 +326,36 @@ mod tests {
     fn max_length_accepted() {
         let max = "a".repeat(255);
         assert!(validate_ttl_attribute_name(&max).is_ok());
+    }
+
+    /// DescribeTimeToLive is refused while the table is CREATING or DELETING,
+    /// with the service's sentence for each byte for byte, and served while it
+    /// is ACTIVE or UPDATING.
+    #[test]
+    fn describe_is_refused_while_creating_or_deleting() {
+        for (status, sentence) in [
+            (
+                TableStatus::Deleting,
+                "Cannot describe time to live while table is in DELETING state: \
+                 Current table state is DELETING",
+            ),
+            (
+                TableStatus::Creating,
+                "Cannot describe time to live while table is in CREATING state: \
+                 Current table state is CREATING",
+            ),
+        ] {
+            match check_describe_status(status).unwrap_err() {
+                DynamoDbError::ValidationException(msg) => assert_eq!(msg, sentence),
+                other => panic!("expected ValidationException for {status:?}, got {other:?}"),
+            }
+        }
+        for status in [TableStatus::Active, TableStatus::Updating] {
+            assert!(
+                check_describe_status(status).is_ok(),
+                "{status:?} must be served"
+            );
+        }
     }
 
     #[test]

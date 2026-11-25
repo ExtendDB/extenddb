@@ -58,6 +58,13 @@ pub enum ErrorMessageKey {
     /// Measured on the service 2026-10-24 for a second `DeleteTable` and for
     /// `UpdateTable` during the window.
     TableBeingDeleted,
+    /// `DescribeTimeToLive` refused because the table is in the state
+    /// `args[0]`, `DELETING` or `CREATING`. Measured on the service for
+    /// `DELETING` on 2026-10-25 on three tables, every call inside the window,
+    /// and for `CREATING` on 2026-10-26, five calls, each while `DescribeTable`
+    /// read `CREATING`. `UpdateTimeToLive` has no such refusal: it runs its
+    /// ordinary rules.
+    DescribeTtlInState,
     MissingKeySchema,
     KeySchemaTooMany,
     KeySchemaFirstNotHash,
@@ -103,6 +110,13 @@ pub fn error_message(key: ErrorMessageKey, args: &[&str]) -> String {
         ErrorMessageKey::TableBeingDeleted => {
             format!(
                 "Attempt to change a resource which is still in use: Table is being deleted: {}",
+                args[0]
+            )
+        }
+        ErrorMessageKey::DescribeTtlInState => {
+            format!(
+                "Cannot describe time to live while table is in {0} state: \
+                 Current table state is {0}",
                 args[0]
             )
         }

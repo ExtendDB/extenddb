@@ -152,9 +152,14 @@ impl MetadataEngine for MongoEngine {
 
             let result = coll
                 .update_one(
+                    // DELETING is admitted beside ACTIVE: the service runs
+                    // UpdateTimeToLive's ordinary rules during the window and
+                    // the write lands on the catalog document the delete then
+                    // removes (measured 2026-10-25). The other non-ACTIVE
+                    // statuses keep their refusal.
                     doc! {
                         "_id": { "account_id": &account_id, "table_name": &table_name },
-                        "table_status": "ACTIVE",
+                        "table_status": { "$in": ["ACTIVE", "DELETING"] },
                     },
                     doc! {
                         "$set": {
@@ -352,6 +357,13 @@ impl MetadataEngine for MongoEngine {
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?
                 .ok_or_else(|| StorageError::TableNotFound(table_name.clone()))?;
+            // A delete call drops the data collection after it marks the
+            // document DELETING, and create_index on a dropped collection
+            // creates it again. A build that reads the document after the mark
+            // refuses before create_index, which the engine logs as deferred.
+            if matches!(table_doc.get_str("table_status"), Ok("DELETING")) {
+                return Err(StorageError::TableNotActive(table_name));
+            }
 
             // MongoDB interprets dots in an index key as nested traversal,
             // while DynamoDB treats them as part of the attribute name. The

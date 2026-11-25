@@ -30,7 +30,9 @@ extenddb-storage = { path = "../storage", features = ["test-util"] }
 # itself turns both features on for test builds only.
 extenddb-storage-postgres = { path = ".", features = ["test-hooks", "test-util"] }
 # The store identity tests run the engine's checks over two engines on one
-# scratch catalog and two filesystem stores.
+# scratch catalog and two filesystem stores. The DELETING-window TTL rows call
+# the engine's UpdateTimeToLive handler over a PostgresEngine, to see which
+# index statements it sends for such a table.
 extenddb-engine = { path = "../engine" }
 extenddb-backup-store = { path = "../backup-store" }
 tempfile = "3"
