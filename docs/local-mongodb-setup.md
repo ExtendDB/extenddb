@@ -1,4 +1,8 @@
-# Local MongoDB Setup
+---
+description: "Set up a single-node MongoDB replica set on a development machine for building and testing ExtendDB."
+---
+
+# Local MongoDB setup (development)
 
 ## Prerequisites
 
@@ -105,8 +109,11 @@ one binary per backend.
 
 ## Initializing ExtendDB with MongoDB
 
+`init` reads the MongoDB connection string from an existing `extenddb.toml`, so write the `[storage.mongodb]` section first and pass `--overwrite`:
+
 ```bash
-./target/release/extenddb init --backend mongodb --config extenddb.toml
+printf '[storage]\nbackend = "mongodb"\n\n[storage.mongodb]\nconnection_string = "mongodb://localhost:27017/?replicaSet=rs0"\n' > extenddb.toml
+./target/release/extenddb init --backend mongodb --config extenddb.toml --overwrite
 ```
 
 This creates:
@@ -155,13 +162,18 @@ export EXTENDDB__STORAGE__MONGODB__CONNECTION_STRING="mongodb://localhost:27017/
 
 ## Verifying the Connection
 
+`list-tables` needs an access key that this server issued. The server answers `UnrecognizedClientException` to any other key. Create one as in the [post-init workflow](getting-started.md#post-init-workflow) of the full walkthrough, then:
+
 ```bash
 # Health check
-curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:8000/health
+curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
 
 # List tables (should return empty)
+export AWS_ACCESS_KEY_ID=<access-key-from-create-access-key>
+export AWS_SECRET_ACCESS_KEY=<secret-key-from-create-access-key>
+export AWS_REGION=us-east-1
 aws dynamodb list-tables \
-    --endpoint-url https://127.0.0.1:8000 \
+    --endpoint-url https://127.0.0.1:18443 \
     --region us-east-1
 ```
 
@@ -190,7 +202,7 @@ brew services stop mongodb-community@7.0
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is an open
 source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.

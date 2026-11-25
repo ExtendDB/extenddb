@@ -1,4 +1,8 @@
-# extenddb — Component Design: DynamoDB Streams
+---
+description: "Change data capture for tables: stream records, shards, iterators and retention."
+---
+
+# Component design: DynamoDB Streams
 
 **Version:** 1.0
 **Date:** 2026-04-03
@@ -177,7 +181,7 @@ GetRecords handler:
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is an open
 source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
