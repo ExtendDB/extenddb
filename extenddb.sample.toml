@@ -20,11 +20,9 @@
 #   EXTENDDB__STORAGE__POSTGRES__CONNECTION_STRING="postgresql://..."
 #   EXTENDDB__AUTH__ENCRYPTION__KEY_FILE=/etc/extenddb/kek
 #   EXTENDDB__AUTH__ENCRYPTION__REQUIRE_LOCKED_MEMORY=true
-# Every key accepts this form. A list key (import.paths, export.paths,
-# storage.cassandra.contact_points) takes one comma-delimited string:
-#   EXTENDDB__IMPORT__PATHS="/data/in,/data/shared"
-# Items are trimmed and empty items dropped, so an empty variable is an empty
-# list; an item that itself contains a comma can only be written as an array.
+# Scalar keys accept this form. The list keys (import.paths, export.paths,
+# storage.cassandra.contact_points) and the numeric keys of [storage.sqlite]
+# and [storage.cassandra] are file only.
 # Precedence: environment variables, then this file, then the built-in
 # defaults. `extenddb serve --port` overrides server.port on top of all three.
 #
