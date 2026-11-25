@@ -8,7 +8,7 @@ description: "The parts of an ExtendDB server, how a request flows through them,
 
 ## Overview
 
-ExtendDB (ExtendDB) is a standalone DynamoDB-compatible API server written in Rust. It receives DynamoDB wire protocol
+ExtendDB is a standalone DynamoDB-compatible API server written in Rust. It receives DynamoDB wire protocol
 requests over HTTP/HTTPS, authenticates and authorizes them via SigV4 and a local IAM policy engine, executes operation
 logic in a backend-agnostic engine, and delegates persistence to a pluggable storage backend (PostgreSQL, SQLite,
 MongoDB, or Apache Cassandra).

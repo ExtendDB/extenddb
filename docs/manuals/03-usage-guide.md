@@ -583,7 +583,7 @@ ExtendDB returns the DynamoDB error types and, where measured against the servic
 | Legacy API (Expected, AttributeUpdates, AttributesToGet) | ✓ |
 | PartiQL (ExecuteStatement, BatchExecuteStatement, ExecuteTransaction) | ✓ (behind the `partiql` build feature, on by default; see the [PartiQL section](../differences-from-dynamodb.md#partiql) of Differences from DynamoDB) |
 | DAX | ✗ (not applicable) |
-| Global Tables | ✗ (not implemented; returns UnknownOperationException) |
+| Global Tables | ✗ (not implemented: the Global Tables operations answer `UnknownOperationException`; `UpdateTable` with `ReplicaUpdates` answers `ValidationException`) |
 | On-demand backups (CreateBackup / RestoreTableFromBackup) | ✓: CreateBackup to the configured filesystem or S3 backup store on PostgreSQL, SQLite and MongoDB (in-catalog without one and on Cassandra); RestoreTableFromBackup from the store into every backend (a filesystem or S3 store; a backup taken on one backend restores into another once the target's catalog has a row for it: copy its prefix under the target's root and run `extenddb backup sync`, or adopt the source's root with `extenddb backup sync --adopt-store`, which moves the root to the target's catalog: stop the source's servers first, and they then report the store owned by another catalog), and of in-catalog backups |
 | Point-in-time recovery | ✗ (`UpdateContinuousBackups` refuses to enable it; see differences-from-dynamodb.md) |
 | Import/Export (local filesystem) | ✓ (FileSource instead of S3) |

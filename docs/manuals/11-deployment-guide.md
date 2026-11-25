@@ -226,7 +226,7 @@ extenddb init \
 
 ### Network
 
-- [ ] Set `bind_addr` to the interface your clients reach, not `0.0.0.0`
+- [ ] Set `bind_addr` to the interface your clients reach. Bind `0.0.0.0` only inside a container, where the container runtime's port mapping decides who reaches it, or behind a load balancer that is the only route to the server
 - [ ] Firewall: allow only necessary ports (the ExtendDB port, the storage backend port)
 - [ ] Consider a reverse proxy (nginx, HAProxy) for TLS termination, rate limiting, and access logging. Unless the proxy preserves the client address, login limits count the proxy's address as the source for every caller behind it (see the security model manual).
 
