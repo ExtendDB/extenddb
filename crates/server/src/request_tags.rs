@@ -18,6 +18,8 @@
 
 use std::collections::HashMap;
 
+use extenddb_core::error::DynamoDbError;
+use extenddb_core::validation::{validate_tag_keys, validate_tags_member};
 use serde_json::Value;
 
 /// The tag condition keys `operation` populates from `input`.
@@ -80,6 +82,25 @@ pub(crate) fn tag_condition_keys(
             (None, Some(keys))
         }
         _ => (None, None),
+    }
+}
+
+/// The tag keys and values of a `TagResource` or `UntagResource` request,
+/// checked with the engine's rules. A `Tags` or `TagKeys` member that does not
+/// parse is left to the engine, which reports it after authorization.
+///
+/// # Errors
+///
+/// `ValidationException` for the first key or value outside the grammar.
+pub(crate) fn validate_request_tags(operation: &str, input: &Value) -> Result<(), DynamoDbError> {
+    use serde::Deserialize;
+    match operation {
+        "TagResource" => validate_tags_member(input),
+        "UntagResource" => match input.get("TagKeys").map(Vec::<String>::deserialize) {
+            Some(Ok(keys)) => validate_tag_keys(&keys),
+            _ => Ok(()),
+        },
+        _ => Ok(()),
     }
 }
 

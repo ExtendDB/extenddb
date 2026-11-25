@@ -1,0 +1,469 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""The order of the tag checks against the ARN checks and the table definition.
+
+TagResource and UntagResource check, in this order: the ARN prefix, the
+resource kind, the account, the partition, service and region of a stream ARN,
+the tag keys and values, a table ARN's table segment, partition, service and
+region, the table's existence, and last a key that reads ``aws:`` once U+017F
+is read as ``s``. CreateTable checks a member of the wrong JSON type first,
+then a TableName of bad length or outside the pattern, then a missing
+TableName, then the Tags, then the rest of the request. A key that reads
+``aws:`` once U+017F is read as ``s`` comes in the middle of the rest: after
+the index names and the throughput checks, before the key schema, attribute
+definition and stream checks. Every expected response in this file was
+measured against DynamoDB in us-east-1 on 2026-10-24, 2026-11-20, 2026-11-23
+or 2026-11-24.
+
+REQ-TEST-001
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+
+import pytest
+from botocore.exceptions import ClientError
+
+from conftest import scoped_table
+from test_tag_validation import (
+    LONG_S_MESSAGE,
+    assert_create_table_refused,
+    assert_error,
+    assert_validation,
+    create_table_error,
+    key_message,
+    prefix_message,
+    value_message,
+)
+
+K_BAD = [{"Key": "k!", "Value": "v"}]
+K_OK = [{"Key": "valid-key", "Value": "v"}]
+K_LONG_S = [{"Key": "aw\u017f:foo", "Value": "v"}]
+STREAM = "stream/2026-01-01T00:00:00.000"
+
+
+def with_field(arn: str, index: int, value: str) -> str:
+    fields = arn.split(":", 5)
+    fields[index] = value
+    return ":".join(fields)
+
+
+@pytest.fixture(scope="module")
+def tag_table(dynamodb_client):
+    with scoped_table(dynamodb_client) as name:
+        arn = dynamodb_client.describe_table(TableName=name)["Table"]["TableArn"]
+        region = arn.split(":")[3]
+        yield {
+            "name": name,
+            "arn": arn,
+            "other_region": "eu-west-1" if region != "eu-west-1" else "us-west-2",
+            "other_account": "111122223333" if arn.split(":")[4] != "111122223333" else "222233334444",
+        }
+
+
+def absent(t) -> str:
+    return t["arn"].replace(t["name"], f"absent-{uuid.uuid4().hex[:8]}")
+
+
+class TestTagsAgainstEachOther:
+    """Which of two broken tag inputs the response reports."""
+
+    @pytest.mark.parametrize(
+        "tags,expected",
+        [
+            ([{"Key": "aws:k!", "Value": "v"}], key_message("aws:k!")),
+            ([{"Key": "aws:" + "k" * 130, "Value": "v"}], key_message("aws:" + "k" * 130)),
+            ([{"Key": "k!", "Value": "v!"}], key_message("k!")),
+            ([{"Key": "ok1", "Value": "v!"}, {"Key": "k!", "Value": "ok2"}], value_message("v!")),
+            ([{"Key": "aw\u017f:foo", "Value": "v"}, {"Key": "k!", "Value": "v"}], key_message("k!")),
+        ],
+        ids=[
+            "characters-before-prefix",
+            "length-before-prefix",
+            "key-before-value",
+            "request-order",
+            "grammar-before-long-s-prefix",
+        ],
+    )
+    def test_reported_input(self, dynamodb_client_no_validation, tag_table, tags, expected):
+        assert_validation(
+            lambda: dynamodb_client_no_validation.tag_resource(
+                ResourceArn=tag_table["arn"], Tags=tags
+            ),
+            expected,
+        )
+
+
+# Each ARN shape with an invalid key: the answer the service gives, so whether
+# the ARN check runs before or after the tags. Built from the probe table's ARN.
+ARN_BEFORE_OR_AFTER_TAGS = [
+    # The account and the resource kind come before the tags.
+    ("other-account", lambda t: with_field(t["arn"], 4, t["other_account"]), "account"),
+    (
+        "foreign-service-other-account",
+        lambda t: f"arn:aws:s3:{t['arn'].split(':')[3]}:{t['other_account']}:table/x/",
+        "account",
+    ),
+    ("index", lambda t: f"{t['arn']}/index/gsi1", "index"),
+    ("export", lambda t: f"{t['arn']}/export/01700000000000-abcdef12", "not-dynamodb"),
+    ("import", lambda t: f"{t['arn']}/import/01700000000000-abcdef12", "not-dynamodb"),
+    # A stream ARN outside this deployment comes before the tags.
+    ("stream-other-region", lambda t: with_field(f"{t['arn']}/{STREAM}", 3, t["other_region"]), "stream"),
+    ("stream-aws-cn", lambda t: with_field(f"{t['arn']}/{STREAM}", 1, "aws-cn"), "stream"),
+    ("stream-s3", lambda t: with_field(f"{t['arn']}/{STREAM}", 2, "s3"), "stream"),
+    ("stream-bad-table-segment", lambda t: t["arn"].replace(t["name"], "bad!name") + f"/{STREAM}", "stream"),
+    # The tags come before everything else.
+    ("stream-absent-table", lambda t: f"{absent(t)}/{STREAM}", "tag"),
+    ("absent-table", absent, "tag"),
+    ("other-region", lambda t: with_field(t["arn"], 3, t["other_region"]), "tag"),
+    ("aws-cn", lambda t: with_field(t["arn"], 1, "aws-cn"), "tag"),
+    ("foreign-service-table", lambda t: with_field(t["arn"], 2, "s3"), "tag"),
+    ("bad-table-segment", lambda t: t["arn"].replace(t["name"], "bad!name"), "tag"),
+    (
+        "bad-table-segment-other-region",
+        lambda t: with_field(t["arn"].replace(t["name"], "bad!name"), 3, t["other_region"]),
+        "tag",
+    ),
+]
+
+
+def arn_answer(kind: str, arn: str) -> tuple[str, str]:
+    return {
+        "account": ("AccessDeniedException", "Access is denied"),
+        "index": (
+            "ValidationException",
+            "One or more parameter values were invalid: Invalid resource arn provided, only "
+            f"table or stream is accepted. Provided resource arn: {arn}",
+        ),
+        "not-dynamodb": (
+            "ValidationException",
+            f"One or more parameter values were invalid: Provided Arn is not a DynamoDB resource arn: {arn}",
+        ),
+        "stream": ("ValidationException", "Invalid StreamArn"),
+        "tag": ("ValidationException", key_message("k!")),
+    }[kind]
+
+
+@pytest.mark.parametrize("op", ["tag_resource", "untag_resource"])
+@pytest.mark.parametrize(
+    "label,build,kind", ARN_BEFORE_OR_AFTER_TAGS, ids=[r[0] for r in ARN_BEFORE_OR_AFTER_TAGS]
+)
+def test_arn_checks_against_an_invalid_key(
+    dynamodb_client_no_validation, tag_table, op, label, build, kind
+):
+    arn = build(tag_table)
+    client = dynamodb_client_no_validation
+    calls = {
+        "tag_resource": lambda: client.tag_resource(ResourceArn=arn, Tags=K_BAD),
+        "untag_resource": lambda: client.untag_resource(ResourceArn=arn, TagKeys=["k!"]),
+    }
+    assert_error(calls[op], *arn_answer(kind, arn))
+
+
+@pytest.mark.parametrize(
+    "tags,expected",
+    [
+        ([{"Key": "ok", "Value": "v!"}], value_message("v!")),
+        ([{"Key": "aws:foo", "Value": "v"}], prefix_message("aws:foo")),
+    ],
+    ids=["value", "prefix"],
+)
+def test_a_bad_table_segment_reports_the_tag_value_and_prefix(
+    dynamodb_client_no_validation, tag_table, tags, expected
+):
+    arn = tag_table["arn"].replace(tag_table["name"], "bad!name")
+    assert_validation(
+        lambda: dynamodb_client_no_validation.tag_resource(ResourceArn=arn, Tags=tags), expected
+    )
+
+
+# With a valid key every operation still runs both halves of the ARN check.
+# The long-s key is valid until the table is found, so it reports the ARN too.
+VALID_KEY_SHAPES = [
+    ("cross_region", lambda t: with_field(t["arn"], 3, t["other_region"])),
+    ("cross_partition", lambda t: with_field(t["arn"], 1, "aws-cn")),
+    ("wrong_service", lambda t: with_field(t["arn"], 2, "s3")),
+    ("bad_table_segment", lambda t: t["arn"].replace(t["name"], "bad!name")),
+    ("absent", absent),
+    ("cross_account", lambda t: with_field(t["arn"], 4, t["other_account"])),
+]
+
+
+def valid_key_answer(shape: str, arn: str) -> tuple[str, str]:
+    if shape == "absent":
+        return ("ResourceNotFoundException", f"Requested resource not found: ResourceArn: {arn} not found")
+    if shape == "cross_account":
+        return ("AccessDeniedException", "Access is denied")
+    return ("ValidationException", f"Invalid TableArn: Invalid ResourceArn provided as input {arn}")
+
+
+@pytest.mark.parametrize(
+    "op", ["tag_resource", "tag_resource_long_s", "untag_resource", "list_tags_of_resource"]
+)
+@pytest.mark.parametrize("shape,build", VALID_KEY_SHAPES, ids=[r[0] for r in VALID_KEY_SHAPES])
+def test_a_valid_key_still_checks_the_arn(dynamodb_client_no_validation, tag_table, op, shape, build):
+    arn = build(tag_table)
+    client = dynamodb_client_no_validation
+    calls = {
+        "tag_resource": lambda: client.tag_resource(ResourceArn=arn, Tags=K_OK),
+        "tag_resource_long_s": lambda: client.tag_resource(
+            ResourceArn=arn, Tags=[{"Key": "aw\u017f:foo", "Value": "v"}]
+        ),
+        "untag_resource": lambda: client.untag_resource(ResourceArn=arn, TagKeys=["valid-key"]),
+        "list_tags_of_resource": lambda: client.list_tags_of_resource(ResourceArn=arn),
+    }
+    assert_error(calls[op], *valid_key_answer(shape, arn))
+
+
+# CreateTable: each definition error with an invalid tag reports the tag. A
+# long-s key reports itself after the enum, index name and throughput checks
+# and before the key schema, attribute definition and stream checks.
+UNDEFINED_KEY = [{"AttributeName": "other", "AttributeType": "S"}]
+TWO_HASH_KEYS = {
+    "AttributeDefinitions": [
+        {"AttributeName": "pk", "AttributeType": "S"},
+        {"AttributeName": "p2", "AttributeType": "S"},
+    ],
+    "KeySchema": [
+        {"AttributeName": "pk", "KeyType": "HASH"},
+        {"AttributeName": "p2", "KeyType": "HASH"},
+    ],
+}
+STREAM_WITHOUT_VIEW_TYPE = {"StreamSpecification": {"StreamEnabled": True}}
+
+
+def attributes(*names: str) -> list[dict]:
+    return [{"AttributeName": n, "AttributeType": "S"} for n in names]
+
+
+def keys(*pairs: tuple[str, str]) -> list[dict]:
+    return [{"AttributeName": n, "KeyType": t} for n, t in pairs]
+
+
+def gsi(name: str, **members) -> dict:
+    projection = {"ProjectionType": "ALL"}
+    return {"IndexName": name, "KeySchema": keys(("gk", "HASH")), "Projection": projection, **members}
+
+
+CREATE_TABLE_ORDER = [
+    ("undefined-key-attribute", {"AttributeDefinitions": UNDEFINED_KEY}, K_BAD, key_message("k!")),
+    (
+        "undefined-key-attribute-value",
+        {"AttributeDefinitions": UNDEFINED_KEY},
+        [{"Key": "ok", "Value": "v!"}],
+        value_message("v!"),
+    ),
+    (
+        "undefined-key-attribute-prefix",
+        {"AttributeDefinitions": UNDEFINED_KEY},
+        [{"Key": "aws:owner", "Value": "v"}],
+        prefix_message("aws:owner"),
+    ),
+    ("provisioned-without-throughput", {"BillingMode": "PROVISIONED"}, K_BAD, key_message("k!")),
+    ("billing-mode-enum", {"BillingMode": "FOO"}, K_BAD, key_message("k!")),
+    (
+        "attribute-type-enum",
+        {"AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "X"}]},
+        K_BAD,
+        key_message("k!"),
+    ),
+    ("missing-key-schema", {"KeySchema": None}, K_BAD, key_message("k!")),
+    ("two-hash-keys", TWO_HASH_KEYS, K_BAD, key_message("k!")),
+    ("stream-without-view-type", STREAM_WITHOUT_VIEW_TYPE, K_BAD, key_message("k!")),
+    (
+        "long-s-before-undefined-key-attribute",
+        {"AttributeDefinitions": UNDEFINED_KEY},
+        K_LONG_S,
+        LONG_S_MESSAGE,
+    ),
+    (
+        "billing-mode-enum-before-long-s",
+        {"BillingMode": "FOO"},
+        K_LONG_S,
+        "1 validation error detected: Value 'FOO' at 'billingMode' failed to satisfy constraint: "
+        "Member must satisfy enum value set: [PROVISIONED, PAY_PER_REQUEST]",
+    ),
+    (
+        "on-demand-throughput-before-long-s",
+        {"ProvisionedThroughput": {"ReadCapacityUnits": 1, "WriteCapacityUnits": 1}},
+        K_LONG_S,
+        "One or more parameter values were invalid: Neither ReadCapacityUnits nor "
+        "WriteCapacityUnits can be specified when BillingMode is PAY_PER_REQUEST",
+    ),
+    ("long-s-before-two-hash-keys", TWO_HASH_KEYS, K_LONG_S, LONG_S_MESSAGE),
+    (
+        "long-s-before-third-key-schema-element",
+        {
+            "AttributeDefinitions": attributes("pk", "sk", "xk"),
+            "KeySchema": keys(("pk", "HASH"), ("sk", "RANGE"), ("xk", "RANGE")),
+        },
+        K_LONG_S,
+        LONG_S_MESSAGE,
+    ),
+    (
+        "long-s-before-unused-attribute-definition",
+        {"AttributeDefinitions": attributes("pk", "extra")},
+        K_LONG_S,
+        LONG_S_MESSAGE,
+    ),
+    (
+        "long-s-before-on-demand-gsi-throughput",
+        {
+            "AttributeDefinitions": attributes("pk", "gk"),
+            "GlobalSecondaryIndexes": [
+                gsi("gsi1", ProvisionedThroughput={"ReadCapacityUnits": 1, "WriteCapacityUnits": 1})
+            ],
+        },
+        K_LONG_S,
+        LONG_S_MESSAGE,
+    ),
+    ("long-s-before-stream-without-view-type", STREAM_WITHOUT_VIEW_TYPE, K_LONG_S, LONG_S_MESSAGE),
+]
+
+
+@pytest.mark.parametrize(
+    "label,definition,tags,expected", CREATE_TABLE_ORDER, ids=[r[0] for r in CREATE_TABLE_ORDER]
+)
+def test_create_table_checks_the_tags_before_the_definition(
+    dynamodb_client_no_validation, label, definition, tags, expected
+):
+    assert_create_table_refused(dynamodb_client_no_validation, expected, Tags=tags, **definition)
+
+
+# These faults beside a long-s key are reported before it (measured
+# 2026-11-24). ExtendDB words each of them in its own text, as main does
+# (#1041, #1147, #904), so a row holds the code and that the long-s check did
+# not answer.
+CONSTRAINTS_BEFORE_LONG_S = [
+    ("provisioned-without-throughput", {"BillingMode": "PROVISIONED"}),
+    (
+        "throughput-below-one",
+        {
+            "BillingMode": "PROVISIONED",
+            "ProvisionedThroughput": {"ReadCapacityUnits": 0, "WriteCapacityUnits": 0},
+        },
+    ),
+    (
+        "gsi-name-too-short",
+        {"AttributeDefinitions": attributes("pk", "gk"), "GlobalSecondaryIndexes": [gsi("g")]},
+    ),
+    (
+        "lsi-name-too-short",
+        {
+            "AttributeDefinitions": attributes("pk", "sk", "lk"),
+            "KeySchema": keys(("pk", "HASH"), ("sk", "RANGE")),
+            "LocalSecondaryIndexes": [
+                {
+                    "IndexName": "g",
+                    "KeySchema": keys(("pk", "HASH"), ("lk", "RANGE")),
+                    "Projection": {"ProjectionType": "ALL"},
+                }
+            ],
+        },
+    ),
+    (
+        "gsi-throughput-below-one",
+        {
+            "BillingMode": "PROVISIONED",
+            "ProvisionedThroughput": {"ReadCapacityUnits": 1, "WriteCapacityUnits": 1},
+            "AttributeDefinitions": attributes("pk", "gk"),
+            "GlobalSecondaryIndexes": [
+                gsi("gsi1", ProvisionedThroughput={"ReadCapacityUnits": 0, "WriteCapacityUnits": 0})
+            ],
+        },
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "label,definition", CONSTRAINTS_BEFORE_LONG_S, ids=[r[0] for r in CONSTRAINTS_BEFORE_LONG_S]
+)
+def test_create_table_reports_a_constraint_before_a_long_s_key(
+    dynamodb_client_no_validation, label, definition
+):
+    err = create_table_error(dynamodb_client_no_validation, Tags=K_LONG_S, **definition)
+    assert (err["Status"], err["Code"]) == (400, "ValidationException"), err
+    assert err["Message"] != LONG_S_MESSAGE, err
+
+
+TOO_SHORT = (
+    "1 validation error detected: Value 'ab' at 'tableName' failed to satisfy constraint: "
+    "Member must have length greater than or equal to 3"
+)
+
+
+@pytest.mark.parametrize(
+    "request_name,definition,tags,expected",
+    [
+        ("ab", {}, K_BAD, TOO_SHORT),
+        (None, {}, K_BAD, "The parameter 'TableName' is required but was not present in the request"),
+        # Without tags the TableName length still comes first.
+        ("ab", {"BillingMode": "FOO"}, None, TOO_SHORT),
+        ("ab", {"KeySchema": None}, None, TOO_SHORT),
+    ],
+    ids=["too-short", "missing", "too-short-billing-mode-enum", "too-short-missing-key-schema"],
+)
+def test_create_table_checks_the_table_name_first(
+    dynamodb_client_no_validation, request_name, definition, tags, expected
+):
+    params = {
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "BillingMode": "PAY_PER_REQUEST",
+        "TableName": request_name,
+        "Tags": tags,
+    }
+    params.update(definition)
+    params = {k: v for k, v in params.items() if v is not None}
+    assert_validation(lambda: dynamodb_client_no_validation.create_table(**params), expected)
+
+
+# A member of the wrong JSON type is reported before the TableName length and
+# the Tags (measured 2026-11-23). The service words the refusal as its JSON
+# reader does, `Unexpected field type`, and ExtendDB as its own deserializer
+# does, so only the code is compared; #1109 holds the message texts. botocore
+# cannot write a string where the model has a list, so the body is put in
+# place before the request is signed. Neither request can create a table.
+WRONG_TYPE_MEMBERS = [
+    ("tags-string-before-short-table-name", {"TableName": "ab", "Tags": "x"}),
+    ("key-schema-string-before-invalid-tag", {"KeySchema": "x", "Tags": K_BAD}),
+]
+
+
+@pytest.mark.parametrize("label,members", WRONG_TYPE_MEMBERS, ids=[r[0] for r in WRONG_TYPE_MEMBERS])
+def test_create_table_reports_a_member_of_the_wrong_type_first(
+    dynamodb_client_no_validation, label, members
+):
+    client = dynamodb_client_no_validation
+    body = {
+        "TableName": f"extenddb-test-{uuid.uuid4().hex[:12]}",
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "BillingMode": "PAY_PER_REQUEST",
+        **members,
+    }
+    payload = json.dumps(body).encode()
+
+    def swap(params, **_kwargs):
+        params["body"] = payload
+
+    event = "before-call.dynamodb.CreateTable"
+    client.meta.events.register(event, swap, unique_id="tag-order-raw-body")
+    try:
+        with pytest.raises(ClientError) as exc:
+            client.create_table(
+                TableName=body["TableName"],
+                AttributeDefinitions=body["AttributeDefinitions"],
+                KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+                BillingMode="PAY_PER_REQUEST",
+            )
+    finally:
+        client.meta.events.unregister(event, unique_id="tag-order-raw-body")
+    response = exc.value.response
+    assert (response["ResponseMetadata"]["HTTPStatusCode"], response["Error"]["Code"]) == (
+        400,
+        "SerializationException",
+    ), response["Error"]

@@ -7,6 +7,7 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::types::{
     ListTagsOfResourceInput, ListTagsOfResourceOutput, TagResourceInput, UntagResourceInput,
 };
+use extenddb_core::validation::{validate_folded_tag_prefix, validate_tag_keys, validate_tags};
 use serde_json::Value;
 
 use crate::OperationContext;
@@ -71,16 +72,13 @@ fn deployment_scope_error(
     )))
 }
 
-/// Extract the table name from a `DynamoDB` table ARN, using the one shared
-/// resource parser ([`extenddb_core::arn::fields`]) so this layer splits an ARN
-/// the same way authorization and the engine stream resolver do.
-///
-/// Expected format: `arn:aws:dynamodb:{region}:{account}:table/{name}[/...]`
-fn extract_table_name_from_arn(arn: &str) -> Option<&str> {
-    let resource = extenddb_core::arn::fields(arn)?.resource;
-    let table_name = resource.strip_prefix("table/")?;
-    // Strip any sub-resource (e.g. /index/foo, /stream/label).
-    Some(table_name.split('/').next().unwrap_or(table_name))
+/// The table name of a `table/<name>[/<kind>/<id>]` resource, the shape
+/// [`validate_arn_shape_and_account`] leaves. The fields come from the one
+/// shared resource parser ([`extenddb_core::arn::fields`]), so this layer
+/// splits an ARN the same way authorization and the engine stream resolver do.
+fn table_name_of(resource: &str) -> &str {
+    let tail = resource.strip_prefix("table/").unwrap_or(resource);
+    tail.split('/').next().unwrap_or(tail)
 }
 
 /// Validate that the ARN refers to an existing table owned by the caller.
@@ -105,7 +103,27 @@ fn extract_table_name_from_arn(arn: &str) -> Option<&str> {
 /// fields are valid. For a table ARN, a no-permissions principal is denied by
 /// authorization before this runs; the partition, service, region, and
 /// existence errors therefore surface only for an authorized principal.
+///
+/// The two halves are called separately by the tag-writing handlers, because
+/// tag keys and values are checked between them: a request carrying an invalid
+/// tag key is refused for the tag on a cross-region table ARN and on an ARN
+/// naming no existing table, and denied on a cross-account ARN (measured). A
+/// stream ARN with another partition, service or region is refused in the
+/// first half, before the tags (measured 2026-11-20).
 async fn validate_resource_arn(arn: &str, ctx: &OperationContext) -> Result<(), DynamoDbError> {
+    let fields = validate_arn_shape_and_account(arn, &ctx.account_id, &ctx.region)?;
+    validate_arn_region_and_table(fields, arn, ctx).await
+}
+
+/// First half of [`validate_resource_arn`]: the ARN prefix, its resource kind,
+/// the account, and the deployment scope of a stream ARN. Returns the parsed
+/// fields, whose resource is `table/<name>` or `table/<name>/stream/<label>`,
+/// for the second half.
+fn validate_arn_shape_and_account<'a>(
+    arn: &'a str,
+    account_id: &str,
+    region: &str,
+) -> Result<extenddb_core::arn::ArnFields<'a>, DynamoDbError> {
     if !arn.starts_with("arn:") {
         return Err(DynamoDbError::ValidationException(format!(
             "One or more parameter values were invalid: ARNs must start with 'arn:': {arn}"
@@ -153,26 +171,35 @@ async fn validate_resource_arn(arn: &str, ctx: &OperationContext) -> Result<(), 
         )));
     }
 
-    if fields.account != ctx.account_id.as_ref() {
+    if fields.account != account_id {
         return Err(DynamoDbError::AccessDeniedException(
             "Access is denied".to_owned(),
         ));
     }
 
+    if tag_subresource_is_stream(resource)
+        && let Some(err) = deployment_scope_error(&fields, arn, region)
+    {
+        return Err(err);
+    }
+
+    Ok(fields)
+}
+
+/// Second half of [`validate_resource_arn`]: the partition, service and region,
+/// then the table's existence. `fields` is the first half's parse of `arn`.
+async fn validate_arn_region_and_table(
+    fields: extenddb_core::arn::ArnFields<'_>,
+    arn: &str,
+    ctx: &OperationContext,
+) -> Result<(), DynamoDbError> {
     if let Some(err) = deployment_scope_error(&fields, arn, &ctx.region) {
         return Err(err);
     }
 
-    let table_name = extract_table_name_from_arn(arn).ok_or_else(|| {
-        DynamoDbError::ValidationException(format!(
-            "One or more parameter values were invalid: \
-             Provided Arn is not a DynamoDB resource arn: {arn}"
-        ))
-    })?;
-
     // Verify the table exists via table_key_info (lightweight check).
     ctx.storage
-        .table_key_info(&ctx.account_id, table_name)
+        .table_key_info(&ctx.account_id, table_name_of(fields.resource))
         .await
         .map_err(|e| match e {
             extenddb_storage::error::StorageError::TableNotFound(_) => {
@@ -191,7 +218,8 @@ async fn validate_resource_arn(arn: &str, ctx: &OperationContext) -> Result<(), 
 /// # Errors
 ///
 /// Returns `ResourceNotFoundException` if the resource does not exist.
-/// Returns `ValidationException` if the resource ARN is empty.
+/// Returns `ValidationException` if the resource ARN is empty or a tag key or
+/// value is outside the grammar the service accepts.
 /// Returns `InternalServerError` on storage failures.
 pub async fn handle_tag_resource(
     body: Value,
@@ -205,7 +233,10 @@ pub async fn handle_tag_resource(
         ));
     }
 
-    validate_resource_arn(&input.resource_arn, ctx).await?;
+    let fields = validate_arn_shape_and_account(&input.resource_arn, &ctx.account_id, &ctx.region)?;
+    validate_tags(&input.tags)?;
+    validate_arn_region_and_table(fields, &input.resource_arn, ctx).await?;
+    validate_folded_tag_prefix(&input.tags)?;
 
     ctx.storage
         .tag_resource(&input.resource_arn, &input.tags)
@@ -227,7 +258,8 @@ pub async fn handle_tag_resource(
 /// # Errors
 ///
 /// Returns `ResourceNotFoundException` if the resource does not exist.
-/// Returns `ValidationException` if the resource ARN is empty.
+/// Returns `ValidationException` if the resource ARN is empty or a tag key is
+/// outside the grammar the service accepts.
 /// Returns `InternalServerError` on storage failures.
 pub async fn handle_untag_resource(
     body: Value,
@@ -242,7 +274,9 @@ pub async fn handle_untag_resource(
         ));
     }
 
-    validate_resource_arn(&input.resource_arn, ctx).await?;
+    let fields = validate_arn_shape_and_account(&input.resource_arn, &ctx.account_id, &ctx.region)?;
+    validate_tag_keys(&input.tag_keys)?;
+    validate_arn_region_and_table(fields, &input.resource_arn, ctx).await?;
 
     ctx.storage
         .untag_resource(&input.resource_arn, &input.tag_keys)
@@ -295,10 +329,43 @@ pub async fn handle_list_tags_of_resource(
 #[cfg(test)]
 mod tests {
     use super::{
-        deployment_scope_error, tag_subresource_not_dynamodb_resource,
-        tag_subresource_not_table_or_stream,
+        deployment_scope_error, table_name_of, tag_subresource_not_dynamodb_resource,
+        tag_subresource_not_table_or_stream, validate_arn_shape_and_account,
     };
     use extenddb_core::error::DynamoDbError;
+
+    #[test]
+    fn table_name_of_strips_the_sub_resource() {
+        assert_eq!(table_name_of("table/t"), "t");
+        assert_eq!(table_name_of("table/t/stream/2026-10-20T16:17:40.188"), "t");
+    }
+
+    /// The first half refuses an index ARN and an export ARN with the
+    /// service's texts. The server's gate answers both before the engine
+    /// runs, so no wire test reaches these two checks.
+    #[test]
+    fn the_first_half_refuses_an_index_and_an_export_arn() {
+        let table = "arn:aws:dynamodb:us-east-1:444455556666:table/T";
+        for (arn, reason) in [
+            (
+                format!("{table}/index/g"),
+                "Invalid resource arn provided, only table or stream is accepted. \
+                 Provided resource arn",
+            ),
+            (
+                format!("{table}/export/01700000000000-abcdef12"),
+                "Provided Arn is not a DynamoDB resource arn",
+            ),
+        ] {
+            match validate_arn_shape_and_account(&arn, "444455556666", "us-east-1") {
+                Err(DynamoDbError::ValidationException(m)) => assert_eq!(
+                    m,
+                    format!("One or more parameter values were invalid: {reason}: {arn}")
+                ),
+                other => panic!("{arn}: {other:?}"),
+            }
+        }
+    }
 
     /// The tag handler refuses exactly the ARNs the shared predicate puts
     /// outside this deployment, the predicate the server's StreamArn scope

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 pub mod number;
 pub mod restorable_item;
+pub mod tag;
 pub mod vector_item;
 pub mod warm_throughput;
 
@@ -9,6 +10,7 @@ pub use restorable_item::{
     RestorableItemError, RestorableItemReason, RestorableKeySchema, RestorableLimits,
     SHOWN_VALUE_BYTES, validate_restorable_item,
 };
+pub use tag::{validate_folded_tag_prefix, validate_tag_keys, validate_tags, validate_tags_member};
 pub use vector_item::{
     MAX_HASH_KEY_SIZE, MAX_INLINE_FILTER_SIZE, validate_vector_write,
     validate_vector_write_changed, vector_components, vector_norm,
@@ -103,23 +105,64 @@ pub fn validate_index_name(name: &str) -> Result<(), DynamoDbError> {
     Ok(())
 }
 
-/// Validate a `CreateTable` request.
+/// Validate a `CreateTable` request: the table name, then
+/// [`validate_create_table_constraints`], then
+/// [`validate_create_table_definition`]. `handle_create_table` calls the two
+/// groups itself, with its tag check between them; `RestoreTableFromBackup`
+/// calls this.
 ///
-/// When `allow_multipart_table_keys` is `true`, base tables may have up to 4 HASH
-/// and 4 RANGE key schema elements (preview extension). GSIs always allow multi-part
-/// keys regardless of this flag.
+/// # Errors
+///
+/// `ValidationException` for the first failed check.
 pub fn validate_create_table(
     input: &CreateTableInput,
     limits: &LimitsConfig,
 ) -> Result<(), DynamoDbError> {
     validate_table_name(&input.table_name, limits)?;
+    validate_create_table_constraints(input)?;
+    validate_create_table_definition(input, limits)
+}
+
+/// The `CreateTable` checks the service makes before a tag key that reads
+/// `aws:` once U+017F is read as `s`: each index name, the table's throughput
+/// against its billing mode, and the throughput minimum of a provisioned
+/// table's GSIs (measured 2026-11-24).
+///
+/// # Errors
+///
+/// `ValidationException` for the first failed check.
+pub fn validate_create_table_constraints(input: &CreateTableInput) -> Result<(), DynamoDbError> {
+    for gsi in input.global_secondary_indexes.iter().flatten() {
+        validate_index_name(&gsi.index_name)?;
+    }
+    for lsi in input.local_secondary_indexes.iter().flatten() {
+        validate_index_name(&lsi.index_name)?;
+    }
+    validate_provisioned_throughput(input)?;
+    validate_gsi_throughput_minimum(input)
+}
+
+/// The rest of the `CreateTable` checks, which the service makes after that
+/// tag key. Measured on 2026-11-20 and 2026-11-24: two HASH keys, a third key
+/// schema element, an undefined or unused attribute definition, a GSI's
+/// throughput on an on-demand table and `StreamEnabled` without a view type.
+///
+/// When `allow_multipart_table_keys` is `true`, base tables may have up to 4 HASH
+/// and 4 RANGE key schema elements (preview extension). GSIs always allow multi-part
+/// keys regardless of this flag.
+///
+/// # Errors
+///
+/// `ValidationException` for the first failed check.
+pub fn validate_create_table_definition(
+    input: &CreateTableInput,
+    limits: &LimitsConfig,
+) -> Result<(), DynamoDbError> {
     validate_key_schema(input, limits.allow_multipart_table_keys)?;
     validate_gsi_key_schemas(input)?;
     validate_lsi_key_schemas(input)?;
     validate_attribute_definitions(input)?;
-    validate_provisioned_throughput(input)?;
     validate_gsi_provisioned_throughput(input)?;
-    validate_gsi_throughput_minimum(input)?;
     validate_gsi_count(input, limits)?;
     validate_lsi_count(input, limits)?;
     validate_lsi_requires_range_key(input)?;
@@ -817,7 +860,6 @@ fn validate_gsi_key_schemas(input: &CreateTableInput) -> Result<(), DynamoDbErro
         return Ok(());
     };
     for gsi in gsis {
-        validate_index_name(&gsi.index_name)?;
         if gsi.key_schema.is_empty() {
             return Err(DynamoDbError::ValidationException(format!(
                 "One or more parameter values were invalid: No defined key schema for index: {}",
@@ -843,7 +885,6 @@ fn validate_lsi_key_schemas(input: &CreateTableInput) -> Result<(), DynamoDbErro
     };
     let table_hash_key = &input.key_schema[0].attribute_name;
     for lsi in lsis {
-        validate_index_name(&lsi.index_name)?;
         match lsi.key_schema.as_slice() {
             [hash, range] => {
                 if hash.key_type != KeyType::Hash {

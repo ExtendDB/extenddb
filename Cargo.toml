@@ -217,6 +217,12 @@ config = "0.14"
 # Security
 zeroize = { version = "1.8", features = ["derive"] }
 
+unicode-properties = "0.1.4"
+# Unicode 13.0 general categories for the table tag grammar. The service
+# refuses letters and digits that Unicode 14.0 and later assign, so the
+# version is pinned to the last release with 13.0 tables.
+unicode-general-category = "=0.4.0"
+
 # Size-optimised profile for the `extenddb-dev` container image only.
 #
 # Deliberately NOT applied to `[profile.release]`: the production Postgres and

@@ -21,6 +21,7 @@ md-5 = { workspace = true }
 sha2 = { workspace = true }
 time = { workspace = true }
 uuid = { workspace = true }
+unicode-general-category = { workspace = true }
 zeroize = { workspace = true }
 web-time = { workspace = true }
 
