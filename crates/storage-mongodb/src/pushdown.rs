@@ -42,8 +42,9 @@
 //!   ≠ bytewise byte ordering across mismatched lengths)
 //! - Any operand type the analyzer doesn't yet classify
 //! - A condition whose `AND`, `OR` and `NOT` nest more than
-//!   64 levels deep (`MAX_LOGICAL_DEPTH`; the compiled filter would pass
-//!   MongoDB's BSON depth limit)
+//!   64 levels deep (`MAX_LOGICAL_DEPTH`, a margin below the depth at which
+//!   MongoDB refuses the compiled filter: 99 levels with equality leaves,
+//!   98 with `contains` leaves)
 
 use extenddb_core::expression::{CompareOp, Expr, ExpressionMaps, PathElement};
 use extenddb_core::types::AttributeValue;
