@@ -160,7 +160,11 @@ only) — identical to Postgres, no change needed.
   not match the Postgres backend's eventual-consistency behaviour for GSIs.
 - **Stream sequence numbers** come from a `seq_counters` row updated inside the
   write txn → monotonic per the contract.
-- **Parallel scan** uses `rowid % total_segments`.
+- **Parallel scan** puts a row in a segment by the CRC32 of its `pk` column
+  text modulo `total_segments`, through the SQL function
+  `extenddb_scan_segment` that every pool connection registers. DynamoDB
+  returns all items of a partition key from one segment, on a table and on a
+  GSI (measured 2026-11-13 and 2026-11-14).
 - **Encryption** (access-key secrets) reuses AES-256-GCM with AAD, identical to
   Postgres/memory.
 

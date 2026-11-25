@@ -18,7 +18,7 @@ use extenddb_core::types::{
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{
-    composite_pk_to_text, encode_netstring_composite, pk_to_text, sk_info,
+    composite_pk_to_text, encode_netstring_composite, pk_to_text, scan_segment, sk_info,
 };
 use extenddb_storage::{
     DataEngine, IdempotencyKey, ItemPairResult, QueryResult, StreamCapture, TransactGetOp,
@@ -322,12 +322,7 @@ impl DataEngine for MongoEngine {
         let key = key.clone();
         Box::pin(async move {
             let pk_text = composite_pk_to_text(&key, &key_schema)?;
-            let hash = crc32fast::hash(pk_text.as_bytes());
-            #[allow(clippy::cast_sign_loss)]
-            let total_u = total_segments as u32;
-            #[allow(clippy::cast_sign_loss)]
-            let seg_u = segment as u32;
-            Ok(hash % total_u == seg_u)
+            Ok(scan_segment(pk_text.as_bytes(), total_segments) == segment)
         })
     }
 
@@ -1709,12 +1704,7 @@ impl MongoEngine {
 
             if let (Some(seg), Some(total)) = (segment, total_segments) {
                 let pk_text = composite_pk_to_text(&item, &key_info.key_schema)?;
-                let hash = crc32fast::hash(pk_text.as_bytes());
-                #[allow(clippy::cast_sign_loss)]
-                let total_u = total as u32;
-                #[allow(clippy::cast_sign_loss)]
-                let seg_u = seg as u32;
-                if hash % total_u != seg_u {
+                if scan_segment(pk_text.as_bytes(), total) != seg {
                     continue;
                 }
             }

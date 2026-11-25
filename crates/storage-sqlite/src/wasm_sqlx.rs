@@ -560,6 +560,32 @@ pub struct SqliteConnection {
     handle: Handle,
 }
 
+impl SqliteConnection {
+    /// Borrow the connection's `sqlite3` handle for a C API call the shim
+    /// does not wrap, mirroring `sqlx::SqliteConnection::lock_handle`. `sqlx`
+    /// locks the connection's worker thread for the borrow; the shim has no
+    /// worker, so the call does not fail.
+    pub async fn lock_handle(&mut self) -> Result<LockedSqliteHandle<'_>, Error> {
+        Ok(LockedSqliteHandle { conn: self })
+    }
+}
+
+/// A connection's `sqlite3` handle, borrowed from the connection, mirroring
+/// `sqlx::sqlite::LockedSqliteHandle`.
+pub struct LockedSqliteHandle<'a> {
+    conn: &'a mut SqliteConnection,
+}
+
+impl LockedSqliteHandle<'_> {
+    /// The `sqlite3` handle, mirroring `sqlx`'s `as_raw_handle`.
+    pub fn as_raw_handle(&mut self) -> ptr::NonNull<ffi::sqlite3> {
+        // SAFETY: a connection holds the handle of an `open` that returned
+        // `Ok`, so `sqlite3_open_v2` returned `SQLITE_OK`, and SQLite then
+        // writes a non-null handle.
+        unsafe { ptr::NonNull::new_unchecked(self.conn.handle.db) }
+    }
+}
+
 /// A connection checked out of a [`SqlitePool`], mirroring
 /// `sqlx::pool::PoolConnection`. Dereferences to the connection, so
 /// `&mut *conn` is an [`Executor`]; the pool gets the connection back when

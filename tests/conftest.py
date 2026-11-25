@@ -156,6 +156,24 @@ def wait_for_gsi_items(paginate, expected: int, timeout: float = 15.0):
         items = paginate()
     return items
 
+
+def _paginate(client, operation: str, max_pages: int = 100, **kwargs) -> list[dict]:
+    """Run a Scan or Query to exhaustion, returning the list of raw pages.
+
+    Bounded so a LastEvaluatedKey that fails to advance surfaces as a short
+    result instead of spinning forever.
+    """
+    pages: list[dict] = []
+    call = getattr(client, operation)
+    request = dict(kwargs)
+    for _ in range(max_pages):
+        resp = call(**request)
+        pages.append(resp)
+        if "LastEvaluatedKey" not in resp:
+            break
+        request["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+    return pages
+
 @pytest.fixture()
 def create_and_cleanup_table(dynamodb_client, unique_table_name):
     """Create a table and ensure it's deleted after the test (REQ-TEST-005)."""

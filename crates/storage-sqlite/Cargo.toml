@@ -53,7 +53,8 @@ web-time = { workspace = true }
 # text.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 sqlx = { workspace = true, features = ["sqlite"] }
-# SQLite's C API, for the online-backup copy that sqlx does not expose. The
+# SQLite's C API, for the online-backup copy and the registration of the
+# `extenddb_scan_segment` SQL function, which sqlx does not expose. The
 # version is the one `sqlx-sqlite` depends on.
 libsqlite3-sys = { workspace = true }
 # `flock(2)` for the one-owner-per-file serve lock and `statvfs(3)` for the
@@ -68,12 +69,13 @@ tokio = { workspace = true, features = ["sync"] }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Real SQLite compiled for wasm with an in-memory VFS (no threads, no C
 # sysroot, no Emscripten). The `wasm_sqlx` shim drives its raw libsqlite3 C ABI
-# synchronously, standing in for sqlx + libsqlite3-sys. The `wasm-bindgen`
-# feature supplies the runtime host hooks (clock, randomness, VFS glue) the
-# module links against in a JavaScript host. 0.6.3 is the first release that
-# bundles SQLite 3.54.1 (0.6.0 to 0.6.2 bundle 3.53.4), and 0.6.0 and 0.6.1 do
-# not compile with clang 15, which rejects the C23 `[[noreturn]]` attribute
-# their shim header uses.
+# synchronously, standing in for sqlx, and `sqlite_util.rs` calls the same C
+# ABI to register `extenddb_scan_segment`, standing in for libsqlite3-sys. The
+# `wasm-bindgen` feature supplies the runtime host hooks (clock, randomness, VFS
+# glue) the module links against in a JavaScript host. 0.6.3 is the first
+# release that bundles SQLite 3.54.1 (0.6.0 to 0.6.2 bundle 3.53.4), and 0.6.0
+# and 0.6.1 do not compile with clang 15, which rejects the C23 `[[noreturn]]`
+# attribute their shim header uses.
 sqlite-wasm-rs = { version = "0.6.3", features = ["wasm-bindgen"] }
 # `rt-multi-thread` is deliberately absent: a browser wasm module is
 # single-threaded.

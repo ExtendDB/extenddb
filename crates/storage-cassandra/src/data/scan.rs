@@ -270,7 +270,7 @@ impl crate::CassandraEngine {
     /// is still classified correctly rather than refused.
     ///
     /// Returns `Ok(true)` for the whole-ring cases (`total_segments <= 1`, or
-    /// bounds absent), matching the trait's "cannot be proven foreign" rule.
+    /// bounds absent).
     pub(crate) async fn scan_key_in_segment_impl(
         &self,
         key_info: &TableKeyInfo,
