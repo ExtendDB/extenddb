@@ -307,6 +307,7 @@ async fn a_read_that_ends_late_answers_the_next_request() {
     assert!(is_unavailable(&settings.enabled_accounts().await));
     tokio::time::advance(REFRESH).await;
     gate.notify_one();
+    until_the_read_ends(&settings).await;
     let started = tokio::time::Instant::now();
     assert_eq!(
         settings.enabled_accounts().await.unwrap(),
@@ -560,3 +561,6 @@ async fn a_request_reads_the_setting_with_the_bounded_read() {
 
 #[path = "search_vectors_settings_fault_tests.rs"]
 mod fault;
+
+#[path = "search_vectors_settings_wait_tests.rs"]
+mod wait;

@@ -27,9 +27,10 @@
 //! do not read it keep the rest. Once a read has answered, a request never
 //! waits on a read another request sent: while a read is in flight, it uses
 //! the value of the last read that answered. Before any read has answered,
-//! a request waits on the read in flight for at most [`READ_TIMEOUT`]. A
-//! change through the management API applies at the first read sent after
-//! it, which is the next one once no read is in flight.
+//! a request waits on the read in flight until [`READ_TIMEOUT`] after it
+//! was sent, and once that has passed, it answers at once. A change through
+//! the management API applies at the first read sent after it, which is the
+//! next one once no read is in flight.
 
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
@@ -117,6 +118,8 @@ struct Kept {
 struct InFlight {
     /// The value of [`Settings::changes`] when the read was sent.
     changes: u64,
+    /// When the read was sent.
+    sent_at: Instant,
     task: JoinHandle<OpResult<Option<String>>>,
 }
 
@@ -171,6 +174,7 @@ impl Settings {
         let store = Arc::clone(&self.store);
         InFlight {
             changes: self.changes(),
+            sent_at: Instant::now(),
             task: tokio::spawn(async move {
                 store.get_setting_bounded(SEARCH_INEQUALITY_FILTERS).await
             }),
@@ -216,7 +220,11 @@ impl Settings {
         }
         let in_flight = reading.get_or_insert_with(|| self.send_read());
         let sent = in_flight.changes;
-        let read = tokio::time::timeout(READ_TIMEOUT, &mut in_flight.task).await;
+        // A request waits on a read only until READ_TIMEOUT after it was
+        // sent, so a read that does not end delays the first requests
+        // rather than one request after each refresh.
+        let wait = READ_TIMEOUT.saturating_sub(in_flight.sent_at.elapsed());
+        let read = tokio::time::timeout(wait, &mut in_flight.task).await;
         if read.is_ok() {
             *reading = None;
         }
