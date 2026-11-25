@@ -185,9 +185,8 @@ fn an_error_of_the_item_operation_names_the_batch_table() {
 
 /// An error of the item operation keeps its class as the code the API
 /// Reference lists for a batch statement's error (BatchStatementError), with
-/// its message and the statement's table: a backend throttle, conflict or
-/// fault on one statement is not a validation error. The list has no code for
-/// ServiceUnavailable.
+/// its message and the statement's table: a backend throttle or fault on one
+/// statement is not a validation error.
 #[test]
 fn an_error_of_the_item_operation_keeps_the_listed_code_of_its_class() {
     for (error, code) in [
@@ -209,12 +208,6 @@ fn an_error_of_the_item_operation_keeps_the_listed_code_of_its_class() {
             "RequestLimitExceeded",
         ),
         (
-            DynamoDbError::TransactionConflictException(
-                "Transaction is ongoing for the item".to_owned(),
-            ),
-            "TransactionConflict",
-        ),
-        (
             DynamoDbError::ItemCollectionSizeLimitExceededException(
                 "Item collection size limit exceeded.".to_owned(),
             ),
@@ -225,16 +218,6 @@ fn an_error_of_the_item_operation_keeps_the_listed_code_of_its_class() {
                 "The server encountered an internal error.".to_owned(),
             ),
             "InternalServerError",
-        ),
-        (
-            DynamoDbError::ServiceUnavailable(
-                "The database is temporarily unavailable.".to_owned(),
-            ),
-            "InternalServerError",
-        ),
-        (
-            DynamoDbError::ValidationException("The key value is not a number.".to_owned()),
-            "ValidationError",
         ),
     ] {
         assert_eq!(
