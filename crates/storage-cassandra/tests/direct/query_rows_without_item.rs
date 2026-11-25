@@ -3,59 +3,35 @@
 
 //! Query over data rows that hold no item.
 //!
-//! A partition whose items have all been deleted answers a partition read
-//! with one row of its static columns, and a TTL claim or a transaction
-//! prepare on an absent key writes a row with only `prepared_txn_id` set.
-//! Neither row is an item. A page may come back short because of them, but
-//! while items remain it carries a LastEvaluatedKey, so a reader paging on
-//! from the last item reads every item.
+//! A row without `item_data` holds no item. Such rows are the static-only
+//! row that a partition whose items have all been deleted answers a
+//! partition read with, the row a TTL claim on an absent key writes (only
+//! `prepared_txn_id` and `prepared_txn_timestamp` set), and the row a
+//! transaction prepare leaves when its `UPDATE ... IF prepared_txn_id =
+//! null` lands on an item deleted after the transaction read it. A page may
+//! come back short because of them, but while items remain it carries a
+//! LastEvaluatedKey, so a reader paging on from the last item reads every
+//! item. A run of such rows is read on after its last row, in reads of at
+//! most 1,000 rows (or the read's own LIMIT, if larger), and no row is read
+//! twice.
 
+use cdrs_tokio::types::value::Value;
 use extenddb_core::expression::{Expr, ExpressionMaps, KeyCondition, PathElement};
 use extenddb_core::types::{AttributeValue, Item};
 use extenddb_storage::DataEngine;
 use extenddb_storage_cassandra::CassandraEngine;
-use std::collections::BTreeMap;
+use futures::StreamExt;
 
-use crate::helpers::{TestTable, setup_engine};
+use crate::helpers::{TestTable, claim_row, data_table_metric, key, put, setup_engine};
 
-fn key(sk: &str) -> Item {
-    BTreeMap::from([
-        ("id".to_string(), AttributeValue::S("p".to_string())),
-        ("sort".to_string(), AttributeValue::S(sk.to_string())),
-    ])
+/// The key of the item with sort key `sk` in partition `p`.
+fn at(sk: &str) -> Item {
+    key("p", Some(AttributeValue::S(sk.to_string())))
 }
 
-async fn put(engine: &CassandraEngine, table: &TestTable, sk: &str) {
-    let mut item = key(sk);
-    item.insert("v".to_string(), AttributeValue::S("x".to_string()));
-    engine
-        .put_item(
-            &table.key_info,
-            item,
-            false,
-            None,
-            &ExpressionMaps::default(),
-            None,
-        )
-        .await
-        .expect("put_item");
-}
-
-/// Writes the row a TTL claim on the absent key `sk` leaves: no `item_data`.
-async fn claim_row(engine: &CassandraEngine, table: &TestTable, sk: &str) {
-    let keyspace = engine.account_keyspace(&table.key_info.account_id);
-    let data_table = format!("items_{}", table.key_info.table_id.replace('-', "_"));
-    engine
-        .session_arc()
-        .query_with_values(
-            format!(
-                "UPDATE {keyspace}.{data_table} SET prepared_txn_id = uuid(), \
-                 prepared_txn_timestamp = 1 WHERE pk = ? AND sk_s = ?"
-            ),
-            cdrs_tokio::query_values!("p", sk),
-        )
-        .await
-        .expect("claim row");
+/// Writes the row a TTL claim on the absent key `sk` of partition `p` leaves.
+async fn claim(engine: &CassandraEngine, table: &TestTable, sk: &str) {
+    claim_row(engine, table, "p", Some(Value::from(sk))).await;
 }
 
 async fn query(
@@ -117,6 +93,15 @@ async fn read_all(
     panic!("more than 100 pages");
 }
 
+/// The single-partition reads Cassandra has made of `table` (the count of
+/// its `system_views.local_read_latency`). The table is the test's own, so
+/// a change in the count is the test's reads.
+async fn partition_reads(engine: &CassandraEngine, table: &TestTable) -> i64 {
+    data_table_metric::<i64>(engine, table, "local_read_latency", "count")
+        .await
+        .unwrap_or(0)
+}
+
 #[tokio::test]
 async fn test_query_of_an_emptied_partition() {
     if crate::helpers::skip_without_cassandra() {
@@ -125,13 +110,13 @@ async fn test_query_of_an_emptied_partition() {
     let engine = setup_engine().await;
     let table = TestTable::new(&engine, "QueryEmptied", true).await;
     for sk in ["a", "b"] {
-        put(&engine, &table, sk).await;
+        put(&engine, &table, at(sk)).await;
     }
     for sk in ["a", "b"] {
         engine
             .delete_item(
                 &table.key_info,
-                &key(sk),
+                &at(sk),
                 false,
                 None,
                 &Default::default(),
@@ -163,11 +148,11 @@ async fn test_query_pages_past_rows_without_an_item() {
     let table = TestTable::new(&engine, "QueryClaimRows", true).await;
     let live: Vec<String> = (0..10).map(|i| format!("s{i:02}")).collect();
     for sk in &live {
-        put(&engine, &table, sk).await;
+        put(&engine, &table, at(sk)).await;
     }
     // Two before every item, two between s04 and s05, two after every item.
     for sk in ["a0", "a1", "s04a", "s04b", "t0", "t1"] {
-        claim_row(&engine, &table, sk).await;
+        claim(&engine, &table, sk).await;
     }
     let reversed: Vec<String> = live.iter().rev().cloned().collect();
 
@@ -175,10 +160,10 @@ async fn test_query_pages_past_rows_without_an_item() {
     // fill the LIMIT.
     let (page, last_key) = query(&engine, &table, true, Some(1), None).await;
     assert_eq!(page, ["s00"]);
-    assert_eq!(last_key, Some(key("s00")));
+    assert_eq!(last_key, Some(at("s00")));
     let (page, last_key) = query(&engine, &table, false, Some(1), None).await;
     assert_eq!(page, ["s09"]);
-    assert_eq!(last_key, Some(key("s09")));
+    assert_eq!(last_key, Some(at("s09")));
 
     // No Limit.
     assert_eq!(
@@ -210,51 +195,180 @@ async fn test_query_past_a_row_without_an_item_in_a_large_partition() {
     if crate::helpers::skip_without_cassandra() {
         return;
     }
-    use futures::StreamExt;
-
     let engine = setup_engine().await;
     let table = TestTable::new(&engine, "QueryClaimRowLarge", true).await;
     let live: Vec<String> = (0..3000).map(|i| format!("s{i:04}")).collect();
     futures::stream::iter(&live)
-        .for_each_concurrent(32, |sk| put(&engine, &table, sk))
+        .for_each_concurrent(32, |sk| put(&engine, &table, at(sk)))
         .await;
-    claim_row(&engine, &table, "a0").await;
+    claim(&engine, &table, "a0").await;
 
     // The page comes from the first rows read, whatever the size of the
     // partition behind them.
     let (page, last_key) = query(&engine, &table, true, Some(1), None).await;
     assert_eq!(page, ["s0000"]);
-    assert_eq!(last_key, Some(key("s0000")));
+    assert_eq!(last_key, Some(at("s0000")));
     let (page, last_key) = query(&engine, &table, true, Some(100), None).await;
     assert_eq!(page, live[..100]);
-    assert_eq!(last_key, Some(key("s0099")));
+    assert_eq!(last_key, Some(at("s0099")));
     assert_eq!(read_all(&engine, &table, true, 1000).await, live);
 }
 
+/// 3,000 rows without an item ahead of two items. With Limit 1, the reads
+/// take 2, 4, 8 and so on up to 512 rows, then 1,000, and the 11th read
+/// reaches the items. A read again from the start with a doubled LIMIT takes
+/// 13 reads, and reads that stay at 2 rows take 1,500.
 #[tokio::test]
 async fn test_query_past_a_long_run_of_rows_without_an_item() {
     if crate::helpers::skip_without_cassandra() {
         return;
     }
-    use futures::StreamExt;
-
     let engine = setup_engine().await;
     let table = TestTable::new(&engine, "QueryClaimRowRun", true).await;
     let claims: Vec<String> = (0..3000).map(|i| format!("a{i:04}")).collect();
     futures::stream::iter(&claims)
-        .for_each_concurrent(32, |sk| claim_row(&engine, &table, sk))
+        .for_each_concurrent(32, |sk| claim(&engine, &table, sk))
         .await;
     for sk in ["s0", "s1"] {
-        put(&engine, &table, sk).await;
+        put(&engine, &table, at(sk)).await;
     }
 
+    let before = partition_reads(&engine, &table).await;
     assert_eq!(
         query(&engine, &table, true, Some(1), None).await,
-        (vec!["s0".to_string()], Some(key("s0")))
+        (vec!["s0".to_string()], Some(at("s0")))
     );
+    let reads = partition_reads(&engine, &table).await - before;
+    assert!(reads <= 11, "limit 1: {reads} reads");
     assert_eq!(read_all(&engine, &table, true, 1).await, ["s0", "s1"]);
     assert_eq!(
         query(&engine, &table, false, Some(5), None).await,
-        (vec!["s1".to_string(), "s0".to_string()], Some(key("s0")))
+        (vec!["s1".to_string(), "s0".to_string()], Some(at("s0")))
+    );
+}
+
+/// Writes `claims` rows without an item, then 300 items, in partition `p`
+/// of a new table, reads it with Limit 128, and returns the most rows one
+/// read of the data table returned (the `max` of its
+/// `system_views.rows_per_read` histogram).
+async fn max_rows_per_read_at_limit_128(
+    engine: &CassandraEngine,
+    name: &str,
+    claims: usize,
+) -> f64 {
+    let table = TestTable::new(engine, name, true).await;
+    let claim_keys: Vec<String> = (0..claims).map(|i| format!("a{i:04}")).collect();
+    let live: Vec<String> = (0..300).map(|i| format!("s{i:04}")).collect();
+    futures::stream::iter(&claim_keys)
+        .for_each_concurrent(32, |sk| claim(engine, &table, sk))
+        .await;
+    futures::stream::iter(&live)
+        .for_each_concurrent(32, |sk| put(engine, &table, at(sk)))
+        .await;
+
+    let reads_before = partition_reads(engine, &table).await;
+    let counted_before = data_table_metric::<i64>(engine, &table, "rows_per_read", "count")
+        .await
+        .unwrap_or(0);
+    assert_eq!(
+        query(engine, &table, true, Some(128), None).await,
+        (live[..128].to_vec(), Some(at("s0127"))),
+        "{claims} rows without an item"
+    );
+    let reads = partition_reads(engine, &table).await - reads_before;
+    // Cassandra adds each read to the rows_per_read histogram a moment after
+    // the read; wait for all of them.
+    let mut counted = counted_before;
+    for _ in 0..50 {
+        counted = data_table_metric::<i64>(engine, &table, "rows_per_read", "count")
+            .await
+            .unwrap_or(0);
+        if counted >= counted_before + reads {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        counted >= counted_before + reads,
+        "rows_per_read counted {} of {reads} reads",
+        counted - counted_before
+    );
+    data_table_metric::<f64>(engine, &table, "rows_per_read", "max")
+        .await
+        .unwrap_or(0.0)
+}
+
+/// Rows without an item ahead of 300 items, read with Limit 128. With 1,030
+/// such rows the reads take 129, 258 and 516 rows, then up to 1,000, which
+/// reaches the items. With 3,500, the reads after the read of 516 rows take
+/// up to 1,000 rows each. No read returns more than 1,000 rows. A read again
+/// from the start with a doubled LIMIT ends with a read that returns every
+/// row of the partition (1,330 and 3,800). Reads that double without the cap
+/// of 1,000 rows return 1,865 rows in the fifth read of the second shape.
+#[tokio::test]
+async fn test_query_past_a_run_of_rows_without_an_item_reads_1000_rows_at_most() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    for (name, claims) in [
+        ("QueryClaimRowOvershoot", 1030),
+        ("QueryClaimRowLongRun", 3500),
+    ] {
+        let max = max_rows_per_read_at_limit_128(&engine, name, claims).await;
+        // The histogram rounds a count up: a read of 1,000 rows shows as
+        // 1,109, and one of 1,330 rows as 1,331.
+        assert!(max > 0.0, "no read counted, so the check proves nothing");
+        assert!(
+            max <= 1_109.0,
+            "{claims} rows without an item: one read returned {max} rows"
+        );
+    }
+}
+
+/// 2,100 rows without an item, each followed by 110 deleted rows, ahead of
+/// two items. With Limit 1 the reads take 2, 4, 8 and so on up to 512 rows,
+/// and pass at most 56,320 deleted rows. The read of 1,000 rows passes about
+/// 110,000, more than Cassandra's `tombstone_failure_threshold` (100,000 by
+/// default), and Cassandra refuses it. The read runs again with 500 rows,
+/// and the later reads stay at 500 rows, so the Query answers the first item.
+#[tokio::test]
+async fn test_query_reads_again_with_half_the_rows_when_cassandra_refuses_a_read() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let table = TestTable::new(&engine, "QueryClaimRowsTombstones", true).await;
+    let t = crate::helpers::data_table(&engine, &table);
+    let session = engine.session_arc();
+    let runs: Vec<usize> = (0..2100).collect();
+    futures::stream::iter(&runs)
+        .for_each_concurrent(8, |i| {
+            let (session, t) = (session.clone(), t.clone());
+            async move {
+                // Test-generated ASCII keys, so literals are safe here.
+                let mut cql = format!(
+                    "BEGIN UNLOGGED BATCH UPDATE {t} SET prepared_txn_id = uuid(), \
+                     prepared_txn_timestamp = 1 WHERE pk = 'p' AND sk_s = 'c{i:04}'; "
+                );
+                for j in 0..110 {
+                    cql.push_str(&format!(
+                        "DELETE FROM {t} WHERE pk = 'p' AND sk_s = 'c{i:04}_{j:03}'; "
+                    ));
+                }
+                cql.push_str("APPLY BATCH");
+                session
+                    .query(cql)
+                    .await
+                    .expect("claim row and deleted rows");
+            }
+        })
+        .await;
+    for sk in ["s0", "s1"] {
+        put(&engine, &table, at(sk)).await;
+    }
+    assert_eq!(
+        query(&engine, &table, true, Some(1), None).await,
+        (vec!["s0".to_string()], Some(at("s0")))
     );
 }

@@ -1,8 +1,9 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Data rows for the Cassandra Scan and Query: the item a row holds, reads
-//! that go on after the last row read, and reads that Cassandra refuses.
+//! Data rows for the Cassandra Scan, Query and GSI backfill: the item a row
+//! holds, reads that go on after the last row read, and reads that
+//! Cassandra refuses.
 //!
 //! A partition whose items have all been deleted answers a read with one row
 //! of its static columns. A TTL claim on an absent key, and a transaction
@@ -11,11 +12,13 @@
 //! full read holds no item, the scan reads on after the last row read (its
 //! partition key and, for a row with one, its sort key), with up to twice as
 //! many rows each time and at most [`RUN_READ_ROWS`] (or the read's own
-//! LIMIT, if larger). Cassandra counts a tombstone for each deleted row in
-//! the partitions a read passes, so every read of a call, the first one
-//! included, that Cassandra refuses with a read failure (for example
-//! `READ_TOO_MANY_TOMBSTONES`) is tried again with half as many rows, down to
-//! one, and the later reads in the same call stay at that size.
+//! LIMIT, if larger). A Query reads on the same way inside its partition,
+//! after the last row's sort key. Cassandra counts a tombstone for each
+//! deleted row in the partitions a read passes, so every read of a Scan
+//! call, the first one included, that Cassandra refuses with a read failure
+//! (for example `READ_TOO_MANY_TOMBSTONES`) is tried again with half as many
+//! rows, down to one, and the later reads in the same call stay at that
+//! size. A Query's reads after its first read get the same retry.
 
 use cdrs_tokio::error::Error as CdrsError;
 use cdrs_tokio::frame::message_error::ErrorType;
@@ -60,15 +63,28 @@ pub(super) fn row_position(
     row: &Row,
     sk_type: Option<ScalarAttributeType>,
 ) -> Result<Position, StorageError> {
-    let parse =
-        |error: CdrsError| StorageError::Internal(format!("scan parse row key failed: {error}"));
-    let pk: Option<String> = row.get_by_name("pk").map_err(parse)?;
+    let pk: Option<String> = row
+        .get_by_name("pk")
+        .map_err(|error| StorageError::Internal(format!("scan parse row key failed: {error}")))?;
     let pk = pk.ok_or_else(|| StorageError::Internal("scan row without pk".to_owned()))?;
     let Some(sk_type) = sk_type else {
         return Ok((pk, None));
     };
     let col = sk_column(sk_type);
-    let value = match sk_type {
+    let clustering = row_sort_key(row, sk_type)?.map(|v| (format!("{col} > ?"), vec![v]));
+    Ok((pk, clustering))
+}
+
+/// The sort key of a base-table row of a table whose sort key has type
+/// `sk_type`, as a bind value; `None` for a static-only row.
+pub(super) fn row_sort_key(
+    row: &Row,
+    sk_type: ScalarAttributeType,
+) -> Result<Option<Value>, StorageError> {
+    let parse =
+        |error: CdrsError| StorageError::Internal(format!("parse row sort key failed: {error}"));
+    let col = sk_column(sk_type);
+    Ok(match sk_type {
         ScalarAttributeType::S => IntoRustByName::<String>::get_by_name(row, col)
             .map_err(parse)?
             .map(Value::from),
@@ -78,13 +94,12 @@ pub(super) fn row_position(
         ScalarAttributeType::B => IntoRustByName::<Blob>::get_by_name(row, col)
             .map_err(parse)?
             .map(Value::from),
-    };
-    Ok((pk, value.map(|v| (format!("{col} > ?"), vec![v]))))
+    })
 }
 
 /// Runs one read at the consistency level of [`Stmt::Read`] and returns its
 /// rows, keeping the driver's error.
-async fn rows_of(
+pub(super) async fn rows_of(
     session: &Arc<CassandraSession>,
     query: &str,
     values: Vec<Value>,
