@@ -249,6 +249,28 @@ async fn prepare_creates_the_target_of_a_dangling_symlink() {
     pool.close().await;
 }
 
+/// An existing database at 0644 reached through a symlink at the database
+/// name: `prepare` sets the link's target, and the sidecar named after the
+/// target, to 0600, and the name stays a symlink.
+#[test]
+fn prepare_sets_an_existing_database_behind_a_symlink_to_0600() {
+    let tmp = temp_dir();
+    let dir = tmp.path();
+    let target = dir.join("real.sqlite");
+    let link = dir.join("link.sqlite");
+    let wal = sidecar(&target, "-wal");
+    for file in [&target, &wal] {
+        std::fs::write(file, b"").expect("create");
+        set_mode(file, 0o644);
+    }
+    std::os::unix::fs::symlink(&target, &link).expect("symlink");
+    prepare(&link.to_string_lossy()).expect("prepare");
+    assert_eq!(mode(&target), 0o600);
+    assert_eq!(mode(&wal), 0o600);
+    let at_name = std::fs::symlink_metadata(&link).expect("lstat link.sqlite");
+    assert!(at_name.file_type().is_symlink(), "link.sqlite replaced");
+}
+
 /// The `fchmod` of a file `create_owner_only` has just created, failing with
 /// `EROFS`.
 fn read_only_created(_: &std::fs::File) -> std::io::Result<()> {
