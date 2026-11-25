@@ -225,6 +225,47 @@ fn a_disabled_stream_stays_describable_with_its_ending_numbers() {
     assert!(p2.last_evaluated_shard_id.is_none());
 }
 
+/// A `Limit` above `u32::MAX` asks for more shards than a stream has, so the
+/// page holds every shard and no `LastEvaluatedShardId`, on a target whose
+/// `usize` is 32 bits as on one whose `usize` is 64.
+#[test]
+fn a_limit_above_u32_max_describes_every_shard() {
+    let shards = stream_rows(OLD, StreamViewType::KeysOnly, None);
+    let t = table(Some(OLD), Some(spec(true, Some(StreamViewType::KeysOnly))));
+    for limit in [4_294_967_295, 4_294_967_296, 4_294_967_297, i64::MAX] {
+        let d = describe_stream(
+            "arn".into(),
+            &t,
+            Vec::new(),
+            OLD.into(),
+            &shards,
+            Some(limit),
+            None,
+        )
+        .unwrap();
+        assert_eq!(d.shards.len(), shards.len(), "Limit {limit}");
+        assert!(d.last_evaluated_shard_id.is_none(), "Limit {limit}");
+    }
+}
+
+/// The same for a `ListStreams` page: a `Limit` above `u32::MAX` lists every
+/// stream, with no `LastEvaluatedStreamArn`.
+#[test]
+fn a_limit_above_u32_max_lists_every_stream() {
+    let mut shards = stream_rows(OLD, StreamViewType::KeysOnly, Some("5"));
+    shards.extend(stream_rows(NEW, StreamViewType::KeysOnly, None));
+    let tables = vec![table(
+        Some(NEW),
+        Some(spec(true, Some(StreamViewType::KeysOnly))),
+    )];
+    let arn = |t: &str, l: &str| format!("{t}/{l}");
+    for limit in [4_294_967_295, 4_294_967_296, 4_294_967_297, i64::MAX] {
+        let (all, last) = list_streams(&tables, &shards, None, limit, None, arn).unwrap();
+        assert_eq!(all.len(), 2, "Limit {limit}");
+        assert!(last.is_none(), "Limit {limit}");
+    }
+}
+
 #[test]
 fn a_re_enabled_table_has_two_streams_and_only_the_new_one_is_enabled() {
     let mut shards = stream_rows(OLD, StreamViewType::NewAndOldImages, Some("5"));

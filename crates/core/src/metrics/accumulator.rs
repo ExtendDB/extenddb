@@ -8,7 +8,7 @@
 //! and a `record` call reallocates at most one chunk.
 
 use std::collections::VecDeque;
-use std::time::{Instant, SystemTime};
+use web_time::{Instant, SystemTime};
 
 use super::collector::window_cutoff;
 use super::types::TimeWindow;

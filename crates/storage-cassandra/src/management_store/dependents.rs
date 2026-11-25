@@ -23,7 +23,7 @@ use cdrs_tokio::query::QueryValues;
 use cdrs_tokio::query_values;
 use extenddb_storage::management_store::{OpError, OpResult};
 
-use crate::cassandra_util::{apply_lwt, apply_lwt_quorum, execute, get_column, query_rows};
+use crate::cassandra_util::{apply_lwt, execute, get_column, query_rows};
 use crate::catalog_store::CassandraCatalogStore;
 
 impl CassandraCatalogStore {
@@ -232,7 +232,7 @@ impl CassandraCatalogStore {
         let ks = self.catalog_keyspace();
         let what = format!("delete {principal_type} {principal_name}");
         match principal_type {
-            "user" => apply_lwt_quorum::<OpError>(
+            "user" => apply_lwt::<OpError>(
                 self.session(),
                 &format!(
                     "DELETE FROM {ks}.iam_users WHERE account_id = ? AND user_name = ? IF EXISTS"

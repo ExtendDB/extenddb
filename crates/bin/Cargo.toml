@@ -54,3 +54,8 @@ sqlx = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 extenddb-storage = { path = "../storage", features = ["test-util"] }
+# The catalog-check test builds its deployment with the PostgreSQL storage
+# tests' catalog_check support module, which names core types and the
+# relation naming functions that `test-hooks` exports.
+extenddb-core = { path = "../core" }
+extenddb-storage-postgres = { path = "../storage-postgres", features = ["test-hooks"] }

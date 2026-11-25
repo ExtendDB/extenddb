@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Mutex, RwLock};
-use std::time::{Duration, Instant, SystemTime};
+use web_time::{Duration, Instant, SystemTime};
 
 use super::accumulator::Accumulator;
 use super::types::{LatencySegments, MetricName, TimeWindow};

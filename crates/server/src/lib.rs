@@ -20,6 +20,7 @@ mod handler;
 mod import_export_paths;
 mod import_export_roots;
 mod item_authz;
+pub mod key_file;
 pub mod key_info_cache;
 mod leading_keys;
 mod listener;
