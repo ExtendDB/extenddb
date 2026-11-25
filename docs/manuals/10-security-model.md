@@ -175,6 +175,11 @@ Policy sources collected for evaluation:
 ### Fail-Closed Design
 
 - **Unparseable policies deny**: A stored policy that cannot be parsed results in access denied, not silent skip. A corrupted Deny policy still denies; a corrupted Allow policy is treated as absent.
+- **Unreadable documents fail the request on MongoDB**: Each request whose authorization reads one of the stored documents below fails with HTTP 500 (`InternalServerError`). The server logs the collection, the document's `_id` and the fields that name its owner. A server that cached the document before the damage keeps using the cached copy until the entry is `ttl_seconds` old (60 seconds by default). This is the same window as for any change written to the catalog directly (see Credential and Policy Caching). A `policy_document` that converts to JSON but is not a policy is an unparseable policy, which denies (above). As on the other backends, the MongoDB store leaves out a session tags value that is neither an array nor an object. It also leaves out a session tag entry whose key or value is not a string. The documents that fail the request are:
+  - a policy or permissions boundary with no `policy_document`, or whose `policy_document` has no JSON form (a Decimal128, or binary data of the generic subtype)
+  - a session policy or session tags value with no JSON form
+  - a group membership or group policy whose group name is not a string
+  - a user, role or resource tag whose key or value is not a string
 - **Auth before JSON parse**: SigV4 signature verification runs before the request body is parsed. Invalid signatures are rejected with constant-time comparison before any business logic executes.
 - **Concurrent policy fetching**: Identity policies, group policies, and permissions boundaries are fetched concurrently from the catalog when they are not in the server's cache (see Credential and Policy Caching). All must succeed for evaluation to proceed.
 - **Constant-time rejection for inactive keys**: Inactive or expired access keys are rejected without timing differences that could reveal key existence.
