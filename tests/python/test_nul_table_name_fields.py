@@ -211,8 +211,9 @@ INDEX_NAME_MEMBERS = {
 }
 
 # Measured in us-east-1: #904 on 2026-11-06, #1021 on 2026-11-14 (the emoji
-# names in a CreateTable GSI or LSI and an UpdateTable GSI Create), the other
-# rows on 2026-11-18. DynamoDB lists the two clauses in either order.
+# names in a CreateTable GSI or LSI and an UpdateTable GSI Create), the empty
+# names in a vector index member on 2026-11-20, the other rows on 2026-11-18.
+# DynamoDB lists the two clauses in either order.
 INDEX_NAME_ROWS = [
     pytest.param(member, name, clauses, id=f"{member}-{label}")
     for member in INDEX_NAME_MEMBERS
@@ -222,6 +223,7 @@ INDEX_NAME_ROWS = [
         ("256-chars", "a" * 256, [LONG]),
         ("2-emoji", EMOJI * 2, [SHORT, MEMBER_PATTERN]),
         ("128-emoji", EMOJI * 128, [MEMBER_PATTERN]),
+        ("empty", "", [SHORT, MEMBER_PATTERN]),
     ]
 ] + [
     pytest.param("gsi", "g i", [MEMBER_PATTERN], id="gsi-space"),

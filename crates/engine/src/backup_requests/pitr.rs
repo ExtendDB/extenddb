@@ -68,10 +68,6 @@ const TWO_RESTORE_TIMES: &str = "Invalid Request: Both RestoreDateTime and \
      UseLatestRestorableTime cannot be set for point-in-time restore request. Please \
      specify either RestoreDateTime time or UseLatestRestorableTime";
 
-/// The model's pattern constraint on a table name, in the service's words.
-const NAME_PATTERN_CONSTRAINT: &str =
-    "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+";
-
 /// The member's string value, or the service's missing-table-name refusal.
 fn table_name_member<'a>(body: &'a Value, member: &str) -> Result<&'a str, DynamoDbError> {
     body.get(member)
@@ -81,29 +77,14 @@ fn table_name_member<'a>(body: &'a Value, member: &str) -> Result<&'a str, Dynam
 
 /// `TableName` on the two continuous-backups operations, checked against the
 /// model's constraints with the deployment's length bounds, as `CreateBackup`
-/// checks its member ([`super::validate_name_member`]). An empty name fails
-/// the pattern as well as the length, since the pattern needs one character:
-/// the service lists both constraints for it (measured: "2 validation errors
-/// detected: Value '' at 'tableName' ..."), where `validate_name_member`
-/// lists only the length. A name that starts with `arn:` is left to the
-/// lookup unchecked, so a table ARN keeps the answer it had before this
-/// check (`TableNotFoundException` naming the ARN).
-fn check_table_name(name: &str, (min, max): (usize, usize)) -> Result<(), DynamoDbError> {
+/// checks its member ([`super::validate_name_member`]). A name that starts
+/// with `arn:` is left to the lookup unchecked, so a table ARN keeps the
+/// answer it had before this check (`TableNotFoundException` naming the ARN).
+fn check_table_name(name: &str, bounds: (usize, usize)) -> Result<(), DynamoDbError> {
     if name.starts_with("arn:") {
         return Ok(());
     }
-    if name.is_empty() {
-        let at = "Value '' at 'tableName' failed to satisfy constraint:";
-        return Err(DynamoDbError::ValidationException(if min > 0 {
-            format!(
-                "2 validation errors detected: {at} Member must have length greater than \
-                 or equal to {min}; {at} {NAME_PATTERN_CONSTRAINT}"
-            )
-        } else {
-            format!("1 validation error detected: {at} {NAME_PATTERN_CONSTRAINT}")
-        }));
-    }
-    super::validate_name_member(name, "tableName", (min, max))
+    super::validate_name_member(name, "tableName", bounds)
 }
 
 /// `SourceTableName` on the restore, checked before the source table is

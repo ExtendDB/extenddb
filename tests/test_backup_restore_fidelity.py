@@ -2265,12 +2265,24 @@ def test_backup_and_table_names_are_validated(dynamodb_client):
              + constraint.format(v="a!", path="backupName", c=pattern)),
             ("CreateBackup", {"TableName": "t t", "BackupName": "fine"},
              "1 validation error detected: " + constraint.format(v="t t", path="tableName", c=pattern)),
+            ("CreateBackup", {"TableName": "", "BackupName": "fine"},
+             "2 validation errors detected: "
+             + constraint.format(v="", path="tableName", c=short) + "; "
+             + constraint.format(v="", path="tableName", c=pattern)),
+            ("CreateBackup", {"TableName": source, "BackupName": ""},
+             "2 validation errors detected: "
+             + constraint.format(v="", path="backupName", c=short) + "; "
+             + constraint.format(v="", path="backupName", c=pattern)),
             ("ListBackups", {"TableName": "ab"},
              "1 validation error detected: " + constraint.format(v="ab", path="tableName", c=short)),
             ("ListBackups", {"TableName": "a*"},
              "2 validation errors detected: "
              + constraint.format(v="a*", path="tableName", c=short) + "; "
              + constraint.format(v="a*", path="tableName", c=pattern)),
+            ("ListBackups", {"TableName": ""},
+             "2 validation errors detected: "
+             + constraint.format(v="", path="tableName", c=short) + "; "
+             + constraint.format(v="", path="tableName", c=pattern)),
         ]
         for operation, body, expected in cases:
             resp = _signed(operation, body)

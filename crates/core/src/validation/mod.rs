@@ -85,6 +85,11 @@ pub fn validate_table_name_chars(name: &str) -> Result<(), DynamoDbError> {
 /// and accepts the length of 128 of them (measured in us-east-1 on
 /// 2026-11-14).
 ///
+/// An empty value is outside the pattern, which needs one character.
+/// DynamoDB answers an empty index name, `BackupName` or `TableName` with
+/// the length clause and the pattern clause (measured in us-east-1 on
+/// 2026-11-18 and 2026-11-20).
+///
 /// # Errors
 ///
 /// `ValidationException` with one clause per failed constraint.
@@ -102,7 +107,7 @@ pub fn validate_name_member(
     } else if length > max {
         failed.push((value, path, too_long.as_str()));
     }
-    if validate_table_name_chars(value).is_err() {
+    if value.is_empty() || validate_table_name_chars(value).is_err() {
         failed.push((
             value,
             path,

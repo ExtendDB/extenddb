@@ -3,9 +3,10 @@
 
 //! Index names that DynamoDB refuses, in each CreateTable and UpdateTable
 //! member that core checks, with DynamoDB's answers measured in us-east-1
-//! (#904 on 2026-11-06, #1021 on 2026-11-14, the other rows on 2026-11-18).
-//! DynamoDB lists the two clauses of one member in either order, and
-//! ExtendDB writes the length clause first.
+//! (#904 on 2026-11-06, #1021 on 2026-11-14, the empty vector index names
+//! on 2026-11-20, the other rows on 2026-11-18). DynamoDB lists the two
+//! clauses of one member in either order, and ExtendDB writes the length
+//! clause first.
 
 use serde_json::{Value, json};
 
@@ -127,7 +128,7 @@ fn an_index_name_is_refused_at_its_member_path_with_one_clause_per_constraint() 
     let vector = "vectorIndexes.1.member.indexName";
     let create = "vectorIndexUpdates.1.member.create.indexName";
     let delete = "vectorIndexUpdates.1.member.delete.indexName";
-    let rows: [(Member, &str, &str, &[&str]); 22] = [
+    let rows: [(Member, &str, &str, &[&str]); 27] = [
         // #1021
         (Gsi, &emoji2, gsi, &[SHORT, PATTERN]),
         (Gsi, &emoji128, gsi, &[PATTERN]),
@@ -141,6 +142,12 @@ fn an_index_name_is_refused_at_its_member_path_with_one_clause_per_constraint() 
             "globalSecondaryIndexes.2.member.indexName",
             &[PATTERN],
         ),
+        // An empty name is outside the pattern too.
+        (Gsi, "", gsi, &[SHORT, PATTERN]),
+        (Lsi, "", lsi, &[SHORT, PATTERN]),
+        (Vector, "", vector, &[SHORT, PATTERN]),
+        (VectorCreate, "", create, &[SHORT, PATTERN]),
+        (VectorDelete, "", delete, &[SHORT, PATTERN]),
         // Names inside the pattern, and the other members.
         (Gsi, "ab", gsi, &[SHORT]),
         (Gsi, &a256, gsi, &[LONG]),
