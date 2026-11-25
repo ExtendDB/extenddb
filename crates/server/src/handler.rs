@@ -202,30 +202,18 @@ pub(crate) async fn handle_request(
     let throttle_start = std::time::Instant::now();
     let (is_read_op, is_write_op) = classify_data_operation(&operation);
     let partition_value = extract_partition_value(&input, &operation);
+    // A name the table name rules refuse (length or pattern), and the ARN of
+    // a table in another Region, are not throttled: the engine answers them
+    // as it does with capacity left. The service refuses such a name before
+    // any throttle (measured 2026-11-25 with GetItem and PutItem on `ab`, an
+    // empty name, 256 characters and the ARN of a table in another Region).
+    // The ARN of a table in this account and Region is checked by the name it
+    // carries, and a throttle refusal names that table.
     if let Some(ref tn) = table_name
         && (is_read_op || is_write_op)
+        && let name = crate::authz_resource::key_lookup_name(tn, &state.region, &ctx.account_id)
+        && extenddb_core::validation::validate_table_name(&name, &state.limits).is_ok()
     {
-        // The table name rules (length and pattern) apply before any bucket
-        // is read: the service refuses a name outside them with
-        // ValidationException however much capacity is left (measured
-        // 2026-11-25 with GetItem and PutItem on `ab`, an empty name, 256
-        // characters and the ARN of a table in another Region). The ARN of a
-        // table in this account and Region is checked by the name it
-        // carries, and a throttle refusal names that table.
-        let name = crate::authz_resource::key_lookup_name(tn, &state.region, &ctx.account_id);
-        if let Err(e) = extenddb_core::validation::validate_table_name(&name, &state.limits) {
-            record_error_metrics(
-                &state.metrics,
-                &e,
-                &ctx.account_id,
-                metric_table.as_deref(),
-                &operation,
-            );
-            state
-                .metrics
-                .record_request_count(&ctx.account_id, &operation);
-            return error_response(&e, &request_id);
-        }
         if !state.throttle.is_registered(&ctx.account_id, tn)
             && let Ok(desc) = ctx
                 .storage

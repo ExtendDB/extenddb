@@ -420,92 +420,38 @@ async fn account_throttle_reason_names_the_table_of_an_arn() {
     );
 }
 
-/// A `TableName` outside the table name rules is refused with
-/// ValidationException before any bucket is read, so the drained account
-/// bucket adds no reasons list. The table name gate refuses a name outside
-/// the pattern; the throttle segment refuses a name of a bad length and the
-/// ARN of a table in another Region. The service answers ValidationException
-/// to each (measured 2026-11-25 with GetItem and PutItem, twice each), with
-/// the texts below for `ab` and 256 characters. For an empty name and the
-/// other Region's ARN its text differs from ExtendDB's, so those rows check
-/// the class.
+/// A `TableName` outside the table name rules is not throttled: with the
+/// account bucket drained, the server answers it as it did with capacity
+/// left, and with no reasons list. The service refuses such a name before
+/// any throttle (measured 2026-11-25 with GetItem and PutItem, twice each).
+/// The table name gate refuses `bad name!` before the throttle segment.
 #[tokio::test]
-async fn names_outside_the_table_name_rules_are_refused_before_the_throttle() {
+async fn names_outside_the_table_name_rules_are_not_throttled() {
     let (state, account_id) = build_state().await;
-    state.throttle.consume(&account_id, "any", 1.0e9, 1.0e9);
     let long = "a".repeat(256);
     let other_region = format!("arn:aws:dynamodb:eu-west-1:{account_id}:table/absent");
-    let refused = |name: &str, constraint: &str| {
-        format!(
-            "1 validation error detected: Value '{name}' at 'tableName' failed to satisfy \
-             constraint: {constraint}"
-        )
-    };
-    let cases = [
-        (
-            "bad name!",
-            Some(refused(
-                "bad name!",
-                "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+",
-            )),
-        ),
-        (
-            "ab",
-            Some(refused(
-                "ab",
-                "Member must have length greater than or equal to 3",
-            )),
-        ),
-        (
-            long.as_str(),
-            Some(refused(
-                &long,
-                "Member must have length less than or equal to 255",
-            )),
-        ),
-        ("", None),
-        (other_region.as_str(), None),
-    ];
-    for (name, message) in &cases {
-        for (operation, request) in [
-            (
-                "GetItem",
-                json!({"TableName": name, "Key": {"pk": {"S": "k"}}}),
-            ),
-            ("PutItem", json!({"TableName": name, "Item": item(16)})),
-        ] {
-            let (status, body) = call(&state, operation, request).await;
-            assert_eq!(status, 400, "{operation} {name:?}: {body}");
-            assert_eq!(
-                body["__type"], "com.amazon.coral.validate#ValidationException",
-                "{operation} {name:?}: {body}"
-            );
-            assert!(
-                body.get("ThrottlingReasons").is_none(),
-                "{operation} {name:?}: {body}"
-            );
-            if let Some(message) = message {
-                assert_eq!(body["message"], message.as_str(), "{operation} {name:?}");
-            }
-        }
+    let mut requests = Vec::new();
+    for name in ["bad name!", "ab", "", long.as_str(), other_region.as_str()] {
+        requests.push((
+            "GetItem",
+            json!({"TableName": name, "Key": {"pk": {"S": "k"}}}),
+        ));
+        requests.push(("PutItem", json!({"TableName": name, "Item": item(16)})));
     }
-    // The eight requests the throttle segment refuses are counted as the
-    // engine's refusals were: one request and one user error each. The gate
-    // records neither for `bad name!`.
-    let count = |metric| {
-        state
-            .metrics
-            .query(&extenddb_core::metrics::MetricsQuery {
-                metric: Some(metric),
-                window: Some(extenddb_core::metrics::TimeWindow::AllTime),
-                ..Default::default()
-            })
-            .iter()
-            .map(|s| s.count)
-            .sum::<u64>()
-    };
-    assert_eq!(count(extenddb_core::metrics::MetricName::RequestCount), 8);
-    assert_eq!(count(extenddb_core::metrics::MetricName::UserErrors), 8);
+    let mut with_capacity = Vec::new();
+    for (operation, request) in &requests {
+        with_capacity.push(call(&state, operation, request.clone()).await);
+    }
+    state.throttle.consume(&account_id, "any", 1.0e9, 1.0e9);
+    for ((operation, request), before) in requests.iter().zip(&with_capacity) {
+        let drained = call(&state, operation, request.clone()).await;
+        assert_eq!(&drained, before, "{operation} {request}");
+        assert_eq!(drained.0, 400, "{operation} {request}");
+        assert!(
+            drained.1.get("ThrottlingReasons").is_none(),
+            "{operation} {request}"
+        );
+    }
 }
 
 /// With capacity available the same requests succeed, so the refusals above
