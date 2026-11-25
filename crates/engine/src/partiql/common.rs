@@ -516,10 +516,10 @@ impl StatementError {
                 include_table_name: true,
                 item: None,
             },
-            // Everything else a well-formed statement can raise per-statement is
-            // a validation error (partial key, bad value, key-type mismatch).
+            // Every other error keeps its class as the code the API Reference
+            // lists for a batch statement's error (see `batch_code`).
             other => Self {
-                code: "ValidationError",
+                code: batch_code(other),
                 message: other.message().to_owned(),
                 include_table_name: false,
                 item: None,
@@ -570,6 +570,32 @@ impl StatementError {
             entry.insert("TableName".to_owned(), Value::String(table.to_owned()));
         }
         Value::Object(entry)
+    }
+}
+
+/// The `Code` of a batch statement's error for an error that
+/// [`StatementError::from_error`] has no arm of its own for: the code the API
+/// Reference lists for its class (`BatchStatementError`), so a throttle, a
+/// conflict or a fault that a backend reports for one statement keeps its
+/// class. Any other class is a validation error: the failures a well-formed
+/// statement raises on its own (partial key, bad value, key-type mismatch).
+/// The list has no code for `ServiceUnavailable`, which gets
+/// `InternalServerError`, the listed code of a fault of the server.
+fn batch_code(err: &DynamoDbError) -> &'static str {
+    match err {
+        DynamoDbError::ProvisionedThroughputExceededException { .. } => {
+            "ProvisionedThroughputExceeded"
+        }
+        DynamoDbError::ThrottlingException { .. } => "ThrottlingError",
+        DynamoDbError::RequestLimitExceeded { .. } => "RequestLimitExceeded",
+        DynamoDbError::TransactionConflictException { .. } => "TransactionConflict",
+        DynamoDbError::ItemCollectionSizeLimitExceededException { .. } => {
+            "ItemCollectionSizeLimitExceeded"
+        }
+        DynamoDbError::InternalServerError { .. } | DynamoDbError::ServiceUnavailable { .. } => {
+            "InternalServerError"
+        }
+        _ => "ValidationError",
     }
 }
 
