@@ -270,10 +270,9 @@ jobs:
   # per run. Both start servers of their own (the store configuration suite
   # on a catalog database it creates per test, the job suite on deployments
   # of its own), so they need the binary, the PostgreSQL service and moto,
-  # not the shards' server. run-tests' main suite excludes them. Its CLI
-  # lifecycle list still runs the store configuration suite's PostgreSQL
-  # cells on one shard, without moto. run-integration-sqlite-s3 runs the two
-  # files on the SQLite build.
+  # not the shards' server. run-tests' main suite excludes them, and under
+  # --shard so does its CLI lifecycle list. run-integration-sqlite-s3 runs
+  # the two files on the SQLite build.
   run-integration-backup:
     runs-on: extenddb_ubuntu-2404_4-core
     # On main's 25 Integration push runs of 18 to 25 Nov 2026, the suites
