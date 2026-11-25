@@ -448,7 +448,8 @@ pub fn server_canonical_request(wire: &Wire) -> String {
     let value = wire
         .value("authorization")
         .expect("an authorization header");
-    let parsed = parse::parse_authorization(value).expect("the server parses the header");
+    let parsed =
+        parse::parse_authorization(value.as_bytes(), true).expect("the server parses the header");
     canonical::canonical_request(
         "POST",
         "/",
@@ -512,8 +513,9 @@ pub const INVALID_TOKEN: &str = "The security token included in the request is i
 /// `INVALID_TOKEN`, so a test that expects either message compares the whole
 /// message, with `Message::Exact`.
 pub const WRONG_TOKEN: &str = "The security token included in the request is invalid";
-/// `X-Amz-Date` is missing.
-pub const MISSING_DATE: &str = "Authorization header requires existence of 'X-Amz-Date' header";
+/// `X-Amz-Date` is missing, and the request carries no `Date` header.
+pub const MISSING_DATE: &str =
+    "Authorization header requires existence of either a 'X-Amz-Date' or a 'Date' header.";
 
 /// How a test compares the message the server refused with against the one
 /// it expects.

@@ -17,9 +17,11 @@ REQ-TEST-001, REQ-AUTH-001
 from __future__ import annotations
 
 import base64
+import email.utils
 import hashlib
 import json
 import os
+import time
 from typing import Any
 from urllib.parse import urlparse
 
@@ -259,9 +261,32 @@ def _env_credentials() -> tuple[str, str, str | None]:
 
 
 # The documentation's example key and a zero signature.
+_ALG = "AWS4-HMAC-SHA256"
 _CRED = "Credential=AKIAIOSFODNN7EXAMPLE/20261120/us-east-1/dynamodb/aws4_request"
 _SH = "SignedHeaders=host;x-amz-target"
 _SIG = "Signature=" + "0" * 64
+
+# The service's texts for a malformed Authorization header. {hash} is the
+# Base64 of the SHA-256 of the value without the spaces and tabs at its ends,
+# with each byte read as a Latin-1 character. {header} is that value.
+_PAIR = (
+    "Invalid key=value pair ({}) in Authorization header "
+    "(hashed with SHA-256 and encoded with Base64): '{{hash}}'."
+)
+_EQ = _PAIR.format("missing equal-sign")
+_KEY = _PAIR.format("missing key")
+_CASE = "Algorithm must start with 'AWS4-'; got '{header}'"
+_UNSUPPORTED = "Unsupported AWS 'algorithm': '{}'. "
+
+
+def _missing(*names: str, date: bool = False) -> str:
+    """The service's text for missing parameters and a missing date header."""
+    sentences = [f"Authorization header requires '{name}' parameter." for name in names]
+    if date:
+        sentences.append(
+            "Authorization header requires existence of either a 'X-Amz-Date' or a 'Date' header."
+        )
+    return " ".join(sentences) + " (Hashed with SHA-256 and encoded with Base64) Authorization={hash}"
 
 
 class TestRequestChecks:
@@ -471,48 +496,126 @@ class TestRequestChecks:
         if self.endpoint_url is not None:
             assert text == "400 Bad Request", text[:200]
 
-    @pytest.mark.parametrize(
-        "pairs,same_text",
-        [
-            ("garbage", True),
-            (f"garbage, {_CRED}, {_SH}, {_SIG}", True),
-            (f"{_CRED}, {_SH}, {_SIG}, garbage", True),
-            (f"{_CRED}, garbage, {_SIG}", True),
-            ("Credential", True),
-            ("=x", False),
-            ("Foo=bar", False),
-        ],
-        ids=["alone", "first", "last", "middle", "key-only", "no-key", "unknown-key"],
-    )
-    def test_authorization_part_without_equal_sign(self, pairs, same_text):
-        # Measured against the service on 2026-11-20: a part with no '=' gets
-        # this text wherever it sits, before any missing parameter is named.
-        header = f"AWS4-HMAC-SHA256 {pairs}"
+    def _describe(self, authorization: str | None, date: str | None) -> tuple[int, dict]:
+        """Send a DescribeTable of a table that does not exist.
+
+        ``authorization`` goes out one byte per character, and None sends no
+        Authorization header. ``date`` names a date header to send with the
+        current time: "X-Amz-Date", "Date" or None.
+        """
         u = urlparse(self.url)
+        headers = [
+            ("Host", u.netloc),
+            ("X-Amz-Target", "DynamoDB_20120810.DescribeTable"),
+            ("Content-Type", "application/x-amz-json-1.0"),
+        ]
+        if date == "X-Amz-Date":
+            headers.append((date, time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())))
+        elif date == "Date":
+            headers.append((date, email.utils.formatdate(usegmt=True)))
+        if authorization is not None:
+            headers.append(("Authorization", authorization))
         status, text, _ = self._raw_request(
-            "POST",
-            "/",
-            [
-                ("Host", u.netloc),
-                ("X-Amz-Target", "DynamoDB_20120810.DescribeTable"),
-                ("Content-Type", "application/x-amz-json-1.0"),
-                ("Authorization", header),
-            ],
-            body=b'{"TableName": "no-such-table"}',
+            "POST", "/", headers, body=b'{"TableName": "no-such-table"}'
         )
-        assert status == 400, (status, text[:300])
-        payload = json.loads(text)
-        assert payload["__type"].endswith("#IncompleteSignatureException"), text
-        if not same_text:
-            # Every part holds '=' here, and the service and extenddb answer
-            # with different texts, so only the type is checked.
-            assert not payload["message"].startswith("Invalid key=value pair (missing equal-sign)"), text
-            return
-        digest = base64.b64encode(hashlib.sha256(header.encode()).digest()).decode()
-        assert payload["message"] == (
-            "Invalid key=value pair (missing equal-sign) in Authorization header "
-            f"(hashed with SHA-256 and encoded with Base64): '{digest}'."
-        ), text
+        return status, json.loads(text)
+
+    @pytest.mark.parametrize(
+        "date,header,want",
+        [
+            pytest.param(None, f"{_ALG} garbage", _EQ, id="no-equal-sign"),
+            pytest.param(None, f"{_ALG} garbage, {_CRED}, {_SH}, {_SIG}", _EQ, id="no-equal-sign-first"),
+            pytest.param(None, f"{_ALG} {_CRED}, {_SH}, {_SIG}, garbage", _EQ, id="no-equal-sign-last"),
+            pytest.param(None, f"{_ALG} {_CRED}, garbage, {_SIG}", _EQ, id="no-equal-sign-middle"),
+            pytest.param(None, f"{_ALG} Credential", _EQ, id="key-only"),
+            pytest.param(None, f"{_ALG}\tgarbage", _EQ, id="tab-after-algorithm"),
+            pytest.param(None, f"{_ALG} garbag\u00c3\u00a9", _EQ, id="utf-8-bytes"),
+            pytest.param(None, f"{_ALG} garbag\u00e9", _EQ, id="latin-1-byte"),
+            pytest.param(None, f"{_ALG} =x", _KEY, id="no-key"),
+            pytest.param("X-Amz-Date", f"{_ALG} =x", _KEY, id="no-key-with-date"),
+            pytest.param(None, _ALG, _missing("Credential", "Signature", "SignedHeaders", date=True),
+                         id="algorithm-only"),
+            pytest.param(None, f"{_ALG} ", _missing("Credential", "Signature", "SignedHeaders", date=True),
+                         id="algorithm-and-space"),
+            pytest.param(None, f"{_ALG} Foo=bar", _missing("Credential", "Signature", "SignedHeaders", date=True),
+                         id="unknown-key"),
+            pytest.param(None, f"{_ALG} {_CRED}, {_SH}", _missing("Signature", date=True), id="no-signature"),
+            pytest.param(None, f"{_ALG} {_SH}, {_SIG}", _missing("Credential", date=True), id="no-credential"),
+            pytest.param(None, f"{_ALG} {_CRED}, {_SIG}", _missing("SignedHeaders", date=True),
+                         id="no-signed-headers"),
+            pytest.param(None, f"{_ALG} {_CRED},{_SH},{_SIG}", _missing(date=True), id="no-date"),
+            pytest.param(None, f"{_ALG} {_CRED}, {_SH}, {_SIG}, ", _missing(date=True), id="no-date-trailing-comma"),
+            pytest.param(None, f"{_ALG} {_CRED} {_SH} {_SIG}", _missing(date=True), id="no-date-split-by-spaces"),
+            pytest.param(None, f"{_ALG} Credential=x, {_SH}, {_SIG}", _missing(date=True),
+                         id="no-date-bad-credential"),
+            pytest.param("X-Amz-Date", _ALG, _missing("Credential", "Signature", "SignedHeaders"),
+                         id="algorithm-only-with-date"),
+            pytest.param("X-Amz-Date", f"{_ALG} Foo=bar", _missing("Credential", "Signature", "SignedHeaders"),
+                         id="unknown-key-with-date"),
+            pytest.param("X-Amz-Date", f"{_ALG} {_CRED}, {_SH}", _missing("Signature"),
+                         id="no-signature-with-date"),
+            pytest.param("X-Amz-Date", f"{_ALG} {_SH}, {_SIG}", _missing("Credential"),
+                         id="no-credential-with-date"),
+            pytest.param("X-Amz-Date", f"{_ALG} {_CRED}, {_SIG}", _missing("SignedHeaders"),
+                         id="no-signed-headers-with-date"),
+            pytest.param("Date", f"{_ALG} {_CRED}, {_SH}", _missing("Signature"), id="no-signature-with-http-date"),
+            pytest.param(
+                "X-Amz-Date",
+                f"{_ALG} Credential=x, {_SH}, {_SIG}",
+                "Credential must have exactly 5 slash-delimited elements, "
+                "e.g. keyid/date/region/service/term, got 'x'",
+                id="bad-credential-with-date",
+            ),
+            pytest.param("X-Amz-Date", f"AWS4-HMAC-SHA512 {_CRED}, {_SH}, {_SIG}",
+                         _UNSUPPORTED.format("AWS4-HMAC-SHA512"), id="other-algorithm"),
+            pytest.param("X-Amz-Date", f"{_ALG}X {_CRED}, {_SH}, {_SIG}", _UNSUPPORTED.format(f"{_ALG}X"),
+                         id="algorithm-with-suffix"),
+            pytest.param("X-Amz-Date", "AWS4-X garbage", _EQ, id="no-equal-sign-other-algorithm"),
+            pytest.param(None, "AWS4-X", _missing("Credential", "Signature", "SignedHeaders", date=True),
+                         id="other-algorithm-only"),
+            pytest.param(None, f"AWS4-HMAC-SHA512 {_CRED}, {_SH}, {_SIG}", _missing(date=True),
+                         id="no-date-other-algorithm"),
+            pytest.param("X-Amz-Date", "aws4-x garbage", _CASE, id="lowercase-prefix-no-equal-sign"),
+            pytest.param("X-Amz-Date", "aws4-hmac-sha256", _CASE, id="lowercase-algorithm-only"),
+            pytest.param("X-Amz-Date", "bearer abc", _EQ, id="lowercase-bearer-no-equal-sign"),
+            pytest.param(None, "Bearer a=b", _missing("Credential", "Signature", "SignedHeaders", date=True),
+                         id="bearer-unknown-key"),
+            pytest.param(None, f"Bearer {_CRED}, {_SH}, {_SIG}", _missing(date=True), id="bearer-no-date"),
+        ],
+    )
+    def test_malformed_authorization_header(self, date, header, want):
+        # Measured against the service on 2026-11-20 and 2026-11-21. AWS4- in
+        # another case is refused first. A part with no '=' or no key is named
+        # before any missing parameter. Every missing parameter and a missing
+        # date header are named in one message. Another algorithm comes last.
+        status, payload = self._describe(header, date)
+        assert status == 400, (status, payload)
+        assert payload["__type"].endswith("#IncompleteSignatureException"), payload
+        value = header.strip(" \t")
+        digest = base64.b64encode(hashlib.sha256(value.encode()).digest()).decode()
+        assert payload["message"] == want.format(hash=digest, header=value), payload
+
+    @pytest.mark.parametrize(
+        "date,header,reference",
+        [
+            pytest.param(None, "garbage", None, id="no-algorithm"),
+            pytest.param("X-Amz-Date", "garbage", None, id="no-algorithm-with-date"),
+            pytest.param(None, "", None, id="empty-value"),
+            pytest.param(None, "   ", None, id="spaces-only"),
+            pytest.param("X-Amz-Date", f"AWS4 {_CRED}, {_SH}, {_SIG}", None, id="aws4-without-dash"),
+            pytest.param("X-Amz-Date", "Bearer", None, id="bearer-alone"),
+            pytest.param("X-Amz-Date", "Bearer\tabc", None, id="bearer-and-tab"),
+            pytest.param("X-Amz-Date", "Basic abc", None, id="basic"),
+            pytest.param("X-Amz-Date", f"{_ALG} {_CRED} {_SH} {_SIG}", f"{_ALG} {_CRED}, {_SH}, {_SIG}",
+                         id="split-by-spaces-with-date"),
+        ],
+    )
+    def test_authorization_answered_as_another(self, date, header, reference):
+        # Measured against the service on 2026-11-21: a value that starts with
+        # neither AWS4- nor "Bearer ", ignoring ASCII case, gets the answer to a
+        # request with no Authorization header. Pairs split by spaces get the
+        # answer to the same pairs split by commas.
+        assert self._describe(header, date) == self._describe(reference, date)
 
     def test_session_token_with_a_long_term_key_is_rejected(self):
         _, _, env_token = _env_credentials()
