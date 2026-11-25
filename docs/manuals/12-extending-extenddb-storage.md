@@ -427,6 +427,14 @@ session signs in as it, and a membership puts it in a group. So:
 checks these properties against a real database; each backend's test suite
 runs it.
 
+### Request Correlation
+
+The server sets `extenddb_storage::request_scope::RequestScope` around each client request, from authentication through dispatch. It holds the request id the client receives in `x-amzn-RequestId`, the operation name from `X-Amz-Target`, and the `amz-sdk-invocation-id` and `amz-sdk-request` headers when the client sent them. A backend method running inline on the request task reads it with `request_scope::current()` (a clone) or `request_scope::with_current(|s| ...)` (a borrow). Put `s.request_id` on a log line the backend writes for a failure it is about to return as `StorageError::Internal`, `Connection` or `Transient`, so an operator can match the line to the client's request id.
+
+The scope is a Tokio task-local. Both accessors return `None` in a task started with `tokio::spawn` or `spawn_blocking`, in background workers and in tests. A backend does not keep the scope beyond the call that read it. A backend that spawns a task on behalf of a request and wants that task's lines correlated reads `current()` before the spawn and runs the task's future through `request_scope::with_scope_opt`. The two SDK fields are header values the client chose, each at most 256 bytes of printable ASCII (space through tilde) or tab, which cannot hold a line break; treat them as untrusted text and do not use them in a query, a key or a file name.
+
+Construct a scope only through `RequestScope::new` and `with_sdk_headers`; the struct is `#[non_exhaustive]` and may gain fields in a minor release. The engine's own fault lines carry `request_id` and `operation`: `storage internal error` and `backup storage error`, the `storage connection error` and `transient storage error` lines of the shared error mapper, the line for a backup store read that fails during a restore, DeleteBackup's line for a catalog id that cannot be read, and the BatchWriteItem line for the requests a batch did not apply. A backend that returns `Internal`, `Connection` or `Transient` without logging gets one correlated line, except where the engine answers from a task without the scope: a store-backed CreateBackup, and the registration of RestoreTableFromBackup.
+
 ## PostgreSQL-isms in the Default Backend
 
 The PostgreSQL implementation makes backend-specific choices. These are implementation details inside `storage-postgres`, not leaks in the trait abstraction:

@@ -58,7 +58,7 @@ fn source_arn() -> String {
 // --- double -----------------------------------------------------------------
 
 #[derive(Default)]
-struct Fake {
+pub(crate) struct Fake {
     /// Cancelled by `list_dead_restore_jobs`: a token that fires in the
     /// middle of a cycle, after its store check.
     cancel_on_list_dead: Mutex<Option<extenddb_storage::CancellationToken>>,
@@ -67,7 +67,7 @@ struct Fake {
     summaries: Mutex<Vec<BackupSummary>>,
     restore_error: Mutex<Option<StorageError>>,
     /// Returned (once) by `restore_source` instead of the stored source.
-    source_error: Mutex<Option<StorageError>>,
+    pub(crate) source_error: Mutex<Option<StorageError>>,
     restores: Mutex<Vec<RestoreRequest>>,
     /// The permits the legacy restore and create were handed, held as the
     /// backend would hold them for the job's life.
@@ -1013,7 +1013,7 @@ fn unused<T: Send + 'static>() -> BoxedFuture<'static, Result<T, StorageError>> 
 }
 
 /// The runtime the tests run with: four slots, no configured store.
-fn runtime() -> BackupRuntime {
+pub(crate) fn runtime() -> BackupRuntime {
     BackupRuntime::new(4)
 }
 
@@ -1824,6 +1824,35 @@ fn runtime_on(mem: &Arc<MemStore>, identity: StoreIdentity) -> BackupRuntime {
         None,
         Ok(identity),
     ))
+}
+
+/// A `RestoreTableFromBackup` whose backup row is AVAILABLE on the configured
+/// store, and whose store refuses every read under the backup's prefix: the
+/// request's read of the manifest's sidecar fails. The catalog, the runtime
+/// and the request body.
+pub(crate) fn restore_from_an_unreadable_store() -> (Arc<Fake>, BackupRuntime, Value) {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let arn = arn(ACCOUNT);
+    seed_rows(&fake, &[row(&arn, BackupStatus::Available)]);
+    *mem.fail_gets_under.lock().unwrap() = Some(prefix_of(&arn));
+    (fake, runtime, restore_body(json!({})))
+}
+
+/// A `DeleteBackup` of a backup whose row is AVAILABLE on the configured
+/// store, run against a catalog whose id cannot be read, so the deletion
+/// fence fails before the DELETING write: the client's error.
+pub(crate) async fn delete_backup_with_an_unreadable_catalog() -> DynamoDbError {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let arn = arn(ACCOUNT);
+    seed_rows(&fake, &[row(&arn, BackupStatus::Available)]);
+    *fake.catalog_id_error.lock().unwrap() = true;
+    delete_backup(&*fake, &runtime, ACCOUNT, REGION, &own(&arn))
+        .await
+        .unwrap_err()
 }
 
 /// A runtime whose configured store (`store()`'s kind and root) failed its

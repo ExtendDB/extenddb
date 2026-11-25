@@ -546,7 +546,7 @@ pub(crate) fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
         StorageError::TableNotFound(name) => DynamoDbError::ResourceNotFoundException(name),
         StorageError::Service(e) => crate::create_table::service_err_to_dynamo(e),
         other => {
-            tracing::error!(internal_error = %other, "storage internal error");
+            log_storage_fault!(other, "storage internal error");
             DynamoDbError::InternalServerError("Internal server error".to_owned())
         }
     }

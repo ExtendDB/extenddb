@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Main `DynamoDB` request handler with per-segment latency instrumentation.
-//!
-//! Extracted from `lib.rs` to keep both files under the 500-line limit.
 
 use std::sync::Arc;
 
@@ -97,12 +95,217 @@ pub(crate) async fn handle_request(
         Err(e) => return error_response(&e, &request_id),
     };
 
-    // --- Auth segment ---
-    let auth_start = std::time::Instant::now();
-    let identity = match state.auth.authenticate(&headers, &body).await {
-        Ok(id) => id,
+    // --- Authentication through dispatch, inside the request scope ---
+    // The scope carries the request id and operation (and the two SDK
+    // correlation headers when the client sent them) to every storage read
+    // the request makes and to the engine's error mappers, so a fault log line
+    // can name the x-amzn-RequestId the client received. The early returns
+    // above touch no storage and the response building below runs outside it.
+    let Served {
+        account_id,
+        table_name,
+        metric_table,
+        partition_value,
+        batch_entries,
+        dispatch_result,
+        auth_us,
+        authz_us,
+        throttle_us,
+        dispatch_us,
+    } = match extenddb_storage::request_scope::with_scope(
+        request_scope_for(&request_id, &operation, &headers),
+        serve_request(
+            &state,
+            &headers,
+            &body,
+            peer_addr,
+            &request_id,
+            &operation,
+            request,
+        ),
+    )
+    .await
+    {
+        Ok(served) => served,
         Err(e) => return error_response(&e, &request_id),
     };
+
+    // --- Response segment ---
+    let response_start = std::time::Instant::now();
+    let mut succeeded = false;
+    let response = match dispatch_result {
+        Ok(result) => {
+            update_throttle_buckets(
+                &state.throttle,
+                &operation,
+                &account_id,
+                table_name.as_deref(),
+                &result.body,
+            );
+            // A batch a backend served partially is a throttle the server's own
+            // bucket never saw; count it so the metrics do not read as zero.
+            record_partial_batch_throttle(
+                &state.metrics,
+                &account_id,
+                &operation,
+                &result.metrics.throttled_tables,
+            );
+
+            let m = &result.metrics;
+            if let Some(ref tn) = metric_table {
+                if m.read_capacity_units > 0.0 {
+                    state.metrics.record(
+                        extenddb_core::metrics::MetricName::ConsumedReadCapacityUnits,
+                        m.read_capacity_units,
+                        Some(&account_id),
+                        Some(tn),
+                        m.index_name.as_deref(),
+                        Some(&operation),
+                    );
+                }
+                if m.write_capacity_units > 0.0 {
+                    state.metrics.record(
+                        extenddb_core::metrics::MetricName::ConsumedWriteCapacityUnits,
+                        m.write_capacity_units,
+                        Some(&account_id),
+                        Some(tn),
+                        m.index_name.as_deref(),
+                        Some(&operation),
+                    );
+                }
+                if m.returned_item_count > 0 {
+                    state.metrics.record_returned_items(
+                        &account_id,
+                        tn,
+                        &operation,
+                        m.returned_item_count,
+                    );
+                }
+                if m.returned_bytes > 0 {
+                    state.metrics.record_returned_bytes(
+                        &account_id,
+                        tn,
+                        &operation,
+                        m.returned_bytes,
+                    );
+                }
+            }
+            // Throttle buckets stay keyed by the name the request sent, which
+            // is the name they were registered under above.
+            if let Some(ref tn) = table_name {
+                state.throttle.consume_with_partition(
+                    &account_id,
+                    tn,
+                    m.read_capacity_units,
+                    m.write_capacity_units,
+                    partition_value.as_deref(),
+                );
+            }
+
+            succeeded = true;
+            success_response(&result.body, &request_id)
+        }
+        Err(e) => {
+            record_error_metrics(
+                &state.metrics,
+                &e,
+                &account_id,
+                metric_table.as_deref(),
+                &operation,
+            );
+            // A throttle error from a batch is the engine's answer to a batch
+            // whose every entry a backend throttled: each entry is a throttle
+            // event, as on a 200. A throttle the backend reports on the catalog
+            // read also comes out as the batch's throttle error and counts every
+            // entry; the service has no such failure.
+            if e.is_throttle()
+                && let Some(entries) = &batch_entries
+            {
+                record_partial_batch_throttle(&state.metrics, &account_id, &operation, entries);
+            }
+            error_response(&e, &request_id)
+        }
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let response_us = response_start.elapsed().as_micros() as f64;
+
+    // Record per-segment latency breakdown and total latency.
+    #[allow(clippy::cast_precision_loss)]
+    let total_us = handler_start.elapsed().as_micros() as f64;
+    // `SuccessfulRequestLatency` counts successful requests only, as
+    // CloudWatch's does.
+    if succeeded {
+        state
+            .metrics
+            .record_latency(&account_id, metric_table.as_deref(), &operation, total_us);
+    }
+    state.metrics.record_request_count(&account_id, &operation);
+    state.metrics.record_segments(
+        &account_id,
+        &operation,
+        metric_table.as_deref(),
+        extenddb_core::metrics::LatencySegments {
+            auth_us,
+            authz_us,
+            throttle_us,
+            dispatch_us,
+            response_us,
+            total_us,
+        },
+    );
+
+    // P79: Request-level trace logging.
+    tracing::debug!(
+        request_id = %request_id,
+        operation = %operation,
+        table = table_name.as_deref().unwrap_or("-"),
+        auth_us = auth_us,
+        authz_us = authz_us,
+        throttle_us = throttle_us,
+        dispatch_us = dispatch_us,
+        response_us = response_us,
+        total_us = total_us,
+        "request complete"
+    );
+
+    response
+}
+
+/// What the request produced between authentication and the end of dispatch:
+/// the dispatch result and what the response segment needs to account for it.
+struct Served {
+    account_id: Arc<str>,
+    table_name: Option<String>,
+    metric_table: Option<String>,
+    partition_value: Option<String>,
+    /// The entries of a batch by table, for the throttle events of a batch
+    /// whose every entry a backend throttled; `None` for any other request.
+    batch_entries: Option<std::collections::BTreeMap<String, u32>>,
+    dispatch_result: Result<extenddb_engine::DispatchResult, DynamoDbError>,
+    auth_us: f64,
+    authz_us: f64,
+    throttle_us: f64,
+    dispatch_us: f64,
+}
+
+/// Authenticate, authorize, throttle and dispatch one request. Every storage
+/// read the request makes happens here, so `handle_request` runs this whole
+/// future inside the request scope. A refusal before dispatch returns `Err`;
+/// a dispatch error is inside `Served::dispatch_result`, because the response
+/// segment accounts for it differently.
+#[allow(clippy::too_many_lines)] // sequential request pipeline
+async fn serve_request(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    body: &Bytes,
+    peer_addr: std::net::SocketAddr,
+    request_id: &str,
+    operation: &str,
+    request: extenddb_engine::ParsedRequest<'_>,
+) -> Result<Served, DynamoDbError> {
+    // --- Auth segment ---
+    let auth_start = std::time::Instant::now();
+    let identity = state.auth.authenticate(headers, body).await?;
     #[allow(clippy::cast_precision_loss)]
     let auth_us = auth_start.elapsed().as_micros() as f64;
 
@@ -126,9 +329,9 @@ pub(crate) async fn handle_request(
                 principal = crate::authz_resource::cross_account::principal_arn(&identity),
                 "Point-in-time recovery refused"
             );
-            record_error_metrics(&state.metrics, &e, &account_id, None, &operation);
-            state.metrics.record_request_count(&account_id, &operation);
-            return error_response(&e, &request_id);
+            record_error_metrics(&state.metrics, &e, &account_id, None, operation);
+            state.metrics.record_request_count(&account_id, operation);
+            return Err(e);
         }
     };
 
@@ -139,12 +342,9 @@ pub(crate) async fn handle_request(
     {
         if state.catalog_store.is_none() {
             tracing::error!("Authorization required but catalog_store is not configured");
-            return error_response(
-                &DynamoDbError::AccessDeniedException(
-                    "User: is not authorized to perform this operation".to_owned(),
-                ),
-                &request_id,
-            );
+            return Err(DynamoDbError::AccessDeniedException(
+                "User: is not authorized to perform this operation".to_owned(),
+            ));
         }
         // aws:SourceIp is the connection peer address; aws:UserAgent is the
         // User-Agent header. Behind a proxy only the peer address is trusted,
@@ -154,23 +354,19 @@ pub(crate) async fn handle_request(
             .get("user-agent")
             .and_then(|v| v.to_str().ok())
             .map(ToOwned::to_owned);
-        match authorize_request(
-            &state,
+        authorized_key_info = authorize_request(
+            state,
             &identity,
             &input,
-            &operation,
+            operation,
             &account_id,
             Some(source_ip.as_str()),
             user_agent.as_deref(),
         )
-        .await
-        {
-            Ok(ki) => authorized_key_info = ki,
-            Err(e) => return error_response(&e, &request_id),
-        }
+        .await?;
         // The engine authorizes each PartiQL statement through it.
         item_authorizer =
-            crate::item_authz::for_request(&state, identity, &account_id, source_ip, user_agent);
+            crate::item_authz::for_request(state, identity, &account_id, source_ip, user_agent);
     }
     #[allow(clippy::cast_precision_loss)]
     let authz_us = authz_start.elapsed().as_micros() as f64;
@@ -197,12 +393,12 @@ pub(crate) async fn handle_request(
     // when the operation acts on the table it names and the name passes the
     // table name rules, with a table ARN reduced to its name. See
     // `metric_table_name`.
-    let metric_table = metric_table_name(&operation, &input, &state.limits);
+    let metric_table = metric_table_name(operation, &input, &state.limits);
 
     // --- Throttle segment ---
     let throttle_start = std::time::Instant::now();
-    let (is_read_op, is_write_op) = classify_data_operation(&operation);
-    let partition_value = extract_partition_value(&input, &operation);
+    let (is_read_op, is_write_op) = classify_data_operation(operation);
+    let partition_value = extract_partition_value(&input, operation);
     // A name the table name rules refuse (length or pattern), and the ARN of
     // a table in another Region, are not throttled: the engine answers them
     // as it does with capacity left. The service refuses such a name before
@@ -255,7 +451,7 @@ pub(crate) async fn handle_request(
                 Some(&ctx.account_id),
                 metric_table.as_deref(),
                 None,
-                Some(&operation),
+                Some(operation),
             );
             state.metrics.record(
                 extenddb_core::metrics::MetricName::ThrottledRequests,
@@ -263,7 +459,7 @@ pub(crate) async fn handle_request(
                 Some(&ctx.account_id),
                 metric_table.as_deref(),
                 None,
-                Some(&operation),
+                Some(operation),
             );
             // The service names the throttled resource and the limit on a
             // throttle: one reason with the table ARN, the same string
@@ -272,10 +468,7 @@ pub(crate) async fn handle_request(
             // billing mode.
             let table_arn =
                 extenddb_storage::util::table_arn(&state.region, &ctx.account_id, &name);
-            return error_response(
-                &throttle_error(cause, throttled_read, &table_arn),
-                &request_id,
-            );
+            return Err(throttle_error(cause, throttled_read, &table_arn));
         }
     }
     #[allow(clippy::cast_precision_loss)]
@@ -285,14 +478,14 @@ pub(crate) async fn handle_request(
     // The entries of a batch, for the throttle events of a batch whose every
     // entry a backend throttled: the engine answers that one with the error
     // alone (`input` moves into the dispatch).
-    let batch_entries = batch_entry_counts(&operation, &input);
+    let batch_entries = batch_entry_counts(operation, &input);
     let dispatch_start = std::time::Instant::now();
     let dispatch_result =
-        extenddb_engine::dispatch(&operation, input, &ctx, &state.server_addr).await;
+        extenddb_engine::dispatch(operation, input, &ctx, &state.server_addr).await;
     #[allow(clippy::cast_precision_loss)]
     let dispatch_us = dispatch_start.elapsed().as_micros() as f64;
     // P120c: Record storage query metrics for the request's dispatch phase.
-    let category = match operation.as_str() {
+    let category = match operation {
         "CreateTable"
         | "DeleteTable"
         | "DescribeTable"
@@ -316,151 +509,55 @@ pub(crate) async fn handle_request(
         dispatch_us,
     );
 
-    // --- Response segment ---
-    let response_start = std::time::Instant::now();
-    let mut succeeded = false;
-    let response = match dispatch_result {
-        Ok(result) => {
-            update_throttle_buckets(
-                &state.throttle,
-                &operation,
-                &ctx.account_id,
-                table_name.as_deref(),
-                &result.body,
-            );
-            // A batch a backend served partially is a throttle the server's own
-            // bucket never saw; count it so the metrics do not read as zero.
-            record_partial_batch_throttle(
-                &state.metrics,
-                &ctx.account_id,
-                &operation,
-                &result.metrics.throttled_tables,
-            );
-
-            let m = &result.metrics;
-            if let Some(ref tn) = metric_table {
-                if m.read_capacity_units > 0.0 {
-                    state.metrics.record(
-                        extenddb_core::metrics::MetricName::ConsumedReadCapacityUnits,
-                        m.read_capacity_units,
-                        Some(&ctx.account_id),
-                        Some(tn),
-                        m.index_name.as_deref(),
-                        Some(&operation),
-                    );
-                }
-                if m.write_capacity_units > 0.0 {
-                    state.metrics.record(
-                        extenddb_core::metrics::MetricName::ConsumedWriteCapacityUnits,
-                        m.write_capacity_units,
-                        Some(&ctx.account_id),
-                        Some(tn),
-                        m.index_name.as_deref(),
-                        Some(&operation),
-                    );
-                }
-                if m.returned_item_count > 0 {
-                    state.metrics.record_returned_items(
-                        &ctx.account_id,
-                        tn,
-                        &operation,
-                        m.returned_item_count,
-                    );
-                }
-                if m.returned_bytes > 0 {
-                    state.metrics.record_returned_bytes(
-                        &ctx.account_id,
-                        tn,
-                        &operation,
-                        m.returned_bytes,
-                    );
-                }
-            }
-            // Throttle buckets stay keyed by the name the request sent, which
-            // is the name they were registered under above.
-            if let Some(ref tn) = table_name {
-                state.throttle.consume_with_partition(
-                    &ctx.account_id,
-                    tn,
-                    m.read_capacity_units,
-                    m.write_capacity_units,
-                    partition_value.as_deref(),
-                );
-            }
-
-            succeeded = true;
-            success_response(&result.body, &request_id)
-        }
-        Err(e) => {
-            record_error_metrics(
-                &state.metrics,
-                &e,
-                &ctx.account_id,
-                metric_table.as_deref(),
-                &operation,
-            );
-            // A throttle error from a batch is the engine's answer to a batch
-            // whose every entry a backend throttled: each entry is a throttle
-            // event, as on a 200. A throttle the backend reports on the catalog
-            // read also comes out as the batch's throttle error and counts every
-            // entry; the service has no such failure.
-            if e.is_throttle()
-                && let Some(entries) = &batch_entries
-            {
-                record_partial_batch_throttle(&state.metrics, &ctx.account_id, &operation, entries);
-            }
-            error_response(&e, &request_id)
-        }
-    };
-    #[allow(clippy::cast_precision_loss)]
-    let response_us = response_start.elapsed().as_micros() as f64;
-
-    // Record per-segment latency breakdown and total latency.
-    #[allow(clippy::cast_precision_loss)]
-    let total_us = handler_start.elapsed().as_micros() as f64;
-    // `SuccessfulRequestLatency` counts successful requests only, as
-    // CloudWatch's does.
-    if succeeded {
-        state.metrics.record_latency(
-            &ctx.account_id,
-            metric_table.as_deref(),
-            &operation,
-            total_us,
-        );
-    }
-    state
-        .metrics
-        .record_request_count(&ctx.account_id, &operation);
-    state.metrics.record_segments(
-        &ctx.account_id,
-        &operation,
-        metric_table.as_deref(),
-        extenddb_core::metrics::LatencySegments {
-            auth_us,
-            authz_us,
-            throttle_us,
-            dispatch_us,
-            response_us,
-            total_us,
-        },
-    );
-
-    // P79: Request-level trace logging.
-    tracing::debug!(
-        request_id = %request_id,
-        operation = %operation,
-        table = table_name.as_deref().unwrap_or("-"),
-        auth_us = auth_us,
-        authz_us = authz_us,
-        throttle_us = throttle_us,
-        dispatch_us = dispatch_us,
-        response_us = response_us,
-        total_us = total_us,
-        "request complete"
-    );
-
-    response
+    Ok(Served {
+        account_id: ctx.account_id,
+        table_name,
+        metric_table,
+        partition_value,
+        batch_entries,
+        dispatch_result,
+        auth_us,
+        authz_us,
+        throttle_us,
+        dispatch_us,
+    })
 }
 
+/// The scope the request runs inside from authentication through dispatch:
+/// the request id the response will carry in `x-amzn-RequestId`, the
+/// operation from `X-Amz-Target`, and the two SDK correlation headers when the
+/// client sent them. Cost: two `String` clones per request plus the header
+/// copies.
+fn request_scope_for(
+    request_id: &str,
+    operation: &str,
+    headers: &HeaderMap,
+) -> extenddb_storage::RequestScope {
+    extenddb_storage::RequestScope::new(request_id.to_owned(), operation.to_owned())
+        .with_sdk_headers(
+            header_string(headers, "amz-sdk-invocation-id"),
+            header_string(headers, "amz-sdk-request"),
+        )
+}
+
+/// The longest SDK correlation header value the scope carries. The SDKs send
+/// a UUID and a short attempt counter; a longer value is read as absent, so a
+/// client cannot place arbitrary text of any length in a backend's log line.
+const MAX_SDK_HEADER_LEN: usize = 256;
+
+/// The value of header `name` as an owned string, or `None` when the header is
+/// absent, holds a byte outside printable ASCII (space through tilde) and tab,
+/// or is longer than [`MAX_SDK_HEADER_LEN`]. A header value cannot hold CR or
+/// LF, so a value that reads as present cannot split a log line.
+fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| s.len() <= MAX_SDK_HEADER_LEN)
+        .map(str::to_owned)
+}
+
+#[cfg(test)]
+mod request_scope_tests;
 #[cfg(test)]
 mod throttle_wire_tests;

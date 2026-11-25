@@ -578,7 +578,7 @@ pub(crate) fn storage_err_to_dynamo(e: StorageError) -> DynamoDbError {
         StorageError::BackupInUse(msg) => DynamoDbError::BackupInUseException(msg),
         StorageError::Service(e) => crate::create_table::service_err_to_dynamo(e),
         other => {
-            tracing::error!(internal_error = %other, "backup storage error");
+            log_storage_fault!(other, "backup storage error");
             DynamoDbError::InternalServerError("Internal server error".to_owned())
         }
     }

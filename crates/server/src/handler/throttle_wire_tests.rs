@@ -56,15 +56,23 @@ fn cache_cfg(name: &'static str) -> extenddb_cache::SwrCacheConfig {
 /// catalog, the stub auth bound to the default account, throttling on, and
 /// `dev_mode` on. Returns the state and the account id the stub answers with,
 /// so the expected ARN can be formed.
-async fn build_state() -> (Arc<AppState>, String) {
-    build_state_on(None).await
+pub(super) async fn build_state() -> (Arc<AppState>, String) {
+    build_state_with(None, stub_auth).await
+}
+
+/// The stub auth provider bound to `account_id`: `build_state`'s provider,
+/// and the one for a test that replaces the storage but not the auth.
+pub(super) fn stub_auth(account_id: String) -> Arc<dyn AuthProvider> {
+    Arc::new(StubAuth { account_id })
 }
 
 /// `build_state` with `storage`, when given, in place of the SQLite engine
-/// for the table and item calls. The catalog and the authorization stores
-/// stay on SQLite.
-async fn build_state_on(
+/// for the table and item calls (the catalog and the authorization stores
+/// stay on SQLite), and with the auth provider built by `auth` from the
+/// bootstrapped default account id, for a test that needs its own provider.
+pub(super) async fn build_state_with(
     storage: Option<Arc<dyn extenddb_storage::StorageEngine>>,
+    auth: impl FnOnce(String) -> Arc<dyn AuthProvider>,
 ) -> (Arc<AppState>, String) {
     let _ = extenddb_storage::set_backend(extenddb_storage_sqlite::backend());
     let config = extenddb_storage_sqlite::SqliteConfig {
@@ -111,9 +119,7 @@ async fn build_state_on(
     let state = Arc::new(AppState {
         storage: engine,
         backup_runtime: Arc::new(extenddb_engine::BackupRuntime::new(1)),
-        auth: Arc::new(StubAuth {
-            account_id: account_id.clone(),
-        }),
+        auth: auth(account_id.clone()),
         throttle,
         limits,
         region: Arc::from("us-east-1"),
@@ -136,7 +142,7 @@ async fn build_state_on(
     (state, account_id)
 }
 
-async fn call(state: &Arc<AppState>, operation: &str, body: Value) -> (u16, Value) {
+pub(super) async fn call(state: &Arc<AppState>, operation: &str, body: Value) -> (u16, Value) {
     let mut headers = HeaderMap::new();
     headers.insert(
         "x-amz-target",
@@ -533,7 +539,7 @@ async fn a_batch_a_backend_throttled_records_the_throttle_metrics() {
         let store = failing_store::FailingStore::throttling()
             .with_items(&["k1", "k2", "k3"])
             .failing_on(&["k2", "k3"]);
-        let (state, account_id) = build_state_on(Some(Arc::new(store))).await;
+        let (state, account_id) = build_state_with(Some(Arc::new(store)), stub_auth).await;
         let (got, body) = call(&state, operation, request).await;
         assert_eq!(got, status, "{operation}: {body}");
         for (metric, want) in [
