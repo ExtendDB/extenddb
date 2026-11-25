@@ -17,14 +17,11 @@ from helpers import unique_name
 # The clause of a count outside its bound: the requests or keys of a table, or
 # the tables of RequestItems. Each test gives the path and the bound. DynamoDB
 # gave these clauses, two of them in either order, in every answer measured on
-# 2026-11-20. On 2026-11-14 and 2026-11-16 it also quoted the request map in
-# a message that holds QUOTED_MAP, so the test accepts that from DynamoDB.
+# 2026-11-20. In some BatchWriteItem answers of 2026-11-14 and 2026-11-16, and
+# in every one of 2026-11-25, it quoted the request map instead, in a message
+# that holds QUOTED. The BatchWriteItem test accepts that from DynamoDB.
 CLAUSE = "Value at '{}' failed to satisfy constraint: Member must have length {}"
-QUOTED_MAP = (
-    "' at 'requestItems' failed to satisfy constraint: Map value must satisfy "
-    "constraint: [Member must have length less than or equal to 25, "
-    "Member must have length greater than or equal to 1]"
-)
+QUOTED = "' at 'requestItems' failed to satisfy constraint: "
 
 
 def _assert_clauses(message: str, clauses: list[str]) -> None:
@@ -156,7 +153,7 @@ class TestBatchWriteItem:
             )
         error = exc.value.response["Error"]
         assert error["Code"] == "ValidationException"
-        if not is_extenddb and QUOTED_MAP in error["Message"]:
+        if not is_extenddb and QUOTED in error["Message"]:
             return
         if named is None:
             clauses = [CLAUSE.format("RequestItems", "less than or equal to 25")]
