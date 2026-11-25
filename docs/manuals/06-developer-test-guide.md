@@ -156,10 +156,7 @@ pg_ctl -D ~/pgdata status
 tail -f ~/pgdata/server.log
 ```
 
-`pgdata/pg_hba.conf` is configured so:
-- The `extenddb` user requires md5 password auth over TCP (`127.0.0.1`, `::1`)
-- The OS user that ran `initdb` has trust auth for admin tasks
-- Local socket connections use trust auth
+`initdb --auth=trust` gives every local and TCP connection trust authentication, so neither the admin role nor `extenddb` needs a password on this machine. Use it only on a machine no one else can reach.
 
 `extenddb init` writes `extenddb.toml` with the catalog database it creates (`extenddb_catalog` by default). To point the server at the role above, edit the generated section:
 
