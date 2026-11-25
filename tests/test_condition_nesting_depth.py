@@ -3,8 +3,8 @@
 
 """Long and deeply nested condition expressions on UpdateItem and DeleteItem.
 
-Amazon DynamoDB evaluates a condition whose AND, OR and NOT chains run 150
-terms long or nest 140 levels deep, and a legacy ``Expected`` map of 120
+Amazon DynamoDB evaluates a condition whose AND and OR chains run 150 terms
+long or nest 140 levels deep, and a legacy ``Expected`` map of 120
 entries joined by ``ConditionalOperator``: it answers
 ConditionalCheckFailedException when the condition fails and applies the
 write when it holds. Measured on 2026-10-25 at 18:34 and 19:53 UTC
@@ -32,6 +32,11 @@ from conftest import scoped_table
 NAMES = {"#v": "v", "#u": "u"}
 VALUES = {":v": {"S": "x"}, ":w": {"S": "y"}, ":x": {"S": "z"}}
 UPDATE = "SET #u = :x"
+# The answer tests/test_conditional_writes.py asserts for a failing condition.
+CONDITION_FAILED = {
+    "Code": "ConditionalCheckFailedException",
+    "Message": "The conditional request failed",
+}
 
 
 def or_chain(n: int, term: str = "#v = :w") -> str:
@@ -110,6 +115,12 @@ def _get(client, table, key):
     return client.get_item(TableName=table, Key=key, ConsistentRead=True).get("Item")
 
 
+def _assert_condition_failed(exc_info):
+    response = exc_info.value.response
+    assert response["ResponseMetadata"]["HTTPStatusCode"] == 400, response
+    assert response["Error"] == CONDITION_FAILED, response
+
+
 @pytest.mark.parametrize(
     "write, condition",
     [
@@ -135,37 +146,36 @@ def test_failing_condition_is_evaluated(dynamodb_client, table, warm, write, con
     key = {"pk": {"S": f"absent-{uuid.uuid4().hex[:8]}"}, "sk": {"S": "absent"}}
     with pytest.raises(ClientError) as exc_info:
         write(dynamodb_client, table, key, condition)
-    err = exc_info.value.response["Error"]
-    assert err["Code"] == "ConditionalCheckFailedException", err
+    _assert_condition_failed(exc_info)
     assert _get(dynamodb_client, table, key) is None
 
 
 @pytest.mark.parametrize(
-    "condition",
+    "write, condition",
     [
-        or_chain(149) + " OR #v = :v",
-        and_chain(150),
-        "#v = :v OR (" + alternating(99) + ")",
+        (update, or_chain(149) + " OR #v = :v"),
+        (delete, or_chain(149) + " OR #v = :v"),
+        (update, and_chain(150)),
+        (delete, and_chain(150)),
+        (update, "#v = :v OR (" + alternating(99) + ")"),
+        (delete, "#v = :v OR (" + alternating(139) + ")"),
     ],
-    ids=["or-150-last-holds", "and-150", "alternating-100-outermost-holds"],
-)
-def test_update_with_holding_condition_applies(dynamodb_client, table, live_key, condition):
-    update(dynamodb_client, table, live_key, condition)
-    assert _get(dynamodb_client, table, live_key)["u"] == {"S": "z"}
-
-
-@pytest.mark.parametrize(
-    "condition",
-    [
-        or_chain(149) + " OR #v = :v",
-        and_chain(150),
-        "#v = :v OR (" + alternating(139) + ")",
+    ids=[
+        "update-or-150-last-holds",
+        "delete-or-150-last-holds",
+        "update-and-150",
+        "delete-and-150",
+        "update-alternating-100-outermost-holds",
+        "delete-alternating-140-outermost-holds",
     ],
-    ids=["or-150-last-holds", "and-150", "alternating-140-outermost-holds"],
 )
-def test_delete_with_holding_condition_applies(dynamodb_client, table, live_key, condition):
-    delete(dynamodb_client, table, live_key, condition)
-    assert _get(dynamodb_client, table, live_key) is None
+def test_holding_condition_applies(dynamodb_client, table, live_key, write, condition):
+    write(dynamodb_client, table, live_key, condition)
+    item = _get(dynamodb_client, table, live_key)
+    if write is update:
+        assert item["u"] == {"S": "z"}
+    else:
+        assert item is None
 
 
 def expected(n: int, last_holds: bool = False) -> dict:
@@ -190,8 +200,7 @@ def test_legacy_expected_failing_is_evaluated(dynamodb_client, table, warm, oper
         getattr(dynamodb_client, operation)(
             TableName=table, Key=key, Expected=expected(120), ConditionalOperator="OR", **extra
         )
-    err = exc_info.value.response["Error"]
-    assert err["Code"] == "ConditionalCheckFailedException", err
+    _assert_condition_failed(exc_info)
     assert _get(dynamodb_client, table, key) is None
 
 
