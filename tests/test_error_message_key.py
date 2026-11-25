@@ -39,9 +39,9 @@ def hash_table(dynamodb_client):
         yield name
 
 
-def _error_code_and_keys(client, operation: str, call) -> tuple[str, list[str]]:
-    """Run ``call``, which must fail, and return the error code and the sorted
-    top-level keys of the raw response body."""
+def _error_code_and_keys(client, operation: str, call) -> tuple[str, list[str], int]:
+    """Run ``call``, which must fail, and return the error code, the sorted
+    top-level keys of the raw response body and the HTTP status."""
     raw: list[bytes] = []
 
     def capture(response_dict, **_kwargs):
@@ -54,11 +54,16 @@ def _error_code_and_keys(client, operation: str, call) -> tuple[str, list[str]]:
             call()
     finally:
         client.meta.events.unregister(event, capture)
-    return exc_info.value.response["Error"]["Code"], sorted(json.loads(raw[-1]))
+    response = exc_info.value.response
+    return (
+        response["Error"]["Code"],
+        sorted(json.loads(raw[-1])),
+        response["ResponseMetadata"]["HTTPStatusCode"],
+    )
 
 
 def test_transaction_canceled_carries_message_under_capital_m(dynamodb_client, hash_table):
-    code, keys = _error_code_and_keys(
+    code, keys, _ = _error_code_and_keys(
         dynamodb_client,
         "TransactWriteItems",
         lambda: dynamodb_client.transact_write_items(
@@ -92,7 +97,9 @@ def test_idempotent_parameter_mismatch_carries_message_under_capital_m(
         )
 
     put("first")
-    code, keys = _error_code_and_keys(dynamodb_client, "TransactWriteItems", lambda: put("second"))
+    code, keys, _ = _error_code_and_keys(
+        dynamodb_client, "TransactWriteItems", lambda: put("second")
+    )
     assert code == "IdempotentParameterMismatchException"
     assert keys == ["Message", "__type"]
 
@@ -128,13 +135,15 @@ def test_serialization_error_carries_message_under_capital_m(
 ):
     client = dynamodb_client_no_validation
     call = getattr(client, xform_name(operation))
-    code, keys = _error_code_and_keys(client, operation, lambda: call(**params))
+    code, keys, status = _error_code_and_keys(client, operation, lambda: call(**params))
+    # The texts are not asserted: ExtendDB's texts differ from DynamoDB's (#1012, #884).
+    assert status == 400
     assert code == "SerializationException"
     assert keys == ["Message", "__type"]
 
 
 def test_conditional_check_failed_carries_message_under_lower_case(dynamodb_client, hash_table):
-    code, keys = _error_code_and_keys(
+    code, keys, _ = _error_code_and_keys(
         dynamodb_client,
         "PutItem",
         lambda: dynamodb_client.put_item(
@@ -148,7 +157,7 @@ def test_conditional_check_failed_carries_message_under_lower_case(dynamodb_clie
 
 
 def test_validation_error_carries_message_under_lower_case(dynamodb_client, hash_table):
-    code, keys = _error_code_and_keys(
+    code, keys, _ = _error_code_and_keys(
         dynamodb_client,
         "GetItem",
         lambda: dynamodb_client.get_item(TableName=hash_table, Key={"pk": {"N": "1"}}),
