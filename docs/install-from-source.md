@@ -15,7 +15,7 @@ A build from source gives you one binary for one storage backend. This page cove
 
 ## Installer scripts
 
-The repository ships one installer script per platform. Each checks dependencies, builds the release binary, sets up a Python virtual environment for the documentation build, and renders the PDF documentation. The scripts report missing software and exit; they never install anything.
+The repository ships one installer script per platform. Each needs the PostgreSQL client (`psql`), checks the other dependencies, builds the PostgreSQL binary, sets up a Python virtual environment for the documentation build, and renders the PDF documentation. The scripts report missing software and exit; they never install anything.
 
 ```bash
 # Linux
@@ -25,7 +25,7 @@ scripts/install-linux.sh
 scripts/install-macos.sh
 ```
 
-After a script completes, continue at [3. Initialize the deployment](#3-initialize-the-deployment).
+After a script completes, continue at [1. Install and start the database](#1-install-and-start-the-database) if PostgreSQL is not running yet, then at [3. Initialize the deployment](#3-initialize-the-deployment). For MongoDB, Cassandra or SQLite, follow steps 1 to 3 instead of the script.
 
 ## 1. Install and start the database
 
@@ -60,9 +60,10 @@ sudo systemctl start postgresql
 sudo systemctl enable postgresql
 ```
 
-**Amazon Linux 2** has no PostgreSQL 14 package of its own; install PostgreSQL 15 from the PGDG repository and run it as your own user with a data directory under your home:
+**Amazon Linux 2**: install PostgreSQL 15 from the PGDG repository, after its two dependencies from the Amazon Linux 2 repositories, and run it as your own user with a data directory under your home:
 
 ```bash
+sudo yum install -y libzstd libicu
 sudo rpm -ivh --nodeps \
     https://download.postgresql.org/pub/repos/yum/reporpms/EL-7-x86_64/pgdg-redhat-repo-latest.noarch.rpm
 sudo yum install -y --releasever=7 \
@@ -80,7 +81,7 @@ brew services start postgresql@17
 export PATH="$(brew --prefix postgresql@17)/bin:$PATH"
 ```
 
-The `postgresql@17` formula is keg-only, so its binaries (`pg_isready`, `psql`) are not on `PATH` until the export above or `brew link --overwrite postgresql@17`. On Homebrew the PostgreSQL superuser is your macOS user name, not `postgres`, with trust authentication over the local socket. The same is true of the Amazon Linux 2 setup above.
+The `postgresql@17` formula is keg-only, so its binaries (`pg_isready`, `psql`) are not on `PATH` until the export above or `brew link --overwrite postgresql@17`. On Homebrew the PostgreSQL superuser is your macOS user name, not `postgres`, with trust authentication over the local socket. The same is true of the Amazon Linux 2 setup above. To run the server without `brew services`, start it on the formula's data directory: `pg_ctl -D "$(brew --prefix)/var/postgresql@17" -l "$(brew --prefix)/var/postgresql@17/server.log" start` (`brew --prefix` is `/opt/homebrew` on Apple silicon).
 
 Confirm the server accepts connections:
 
@@ -104,8 +105,11 @@ ExtendDB uses multi-document transactions, so MongoDB must run as a replica set,
 
 ```bash
 docker run -d --name extenddb-mongo -p 127.0.0.1:27017:27017 mongo:7 --replSet rs0
-docker exec extenddb-mongo mongosh --quiet --eval "rs.initiate()"
+docker exec extenddb-mongo mongosh --quiet --eval \
+    'rs.initiate({_id: "rs0", members: [{_id: 0, host: "localhost:27017"}]})'
 ```
+
+The member is named `localhost:27017`, the address the published port answers on, so `?replicaSet=rs0` finds the primary from the host. A bare `rs.initiate()` names the member after the container ID, which the host cannot resolve.
 
 **Ubuntu or Debian**
 
@@ -227,9 +231,18 @@ test-hooks disabled
 
 ### Initialize on PostgreSQL
 
-On a system PostgreSQL (Ubuntu, Debian, Fedora, RHEL, Amazon Linux 2023) the administrator is `postgres`:
+On a system PostgreSQL (Ubuntu, Debian, Fedora, RHEL, Amazon Linux 2023) the administrator is `postgres`. It has no password, and the packages let it in only over the local socket as the `postgres` operating system user. Give it a password. On Fedora, RHEL and Amazon Linux 2023, also switch TCP connections from `ident` to password authentication; Ubuntu and Debian already use `scram-sha-256` for TCP.
 
 ```bash
+sudo -u postgres psql -c "ALTER ROLE postgres PASSWORD '<admin password>'"
+
+# Fedora, RHEL and Amazon Linux 2023 only
+sudo sed -i 's/^\(host .*\)ident$/\1scram-sha-256/' /var/lib/pgsql/data/pg_hba.conf
+sudo systemctl reload postgresql
+```
+
+```bash
+export EXTENDDB_PG_PASSWORD='<admin password>'
 ./target/release/extenddb init --pg-user postgres
 ```
 
@@ -248,7 +261,7 @@ export EXTENDDB_PG_PASSWORD='<admin password>'
     --pg-user postgres
 ```
 
-Without a password `init` connects with peer or ident authentication, which works only over a local Unix socket. To use a socket, pass the socket directory to `--pg-host` as an absolute path (`--pg-host /var/run/postgresql`).
+Without a password `init` connects with peer or ident authentication, which works only over a local Unix socket and only for a role named after your operating system user. To use a socket, pass the socket directory to `--pg-host` as an absolute path (`--pg-host /var/run/postgresql`).
 
 ### Initialize on MongoDB
 
@@ -315,7 +328,7 @@ The path is written into the generated config under `[storage.sqlite].path`, so 
 
 ### Options
 
-What `init` prints, abridged (the full output also names the certificate files it generated and, when the rendered documentation is absent, says that `/console/docs` is disabled):
+What `init` prints, abridged (the full output also names the certificate files it generated, lists every applied migration and, when the rendered documentation is absent, says that `/console/docs` is disabled):
 
 ```
 === extenddb init (backend: postgres) ===
@@ -325,15 +338,18 @@ What `init` prints, abridged (the full output also names the certificate files i
     Created.
 --- Creating database 'extenddb'...
     Created.
---- Running catalog migrations...
-    Migrations applied.
---- Running data migrations...
-    Data migrations applied.
+--- Creating the catalog through its migrations...
+    Applied migration 1 baseline in extenddb_catalog
+    Applied migration 1 baseline in extenddb
+    ...
+    Applied migration 11 attribute_name_escape in extenddb
+    Recorded migration 12 unique_access_key_ids in extenddb_catalog as not applicable
 --- Generating AES-256-GCM encryption key...
     Encryption key stored.
---- Creating default account '976532242161'...
-    Account ID: 976532242161
+--- Creating default account '123190565100'...
+    Account ID: 123190565100
 --- Creating admin user 'admin'...
+--- Recording data database connection in catalog...
 
   Admin credentials (shown once, save them now)
   Username: admin
@@ -343,11 +359,12 @@ What `init` prints, abridged (the full output also names the certificate files i
     Created extenddb.toml
 
 === extenddb init complete ===
+Start the server with: extenddb serve --config extenddb.toml
 ```
 
-Save the admin password and the account ID. The password is shown once and cannot be retrieved; the account ID is the one you create IAM users in.
+Save the admin password: it is shown once and cannot be retrieved. The PostgreSQL `init` also prints the default account's ID, the account you create IAM users in; on every backend `manage list-accounts` prints it ([6. Smoke test](#6-smoke-test)).
 
-`init` refuses to run when the catalog or data database already exists. To start over, run `extenddb destroy --config extenddb.toml --yes` first (see [Tear down](#tear-down)). It also refuses to overwrite an existing `extenddb.toml` unless `--overwrite` is given (`Error: Config file "extenddb.toml" already exists. Use --overwrite to delete and regenerate it.`, exit 255); with `--overwrite` it loads the PostgreSQL connection defaults from the existing file and writes a new one. On Cassandra, `init` aborts if the catalog is already initialized. If an earlier `init` stopped partway, `init` finishes it, when its `--replication-factor` and `--datacenter` match the ones the earlier `init` used. If `init` stops because its `--replication-factor` is larger than the number of nodes, an `init` with the same `--replication-factor` stops the same way. To go on, see [Keyspace replication](cassandra-setup.md#keyspace-replication).
+`init` refuses to run when the catalog or data database already exists. To start over, run `extenddb destroy --config extenddb.toml --yes` with the same `--pg-user` as `init` first (see [Tear down](#tear-down)). It also refuses to overwrite an existing `extenddb.toml` unless `--overwrite` is given (`Error: Config file "extenddb.toml" already exists. Use --overwrite to delete and regenerate it.`, exit 255); with `--overwrite` it loads the PostgreSQL connection defaults from the existing file and writes a new one. On Cassandra, `init` aborts if the catalog is already initialized. If an earlier `init` stopped partway, `init` finishes it, when its `--replication-factor` and `--datacenter` match the ones the earlier `init` used. If `init` stops because its `--replication-factor` is larger than the number of nodes, an `init` with the same `--replication-factor` stops the same way. To go on, see [Keyspace replication](cassandra-setup.md#keyspace-replication).
 
 | Flag | What it does |
 |---|---|
@@ -403,9 +420,12 @@ Catalog database: extenddb_catalog
 ./target/release/extenddb serve --config extenddb.toml
 ```
 
+The banner follows an ASCII wordmark:
+
 ```
 extenddb 1.0.0 (catalog migration 12) starting on 127.0.0.1:18443
   storage: postgres (postgresql://extenddb:***@localhost:5432/extenddb_catalog)
+  backup store: none ([backup.store] is absent); CreateBackup writes in-catalog backups
 extenddb server started (pid 8644, 127.0.0.1:18443)
 ```
 
@@ -450,22 +470,37 @@ curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
 ```
 
 ```json
-{"status":"healthy"}
+{"components":{},"status":"healthy"}
 ```
 
-Every DynamoDB request must be signed with an access key, so create an IAM user in the default account and give it a policy and a key. `extenddb manage` reads the server endpoint from `extenddb.toml` in the current directory; `--endpoint host:port` overrides it. Use the admin password and the account ID that `init` printed.
+Every DynamoDB request must be signed with an access key, so create an IAM user in the default account and give it a policy and a key. `extenddb manage` reads the server endpoint from `extenddb.toml` in the current directory; `--endpoint host:port` overrides it. Use the admin password that `init` printed. Put it in `EXTENDDB_PASSWORD`: `--password` works too, but the command then warns that the password is visible in process listings and shell history. The account ID is the `account_id` that `list-accounts` prints:
 
 ```bash
-./target/release/extenddb manage --user admin --password '<admin password>' \
+export EXTENDDB_PASSWORD='<admin password>'
+./target/release/extenddb manage --user admin list-accounts
+```
+
+```json
+[
+  {
+    "account_id": "123190565100",
+    "account_name": "default",
+    "created_at": "2026-11-25T11:49:45.772244Z"
+  }
+]
+```
+
+```bash
+./target/release/extenddb manage --user admin \
     create-user --account-id <account-id> \
     --user-name alice --user-password '<console password>'
 
-./target/release/extenddb manage --user admin --password '<admin password>' \
+./target/release/extenddb manage --user admin \
     put-user-policy --account-id <account-id> --user-name alice \
     --policy-name FullAccess \
     --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"dynamodb:*","Resource":"*"}]}'
 
-./target/release/extenddb manage --user <account-id>/alice --password '<console password>' \
+EXTENDDB_PASSWORD='<console password>' ./target/release/extenddb manage --user <account-id>/alice \
     create-access-key
 ```
 
@@ -476,12 +511,13 @@ Every DynamoDB request must be signed with an access key, so create an IAM user 
 }
 ```
 
-The secret is shown once. Point the AWS CLI at the server and list tables:
+The secret is shown once. Point the AWS CLI at the server and list tables. Set both region variables: an `AWS_REGION` already set in your shell would otherwise win over `AWS_DEFAULT_REGION`, and the request would fail with `InvalidSignatureException`.
 
 ```bash
 export AWS_CA_BUNDLE=~/.extenddb/tls/cert.pem
 export AWS_ENDPOINT_URL_DYNAMODB=https://127.0.0.1:18443
 export AWS_DEFAULT_REGION=us-east-1
+export AWS_REGION=us-east-1
 export AWS_ACCESS_KEY_ID=<access_key_id>
 export AWS_SECRET_ACCESS_KEY=<secret_access_key>
 aws dynamodb list-tables
@@ -499,24 +535,30 @@ The server is ready. [First requests](first-requests.md) walks through tables, i
 
 ## Upgrading after a `git pull`
 
-When the new binary carries catalog migrations the deployment has not applied, `serve` refuses to start and `verify` exits 3, each naming the pending migrations. Rebuild and migrate:
-
-```bash
-cargo build --release
-./target/release/extenddb migrate --config extenddb.toml
-./target/release/extenddb migrate --config extenddb.toml --yes
-```
-
-The first command prints what is pending and changes nothing (exit status 3 when work is pending); the second applies it. Table data is not touched. The [upgrade manual](manuals/07-upgrade-manual.md) has the backup step, the rollback procedure and the per-release behavior changes.
-
-## Tear down
+When the new binary carries catalog migrations the deployment has not applied, `serve --foreground` and `verify` exit 3 and name the pending migrations; a daemon `serve` exits 1 with `Server failed to start: daemon process <pid> exited during startup` and writes the refusal to syslog. Stop the server before you migrate: `migrate --yes` waits up to 60 seconds (`--lock-timeout`) for a server of release 0.1.15 or later to stop and then exits 6, and it does not detect a server of an earlier release.
 
 ```bash
 ./target/release/extenddb stop --config extenddb.toml
-./target/release/extenddb destroy --config extenddb.toml --yes
+cargo build --release
+./target/release/extenddb migrate --config extenddb.toml
+./target/release/extenddb migrate --config extenddb.toml --yes
+./target/release/extenddb serve --config extenddb.toml
 ```
 
-On PostgreSQL, `destroy` drops both databases, connecting as the same administrator `init` used (`--pg-user`, `EXTENDDB_PG_PASSWORD`); the `extenddb` application role, `extenddb.toml` and the certificate under `~/.extenddb/tls/` are left in place and a later `init` reuses them. On MongoDB it drops the two databases through the configured connection string. On SQLite it removes the database file. `--yes` is required; there is no interactive prompt.
+The first `migrate` prints what is pending and changes nothing (exit status 3 when work is pending); the second applies it. Table data is not touched. The [upgrade manual](manuals/07-upgrade-manual.md) has the backup step, the rollback procedure and the per-release behavior changes.
+
+## Tear down
+
+Stop the server, then drop the databases.
+
+```bash
+./target/release/extenddb stop --config extenddb.toml
+./target/release/extenddb destroy --config extenddb.toml --yes --pg-user postgres
+```
+
+On PostgreSQL, `destroy` connects as the same administrator `init` used: pass the same `--pg-user`, with `EXTENDDB_PG_PASSWORD` set, and omit `--pg-user` where PostgreSQL runs as your own user. It drops both databases; the `extenddb` application role, `extenddb.toml` and the certificate under `~/.extenddb/tls/` are left in place and a later `init` reuses them. On MongoDB it drops the two databases through the configured connection string. On SQLite it removes the database file and its `-wal` and `-shm` files. It leaves the `.lock` file and the default backup store directory `backups/` beside them. Remove `backups/` too before a new `init`; otherwise the new server reports that store as owned by another catalog (see [`[backup.store]`](manuals/05-admin-guide.md#backupstore) in the administration guide). `--yes` is required; there is no interactive prompt.
+
+Stop the database you started in step 1: `docker stop extenddb-mongo extenddb-cassandra` for the containers, `brew services stop postgresql@17` or `brew services stop mongodb-community@7.0` on macOS, `sudo systemctl stop postgresql` or `sudo systemctl stop mongod` on Linux.
 
 On Cassandra, `destroy` has no way to take the superuser's credentials (it accepts only the PostgreSQL flags), so it cannot connect to a node with password authentication. Drop the keyspaces with `cqlsh` instead; `DESCRIBE KEYSPACES` lists them under the prefix, `extenddb_catalog` and `extenddb_account_<id>` by default:
 
@@ -539,11 +581,14 @@ docker exec extenddb-cassandra cqlsh -u cassandra -p cassandra \
 | Symptom | Fix |
 |---|---|
 | `connection refused` on port 18443 | The server is not running: `./target/release/extenddb serve --config extenddb.toml` |
-| `serve` exits 3, naming pending catalog migrations | `./target/release/extenddb migrate --config extenddb.toml --yes`, then start the server |
+| A daemon `serve` exits 1 with `Server failed to start: daemon process <pid> exited during startup` and syslog names pending catalog migrations (`serve --foreground` exits 3 and prints them) | Stop any running server, then `./target/release/extenddb migrate --config extenddb.toml --yes`, then start the server |
 | `role "postgres" does not exist` | PostgreSQL runs as your user: omit `--pg-user` |
-| `FATAL: Peer authentication failed` | Allow `trust` or `md5` for local connections in `pg_hba.conf` |
-| `Database '<name>' already exists` from `init` | `./target/release/extenddb destroy --config extenddb.toml --yes`, then `init` again |
-| `UnrecognizedClientException` from the AWS CLI | The access key ID or secret does not match what `create-access-key` returned |
+| `password authentication failed for user "postgres"` or `Peer authentication failed for user "postgres"` | Give the `postgres` role a password and pass it in `EXTENDDB_PG_PASSWORD` ([Initialize on PostgreSQL](#initialize-on-postgresql)) |
+| `Ident authentication failed for user "postgres"` | The same, and switch the `host` lines of `pg_hba.conf` from `ident` to `scram-sha-256` as [Initialize on PostgreSQL](#initialize-on-postgresql) shows |
+| `Database '<name>' already exists` from `init` | `./target/release/extenddb destroy --config extenddb.toml --yes`, with the same `--pg-user` as `init`, then `init` again |
+| `destroy` hangs after a hard kill of the server | Stop the leftover `postgres` backends the killed server held (`ps -eo pid,command \| grep postgres`), then run `destroy` again |
+| `UnrecognizedClientException` from the AWS CLI | The access key ID is unknown or inactive: check the ID `create-access-key` returned |
+| `InvalidSignatureException` from the AWS CLI | The secret does not match the access key ID, or the client signs for another region than the server's `[server] region` |
 | `AccessDeniedException` | The user's policy does not allow the operation |
 | `ResourceNotFoundException` right after `create-table` | The table is still `CREATING`; `aws dynamodb wait table-exists --table-name <name>` |
 
