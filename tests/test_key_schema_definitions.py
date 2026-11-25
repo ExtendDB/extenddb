@@ -264,12 +264,13 @@ def test_create_table_refuses_a_name_defined_twice(dynamodb_client, spec, table_
     assert message == f"Attribute Name is duplicated: {name}"
 
 
-def _wait_for_index(client, table, index, timeout=120.0):
+def _wait_for_index(client, table, index, timeout=1800.0):
+    """Wait until the table is ACTIVE and ``index`` is ACTIVE or absent."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         desc = client.describe_table(TableName=table)["Table"]
         status = {i["IndexName"]: i["IndexStatus"] for i in desc.get("GlobalSecondaryIndexes", [])}
-        if desc["TableStatus"] == "ACTIVE" and status.get(index) == "ACTIVE":
+        if desc["TableStatus"] == "ACTIVE" and status.get(index, "ACTIVE") == "ACTIVE":
             return
         time.sleep(0.5)
     raise TimeoutError(f"{index} on {table} not ACTIVE after {timeout} s")
@@ -277,18 +278,23 @@ def _wait_for_index(client, table, index, timeout=120.0):
 
 def test_update_table_keeps_the_type_of_a_redefined_table_key(dynamodb_client):
     with scoped_table(dynamodb_client) as name:
-        dynamodb_client.update_table(
-            TableName=name,
-            AttributeDefinitions=defs("pk:N g:S"),
-            GlobalSecondaryIndexUpdates=[{"Create": {
-                "IndexName": "by-g",
-                "KeySchema": ks("g"),
-                "Projection": {"ProjectionType": "KEYS_ONLY"},
-            }}],
-        )
-        desc = dynamodb_client.describe_table(TableName=name)["Table"]
-        stored = {d["AttributeName"]: d["AttributeType"] for d in desc["AttributeDefinitions"]}
-        assert stored == {"pk": "S", "g": "S"}
-        # The table cannot be deleted while the index is being created.
-        _wait_for_index(dynamodb_client, name, "by-g")
-        dynamodb_client.put_item(TableName=name, Item={"pk": {"S": "a"}, "g": {"S": "b"}})
+        try:
+            dynamodb_client.update_table(
+                TableName=name,
+                AttributeDefinitions=defs("pk:N g:S"),
+                GlobalSecondaryIndexUpdates=[{"Create": {
+                    "IndexName": "by-g",
+                    "KeySchema": ks("g"),
+                    "Projection": {"ProjectionType": "KEYS_ONLY"},
+                }}],
+            )
+            desc = dynamodb_client.describe_table(TableName=name)["Table"]
+            stored = {d["AttributeName"]: d["AttributeType"] for d in desc["AttributeDefinitions"]}
+            assert stored == {"pk": "S", "g": "S"}
+            dynamodb_client.put_item(TableName=name, Item={"pk": {"S": "a"}, "g": {"S": "b"}})
+        finally:
+            # scoped_table deletes the table next, and the service refuses
+            # DeleteTable while an index is being created. On the service the
+            # index on this empty table took about 9 and about 16 minutes to
+            # go ACTIVE (two runs, 2026-11-24).
+            _wait_for_index(dynamodb_client, name, "by-g")
