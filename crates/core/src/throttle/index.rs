@@ -106,16 +106,10 @@ pub(super) fn charge_read(
     read_units: f64,
     now: Instant,
 ) -> bool {
-    match set
-        .iter_mut()
+    set.iter_mut()
         .find(|b| index_name == Some(b.index_name.as_str()))
-    {
-        Some(buckets) => {
-            buckets.read.consume(read_units, now);
-            true
-        }
-        None => false,
-    }
+        .map(|b| b.read.consume(read_units, now))
+        .is_some()
 }
 
 /// Charge a served write to the write bucket of each index in `set` that

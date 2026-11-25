@@ -117,7 +117,7 @@ fn a_write_is_refused_by_the_first_exhausted_index_in_order() {
             index("third", 1, 1),
         ],
     );
-    // Every index is charged the two units: "second" and "third" go below
+    // Each index is charged two units here: "second" and "third" go below
     // zero, "roomy" and the table stay positive.
     mgr.consume("acct", "tbl", 0.0, 2.0);
     consume_index_writes(&mgr, &[("roomy", 2.0), ("second", 2.0), ("third", 2.0)]);

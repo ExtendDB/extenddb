@@ -119,6 +119,18 @@ fn throttle_records(state: &AppState, table: &str) -> Vec<(MetricName, Vec<Dimen
     records
 }
 
+/// The dimensions of a throttle record: the account, the table, the index
+/// when there is one, and the operation.
+fn dims(account: &str, table: &str, index: Option<&str>, op: &str) -> Vec<Dimension> {
+    let mut dims = vec![
+        Dimension::AccountId(account.to_owned()),
+        Dimension::TableName(table.to_owned()),
+    ];
+    dims.extend(index.map(|i| Dimension::GlobalSecondaryIndexName(i.to_owned())));
+    dims.push(Dimension::Operation(op.to_owned()));
+    dims
+}
+
 fn indexed_item() -> Value {
     let mut it = item(16);
     it["sk"] = json!({"S": "s"});
@@ -173,27 +185,13 @@ async fn index_read_throttle_names_the_index_arn_with_the_table_message() {
     );
     // The throttle event carries the index as its dimension; the request
     // count carries the account, the table and the operation, and no index.
-    let t = |op: &str| {
-        vec![
-            Dimension::AccountId(account_id.clone()),
-            Dimension::TableName(table.to_owned()),
-            Dimension::Operation(op.to_owned()),
-        ]
-    };
-    let g = |op: &str| {
-        vec![
-            Dimension::AccountId(account_id.clone()),
-            Dimension::TableName(table.to_owned()),
-            Dimension::GlobalSecondaryIndexName(GSI.to_owned()),
-            Dimension::Operation(op.to_owned()),
-        ]
-    };
-    let mut expected = vec![
-        (MetricName::ReadThrottleEvents, g("Query"), 1.0),
-        (MetricName::ReadThrottleEvents, g("Scan"), 1.0),
-        (MetricName::ThrottledRequests, t("Query"), 1.0),
-        (MetricName::ThrottledRequests, t("Scan"), 1.0),
-    ];
+    let mut expected = Vec::new();
+    for op in ["Query", "Scan"] {
+        let index = dims(&account_id, table, Some(GSI), op);
+        expected.push((MetricName::ReadThrottleEvents, index, 1.0));
+        let table_only = dims(&account_id, table, None, op);
+        expected.push((MetricName::ThrottledRequests, table_only, 1.0));
+    }
     expected.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
     assert_eq!(throttle_records(&state, table), expected);
 }
@@ -248,26 +246,13 @@ async fn index_write_throttle_names_the_index_message_and_arn() {
     // Each refusal is a throttle event of the index and of the table: the
     // service publishes WriteThrottleEvents for both series on an index write
     // refusal. The request count carries no index.
-    let t = |op: &str| {
-        vec![
-            Dimension::AccountId(account_id.clone()),
-            Dimension::TableName(table.to_owned()),
-            Dimension::Operation(op.to_owned()),
-        ]
-    };
-    let g = |op: &str| {
-        vec![
-            Dimension::AccountId(account_id.clone()),
-            Dimension::TableName(table.to_owned()),
-            Dimension::GlobalSecondaryIndexName(GSI.to_owned()),
-            Dimension::Operation(op.to_owned()),
-        ]
-    };
     let mut expected = Vec::new();
     for op in ["PutItem", "UpdateItem", "DeleteItem"] {
-        expected.push((MetricName::WriteThrottleEvents, g(op), 1.0));
-        expected.push((MetricName::WriteThrottleEvents, t(op), 1.0));
-        expected.push((MetricName::ThrottledRequests, t(op), 1.0));
+        let index = dims(&account_id, table, Some(GSI), op);
+        let table_only = dims(&account_id, table, None, op);
+        expected.push((MetricName::WriteThrottleEvents, index, 1.0));
+        expected.push((MetricName::WriteThrottleEvents, table_only.clone(), 1.0));
+        expected.push((MetricName::ThrottledRequests, table_only, 1.0));
     }
     expected.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
     assert_eq!(throttle_records(&state, table), expected);

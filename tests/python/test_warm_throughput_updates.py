@@ -192,11 +192,11 @@ class TestGsiUpdateElements:
     @pytest.mark.parametrize(
         "throughput,expected",
         [
-            ({"ReadCapacityUnits": 0, "WriteCapacityUnits": 5}, ["0", "readCapacityUnits", "ge1"]),
-            ({"ReadCapacityUnits": 5, "WriteCapacityUnits": 0}, ["0", "writeCapacityUnits", "ge1"]),
-            ({"ReadCapacityUnits": -1, "WriteCapacityUnits": 5}, ["-1", "readCapacityUnits", "ge1"]),
-            ({"ReadCapacityUnits": 5}, [None, "writeCapacityUnits", "null"]),
-            ({}, [None, "writeCapacityUnits", "null", None, "readCapacityUnits", "null"]),
+            ({"ReadCapacityUnits": 0, "WriteCapacityUnits": 5}, [("0", "readCapacityUnits", "ge1")]),
+            ({"ReadCapacityUnits": 5, "WriteCapacityUnits": 0}, [("0", "writeCapacityUnits", "ge1")]),
+            ({"ReadCapacityUnits": -1, "WriteCapacityUnits": 5}, [("-1", "readCapacityUnits", "ge1")]),
+            ({"ReadCapacityUnits": 5}, [(None, "writeCapacityUnits", "null")]),
+            ({}, [(None, "writeCapacityUnits", "null"), (None, "readCapacityUnits", "null")]),
         ],
     )
     def test_the_units_of_an_index_update_are_checked_before_the_table(
@@ -212,7 +212,7 @@ class TestGsiUpdateElements:
             "null": "Member must not be null",
         }
         clauses = []
-        for value, unit, rule in zip(expected[::3], expected[1::3], expected[2::3]):
+        for value, unit, rule in expected:
             shown = "null" if value is None else f"'{value}'"
             clauses.append(
                 f"Value {shown} at '{path}{unit}' failed to satisfy constraint: {rules[rule]}"
