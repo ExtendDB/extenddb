@@ -251,6 +251,18 @@ pub async fn handle_update_table(
                 pay_per_request,
                 !pay_per_request && !stored_on_demand,
             )?;
+            // An index throughput the backend stores names an index of the
+            // table, checked here before any backend write, as for
+            // WarmThroughput.
+            for upd in input
+                .global_secondary_index_updates
+                .iter()
+                .flatten()
+                .filter_map(|u| u.update.as_ref())
+                .filter(|u| u.provisioned_throughput.is_some())
+            {
+                crate::warm_throughput::gsi_named(&existing, &upd.index_name, &input.table_name)?;
+            }
         }
         if touches_warm {
             crate::warm_throughput::validate_warm_throughput_updates(&input, &existing)?;

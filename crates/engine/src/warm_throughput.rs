@@ -12,8 +12,8 @@
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::types::{
-    BillingMode, ON_DEMAND_WARM_READ_UNITS, ON_DEMAND_WARM_WRITE_UNITS, TableDescription,
-    UpdateTableInput, WarmThroughput, WarmThroughputDefaults, epoch_seconds_now,
+    BillingMode, GsiDescription, ON_DEMAND_WARM_READ_UNITS, ON_DEMAND_WARM_WRITE_UNITS,
+    TableDescription, UpdateTableInput, WarmThroughput, WarmThroughputDefaults, epoch_seconds_now,
 };
 use extenddb_core::validation::{
     WarmThroughputSubject, validate_created_gsi_warm_throughput, validate_warm_throughput_on_update,
@@ -136,6 +136,25 @@ pub(crate) fn on_demand_switch_warm_throughput(
     })
 }
 
+/// The table's global secondary index `name`, or the service's
+/// `ResourceNotFoundException` for an `Update` naming one the table does not have.
+pub(crate) fn gsi_named<'a>(
+    existing: &'a TableDescription,
+    name: &str,
+    table_name: &str,
+) -> Result<&'a GsiDescription, DynamoDbError> {
+    existing
+        .global_secondary_indexes
+        .iter()
+        .flatten()
+        .find(|g| g.index_name == name)
+        .ok_or_else(|| {
+            DynamoDbError::ResourceNotFoundException(format!(
+                "Requested resource not found: Index {name} for table {table_name}"
+            ))
+        })
+}
+
 /// Apply the measured update rules to `input` against `existing`:
 ///
 /// - the table's `WarmThroughput` may not go below its current values
@@ -168,17 +187,7 @@ pub(crate) fn validate_warm_throughput_updates(
         if let Some(update) = &action.update
             && let Some(spec) = &update.warm_throughput
         {
-            let gsi = existing
-                .global_secondary_indexes
-                .iter()
-                .flatten()
-                .find(|g| g.index_name == update.index_name)
-                .ok_or_else(|| {
-                    DynamoDbError::ResourceNotFoundException(format!(
-                        "Requested resource not found: Index {} for table {}",
-                        update.index_name, input.table_name
-                    ))
-                })?;
+            let gsi = gsi_named(existing, &update.index_name, &input.table_name)?;
             let (rcu, wcu) = gsi.provisioned_throughput.as_ref().map_or((0, 0), |pt| {
                 (pt.read_capacity_units, pt.write_capacity_units)
             });
@@ -320,6 +329,21 @@ mod tests {
             missing,
             DynamoDbError::ResourceNotFoundException(_)
         ));
+    }
+
+    /// An `Update` of `missing` on a provisioned table with the index `gsi`.
+    #[test]
+    fn an_update_naming_no_index_of_the_table_is_not_found() {
+        let existing = TableDescription {
+            global_secondary_indexes: on_demand_table(None).global_secondary_indexes,
+            ..provisioned_table(5, None)
+        };
+        let err = gsi_named(&existing, "missing", "t").expect_err("no such index");
+        assert!(
+            matches!(&err, DynamoDbError::ResourceNotFoundException(m)
+                if m == "Requested resource not found: Index missing for table t"),
+            "{err:?}"
+        );
     }
 
     /// A created index's WarmThroughput follows the create rule under the

@@ -1032,9 +1032,10 @@ impl MongoEngine {
         }
 
         // A provisioned index's new ProvisionedThroughput, in the shape the
-        // create path writes. The engine has checked the units and that the
-        // table is PROVISIONED before and after the request. An Update naming
-        // no GSI of the table is IndexNotFound, as for WarmThroughput.
+        // create path writes. The engine has checked the units, that the
+        // table is PROVISIONED before and after the request, and that the
+        // index exists. An Update naming no GSI of the table (one removed
+        // since that check) is IndexNotFound, as for WarmThroughput.
         let throughput_updates: Vec<_> = input
             .global_secondary_index_updates
             .iter()

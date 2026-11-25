@@ -163,6 +163,32 @@ class TestGsiUpdateElements:
         pt = t["GlobalSecondaryIndexes"][0]["ProvisionedThroughput"]
         assert (pt["ReadCapacityUnits"], pt["WriteCapacityUnits"]) == (5, 7)
 
+    def test_an_update_of_an_index_the_table_does_not_have_changes_nothing(
+        self, dynamodb_client, tables
+    ):
+        """An Update of an index the table does not have answers
+        ResourceNotFoundException, and the table's own ProvisionedThroughput in the
+        same request is not applied."""
+        name, _ = _create(
+            dynamodb_client,
+            tables,
+            BillingMode="PROVISIONED",
+            ProvisionedThroughput=PROVISIONED_5,
+            GlobalSecondaryIndexes=[{**GSI, "ProvisionedThroughput": PROVISIONED_5}],
+        )
+        _wait_all_active(dynamodb_client, name)
+        with pytest.raises(ClientError) as exc:
+            dynamodb_client.update_table(
+                TableName=name,
+                ProvisionedThroughput={"ReadCapacityUnits": 10, "WriteCapacityUnits": 10},
+                GlobalSecondaryIndexUpdates=[
+                    {"Update": {"IndexName": "missing", "ProvisionedThroughput": PROVISIONED_5}}
+                ],
+            )
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        pt = dynamodb_client.describe_table(TableName=name)["Table"]["ProvisionedThroughput"]
+        assert (pt["ReadCapacityUnits"], pt["WriteCapacityUnits"]) == (5, 5)
+
     @pytest.mark.parametrize(
         "throughput,expected",
         [

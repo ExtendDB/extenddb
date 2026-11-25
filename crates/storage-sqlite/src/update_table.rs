@@ -49,9 +49,10 @@ async fn refuse_while_building(
 
 /// Store the `ProvisionedThroughput` of each `GlobalSecondaryIndexUpdates`
 /// `Update` as the index's throughput, in the shape the create path writes,
-/// inside the caller's catalog transaction. The engine has checked the units
-/// and that the table is PROVISIONED before and after the request. An
-/// `Update` naming no GSI of the table is `IndexNotFound`.
+/// inside the caller's catalog transaction. The engine has checked the units,
+/// that the table is PROVISIONED before and after the request, and that the
+/// index exists. An `Update` naming no GSI of the table (one removed since
+/// that check) is `IndexNotFound`.
 async fn store_index_throughput_updates(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     table_id: &str,

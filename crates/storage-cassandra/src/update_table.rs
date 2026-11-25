@@ -177,9 +177,11 @@ impl CassandraEngine {
             }
             // A provisioned index's new ProvisionedThroughput, in the shape
             // the create path writes, in the indexes batch. The engine has
-            // checked the units and that the table is PROVISIONED before and
-            // after the request. A missing index is refused before anything
-            // is written, as for WarmThroughput.
+            // checked the units, that the table is PROVISIONED before and
+            // after the request, and that the index exists. A Cassandra
+            // UPDATE writes a row even when none exists, so the index is read
+            // again here: one removed since the engine's check is refused
+            // before anything is written.
             if let Some(action) = &update.update
                 && let Some(pt) = action.provisioned_throughput_units()
             {
