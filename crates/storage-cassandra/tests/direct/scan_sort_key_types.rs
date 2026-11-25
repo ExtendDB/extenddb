@@ -8,23 +8,24 @@
 //! the row's sort key read back from Cassandra and bound again; the typed
 //! tests check that this works for number, binary and string sort keys. A
 //! read through partitions with many deleted rows can reach Cassandra's
-//! `tombstone_failure_threshold` (100,000 by default) at 1,000 rows; the scan
-//! then reads again with fewer rows.
+//! `tombstone_failure_threshold` (100,000 by default); the scan then reads
+//! again with fewer rows, the first read of a storage call included, and the
+//! later reads of the call stay at that size.
 
 use bigdecimal::BigDecimal;
 use cdrs_tokio::types::IntoRustByName;
 use cdrs_tokio::types::blob::Blob;
 use cdrs_tokio::types::decimal::Decimal;
 use cdrs_tokio::types::value::Value;
-use extenddb_core::expression::ExpressionMaps;
-use extenddb_core::types::{AttributeValue, Item, ScalarAttributeType};
+use extenddb_core::types::{AttributeValue, ScalarAttributeType};
 use extenddb_storage::DataEngine;
 use extenddb_storage_cassandra::CassandraEngine;
 use futures::StreamExt;
-use std::collections::BTreeMap;
 use std::str::FromStr;
 
-use crate::helpers::{TestTable, setup_engine};
+use crate::helpers::{TestTable, claim_row, emptied_partition, key, put, scan_all, setup_engine};
+use crate::scan::ids;
+use crate::scan_rows_without_item::range_reads;
 
 #[derive(Clone, Debug)]
 enum Sk {
@@ -54,94 +55,6 @@ impl Sk {
             Sk::B(b) => Value::from(Blob::new(b.clone())),
         }
     }
-
-    fn column(&self) -> &'static str {
-        match self {
-            Sk::S(_) => "sk_s",
-            Sk::N(_) => "sk_n",
-            Sk::B(_) => "sk_b",
-        }
-    }
-}
-
-fn data_table(engine: &CassandraEngine, table: &TestTable) -> String {
-    format!(
-        "{}.items_{}",
-        engine.account_keyspace(&table.key_info.account_id),
-        table.key_info.table_id.replace('-', "_")
-    )
-}
-
-/// The row a TTL claim on the absent key (`pk`, `sk`) leaves: no `item_data`.
-async fn claim(engine: &CassandraEngine, table: &TestTable, pk: &str, sk: &Sk) {
-    let t = data_table(engine, table);
-    engine
-        .session_arc()
-        .query_with_values(
-            format!(
-                "UPDATE {t} SET prepared_txn_id = uuid(), prepared_txn_timestamp = 1 \
-                 WHERE pk = ? AND {} = ?",
-                sk.column()
-            ),
-            cdrs_tokio::query_values!(pk, sk.bind()),
-        )
-        .await
-        .expect("claim row");
-}
-
-/// A partition as DeleteItem leaves it once its only item is gone.
-async fn emptied(engine: &CassandraEngine, table: &TestTable, pk: &str, sk: &Sk) {
-    let t = data_table(engine, table);
-    engine
-        .session_arc()
-        .query_with_values(
-            format!(
-                "BEGIN UNLOGGED BATCH \
-                 UPDATE {t} SET partition_max_delete_timestamp = 1 WHERE pk = ?; \
-                 DELETE FROM {t} WHERE pk = ? AND {} = ?; \
-                 APPLY BATCH",
-                sk.column()
-            ),
-            cdrs_tokio::query_values!(pk, pk, sk.bind()),
-        )
-        .await
-        .expect("emptied partition");
-}
-
-async fn put_at(engine: &CassandraEngine, table: &TestTable, pk: &str, sk: &Sk) {
-    let item: Item = BTreeMap::from([
-        ("id".to_string(), AttributeValue::S(pk.to_string())),
-        ("sort".to_string(), sk.attr()),
-        ("v".to_string(), AttributeValue::S("x".to_string())),
-    ]);
-    engine
-        .put_item(
-            &table.key_info,
-            item,
-            false,
-            None,
-            &ExpressionMaps::default(),
-            None,
-        )
-        .await
-        .expect("put_item");
-}
-
-/// Pages a Scan to the end and returns the items in the order read.
-async fn read_all(engine: &CassandraEngine, table: &TestTable, limit: Option<i64>) -> Vec<Item> {
-    let (mut all, mut start): (Vec<Item>, Option<Item>) = (Vec::new(), None);
-    for _ in 0..3000 {
-        let (items, last_key) = engine
-            .scan(&table.key_info, limit, start.as_ref(), None, None, None)
-            .await
-            .expect("scan");
-        all.extend(items);
-        match last_key {
-            Some(k) => start = Some(k),
-            None => return all,
-        }
-    }
-    panic!("more than 3000 pages");
 }
 
 /// Numbers are stored in a normal form, so they are compared by value.
@@ -166,13 +79,13 @@ async fn check_typed(ty: ScalarAttributeType, name: &str, rows: Vec<(Sk, bool)>,
     let table = TestTable::with_sort_key_type(&engine, name, ty).await;
     for (sk, is_item) in &rows {
         if *is_item {
-            put_at(&engine, &table, "p", sk).await;
+            put(&engine, &table, key("p", Some(sk.attr()))).await;
         } else {
-            claim(&engine, &table, "p", sk).await;
+            claim_row(&engine, &table, "p", Some(sk.bind())).await;
         }
     }
     for i in 0..40 {
-        emptied(&engine, &table, &format!("gone{i:02}"), &gone).await;
+        emptied_partition(&engine, &table, &format!("gone{i:02}"), &[gone.bind()]).await;
     }
     let want: Vec<String> = rows
         .iter()
@@ -180,7 +93,7 @@ async fn check_typed(ty: ScalarAttributeType, name: &str, rows: Vec<(Sk, bool)>,
         .map(|(sk, _)| canon(&sk.attr()))
         .collect();
     for limit in [Some(1), Some(2), Some(3), Some(7), None] {
-        let items = read_all(&engine, &table, limit).await;
+        let items = scan_all(&engine, &table, limit, None).await;
         let got: Vec<String> = items
             .iter()
             .map(|item| canon(item.get("sort").expect("sort")))
@@ -241,6 +154,12 @@ async fn test_scan_past_claim_rows_with_a_string_sort_key() {
     check_typed(ScalarAttributeType::S, "ScanClaimString", rows, Sk::S("a")).await;
 }
 
+/// The sort keys `s000` onwards of the `n` deleted rows of an emptied
+/// partition.
+fn deleted_rows(n: usize) -> Vec<Value> {
+    (0..n).map(|j| Value::from(format!("s{j:03}"))).collect()
+}
+
 async fn token_of(engine: &CassandraEngine, pk: &str) -> i64 {
     let rows = engine
         .session_arc()
@@ -259,6 +178,17 @@ async fn token_of(engine: &CassandraEngine, pk: &str) -> i64 {
         .expect("not null")
 }
 
+/// `n` partition keys `<prefix><i>`, in token order.
+async fn keys_in_token_order(engine: &CassandraEngine, prefix: &str, n: usize) -> Vec<String> {
+    let mut tokens = Vec::with_capacity(n);
+    for i in 0..n {
+        let pk = format!("{prefix}{i:04}");
+        tokens.push((token_of(engine, &pk).await, pk));
+    }
+    tokens.sort();
+    tokens.into_iter().map(|(_, pk)| pk).collect()
+}
+
 /// 2,100 emptied partitions that each held 110 rows, and one item in the
 /// partition with the highest token. A read of 1,000 such rows counts about
 /// 110,000 tombstones, past the threshold; a read of 500 counts about 55,000.
@@ -270,38 +200,82 @@ async fn test_scan_past_emptied_partitions_with_many_deleted_rows() {
     }
     let engine = setup_engine().await;
     let table = TestTable::new(&engine, "ScanHeavyEmptied", true).await;
-    let t = data_table(&engine, &table);
-    let session = engine.session_arc();
-    let mut tokens: Vec<(i64, String)> = Vec::new();
-    for i in 0..2101 {
-        let pk = format!("heavy{i:04}");
-        tokens.push((token_of(&engine, &pk).await, pk));
-    }
-    tokens.sort();
-    let (_, live) = tokens.pop().expect("partition keys");
-    futures::stream::iter(tokens.iter().map(|(_, pk)| pk))
-        .for_each_concurrent(8, |pk| {
-            let (session, t) = (session.clone(), t.clone());
-            async move {
-                // Test-generated ASCII keys, so literals are safe here.
-                let mut cql = format!(
-                    "BEGIN UNLOGGED BATCH UPDATE {t} SET partition_max_delete_timestamp = 1 \
-                     WHERE pk = '{pk}'; "
-                );
-                for j in 0..110 {
-                    cql.push_str(&format!(
-                        "DELETE FROM {t} WHERE pk = '{pk}' AND sk_s = 's{j:03}'; "
-                    ));
-                }
-                cql.push_str("APPLY BATCH");
-                session.query(cql).await.expect("emptied partition");
-            }
-        })
+    let mut pks = keys_in_token_order(&engine, "heavy", 2101).await;
+    let live = pks.pop().expect("partition keys");
+    let deleted = deleted_rows(110);
+    futures::stream::iter(&pks)
+        .for_each_concurrent(8, |pk| emptied_partition(&engine, &table, pk, &deleted))
         .await;
-    put_at(&engine, &table, &live, &Sk::S("a")).await;
+    put(
+        &engine,
+        &table,
+        key(&live, Some(AttributeValue::S("a".to_string()))),
+    )
+    .await;
     for limit in [Some(1), Some(128)] {
-        let items = read_all(&engine, &table, limit).await;
-        let ids: Vec<&AttributeValue> = items.iter().filter_map(|i| i.get("id")).collect();
-        assert_eq!(ids, [&AttributeValue::S(live.clone())], "limit {limit:?}");
+        let items = scan_all(&engine, &table, limit, None).await;
+        assert_eq!(ids(&items), std::slice::from_ref(&live), "limit {limit:?}");
     }
+}
+
+/// Five items at the lowest tokens, then 300 emptied partitions that each
+/// held 400 rows. The engine reads a page in storage calls: the first, with
+/// Limit 128, reads the 5 items and 124 emptied partitions and returns the
+/// fifth item's key. The second, with Limit 1,024, starts after that item.
+/// Its reads of 1,025, 512 and 256 rows pass more than 100,000 tombstones,
+/// and Cassandra refuses each of them. Each refused read runs again with half
+/// the rows, and the later reads of the call stay at 128 rows. So the call
+/// answers no item and no key in 6 range reads: the 3 refused ones, then 128,
+/// 128 and 44 rows. Later reads that grew back to 256 rows would take the
+/// last 172 partitions in one read, for 5 range reads.
+#[tokio::test]
+async fn test_scan_after_items_past_partitions_with_many_deleted_rows() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let table = TestTable::new(&engine, "ScanHeavyAfterItems", true).await;
+    let mut gone = keys_in_token_order(&engine, "p", 305).await;
+    let live: Vec<String> = gone.drain(..5).collect();
+    let sort = || Some(AttributeValue::S("a".to_string()));
+    for pk in &live {
+        put(&engine, &table, key(pk, sort())).await;
+    }
+    let deleted = deleted_rows(400);
+    futures::stream::iter(&gone)
+        .for_each_concurrent(8, |pk| emptied_partition(&engine, &table, pk, &deleted))
+        .await;
+
+    let (items, last_key) = engine
+        .scan(&table.key_info, Some(128), None, None, None, None)
+        .await
+        .expect("scan, Limit 128");
+    assert_eq!(ids(&items), live);
+    assert_eq!(last_key, Some(key(&live[4], sort())));
+    let before = range_reads(&engine, &table).await;
+    let (items, last_key) = engine
+        .scan(
+            &table.key_info,
+            Some(1024),
+            last_key.as_ref(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("scan after the fifth item, Limit 1024");
+    let reads = range_reads(&engine, &table).await - before;
+    assert_eq!((ids(&items), last_key), (Vec::<String>::new(), None));
+    assert_eq!(reads, 6, "range reads of the call after the fifth item");
+
+    // CreateBackup, export and the TTL work read with Limit 1,000 from the
+    // start. Cassandra refuses that first read of 1,001 rows and its retry
+    // of 500. A read of 250 rows passes 245 emptied partitions (98,000
+    // tombstones) and returns the 5 items with the fifth item's key.
+    let (items, last_key) = engine
+        .scan(&table.key_info, Some(1000), None, None, None, None)
+        .await
+        .expect("scan from the start, Limit 1000");
+    assert_eq!(ids(&items), live);
+    assert_eq!(last_key, Some(key(&live[4], sort())));
 }

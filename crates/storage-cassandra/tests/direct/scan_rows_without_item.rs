@@ -7,48 +7,34 @@
 //! of its static columns, and a TTL claim on an absent key writes a row with
 //! no `item_data`. Neither row is an item. A page may come back short because
 //! of them, but while items remain it carries a LastEvaluatedKey, so a reader
-//! paging on from the last item reads every item. A long run of such rows is
-//! read in reads of at most about 1,000 rows, never from its start again.
+//! paging on from the last item reads every item. With a Limit under 1,000, a
+//! long run of such rows is read in reads of at most 1,000 rows each, and no
+//! read goes back to the start of the run.
 
-use extenddb_core::expression::ExpressionMaps;
+use cdrs_tokio::types::value::Value;
 use extenddb_core::types::{AttributeValue, Item};
 use extenddb_storage::DataEngine;
 use extenddb_storage_cassandra::CassandraEngine;
 use futures::StreamExt;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
-use crate::helpers::{TestTable, setup_engine};
+use crate::helpers::{
+    TestTable, claim_row, data_table_metric, emptied_partition, key, put, scan_all, setup_engine,
+};
+use crate::scan::ids;
 
-fn key(table: &TestTable, id: &str) -> Item {
-    let mut key = BTreeMap::from([("id".to_string(), AttributeValue::S(id.to_string()))]);
-    if table.key_info.key_schema.len() > 1 {
-        key.insert("sort".to_string(), AttributeValue::S("a".to_string()));
-    }
-    key
-}
-
-async fn put(engine: &CassandraEngine, table: &TestTable, id: &str) {
-    let mut item = key(table, id);
-    item.insert("v".to_string(), AttributeValue::S("x".to_string()));
-    engine
-        .put_item(
-            &table.key_info,
-            item,
-            false,
-            None,
-            &ExpressionMaps::default(),
-            None,
-        )
-        .await
-        .expect("put_item");
+/// The key of item `id`: sort key "a" on a table with a sort key.
+fn key_a(table: &TestTable, id: &str) -> Item {
+    let sort = (table.key_info.key_schema.len() > 1).then(|| AttributeValue::S("a".to_string()));
+    key(id, sort)
 }
 
 async fn put_and_delete(engine: &CassandraEngine, table: &TestTable, id: &str) {
-    put(engine, table, id).await;
+    put(engine, table, key_a(table, id)).await;
     engine
         .delete_item(
             &table.key_info,
-            &key(table, id),
+            &key_a(table, id),
             false,
             None,
             &Default::default(),
@@ -56,46 +42,6 @@ async fn put_and_delete(engine: &CassandraEngine, table: &TestTable, id: &str) {
         )
         .await
         .expect("delete_item");
-}
-
-/// Writes the row a TTL claim on the absent key `id` leaves: no `item_data`.
-async fn claim_row(engine: &CassandraEngine, table: &TestTable, id: &str) {
-    let keyspace = engine.account_keyspace(&table.key_info.account_id);
-    let data_table = format!("items_{}", table.key_info.table_id.replace('-', "_"));
-    let session = engine.session_arc();
-    if table.key_info.key_schema.len() > 1 {
-        session
-            .query_with_values(
-                format!(
-                    "UPDATE {keyspace}.{data_table} SET prepared_txn_id = uuid(), \
-                     prepared_txn_timestamp = 1 WHERE pk = ? AND sk_s = ?"
-                ),
-                cdrs_tokio::query_values!(id, "a"),
-            )
-            .await
-            .expect("claim row");
-    } else {
-        session
-            .query_with_values(
-                format!(
-                    "UPDATE {keyspace}.{data_table} SET prepared_txn_id = uuid(), \
-                     prepared_txn_timestamp = 1 WHERE pk = ?"
-                ),
-                cdrs_tokio::query_values!(id),
-            )
-            .await
-            .expect("claim row");
-    }
-}
-
-fn ids(items: &[Item]) -> Vec<String> {
-    items
-        .iter()
-        .map(|item| match item.get("id") {
-            Some(AttributeValue::S(s)) => s.clone(),
-            other => panic!("partition key {other:?}"),
-        })
-        .collect()
 }
 
 /// Pages through the table (or one segment of it) with `limit` and returns
@@ -106,27 +52,7 @@ async fn read_all(
     limit: Option<i64>,
     segment: Option<(i64, i64)>,
 ) -> Vec<String> {
-    let mut all = Vec::new();
-    let mut start: Option<Item> = None;
-    for _ in 0..1000 {
-        let (items, last_key) = engine
-            .scan(
-                &table.key_info,
-                limit,
-                start.as_ref(),
-                segment.map(|(s, _)| s),
-                segment.map(|(_, t)| t),
-                None,
-            )
-            .await
-            .expect("scan");
-        all.extend(ids(&items));
-        match last_key {
-            Some(k) => start = Some(k),
-            None => return all,
-        }
-    }
-    panic!("more than 1000 pages");
+    ids(&scan_all(engine, table, limit, segment).await)
 }
 
 /// 30 live partitions among 300 emptied ones and 20 claim rows, so runs of
@@ -135,14 +61,15 @@ async fn fill(engine: &CassandraEngine, table: &TestTable) -> BTreeSet<String> {
     let live: Vec<String> = (0..30).map(|i| format!("live{i:03}")).collect();
     let emptied: Vec<String> = (0..300).map(|i| format!("gone{i:03}")).collect();
     let claims: Vec<String> = (0..20).map(|i| format!("claim{i:03}")).collect();
+    let claim_sk = (table.key_info.key_schema.len() > 1).then(|| Value::from("a"));
     futures::stream::iter(&live)
-        .for_each_concurrent(32, |id| put(engine, table, id))
+        .for_each_concurrent(32, |id| put(engine, table, key_a(table, id)))
         .await;
     futures::stream::iter(&emptied)
         .for_each_concurrent(32, |id| put_and_delete(engine, table, id))
         .await;
     futures::stream::iter(&claims)
-        .for_each_concurrent(32, |id| claim_row(engine, table, id))
+        .for_each_concurrent(32, |id| claim_row(engine, table, id, claim_sk.clone()))
         .await;
     live.into_iter().collect()
 }
@@ -215,37 +142,13 @@ async fn test_scan_of_a_table_with_no_item_left() {
     }
 }
 
-/// The CQL table behind `table`.
-fn data_table(engine: &CassandraEngine, table: &TestTable) -> String {
-    format!(
-        "{}.items_{}",
-        engine.account_keyspace(&table.key_info.account_id),
-        table.key_info.table_id.replace('-', "_")
-    )
-}
-
 /// Writes `n` emptied partitions with CQL, as DeleteItem leaves them on a
 /// table with a sort key: the static delete timestamp and a deleted row.
 async fn emptied_partitions(engine: &CassandraEngine, table: &TestTable, n: usize) {
-    let cql = format!(
-        "BEGIN UNLOGGED BATCH \
-         UPDATE {t} SET partition_max_delete_timestamp = 1 WHERE pk = ?; \
-         DELETE FROM {t} WHERE pk = ? AND sk_s = 'a'; \
-         APPLY BATCH",
-        t = data_table(engine, table)
-    );
-    let session = engine.session_arc();
     let ids: Vec<String> = (0..n).map(|i| format!("gone{i:06}")).collect();
+    let deleted = [Value::from("a")];
     futures::stream::iter(&ids)
-        .for_each_concurrent(8, |id| {
-            let (session, cql) = (session.clone(), cql.clone());
-            async move {
-                session
-                    .query_with_values(cql, cdrs_tokio::query_values!(id.as_str(), id.as_str()))
-                    .await
-                    .expect("emptied partition");
-            }
-        })
+        .for_each_concurrent(8, |id| emptied_partition(engine, table, id, &deleted))
         .await;
 }
 
@@ -258,36 +161,15 @@ async fn test_scan_past_claim_rows_inside_a_partition() {
     }
     let engine = setup_engine().await;
     let table = TestTable::new(&engine, "ScanClaimRun", true).await;
-    let t = data_table(&engine, &table);
-    let session = engine.session_arc();
     for i in 0..40 {
-        session
-            .query_with_values(
-                format!(
-                    "UPDATE {t} SET prepared_txn_id = uuid(), prepared_txn_timestamp = 1 \
-                     WHERE pk = 'p' AND sk_s = ?"
-                ),
-                cdrs_tokio::query_values!(format!("c{i:03}")),
-            )
-            .await
-            .expect("claim row");
+        claim_row(&engine, &table, "p", Some(Value::from(format!("c{i:03}")))).await;
     }
-    let mut item = BTreeMap::from([
-        ("id".to_string(), AttributeValue::S("p".to_string())),
-        ("sort".to_string(), AttributeValue::S("z".to_string())),
-    ]);
-    item.insert("v".to_string(), AttributeValue::S("x".to_string()));
-    engine
-        .put_item(
-            &table.key_info,
-            item,
-            false,
-            None,
-            &ExpressionMaps::default(),
-            None,
-        )
-        .await
-        .expect("put_item");
+    put(
+        &engine,
+        &table,
+        key("p", Some(AttributeValue::S("z".to_string()))),
+    )
+    .await;
     for limit in [None, Some(1), Some(3)] {
         assert_eq!(
             read_all(&engine, &table, limit, None).await,
@@ -297,39 +179,38 @@ async fn test_scan_past_claim_rows_inside_a_partition() {
     }
 }
 
-/// The most tombstones Cassandra has counted in one read of `table`'s data
-/// table, from its `system_views.tombstones_per_read` histogram.
-async fn max_tombstones_per_read(engine: &CassandraEngine, table: &TestTable) -> f64 {
-    use cdrs_tokio::types::IntoRustByName;
-
-    let keyspace = engine.account_keyspace(&table.key_info.account_id);
-    let data_table = format!("items_{}", table.key_info.table_id.replace('-', "_"));
-    let result = engine
-        .session_arc()
-        .query_with_values(
-            "SELECT max FROM system_views.tombstones_per_read \
-             WHERE keyspace_name = ? AND table_name = ?",
-            cdrs_tokio::query_values!(keyspace.as_str(), data_table.as_str()),
-        )
+/// Checks Cassandra's `system_views.tombstones_per_read` histogram for
+/// `table`: no read counted 1,500 tombstones or more. The histogram rounds
+/// up: a read of 1,001 rows shows as about 1,109.
+async fn assert_no_read_of_1500_tombstones(engine: &CassandraEngine, table: &TestTable) {
+    let max = data_table_metric::<f64>(engine, table, "tombstones_per_read", "max")
         .await
-        .expect("tombstones_per_read");
-    let rows = result
-        .response_body()
-        .expect("tombstones_per_read body")
-        .into_rows()
-        .unwrap_or_default();
-    let max: Option<f64> = rows
-        .first()
-        .map(|row| row.get_by_name("max").expect("max column"))
-        .unwrap_or_default();
-    max.unwrap_or(0.0)
+        .unwrap_or(0.0);
+    assert!(
+        max > 0.0,
+        "no tombstones counted, so the check proves nothing"
+    );
+    assert!(max < 1_500.0, "one read counted {max} tombstones");
+}
+
+/// The range reads Cassandra has made of `table` (its
+/// `system_views.local_scan_latency` count, which a refused read adds to as
+/// well). The table is the test's own, so a change in the count is the
+/// test's reads.
+pub(crate) async fn range_reads(engine: &CassandraEngine, table: &TestTable) -> i64 {
+    data_table_metric::<i64>(engine, table, "local_scan_latency", "count")
+        .await
+        .unwrap_or(0)
 }
 
 /// A run of emptied partitions longer than one bounded read, between items.
-/// A paged Scan reads it in statements of at most about 1,000 rows each, so
-/// no single read of the data table counts more tombstones than that; a scan
+/// A paged Scan reads it in statements of at most 1,000 rows each, so no
+/// single read of the data table counts more tombstones than that; a scan
 /// that read the run again from its start with a growing LIMIT, or let the
 /// read size grow without a cap, would read the whole run in one statement.
+/// Each read takes twice the rows of the one before, so each pass reads the
+/// run in at most 100 range reads; with reads that stay at the first read's
+/// 2 rows, the Limit 1 pass takes about 2,500.
 #[tokio::test]
 async fn test_scan_past_a_long_run_of_emptied_partitions() {
     if crate::helpers::skip_without_cassandra() {
@@ -340,24 +221,21 @@ async fn test_scan_past_a_long_run_of_emptied_partitions() {
     emptied_partitions(&engine, &table, 5_000).await;
     let live: BTreeSet<String> = (0..5).map(|i| format!("live{i}")).collect();
     for id in &live {
-        put(&engine, &table, id).await;
+        put(&engine, &table, key_a(&table, id)).await;
     }
     for limit in [Some(1), Some(2), Some(1000)] {
+        let before = range_reads(&engine, &table).await;
         let read = read_all(&engine, &table, limit, None).await;
+        let reads = range_reads(&engine, &table).await - before;
         assert_eq!(read.len(), live.len(), "limit {limit:?}: {read:?}");
         assert_eq!(
             read.into_iter().collect::<BTreeSet<_>>(),
             live,
             "limit {limit:?}"
         );
+        assert!(reads <= 100, "limit {limit:?}: {reads} range reads");
     }
-    let max = max_tombstones_per_read(&engine, &table).await;
-    assert!(
-        max > 0.0,
-        "no tombstones counted, so the check proves nothing"
-    );
-    // The histogram rounds up: a read of 1,001 rows shows as about 1,109.
-    assert!(max < 1_500.0, "one read counted {max} tombstones");
+    assert_no_read_of_1500_tombstones(&engine, &table).await;
     // No Limit reads up to 1,000,001 rows in one statement, by design.
     let read = read_all(&engine, &table, None, None).await;
     assert_eq!(read.into_iter().collect::<BTreeSet<_>>(), live, "no limit");
@@ -365,7 +243,8 @@ async fn test_scan_past_a_long_run_of_emptied_partitions() {
 
 /// A table with more emptied partitions than Cassandra's
 /// `tombstone_failure_threshold` (100,000 by default). Each read of the run
-/// stays below it, so the scan answers no item and no key.
+/// stays below it, so the scan answers no item and no key, and no read
+/// counts 1,500 tombstones or more.
 #[tokio::test]
 async fn test_scan_of_a_table_emptied_past_the_tombstone_threshold() {
     if crate::helpers::skip_without_cassandra() {
@@ -382,4 +261,5 @@ async fn test_scan_of_a_table_emptied_past_the_tombstone_threshold() {
         assert!(items.is_empty(), "limit {limit:?}");
         assert_eq!(last_key, None, "limit {limit:?}");
     }
+    assert_no_read_of_1500_tombstones(&engine, &table).await;
 }

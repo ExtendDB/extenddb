@@ -1040,3 +1040,186 @@ pub fn skip_without_cassandra() -> bool {
     }
     !reachable
 }
+
+/// The key of an item of a test table: `id`, and `sort` on a table with a
+/// sort key.
+pub fn key(
+    id: &str,
+    sort: Option<extenddb_core::types::AttributeValue>,
+) -> extenddb_core::types::Item {
+    let mut key = std::collections::BTreeMap::from([(
+        "id".to_string(),
+        extenddb_core::types::AttributeValue::S(id.to_string()),
+    )]);
+    if let Some(sort) = sort {
+        key.insert("sort".to_string(), sort);
+    }
+    key
+}
+
+/// Puts the item with the key `key` and one more attribute, `v = "x"`.
+pub async fn put(engine: &CassandraEngine, table: &TestTable, key: extenddb_core::types::Item) {
+    use extenddb_storage::DataEngine;
+
+    let mut item = key;
+    item.insert(
+        "v".to_string(),
+        extenddb_core::types::AttributeValue::S("x".to_string()),
+    );
+    engine
+        .put_item(
+            &table.key_info,
+            item,
+            false,
+            None,
+            &Default::default(),
+            None,
+        )
+        .await
+        .expect("put_item");
+}
+
+/// The CQL name of `table`'s data table: `<keyspace>.items_<table id>`.
+pub fn data_table(engine: &CassandraEngine, table: &TestTable) -> String {
+    format!(
+        "{}.items_{}",
+        engine.account_keyspace(&table.key_info.account_id),
+        table.key_info.table_id.replace('-', "_")
+    )
+}
+
+/// The column that holds `table`'s sort key: `sk_s`, `sk_n` or `sk_b`.
+fn sort_key_column(table: &TestTable) -> &'static str {
+    let (_, sk_type) = extenddb_storage::util::sk_info(
+        &table.key_info.key_schema,
+        &table.key_info.attribute_definitions,
+    )
+    .expect("a table with a sort key");
+    extenddb_storage::util::sk_column(sk_type)
+}
+
+/// Writes with CQL the row a TTL claim on the absent key `pk` (and `sk`, on
+/// a table with a sort key) leaves: `prepared_txn_id` and
+/// `prepared_txn_timestamp` set, and no `item_data`.
+pub async fn claim_row(
+    engine: &CassandraEngine,
+    table: &TestTable,
+    pk: &str,
+    sk: Option<cdrs_tokio::types::value::Value>,
+) {
+    let set = format!(
+        "UPDATE {} SET prepared_txn_id = uuid(), prepared_txn_timestamp = 1 WHERE pk = ?",
+        data_table(engine, table)
+    );
+    let session = engine.session_arc();
+    match sk {
+        Some(sk) => {
+            let cql = format!("{set} AND {} = ?", sort_key_column(table));
+            session
+                .query_with_values(cql, cdrs_tokio::query_values!(pk, sk))
+                .await
+        }
+        None => {
+            session
+                .query_with_values(set, cdrs_tokio::query_values!(pk))
+                .await
+        }
+    }
+    .expect("claim row");
+}
+
+/// Writes with CQL partition `pk` as DeleteItem leaves it on a table with a
+/// sort key once its items are gone: the static delete timestamp, and a
+/// deleted row for each sort key in `deleted`.
+pub async fn emptied_partition(
+    engine: &CassandraEngine,
+    table: &TestTable,
+    pk: &str,
+    deleted: &[cdrs_tokio::types::value::Value],
+) {
+    use cdrs_tokio::types::value::Value;
+
+    let (t, col) = (data_table(engine, table), sort_key_column(table));
+    let mut cql = format!(
+        "BEGIN UNLOGGED BATCH UPDATE {t} SET partition_max_delete_timestamp = 1 WHERE pk = ?; "
+    );
+    let mut values = vec![Value::from(pk)];
+    for sk in deleted {
+        cql.push_str(&format!("DELETE FROM {t} WHERE pk = ? AND {col} = ?; "));
+        values.extend([Value::from(pk), sk.clone()]);
+    }
+    cql.push_str("APPLY BATCH");
+    engine
+        .session_arc()
+        .query_with_values(cql, cdrs_tokio::query::QueryValues::SimpleValues(values))
+        .await
+        .expect("emptied partition");
+}
+
+/// `column` of `system_views.<view>` for `table`'s data table: one of
+/// Cassandra's read metrics of that table, such as the `count` of
+/// `local_scan_latency` or the `max` of `tombstones_per_read`. `None` before
+/// the table's first read.
+pub async fn data_table_metric<T>(
+    engine: &CassandraEngine,
+    table: &TestTable,
+    view: &str,
+    column: &str,
+) -> Option<T>
+where
+    cdrs_tokio::types::rows::Row: cdrs_tokio::types::IntoRustByName<T>,
+{
+    use cdrs_tokio::types::IntoRustByName;
+
+    let keyspace = engine.account_keyspace(&table.key_info.account_id);
+    let name = format!("items_{}", table.key_info.table_id.replace('-', "_"));
+    let rows = engine
+        .session_arc()
+        .query_with_values(
+            format!(
+                "SELECT {column} FROM system_views.{view} \
+                 WHERE keyspace_name = ? AND table_name = ?"
+            ),
+            cdrs_tokio::query_values!(keyspace.as_str(), name.as_str()),
+        )
+        .await
+        .expect(view)
+        .response_body()
+        .expect(view)
+        .into_rows()
+        .unwrap_or_default();
+    rows.first()
+        .and_then(|row| IntoRustByName::<T>::get_by_name(row, column).expect(column))
+}
+
+/// Pages a Scan of `table` (or of one `(segment, total segments)` of it)
+/// with `limit` to the end, and returns the items in the order read.
+pub async fn scan_all(
+    engine: &CassandraEngine,
+    table: &TestTable,
+    limit: Option<i64>,
+    segment: Option<(i64, i64)>,
+) -> Vec<extenddb_core::types::Item> {
+    use extenddb_storage::DataEngine;
+
+    let (mut all, mut start) = (Vec::new(), None);
+    for _ in 0..3000 {
+        let (items, last_key) = engine
+            .scan(
+                &table.key_info,
+                limit,
+                start.as_ref(),
+                segment.map(|(s, _)| s),
+                segment.map(|(_, t)| t),
+                None,
+            )
+            .await
+            .expect("scan");
+        all.extend(items);
+        match last_key {
+            Some(k) => start = Some(k),
+            None => return all,
+        }
+    }
+    panic!("more than 3000 pages");
+}
