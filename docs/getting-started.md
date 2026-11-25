@@ -271,7 +271,7 @@ Config:           extenddb.toml
 Catalog database: extenddb_catalog
 
 --- Checking catalog migrations...
-  OK: Current: the catalog is at migration 13
+  OK: Current: the catalog is at migration 12
 --- Checking catalog connection...
   OK: Connected to catalog.
 --- Checking data database...
@@ -289,7 +289,7 @@ extenddb runs as a daemon (background process) and logs to syslog. On startup it
 
 ```bash
 ./target/release/extenddb serve --config extenddb.toml
-# extenddb 1.0.0 (catalog migration 13) starting on 127.0.0.1:18443
+# extenddb 1.0.0 (catalog migration 12) starting on 127.0.0.1:18443
 #   storage: postgres (postgresql://extenddb:***@localhost:5432/extenddb_catalog)
 ```
 
@@ -1394,7 +1394,7 @@ Each runner requires its tools to be installed. The runner checks prerequisites 
 ```bash
 ./target/release/extenddb version
 # extenddb 1.0.0
-# catalog migration 13 (postgres)
+# catalog migration 12 (postgres)
 # commit abc1234
 # built 2026-04-17T12:00:00Z
 # test-hooks disabled

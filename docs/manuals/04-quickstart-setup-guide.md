@@ -130,7 +130,7 @@ Check the version:
 ```bash
 ./target/release/extenddb version
 # extenddb 1.0.0
-# catalog migration 13 (postgres)
+# catalog migration 12 (postgres)
 # commit abc1234
 # built 2026-04-17T12:00:00Z
 # test-hooks disabled
@@ -175,7 +175,7 @@ Config:           extenddb.toml
 Catalog database: extenddb_catalog
 
 --- Checking catalog migrations...
-  OK: Current: the catalog is at migration 13
+  OK: Current: the catalog is at migration 12
 --- Checking catalog connection...
   OK: Connected to catalog.
 --- Checking data database...
