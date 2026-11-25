@@ -1,6 +1,6 @@
 # RFC-0000: Couchbase Storage Backend
 
-- Status: Draft (revision 3, 2026-11-24, responds to both reviews on #1184)
+- Status: Draft (revision 4, 2026-11-25: the engineering items of revision 3 are implemented and merged in the reference repository, see "Engineering items of revision 3")
 - Author: @suravarjjala
 - Created: 2026-11-04
 - FCP ends: —
@@ -83,6 +83,15 @@ backend build that produced it:
   runs this suite is `extenddb-couchbase-nightly`; the clone stage that kept
   it on the stale `e41f370` checkout was fixed in
   couchbaselabs/extenddb-couchbase#237, merged 2026-11-24.
+- The engineering items of revision 3 (the lease, the stream reader's
+  transactional read, the descending twins, the budgets, the backfill fence,
+  the scoped `destroy`, and the smaller ones) are merged on the reference
+  repository's `main` as commits `b0c272f`, `5e8462b` and `f4f293d`
+  (2026-11-25), each verified against the demo stack and the upstream files
+  at the pin; the three-node harness (`scripts/query-txn-multinode-test.sh`,
+  three Couchbase nodes each running data, index and query, durability
+  `majority`) passes 19 of 19, including the new commit-point hold (see
+  "Transactions" and "DynamoDB Streams").
 - QE: a 343-case Couchbase-specific test plan (`docs/qe/testcases.md`) run
   against a real multi-node cluster; every failure traced to code and fixed or
   filed (`docs/qe/qe-report.md`). No acknowledged write was lost in any
@@ -470,9 +479,15 @@ BY`. `ScanIndexForward=false` runs the same statement with `ORDER BY ... DESC`
 and the reversed comparison. Couchbase pushes an `ORDER BY` down to an index
 only when the keys are aligned with the index order and does not scan an index
 in reverse ("Index pushdowns"), so the base index and every GSI and LSI index
-have a **descending twin** (`... DESC` on the sort column) that the descending
-statement uses; the twins count in the index budget (see "Multi-tenancy") and
-descending paging is in the tests.
+have a **descending twin** (`<name>_desc`, every range column `DESC`) that the
+descending statement uses; the twins are created, built and dropped with
+their siblings, `ensure_desc_twins` gives an existing deployment's indexes
+their twins at server start, the twins count in the index budget (see
+"Multi-tenancy"), and descending paging is in the tests
+(`tests/test_desc_paging.py`: base table, GSI, LSI and range queries across
+several pages). Measured: `EXPLAIN` of a descending Query plans on
+`idx_items_tid_pk_sk_desc` with no `Order` operator, and the ascending one on
+the base index, also without.
 
 **Scan** is a SQL++ scan of the table's partition; a parallel-scan segment is
 selected by hashing the encoded primary key (`SHA-256` of `_xdb.pk` and
@@ -550,12 +565,17 @@ DDL never runs on the request path. The fence between the backfill and
 in-flight writes: `main`'s `CachedTableKeyInfoStore` is stale-while-revalidate
 and `UpdateTable` invalidates it after the catalog mutation succeeds, so a
 request that started before that invalidation may carry the old index list.
-The server keeps an in-flight counter per table (incremented when a request's
-key info is resolved, decremented when the request finishes), and the
-reconciler starts the backfill only after the invalidation has happened and
-every request in flight at that moment, the reindex reconciler's own writes
-included, has finished; every write that resolves its key info after the
-invalidation carries the new index. The sub-document fast path reads the same
+The server keeps an in-flight counter per table (incremented when a write's
+key info is fixed, decremented when the write finishes). `UpdateTable` creates
+and builds the index, backfills once, publishes the catalog row with the
+index `CREATING`, and returns; the fenced second pass then waits for the
+catalog freshness window (after which every write that resolves its key info
+carries the index), then for every write in flight on this server to finish,
+backfills again, and flips the index `ACTIVE`; the GSI worker's later pass
+flips a still-`CREATING` index too. In-tree the first wait is the cache
+invalidation `UpdateTable` performs; out of tree it is the freshness window.
+`tests/test_gsi_fence.py` races four writers against the create and finds
+every item in the `ACTIVE` index. The sub-document fast path reads the same
 key info and refuses any attribute an index names, so it is covered by the
 same fence. `index_num_replicas` sets `num_replica` on every index the backend
 creates, failing closed when the cluster has too few index nodes. Multi-part
@@ -688,11 +708,12 @@ success if the token is there with the request's fingerprint, otherwise 500
 transaction id in the server log; a client retry with the same
 `ClientRequestToken` then replays the committed result or runs the request if
 it did not commit, so the outcome is resolved by the retry. The operational
-requirement is `memory-quota` at 0 (the default) or at least the value a
-measured 100-action, 4 MB `TransactWriteItems` on a stream-enabled table with
-`NEW_AND_OLD_IMAGES` needs (an open engineering item); a valid request on a
-node configured below that answers 503 with the query-service error logged,
-never a silent partial commit.
+requirement is `memory-quota` at 0 (the default, no quota): a 100-action,
+4 MB `TransactWriteItems` on a stream-enabled table with `NEW_AND_OLD_IMAGES`
+(every item pre-existing, so each record carries both images) committed in
+0.63 s on the demo stack at that default. A valid request on a node
+configured below what it needs answers 503 with the query-service error
+logged, never a silent partial commit.
 
 `ClientRequestToken` idempotency is a document in `data.idempotency` with a
 600 s retention; a replay with a matching fingerprint returns the original
@@ -749,10 +770,14 @@ gives no bound on cleanup after a node failure, so no age alone resolves a
 number. The iterator only ever moves over the contiguous resolved prefix, so a
 record that commits late is still delivered, exactly once, and `LATEST` and
 `AT_TIMESTAMP` iterators start no later than the first unresolved number of
-the shard. The out-of-tree reader resolves by age alone; the transactional
-read, and the test that holds one transaction between its commit point and
-its unstaging for longer than the age while a later one commits, are open
-engineering items.
+the shard. Implemented in `resolve_aged_gaps` and `txn_peek` (at most 64 probes per
+`GetRecords` call), with `contiguous_prefix` as the fast path for a gapless
+prefix. Tested by the three-node harness's commit-point hold: one node's
+query engine is frozen (`SIGSTOP`) for 60 s, longer than the gap grace,
+under three transaction writers, two plain writers and a stream reader on
+one table; over two runs the reader delivered 3,430 and 5,622 records live
+and, against the final shard content, never passed a number whose record
+appeared later (`scripts/txn-commitpoint-test.py`).
 
 **Single-item writes on a stream-enabled table** run as query-service
 transactions without a `transact_write` lease (they are not
@@ -1050,9 +1075,12 @@ definitions), `crates/auth/`, or `crates/core/`.
   bound; the README row states it as a known limit, and the sizing guidance in
   `docs/perf-pass-plan.md` is the per-instance one.
 - **Flagged tables.** A plain write on a table a transaction has touched adds
-  a lease insert and delete, two sub-millisecond KV operations, to its write;
-  the measured YCSB workload A figures for a flagged and an unflagged table
-  are published before FCP (open item 12).
+  a lease insert and delete, two KV operations, to its write. On the demo
+  stack (one node, 1,500 operations each) a bare `PutItem` goes from a median
+  of 0.81 ms (p99 1.26) to 1.88 ms (p99 2.98), and an `UpdateItem` `SET` from
+  1.08 ms (p99 2.13) to 1.97 ms (p99 3.43). The multi-node figures for the
+  README row come from the same YCSB workload A on the performance cluster
+  before FCP.
 - Connection-pool metrics are not emitted: the Couchbase SDK owns pooling and
   does not expose per-acquire latency (couchbaselabs/extenddb-couchbase#178).
 
@@ -1076,8 +1104,8 @@ and about forty criteria. The table below maps each criterion to the mechanism
 in this backend and to the test that proves it. "Upstream" tests are files in
 the ExtendDB conformance suite (`upstream/tests/`); QE ids are cases in
 `docs/qe/testcases.md`; `tests/` and `scripts/` are the reference repository's
-own. Criteria that this backend does **not** fully satisfy today are marked
-**OPEN** with the planned fix.
+own. No criterion is open as of revision 4; the items revision 3 listed and their
+state are under "Engineering items of revision 3" below.
 
 ### 1. Item identity
 
@@ -1095,7 +1123,7 @@ own. Criteria that this backend does **not** fully satisfy today are marked
 | 2.1 | Duplicate index keys | There is no separate index entry: the derived keys live in the item document and the Couchbase GSI indexes the document itself, so identity is the base document key | IX-04, upstream `test_put_item_create_race.py` (GSI and LSI tables) |
 | 2.2 | Stale entry prevention | Every write path rebuilds `_xdb` through `item_to_document`; the sub-document fast path is refused for any key or index attribute | IX-09, upstream `test_query_scan.py` GSI cases, stress "GSI query after updating a key attribute" |
 | 2.3 | Sparse semantics and type validation | The shared validators in `crates/core/src/validation` reject a wrong-type or empty index key with `ValidationException`; a missing attribute yields no derived key and the GSI `WHERE` excludes it | IX-03, DT-20, upstream `test_gsi_attribute_definitions.py` |
-| 2.4 | Backfill on UpdateTable | Catalog row written `CREATING`; the index reconciler waits for the key-info cache invalidation and for every request in flight at that moment to finish, backfills `_xdb._g<slot>` for existing items, and only then flips to `ACTIVE` (the fence is an open engineering item) | IX-07 (the upstream `gsi_async*` files spawn their own server and are outside the endpoint sweep, so IX-07 is the gate) |
+| 2.4 | Backfill on UpdateTable | Catalog row written `CREATING`; the index reconciler waits for the key-info cache invalidation and for every request in flight at that moment to finish, backfills `_xdb._g<slot>` for existing items, and only then flips to `ACTIVE` (implemented; see "Global and Local Secondary Indexes") | IX-07, `tests/test_gsi_fence.py` (the upstream `gsi_async*` files spawn their own server and are outside the endpoint sweep, so IX-07 is the gate) |
 | 2.5 | Transactional index maintenance | Transactional writes rewrite the whole document, derived keys included, inside the query-service transaction | TX-01, TX-13, upstream `test_transaction_operations.py` |
 | 2.6 | Index query pagination | `LastEvaluatedKey` carries index and base keys; the resume bound is merged with, not substituted for, the key condition | IX-06, QS-07, upstream `test_read_paging.py` |
 | 2.7 | ConsistentRead on GSI | Rejected by the engine with `ValidationException`; the backend exposes no strong-read option for index reads (see "Reads") | IX-10, QS-20 |
@@ -1108,15 +1136,15 @@ own. Criteria that this backend does **not** fully satisfy today are marked
 | 3.2 | Stream records in transaction | `stream_txn_write` appends the records to the same transaction as the writes | ST-04, TX-13, upstream `test_streams.py` |
 | 3.3 | Idempotency token atomicity | The token document `<account>#<token>` is read first (replay or mismatch by fingerprint, 600 s retention), then **recorded as a fail-if-exists create inside the same transaction as the writes**. Two concurrent requests with the same fresh token race on that create; exactly one commits, the loser's "exists" is mapped to replay or mismatch. Token and data commit or roll back together, and a cancelled transaction releases its token | TX-05, TX-06, upstream `test_idempotency_account_scope.py`, `test_conditional_atomicity.py`, `tests/test_transaction_rollback.py` |
 | 3.4 | CancellationReasons fidelity | Per-operation reasons in input order; `ALL_OLD` item attached on condition failure | TX-02, CR-12, upstream `test_transaction_operations.py`, `test_transact_expression_validation.py` |
-| 3.5 | TransactGetItems isolation | Every read key is leased, present or absent, and every present document's write lock is taken inside one read transaction (see "Transactions"); a read that cannot lease or lock within 10 attempts and 5 s is cancelled with `TransactionConflict`. **OPEN**: the absent-key lease, with a test where a `PutItem` creates an absent key during a `TransactGetItems` | TX-07, upstream `test_transact_get_snapshot.py` |
+| 3.5 | TransactGetItems isolation | Every read key is leased, present or absent, and every present document's write lock is taken inside one read transaction (see "Transactions"); a read that cannot lease or lock within 10 attempts and 5 s is cancelled with `TransactionConflict` | TX-07, upstream `test_transact_get_snapshot.py`, `tests/test_txn_lease.py` (a `TransactWriteItems` creates and updates a pair under three `TransactGetItems` readers: never torn across an absent key) |
 
 ### 4. Concurrency and isolation
 
 | # | Criterion | How the backend meets it | Evidence |
 |---|---|---|---|
-| 4.1 | Unconditional writes never fail under contention | A bare unconditional `PutItem` with no `ReturnValues` is one KV write: no CAS, no retry, last writer wins, **both racing calls succeed**. With `ALL_OLD` it is a CAS loop of 64 attempts / 10 s that answers 503 at exhaustion, as MongoDB does; no CAS detail is client-visible. **OPEN**: the out-of-tree loop answers `TransactionConflict` at exhaustion; the 503 is part of the port, with the differences-document rows | upstream `test_put_item_create_race.py::test_racing_puts_with_all_old_all_succeed`, `::test_racing_puts_on_a_stream_table_all_succeed`, `test_concurrency.py::test_parallel_inserts`, CR-03 |
+| 4.1 | Unconditional writes never fail under contention | A bare unconditional `PutItem` with no `ReturnValues` is one KV write: no CAS, no retry, last writer wins, **both racing calls succeed**. With `ALL_OLD` it is a CAS loop of 64 attempts / 10 s that answers 503 at exhaustion, as MongoDB does; no CAS detail is client-visible (`cas_contended`); the differences-document rows come with the implementation PR | upstream `test_put_item_create_race.py::test_racing_puts_with_all_old_all_succeed`, `::test_racing_puts_on_a_stream_table_all_succeed`, `test_concurrency.py::test_parallel_inserts`, CR-03 |
 | 4.2 | Conditional writes: correct error on race | The CAS loop re-evaluates the condition against the winner's image and returns `ConditionalCheckFailedException` | CC-01, upstream `test_put_item_create_race.py::test_racing_puts_check_their_condition_against_the_winner`, `::test_racing_conditional_creates_have_one_winner` |
-| 4.3 | Transaction conflict mapping | A plain write meeting a `transact_write` lease returns `TransactionConflictException`; a transaction that cannot take its leases in 2 s returns `TransactionCanceledException` with `TransactionConflict`; a plain write meeting a `transact_get` or `plain` lease retries and answers 503 at its budget; plain-writer contention never surfaces as a transaction conflict. **OPEN**: the lease on every plain path (see "Open engineering items") | TX-08, CC-09, upstream `test_transact_write_conflict.py`, `scripts/write-race-test.py` |
+| 4.3 | Transaction conflict mapping | A plain write meeting a `transact_write` lease returns `TransactionConflictException`; a transaction that cannot take its leases in 2 s returns `TransactionCanceledException` with `TransactionConflict`; a plain write meeting a `transact_get` or `plain` lease retries and answers 503 at its budget; plain-writer contention never surfaces as a transaction conflict (implemented; see "Transactions") | TX-08, CC-09, upstream `test_transact_write_conflict.py`, `scripts/write-race-test.py`, `tests/test_txn_lease.py`, the three-node harness's commit-point hold |
 | 4.4 | UpdateItem serializes | CAS read-modify-write with jittered backoff; arithmetic and `ADD` never take the sub-document path; on a stream-enabled table each write is a transaction, two on one key conflict at the document and the later retries within the same budget, and both succeed | CC-02, CC-03, `scripts/concurrency-property-test.py` (`prop_add_counter`, `prop_optlock_counter`), upstream `test_concurrency.py::test_atomic_counter` |
 | 4.5 | Read-your-writes | `GetItem` is a KV get served by the active vbucket; no replica reads | CC-04, CR-06 |
 
@@ -1125,7 +1153,7 @@ own. Criteria that this backend does **not** fully satisfy today are marked
 | # | Criterion | How the backend meets it | Evidence |
 |---|---|---|---|
 | 5.1 | Atomicity with data writes | Records are written in the data transaction | ST-04, upstream `test_streams.py` |
-| 5.2 | Per-shard ordering | Numbers are taken before commit; `GetRecords` walks the shard in sequence order and stops at an unresolved number, which only a skip marker written after a definite failure, or a transactional read of the record after the age, resolves (see "DynamoDB Streams"), so no reader passes a number whose record may still appear. **OPEN**: the transactional read, and the test that holds one transaction between commit point and unstaging for longer than the age while a later one commits | ST-03, DC-07, upstream `test_streams.py`, stress "consumer reading during concurrent writes" |
+| 5.2 | Per-shard ordering | Numbers are taken before commit; `GetRecords` walks the shard in sequence order and stops at an unresolved number, which only a skip marker written after a definite failure, or a transactional read of the record after the age, resolves (see "DynamoDB Streams"), so no reader passes a number whose record may still appear (implemented; see "DynamoDB Streams") | ST-03, DC-07, upstream `test_streams.py`, stress "consumer reading during concurrent writes", the three-node harness's commit-point hold (a query engine frozen 60 s, longer than the age) |
 | 5.3 | Account and table isolation | Shard id embeds the table id; records carry the table id and every read is scoped by it | upstream `test_cross_account_isolation.py` (one case in this file failed in the nightly baseline for a test-suite-skew reason, see 6.3; it passes against the pinned suite), `test_stream_table_reuse.py` |
 | 5.4 | Correct event types | `INSERT` / `MODIFY` / `REMOVE` with images per view type; an unchanged item emits no record | ST-01, ST-05, upstream `test_streams.py` |
 | 5.5 | Retention and cleanup | `idx_stream_ts` plus a delete at 24 h on every TTL sweep cycle | ST-06, ST-07 |
@@ -1136,7 +1164,7 @@ own. Criteria that this backend does **not** fully satisfy today are marked
 | # | Criterion | How the backend meets it | Evidence |
 |---|---|---|---|
 | 6.1 | Evaluation semantics | Delegates to `extenddb_core::expression::evaluate_condition` on the read image; no native pushdown | CR-10 to CR-13, upstream `test_conditional_writes.py`, `test_conditional_operator.py` |
-| 6.2 | No hidden unused code | **OPEN.** `engine.rs` and `catalog.rs` carry a crate-level `#![allow(unused_variables, unused_imports, clippy::too_many_arguments)]`, which RFC-0003 prohibits, plus three targeted `#[allow(dead_code)]` with comments. Measured on 2026-11-05 with those lints force-enabled: the blanket allows hide 3 unused imports and no unused variables; the dead-code lint is not suppressed and reports 5 never-used items. Fix before the implementation PR: delete the blanket allows and the 5 dead items, keep only commented targeted allows | `cargo check --lib` with `--force-warn unused_imports --force-warn unused_variables --force-warn dead_code` |
+| 6.2 | No hidden unused code | The crate-level `#![allow(unused_variables, unused_imports, clippy::too_many_arguments)]` of `engine.rs` and `catalog.rs` is gone, with the 3 unused imports and the 5 dead items it hid (measured 2026-11-05, removed 2026-11-24, commit `b0c272f`). One targeted, commented `#[allow(dead_code)]` remains, on the sidecar-format detector the proposed v3.1 → map-form data migration will call | `cargo rustc --lib -- --force-warn unused_imports --force-warn unused_variables --force-warn dead_code`: that one item |
 | 6.3 | Documentation describes the system as built | Every mechanism described in this RFC is implemented and on the live code path or marked OPEN with its engineering item; Capella is stated as unvalidated, the failover-sweep claim cites a specific nightly run, every conformance figure names its suite revision, and the scaling figures cite measured runs. Also recorded here for honesty: nightlies #46 through #58 reported a **baseline** sweep of 908 of 913 with the same 5 non-passes every run (`test_abac.py` ×3, `test_auth_permissions.py::test_explicit_deny_all_service_operations`, `test_cross_account_isolation.py::TestStreamAccountScoping::test_shard_iterator_only_returns_owning_account_records`). Triaged 2026-11-09 as test-suite skew: the nightly's heavy lane skipped the "clone upstream at the pinned rev" stage, so the sweep ran the stale `e41f370` test checkout (913 collected) against the auth-cluster build. What the pinned `7b828b0` run of 2026-11-24 (under "Evidence") shows: the `test_auth_permissions.py` and `test_cross_account_isolation.py` cases pass, and three `test_abac.py` cases fail, all three `aws:SourceIp` loopback cases, behind Docker Desktop's bridge on the machine that ran it. Whether the nightly's three `test_abac.py` non-passes were those cases, and whether they pass on the Linux agent, is settled by the first nightly after couchbaselabs/extenddb-couchbase#237 (merged 2026-11-24: the clone stage runs in both lanes and `scripts/sweep-under-failover.sh` refuses a checkout that does not match the Cargo pin); until then the skew triage covers two of the five, not all five | Jenkins `extenddb-couchbase-nightly` #51 console; #237; the pinned run under "Evidence" |
 
 ### 7. Query and Scan
@@ -1186,53 +1214,33 @@ runbook in `CONFORMANCE.md` plus `cargo test --lib`, which runs on every PR of
 the reference repository as a required check, and the pytest sweeps in its
 Jenkins nightly.
 
-### Open engineering items
+### Engineering items of revision 3
 
-Work the implementation PR carries, each with the test that proves it, listed
-so the acceptance table above is read with them in mind:
+The items revision 3 listed as open, with their state in the reference
+repository (commits on `main`, 2026-11-25):
 
-1. The lease on every plain write path of a flagged table, the `transactional`
-   flag, the `committing` state and the transactional escalation, and the
-   pre-commit lease check with rollback. Tests: `PutItem` against a
-   transaction held between its commit point and its unstaging (the query node
-   killed after `COMMIT WORK` is sent), both orders; a `PutItem` of a key the
-   transaction creates; a live test that stages a mutation and checks that
-   each plain write path (`PutItem`, `UpdateItem` on both of its paths,
-   `DeleteItem`, `BatchWriteItem`) refuses while the lease is held; a
-   transaction whose renewal is made to fail rolls back before `COMMIT WORK`.
-2. The transactional read that resolves an aged stream number, and `LATEST`
-   and `AT_TIMESTAMP` starting no later than the first unresolved number.
-   Test: hold one transaction between commit point and unstaging for longer
-   than the age while a later one commits; a reader must not pass the earlier
-   number and must deliver it afterwards.
-3. The `UpdateItem` fast path falls back above 16 sub-document operations.
-   Test: nine `SET`s on a v3.2 table.
-4. `TransactGetItems` leases on absent keys and its 5 s bound. Test: a
-   `PutItem` creates an absent key during a `TransactGetItems`.
-5. The GSI backfill fence on the cache invalidation and the in-flight
-   counter. Test: a write whose key info was resolved before the invalidation
-   lands after the backfill passed its item; the reindex reconciler's writes
-   in the same window.
-6. The 100-action, 4 MB `TransactWriteItems` measurement on a stream-enabled
-   table with `NEW_AND_OLD_IMAGES`, the `memory-quota` it sets, the 503 below
-   it, and the two timeout answers.
-7. The descending twin indexes, counted in the budget, with descending paging
-   in the tests.
-8. Cluster-wide scope, collection and index counting under the create lock,
-   twins and replicas included; `LimitExceededException` at the limit; the
-   measured shared-tier bound.
-9. `destroy` from the catalog and the ledgers; the foreign-store check on an
-   `Uninitialized` store; adoption of an out-of-tree deployment by
-   `migrate --yes`; the lock in `_default._default`.
-10. CAS exhaustion answers 503, and the `docs/differences-from-dynamodb.md`
-    rows: contended single-item writes, plain writes meeting a read lease,
-    `TransactGetItems` conflicts, backup, the per-instance throughput bound.
-11. The hashed-key read compares the stored encoded keys; a partition key
-    containing `|S#` in the separator-collision test.
-12. The lease cost: YCSB workload A on a flagged table against an unflagged
-    one, published under "Performance characteristics" and in the README row.
-13. The upstream multi-part RANGE tests against the per-part columns.
-14. The lint item 6.2.
+| # | Item | State |
+|---|---|---|
+| 1 | The lease on every plain write path of a flagged table, the `transactional` flag, the `committing` state, the transactional escalation, the pre-commit lease check with rollback | Implemented (`5e8462b`). `tests/test_txn_lease.py`: plain updates racing transfers (balance conserved, no acknowledged update lost, no 5xx, transactions keep committing), the create race on a key a transaction creates, `TransactGetItems` never torn across an absent key, `PutItem`s against a read lease all acknowledged. Three-node harness commit-point hold: a query engine frozen 60 s under the load, 1,646 and 2,816 commits over two runs, every invariant held |
+| 2 | The transactional read that resolves an aged stream number; `LATEST` no later than the first unresolved number | Implemented (`5e8462b`). The same commit-point hold: the reader never passed a number whose record appeared later |
+| 3 | The `UpdateItem` fast path falls back above 16 sub-document operations | Implemented (`b0c272f`), unit-tested at 8, 9 and 8 + `REMOVE` |
+| 4 | `TransactGetItems` leases on absent keys, 10 attempts and 5 s | Implemented (`5e8462b`), `tests/test_txn_lease.py` |
+| 5 | The GSI backfill fence | Implemented (`f4f293d`): `CREATING`, the fenced second pass, `ACTIVE`; `tests/test_gsi_fence.py` |
+| 6 | The 100-action, 4 MB `TransactWriteItems` on `NEW_AND_OLD_IMAGES` | Measured on the demo stack: committed in 0.63 s at the default `memory-quota` (0); the requirement is the default |
+| 7 | The descending twin indexes, counted in the budget, descending paging in the tests | Implemented (`f4f293d`); `tests/test_desc_paging.py`; `EXPLAIN` confirms the twin serves a descending Query without a sort |
+| 8 | Cluster-wide scope, collection and index counting under the create lock, twins and replicas included; `LimitExceededException` | Implemented (`f4f293d`). The measured shared-tier bound is still to be published (unresolved question 1) |
+| 9 | `destroy` from the catalog; the foreign-store check; adoption by `migrate --yes`; the lock in `_default._default` | `destroy` and the foreign-store refusal implemented (`f4f293d`); adoption and the lock location are the in-tree migrations module |
+| 10 | CAS exhaustion answers 503; the `docs/differences-from-dynamodb.md` rows | The out-of-tree loops already answered 503 (`cas_contended`); revision 3's text was wrong. The rows come with the implementation PR, with the hot-key observation under Drawbacks |
+| 11 | The hashed-key read compares the stored encoded keys; a partition key containing `|S#` in the separator-collision test | Implemented (`b0c272f`) |
+| 12 | The lease cost | Measured on the demo stack (see "Performance characteristics"); the multi-node YCSB figures come from the performance cluster before FCP |
+| 13 | The upstream multi-part RANGE tests against the per-part columns | Blocked on the pin: the engine at `7b828b0` refuses those queries before the backend sees them (#381 is on `main` only); runs with the in-tree port |
+| 14 | The lint item 6.2 | Done (`b0c272f`) |
+
+Two `init` fixes came out of the three-node harness and are in `f4f293d`:
+the base index's twin was created before the collection existed on a fresh
+cluster (a regression of item 7), and the idempotent DDL of `init` now
+retries while a scope or collection created through one query node
+propagates to another's manifest, a pre-existing multi-node race.
 
 ## Drawbacks
 
@@ -1260,9 +1268,14 @@ so the acceptance table above is read with them in mind:
   RFC.
 - **The lease on transaction-touched tables.** A plain write on a table that
   has ever seen a transaction costs a lease insert and delete around its KV
-  write, about three KV operations instead of one, and the flag never clears.
-  The measured cost is published before FCP (open item 12); an operator who
-  needs the single-operation path back recreates the table.
+  write, about three KV operations instead of one (roughly double the median
+  on the demo stack, see "Performance characteristics"), and the flag never
+  clears; an operator who needs the single-operation path back recreates the
+  table. Under a sustained transaction firehose on one item, plain writes to
+  that item are refused with `TransactionConflictException` almost every time
+  (in the harness, 4 acknowledged against 5,961 refusals over 110 s with three
+  transaction writers on the item): DynamoDB's priority for the transaction,
+  stated here because a client that mixes the two on a hot key will see it.
 - **Maintenance burden.** ~24k non-test lines of backend plus QE harness, Helm,
   and runbooks owned by the Couchbase team; trait changes upstream require a
   coordinated update, as RFC-0002 anticipates.
@@ -1330,7 +1343,8 @@ snapshots (8). What remains:
    the README row can say more than "untested".
 3. **The `transactional` flag.** Whether a never-clearing per-table flag is
    acceptable to the maintainers, or the lease should be taken on every table
-   unconditionally once the measured cost is known.
+   unconditionally. On the demo stack the lease roughly doubles a bare
+   `PutItem`'s median (0.81 ms to 1.88 ms); the multi-node figure is pending.
 
 ## Prior art
 
