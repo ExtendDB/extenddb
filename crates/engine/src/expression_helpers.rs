@@ -367,8 +367,8 @@ mod tests {
         );
     }
 
-    /// A name that starts with `_` in a filter and in a PutItem condition, in
-    /// the parse each runs, with Amazon DynamoDB's answers (measured
+    /// A name that starts with `_` in a filter and in a `PutItem` condition, in
+    /// the parse each runs, with Amazon `DynamoDB`'s answers (measured
     /// 2026-11-14 and 2026-11-18). The condition of a single-item write counts
     /// the refusal.
     #[test]

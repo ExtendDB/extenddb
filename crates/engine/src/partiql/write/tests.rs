@@ -69,7 +69,7 @@ fn a_deep_write_condition_is_written_for_the_classic_parser() {
 }
 
 /// The classic tokenizer refuses a name that starts with `_` written in an
-/// expression. A PartiQL statement keeps its answer: its names reach the
+/// expression. A `PartiQL` statement keeps its answer: its names reach the
 /// classic parser as `#name` placeholders.
 #[test]
 fn a_partiql_name_that_starts_with_an_underscore_is_written_as_a_placeholder() {
