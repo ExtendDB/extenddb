@@ -137,7 +137,7 @@ mod tests {
             let paths =
                 crate::expression::parse_projection(&crate::expression::tokenize(text).unwrap())
                     .unwrap();
-            crate::expression::Projection::compile(&paths, &maps(), true).map(|_| ())
+            crate::expression::Projection::compile(&paths, &maps(), true, true).map(|_| ())
         };
         let long = path_text("#m", 33);
         let length = format!("Invalid ProjectionExpression: {LEVELS_33}");
