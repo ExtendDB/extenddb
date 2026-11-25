@@ -35,6 +35,9 @@
 //!   and its `active_restores` lightweight transaction, so a test can move
 //!   the backup to DELETING in that gap and see the transaction's own
 //!   `backup_status = 'AVAILABLE'` condition refuse the registration;
+//! * a pause at the start of a legacy restore's copy, after its
+//!   registration, so a test can keep the registration in place while
+//!   concurrent restores of the same backup are answered;
 //! * a pause in `claim_restore_dead` between its read and its takeover
 //!   lightweight transaction, and the batch size of a store-backed
 //!   `bulk_load`;
@@ -161,6 +164,7 @@ mod armed {
         pub(super) convert_stops: std::collections::HashSet<String>,
         pub(super) before_convert: HashMap<String, Arc<Pause>>,
         pub(super) before_legacy_registration: HashMap<String, Arc<Pause>>,
+        pub(super) before_legacy_restore_copy: HashMap<String, Arc<Pause>>,
         pub(super) convert_refusals: HashMap<String, usize>,
         pub(super) legacy_keys_page: Option<i32>,
     }
@@ -539,6 +543,33 @@ pub(crate) async fn before_legacy_restore_registration(backup_arn: &str) {
     #[cfg(feature = "test-hooks")]
     if let Some(pause) =
         armed::with_hooks(|hooks| hooks.before_legacy_registration.remove(backup_arn))
+    {
+        pause.hold().await;
+    }
+    let _ = backup_arn;
+}
+
+/// Arm a pause at the start of the next legacy restore copy of `backup_arn`,
+/// after its registration and before its first item is written, so a test
+/// can keep the registration in place until every concurrent restore of the
+/// backup has been answered. Taken once, then disarmed.
+#[cfg(feature = "test-hooks")]
+pub fn pause_before_legacy_restore_copy(backup_arn: &str) -> std::sync::Arc<Pause> {
+    let pause = std::sync::Arc::new(Pause::new());
+    armed::with_hooks(|hooks| {
+        hooks
+            .before_legacy_restore_copy
+            .insert(backup_arn.to_owned(), std::sync::Arc::clone(&pause));
+    });
+    pause
+}
+
+/// Hold here if a test armed [`pause_before_legacy_restore_copy`] for
+/// `backup_arn`.
+pub(crate) async fn before_legacy_restore_copy(backup_arn: &str) {
+    #[cfg(feature = "test-hooks")]
+    if let Some(pause) =
+        armed::with_hooks(|hooks| hooks.before_legacy_restore_copy.remove(backup_arn))
     {
         pause.hold().await;
     }

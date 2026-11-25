@@ -1178,9 +1178,7 @@ async fn test_backup_and_target_are_held_while_restoring() {
 /// into the target's name is `TableBeingRestored` naming the target and its
 /// source backup. Once the target is ACTIVE a
 /// restore of the backup is accepted and a restore into the name is
-/// `TableAlreadyExists`. The registration is one lightweight transaction
-/// conditioned on `active_restores = null`, so two simultaneous restores of
-/// one backup admit exactly one.
+/// `TableAlreadyExists`.
 #[tokio::test]
 async fn test_a_restore_is_refused_while_a_target_of_its_backup_is_creating() {
     if crate::helpers::skip_without_cassandra() {
@@ -1306,17 +1304,36 @@ async fn test_a_restore_is_refused_while_a_target_of_its_backup_is_creating() {
         Duration::from_secs(180),
     )
     .await;
+}
 
-    // Simultaneous: four restores of b2 started together, exactly one admitted.
+/// Four restores of one backup started together admit exactly one; the
+/// other three are `BackupInUse`. Each restore creates its target's tables
+/// before it registers, and that takes a schema agreement round that can
+/// outlast a copy. The admitted restore's copy is held until all four have
+/// been answered, so a slow registration meets the first one's
+/// `active_restores` entry instead of an empty map (#869).
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn test_simultaneous_restores_of_one_backup_admit_exactly_one() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    const ITEMS: usize = 200;
+    let engine = setup_engine().await;
+    let (account, _source, backup_arn) = backed_up_plain_table(&engine, "SimSource", ITEMS).await;
+    let account_id = account.account_id.clone();
+
+    let copy_pause =
+        extenddb_storage_cassandra::test_hooks::pause_before_legacy_restore_copy(&backup_arn);
     let results = futures::future::join_all((0..4).map(|i| {
         let engine = engine.clone();
         let account_id = account_id.clone();
-        let b2 = b2.clone();
+        let backup_arn = backup_arn.clone();
         async move {
             restore(
                 &engine,
                 &account_id,
-                &b2,
+                &backup_arn,
                 &format!("SimTarget{i}"),
                 &RestoreTableOverrides::default(),
             )
@@ -1324,6 +1341,7 @@ async fn test_a_restore_is_refused_while_a_target_of_its_backup_is_creating() {
         }
     }))
     .await;
+    copy_pause.release();
     let accepted: Vec<usize> = results
         .iter()
         .enumerate()
