@@ -19,6 +19,10 @@ pub mod docs_embed;
 pub mod html;
 mod pages;
 pub mod session;
+#[cfg(test)]
+mod tab_gate_tests;
+#[cfg(test)]
+mod test_catalog;
 
 use std::sync::Arc;
 
