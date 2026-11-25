@@ -2115,7 +2115,7 @@
       "checks": [
         {
           "path": "/message",
-          "equals": "Invalid Request: BackupArn is not valid"
+          "equals": "Invalid Backup ARN"
         }
       ]
     },
@@ -2789,7 +2789,7 @@
       "checks": [
         {
           "path": "/message",
-          "equals": "Invalid Request: BackupArn is not valid"
+          "equals": "Invalid Backup ARN"
         }
       ],
       "onWasm": {
@@ -2811,7 +2811,7 @@
       "checks": [
         {
           "path": "/message",
-          "equals": "1 validation error detected: Value null at 'backupArn' failed to satisfy constraint: Member must not be null"
+          "equals": "Invalid Backup ARN"
         }
       ],
       "onWasm": {

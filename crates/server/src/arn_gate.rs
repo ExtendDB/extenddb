@@ -235,8 +235,9 @@ pub(crate) fn check_stream_arn(arn: &str) -> Result<(), DynamoDbError> {
 
 /// A backup ARN whose table segment fails the pattern: `Invalid Backup ARN`
 /// (measured for `DescribeBackup`, `DeleteBackup` and
-/// `RestoreTableFromBackup`). U+0000 in the backup id keeps the engine's
-/// `Invalid Request: BackupArn is not valid`, as measured.
+/// `RestoreTableFromBackup`, and on 21 Nov 2026 with U+0001 and a space).
+/// U+0000 in the backup id keeps the engine's `Invalid Request: BackupArn is
+/// not valid`, as measured.
 pub(crate) fn check_backup_arn(arn: &str) -> Result<(), DynamoDbError> {
     match parse(arn.trim_matches(|c: char| c.is_ascii_whitespace())) {
         Some(res) if matches!(res.sub, Some(SubResource::Backup(_))) && !in_pattern(&res.table) => {
@@ -532,11 +533,15 @@ mod tests {
             "Invalid StreamArn"
         );
         assert!(check_stream_arn(&format!("{}/stream/2026", table("ok"))).is_ok());
-        let backup = format!("{bad}/backup/01700000000000-abcdef12");
-        assert_eq!(
-            message(check_backup_arn(&backup)).unwrap(),
-            "Invalid Backup ARN"
-        );
+        // U+0001 and a space measured on 21 Nov 2026.
+        for segment in ["t367\u{0}name", "t367\u{1}name", "t367 name"] {
+            let backup = format!("{}/backup/01700000000000-abcdef12", table(segment));
+            assert_eq!(
+                message(check_backup_arn(&backup)).as_deref(),
+                Some("Invalid Backup ARN"),
+                "{segment:?}"
+            );
+        }
         let backup_id = format!("{}/backup/0170\u{0}", table("ok"));
         assert!(check_backup_arn(&backup_id).is_ok(), "left to the engine");
         assert_eq!(

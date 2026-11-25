@@ -59,8 +59,10 @@
 //!   that the overrides' parse refuses
 //!   (`extenddb_engine::check_restore_override_kinds`) and a `BackupArn` of
 //!   another account (the cross-account refusal) are answered before it
-//!   (measured 2026-11-20). The parse accepts a
-//!   `ProvisionedThroughputOverride` list of two integers and a
+//!   (measured 2026-11-20), and so are the account and the shape of the
+//!   `BackupArn` (`extenddb_engine::check_restore_backup_arn`: an absent or
+//!   malformed one is `Invalid Backup ARN`, measured 2026-11-21). The parse
+//!   accepts a `ProvisionedThroughputOverride` list of two integers and a
 //!   `BillingModeOverride` object of one key, which the service refuses
 //!   before the name (#1106).
 //! - A RestoreTableFromBackup `TargetTableName` or `BackupArn`, a
@@ -148,6 +150,9 @@ pub(crate) fn check_table_name_chars(
                 if cross_account::find(operation, input, account_id).is_some() {
                     return Ok(());
                 }
+                // The account and the shape of the `BackupArn` come before the
+                // name, an absent one included (measured on 21 Nov 2026).
+                extenddb_engine::check_restore_backup_arn(input, account_id)?;
                 let name = target.and_then(Value::as_str).unwrap_or_default();
                 extenddb_engine::check_restore_table_name(name, "targetTableName", (3, 255))
             })
@@ -383,6 +388,9 @@ mod tests {
     const NUL: &str = "t367\u{0}name";
     const ARN: &str = "arn:aws:dynamodb:us-east-1:123456789012:table/t367\u{0}name";
     const PAT: &str = "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+";
+    /// The caller's `BackupArn`: a restore's target name is checked after it.
+    const BACKUP: &str =
+        "arn:aws:dynamodb:us-east-1:123456789012:table/t367name/backup/01700000000000-abcdef12";
 
     fn message(operation: &str, input: Value) -> Option<String> {
         match check_table_name_chars(operation, &input, "123456789012") {
@@ -462,7 +470,7 @@ mod tests {
         let cases = [
             (
                 "RestoreTableFromBackup",
-                json!({ "TargetTableName": NUL }),
+                json!({ "TargetTableName": NUL, "BackupArn": BACKUP }),
                 "targetTableName",
             ),
             (
@@ -510,7 +518,11 @@ mod tests {
         );
         // A restore's target name gets the restore's length text first.
         assert_eq!(
-            message("RestoreTableFromBackup", json!({ "TargetTableName": "a*" })).unwrap(),
+            message(
+                "RestoreTableFromBackup",
+                json!({ "TargetTableName": "a*", "BackupArn": BACKUP })
+            )
+            .unwrap(),
             "TableName must be at least 3 characters long and at most 255 characters long"
         );
     }
@@ -567,15 +579,16 @@ mod tests {
                 "exclusiveStartTableName",
             ),
         ];
+        // The other operations do not read `BackupArn`.
         for (op, member, location) in cases {
             for passed in [good, index.as_str(), "arn:aws:s3:::bucket"] {
                 assert!(
-                    message(op, json!({ member: passed })).is_none(),
+                    message(op, json!({ member: passed, "BackupArn": BACKUP })).is_none(),
                     "{op} {passed}"
                 );
             }
             assert_eq!(
-                message(op, json!({ member: ARN })).as_deref(),
+                message(op, json!({ member: ARN, "BackupArn": BACKUP })).as_deref(),
                 Some(one(ARN, location, PAT).as_str()),
                 "{op}"
             );
@@ -740,7 +753,9 @@ mod tests {
     /// Measured on DynamoDB on 20, 21 and 25 Nov 2026: with a target name the
     /// gate refuses, an override member of another JSON kind is answered first,
     /// and a `BackupArn` of another account is passed on to the cross-account
-    /// refusal. Any other override fault keeps the name's answer. Each body has
+    /// refusal. Then the account and the shape of the `BackupArn` are answered
+    /// (a null one stands for an absent one); its id is answered after the
+    /// name. Any other override fault keeps the name's answer. Each body has
     /// the caller's `BackupArn` unless the row gives one. Only the type of a
     /// `SerializationException` is checked (#1012).
     #[test]
@@ -748,6 +763,7 @@ mod tests {
         let own =
             "arn:aws:dynamodb:us-east-1:123456789012:table/t367name/backup/01700000000000-abcdef12";
         let other = own.replace("123456789012", "111122223333");
+        let invalid = "Invalid Backup ARN";
         let gsi = "GlobalSecondaryIndexOverride";
         let pt = "ProvisionedThroughputOverride";
         let sse = "SSESpecificationOverride";
@@ -760,6 +776,24 @@ mod tests {
             (json!({ "BackupArn": other }), "t\u{0}x", "passed"),
             (json!({ "BackupArn": other, gsi: [{}] }), "a*", "passed"),
             (json!({ "BackupArn": other, gsi: {} }), "a*", ser),
+            (json!({ "BackupArn": null }), "a*", invalid),
+            (json!({ "BackupArn": "x" }), "a*", invalid),
+            (
+                json!({ "BackupArn": own.split("/backup/").next() }),
+                "a*",
+                invalid,
+            ),
+            (
+                json!({ "BackupArn": "arn:aws:s3:::b" }),
+                "a*",
+                "Access is denied",
+            ),
+            (
+                json!({ "BackupArn": own.replace("01700000000000-abcdef12", "bad") }),
+                "a*",
+                len,
+            ),
+            (json!({ "BackupArn": "x" }), "ab", "passed"),
             (json!({ gsi: {} }), "a*", ser),
             (json!({ gsi: {} }), "a b", ser),
             (json!({ "LocalSecondaryIndexOverride": {} }), "a*", ser),
@@ -807,7 +841,10 @@ mod tests {
                 match check_table_name_chars("RestoreTableFromBackup", &input, "123456789012") {
                     Ok(()) => "passed".to_owned(),
                     Err(DynamoDbError::SerializationException(_)) => ser.to_owned(),
-                    Err(DynamoDbError::ValidationException(m)) => m,
+                    Err(
+                        DynamoDbError::ValidationException(m)
+                        | DynamoDbError::AccessDeniedException(m),
+                    ) => m,
                     Err(other) => panic!("unexpected error {other:?}"),
                 };
             assert_eq!(answer, expected, "{input}");

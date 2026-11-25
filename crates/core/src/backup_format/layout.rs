@@ -164,23 +164,26 @@ pub struct BackupArnParts<'a> {
     pub backup_id: &'a str,
 }
 
-/// Why a string is not a backup ARN. The two classes carry the two texts the
-/// service answers with (measured on `DynamoDB`). Which text goes with which
-/// input was captured for one input only (a bare 13-digit id is "not
-/// valid"), so the split is the parser's: a string that is not an ARN of the
-/// right shape, is too long, or carries a character no ARN part allows is
-/// `Invalid`; an ARN of the right shape whose backup id is not one is `Id`.
+/// Why a string is not a backup ARN, by the text the service answers for
+/// `DescribeBackup`, `DeleteBackup` and `RestoreTableFromBackup` (measured on
+/// `DynamoDB` in us-east-1 on 21 Nov 2026).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackupArnError {
     /// Not `arn:<partition>:dynamodb:<region>:<account>:table/<name>/backup/<id>`
-    /// with a non-empty region, account, and name, over
-    /// [`MAX_BACKUP_ARN_LEN`] bytes, with a control or non-ASCII character, or
-    /// with a region outside `[a-z0-9-]`, a table name outside
-    /// `[a-zA-Z0-9_.-]`, or an account outside `[0-9]`. The service's text:
-    /// `Invalid Request: BackupArn is not valid`.
+    /// with a partition of `[a-zA-Z0-9-]`, an account of `[0-9]`, a table name
+    /// of `[a-zA-Z0-9_.-]` and an id of at least 3 characters, or over
+    /// [`MAX_BACKUP_ARN_LEN`] bytes. The service's text: `Invalid Backup ARN`.
+    /// The service gives this text to an id of 0, 1 or 2 characters and the
+    /// text of [`Self::Id`] to one of 3.
     Invalid,
+    /// A region outside `[a-z0-9-]`. The service's text: `Invalid Request:
+    /// BackupArn is not valid`.
+    Region,
     /// The backup id is neither the current shape nor one an earlier build
-    /// issued (see [`is_backup_id`]). The service's text: `Invalid Backup ARN`.
+    /// issued (see [`is_backup_id`]), a control character in it included. The
+    /// service's text: `Invalid Request: BackupArn is not valid`. The engine
+    /// answers the service's id shape in upper-case hex as not found when the
+    /// partition is the one it serves.
     Id,
 }
 
@@ -188,6 +191,7 @@ impl std::fmt::Display for BackupArnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Invalid => "not a backup ARN",
+            Self::Region => "a region outside [a-z0-9-]",
             Self::Id => "not a backup id",
         })
     }
@@ -281,7 +285,8 @@ pub fn parse_backup_arn(arn: &str) -> Option<BackupArnParts<'_>> {
 /// or malformed region, account, or table name, a resource other than
 /// `table/<name>/backup/<id>`, a control or non-ASCII character, more than
 /// [`MAX_BACKUP_ARN_LEN`] bytes, or an id that is not a backup id
-/// ([`is_backup_id`]). The region and partition are checked for shape only:
+/// ([`is_backup_id`]). A character no field allows is refused with the class
+/// of the field it is in. The region and partition are checked for shape only:
 /// an ARN in another region of the caller's account resolves on the service,
 /// so the engine substitutes its own region rather than refuse it, and the
 /// engine decides which partitions it serves.
@@ -293,13 +298,12 @@ pub fn parse_backup_arn(arn: &str) -> Option<BackupArnParts<'_>> {
 /// [`BackupArnError`], one class per service text.
 pub fn check_backup_arn(arn: &str) -> Result<BackupArnParts<'_>, BackupArnError> {
     let arn = trim_backup_arn(arn);
-    if arn.len() > MAX_BACKUP_ARN_LEN || !arn.bytes().all(|b| b.is_ascii_graphic()) {
+    if arn.len() > MAX_BACKUP_ARN_LEN {
         return Err(BackupArnError::Invalid);
     }
     let f = crate::arn::fields(arn).ok_or(BackupArnError::Invalid)?;
     if !ascii_word(f.partition, b"-")
         || f.service != "dynamodb"
-        || !is_region(f.region)
         || f.account.is_empty()
         || !f.account.bytes().all(|b| b.is_ascii_digit())
         // `fields` keeps any further `:` inside the resource; a backup
@@ -317,9 +321,12 @@ pub fn check_backup_arn(arn: &str) -> Result<BackupArnParts<'_>, BackupArnError>
     // name this parser accepts.
     if table_name.is_empty()
         || crate::validation::validate_table_name_chars(table_name).is_err()
-        || backup_id.is_empty()
+        || backup_id.chars().count() < 3
     {
         return Err(BackupArnError::Invalid);
+    }
+    if !is_region(f.region) {
+        return Err(BackupArnError::Region);
     }
     if !is_backup_id(backup_id) {
         return Err(BackupArnError::Id);
@@ -638,7 +645,8 @@ fn store_prefix_problem(account_id: &str, table_name: &str, backup_id: &str) -> 
     let formatted = format_backup_arn(PARTITION, REGION, account_id, table_name, backup_id);
     Some(match check_backup_arn(&formatted) {
         Err(BackupArnError::Id) => format!("{:?} is not a backup id", truncated(backup_id)),
-        Err(BackupArnError::Invalid) => format!(
+        // The placeholder region passes, so `Region` is not reached.
+        Err(BackupArnError::Invalid | BackupArnError::Region) => format!(
             "account id {:?}, table name {:?} and backup id {:?} are not the components of a \
              backup ARN",
             truncated(account_id),
@@ -848,8 +856,8 @@ mod tests {
     }
 
     /// The id rule is a grid over millis length and suffix length, not a
-    /// list of instances; and the two error classes map to two service
-    /// texts, so they are pinned here where the parser lives.
+    /// list of instances; and the error classes map to the service's texts
+    /// (measured 21 Nov 2026), so they are pinned here where the parser lives.
     #[test]
     fn id_shape_grid_and_error_classes() {
         for millis_len in 0..=16usize {
@@ -863,26 +871,28 @@ mod tests {
         }
         let arn_with =
             |id: &str| format!("arn:aws:dynamodb:us-east-1:123456789012:table/Music/backup/{id}");
-        assert_eq!(
-            check_backup_arn(&arn_with("1")).unwrap_err(),
-            BackupArnError::Id
-        );
-        assert_eq!(
-            check_backup_arn(&arn_with("a4b1d6c2-0000-4000-8000-000000000000")).unwrap_err(),
-            BackupArnError::Id
-        );
-        for invalid in [
-            "arn:aws:dynamodb:us-east-1:123456789012:table/Music/backup/01489602797149-73d8d5bc:x",
-            "arn:aws:dynamodb:us-east-1:123456789012:table/Music/backup/01489602797149-73d8d5bc/x",
-            "arn:aws:dynamodb:US-EAST-1:123456789012:table/Music/backup/01489602797149-73d8d5bc",
-            "arn:aws:dynamodb:us-east-1:12345678901x:table/Music/backup/01489602797149-73d8d5bc",
-            "arn:aws:s3:us-east-1:123456789012:table/Music/backup/01489602797149-73d8d5bc",
-        ] {
-            assert_eq!(
-                check_backup_arn(invalid).unwrap_err(),
+        for (arn, class) in [
+            (arn_with("1"), BackupArnError::Invalid),
+            (
+                arn_with("a4b1d6c2-0000-4000-8000-000000000000"),
+                BackupArnError::Id,
+            ),
+            (format!("{}:x", arn_with(ID)), BackupArnError::Invalid),
+            (format!("{}/x", arn_with(ID)), BackupArnError::Invalid),
+            (
+                arn_with(ID).replace("us-east-1", "US-EAST-1"),
+                BackupArnError::Region,
+            ),
+            (
+                arn_with(ID).replace("123456789012", "12345678901x"),
                 BackupArnError::Invalid,
-                "{invalid}"
-            );
+            ),
+            (
+                arn_with(ID).replace(":dynamodb:", ":s3:"),
+                BackupArnError::Invalid,
+            ),
+        ] {
+            assert_eq!(check_backup_arn(&arn).unwrap_err(), class, "{arn:?}");
         }
         // Over the service maximum, with the trimmed length reported rather
         // than the input.
@@ -1155,9 +1165,9 @@ mod tests {
                 earlier += 1;
             } else {
                 let reason = not_a_backup(&key);
-                // An empty component is refused as a malformed path before
-                // the id rule is reached.
-                let expected = if id.is_empty() {
+                // An id of fewer than 3 characters is refused as a malformed
+                // path before the id rule is reached.
+                let expected = if id.chars().count() < 3 {
                     "are not the components of a backup ARN"
                 } else {
                     "not a backup id"

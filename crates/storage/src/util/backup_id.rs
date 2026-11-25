@@ -150,7 +150,6 @@ mod tests {
             "arn:aws:dynamodb:us-east-1",
             "arn:aws:dynamodb:us-east-1::table/Music/backup/01489602797149-73d8d5bc",
             "arn:aws:dynamodb:us-east-1:table/Music/backup/123456789012",
-            "arn:aws:dynamodb::123456789012:table/Music/backup/01489602797149-73d8d5bc",
             "arn:aws:s3:us-east-1:123456789012:table/Music/backup/01489602797149-73d8d5bc",
             "xrn:aws:dynamodb:us-east-1:123456789012:table/Music/backup/01489602797149-73d8d5bc",
             "arn:aws:dynamodb:us-east-1:123456789012:table/Music",
@@ -159,21 +158,17 @@ mod tests {
             "arn:aws:dynamodb:us-east-1:123456789012:table/Music/stream/01489602797149-73d8d5bc",
             "arn:aws:dynamodb:us-east-1:123456789012:table/Music/backup/01489602797149-73d8d5bc/x",
             "arn:aws:dynamodb:us-east-1:123456789012:table/Music/backup/01489602797149-73d8d5bc:x",
-            // Region: a slash, `..`, uppercase, a space, empty.
-            "arn:aws:dynamodb:us/east-1:123456789012:table/Music/backup/01489602797149-73d8d5bc",
-            "arn:aws:dynamodb:..:123456789012:table/Music/backup/01489602797149-73d8d5bc",
-            "arn:aws:dynamodb:US-EAST-1:123456789012:table/Music/backup/01489602797149-73d8d5bc",
+            // An id of fewer than 3 characters.
+            "arn:aws:dynamodb:us-east-1:123456789012:table/Music/backup/1",
+            "arn:aws:dynamodb:us-east-1:123456789012:table/Music/backup/*",
             // Account: not digits.
             "arn:aws:dynamodb:us-east-1:12345678901x:table/Music/backup/01489602797149-73d8d5bc",
             // Table name outside [a-zA-Z0-9_.-].
             "arn:aws:dynamodb:us-east-1:123456789012:table/Mu sic/backup/01489602797149-73d8d5bc",
             "arn:aws:dynamodb:us-east-1:123456789012:table/Mu*/backup/01489602797149-73d8d5bc",
-            // Control, NUL, and non-ASCII characters.
-            "arn:aws:dynamodb:us-east-1:123456789012:table/Music/backup/01489602797149-73d8d5bc\u{0}",
+            // Control and non-ASCII characters in the table name.
             "arn:aws:dynamodb:us-east-1:123456789012:table/Mus\u{1}ic/backup/01489602797149-73d8d5bc",
             "arn:aws:dynamodb:us-east-1:123456789012:table/Musïc/backup/01489602797149-73d8d5bc",
-            // Whitespace inside.
-            "arn:aws:dynamodb:us-east-1:123456789012:table/Music/backup/ 01489602797149-73d8d5bc",
         ] {
             assert_eq!(
                 check_backup_arn(bad),
@@ -188,10 +183,17 @@ mod tests {
         );
         assert_eq!(check_backup_arn(&long), Err(BackupArnError::Invalid));
 
+        // Region: a slash, `..`, uppercase, empty.
+        for region in ["us/east-1", "..", "US-EAST-1", ""] {
+            let arn = format!(
+                "arn:aws:dynamodb:{region}:123456789012:table/Music/backup/01489602797149-73d8d5bc"
+            );
+            assert_eq!(check_backup_arn(&arn), Err(BackupArnError::Region), "{arn}");
+        }
+
         // The right shape with an id that is not a backup id.
         for id in [
-            "1",
-            "*",
+            "bad",
             "01489602797149-*",
             "01489602797149",
             "0148960279714-73d8d5b",    // 13 digits, 7 hex
@@ -206,6 +208,9 @@ mod tests {
             "a4b1d6c2-0000-4000-8000-000000000000",
             "A4B1D6C2-0000-4000-8000-000000000000",
             "a4b1d6c200004000800000000000000000",
+            // A control character or whitespace in the id.
+            "01489602797149-73d8d5bc\u{0}",
+            " 01489602797149-73d8d5bc",
         ] {
             let arn = format!("arn:aws:dynamodb:us-east-1:123456789012:table/Music/backup/{id}");
             assert_eq!(check_backup_arn(&arn), Err(BackupArnError::Id), "{id}");

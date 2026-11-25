@@ -43,25 +43,26 @@ pub(crate) fn canonical_backup_arn(
     extenddb_storage::util::backup_arn(region, parts.account_id, parts.table_name, parts.backup_id)
 }
 
-/// The shape check of `backup::backup_arn_field`, for any member that carries a
-/// backup ARN, with the service's two texts (measured on DynamoDB; see
-/// [`extenddb_storage::util::BackupArnError`] for which inputs get which).
-/// A partition other than [`ARN_PARTITION`] is refused here too (the service
-/// answers `ValidationException` for one naming the caller's account,
-/// measured on DynamoDB; its text was not captured, so the "not valid" one
-/// is used), before the account is looked at.
+/// The shape check of `backup::backup_arn_member` and of the `ListBackups`
+/// cursor, with the service's texts (see
+/// [`extenddb_storage::util::BackupArnError`] for which inputs get which). A
+/// partition other than [`ARN_PARTITION`] is refused here too, with `Invalid
+/// Request: BackupArn is not valid` for one naming the caller's account,
+/// which a restore answers after its `TargetTableName` (measured on DynamoDB
+/// in us-east-1 on 21 Nov 2026 for `aws-cn`).
 ///
 /// [`ARN_PARTITION`]: extenddb_storage::util::ARN_PARTITION
 pub(crate) fn check_backup_arn(
     backup_arn: &str,
 ) -> Result<extenddb_storage::util::BackupArnParts<'_>, DynamoDbError> {
-    use extenddb_storage::util::BackupArnError;
-    let parts = extenddb_storage::util::check_backup_arn(backup_arn).map_err(|e| {
-        DynamoDbError::ValidationException(match e {
-            BackupArnError::Invalid => BACKUP_ARN_NOT_VALID.to_owned(),
-            BackupArnError::Id => "Invalid Backup ARN".to_owned(),
-        })
-    })?;
+    extenddb_storage::util::check_backup_arn(backup_arn)
+        .map_err(backup_arn_refusal)
+        .and_then(check_partition)
+}
+
+pub(crate) fn check_partition(
+    parts: extenddb_storage::util::BackupArnParts<'_>,
+) -> Result<extenddb_storage::util::BackupArnParts<'_>, DynamoDbError> {
     if parts.partition != extenddb_storage::util::ARN_PARTITION {
         return Err(DynamoDbError::ValidationException(
             BACKUP_ARN_NOT_VALID.to_owned(),
@@ -70,8 +71,20 @@ pub(crate) fn check_backup_arn(
     Ok(parts)
 }
 
-/// The service's text for a `BackupArn` that is not an ARN of the right
-/// shape (measured on DynamoDB).
+/// The service's text for each [`extenddb_storage::util::BackupArnError`].
+pub(crate) fn backup_arn_refusal(e: extenddb_storage::util::BackupArnError) -> DynamoDbError {
+    use extenddb_storage::util::BackupArnError;
+    DynamoDbError::ValidationException(
+        match e {
+            BackupArnError::Invalid => "Invalid Backup ARN",
+            BackupArnError::Region | BackupArnError::Id => BACKUP_ARN_NOT_VALID,
+        }
+        .to_owned(),
+    )
+}
+
+/// The service's text for a `BackupArn` whose region or backup id it refuses
+/// (measured on DynamoDB).
 pub(crate) const BACKUP_ARN_NOT_VALID: &str = "Invalid Request: BackupArn is not valid";
 
 pub(crate) fn required_str<'a>(

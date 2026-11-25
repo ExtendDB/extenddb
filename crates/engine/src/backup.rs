@@ -18,7 +18,9 @@
 
 use std::sync::Arc;
 
-use extenddb_core::backup_format::{BackupArn, check_store_prefix_table_name, is_region};
+use extenddb_core::backup_format::{
+    BackupArn, BackupArnParts, check_store_prefix_table_name, is_region,
+};
 use extenddb_core::error::{DynamoDbError, ErrorMessageKey, error_message};
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{
@@ -31,6 +33,7 @@ use extenddb_storage::backup_catalog::{
     BackupKey, BackupRow, BackupStatus, DeleteStart, is_backup_not_found,
 };
 use extenddb_storage::error::StorageError;
+use extenddb_storage::util::BackupArnError;
 use extenddb_storage::{
     BackupCatalog, BackupRestoreSource, DataEngine, LegacyBackupReader, MetadataEngine,
     RestoreEngine, RestoreRequest, RestoreSource, RestoreTableOverrides, SnapshotEngine,
@@ -50,22 +53,19 @@ pub use runtime::{
 pub use store_identity::{STORE_IDENTITY_KEY, StoreIdentityFile, StoreProblem};
 
 use crate::backup_requests::{
-    canonical_backup_arn, check_backup_arn, create_backup_table_name, pitr, required_str,
-    storage_err_to_dynamo, table_name_bounds,
+    backup_arn_refusal, canonical_backup_arn, check_partition, create_backup_table_name, pitr,
+    required_str, storage_err_to_dynamo, table_name_bounds,
 };
 use crate::{OperationContext, serialize_output};
 
 /// Resolve the `BackupArn` field to the ARNs the engine tries, in order.
 ///
-/// Order, matching the service (measured on DynamoDB):
-/// a missing member is a `ValidationException`; a string that is not a backup
-/// ARN (see [`check_backup_arn`]) is a `ValidationException` with the
-/// service's text for its class; one in a partition other than `aws` is a
-/// `ValidationException` too; a well-formed ARN naming another account is an
-/// `AccessDeniedException`, not reported as absent, because the service
-/// authorizes on the ARN's account before resolving the backup. A caller can
-/// therefore tell "my backup does not exist" (`BackupNotFoundException`, from
-/// the backend) from "that ARN belongs to another account".
+/// The checks and their order are [`backup_arn_member`]'s. An ARN naming
+/// another account is an `AccessDeniedException`, not reported as absent,
+/// because the service authorizes on the ARN's account before resolving the
+/// backup. A caller can therefore tell "my backup does not exist"
+/// (`BackupNotFoundException`, from the backend) from "that ARN belongs to
+/// another account".
 ///
 /// The service trims a trailing newline and resolves an ARN naming another
 /// region of the caller's account (measured on DynamoDB). The backends look
@@ -83,23 +83,57 @@ fn backup_arn_field(
     account_id: &str,
     region: &str,
 ) -> Result<BackupArnSpellings, DynamoDbError> {
+    let parts = backup_arn_member(body, account_id)??;
+    Ok(BackupArnSpellings::new(&parts, region))
+}
+
+/// `BackupArn` checked in the service's order (measured on DynamoDB in
+/// us-east-1 on 21 Nov 2026), an absent member as an empty one. The outer
+/// error is what a restore answers before its `TargetTableName`: an ARN whose
+/// account field is not the caller's, an empty one included, is
+/// `AccessDeniedException` whatever the rest of it, and a string
+/// [`BackupArnError::Invalid`] refuses is `Invalid Backup ARN`. The inner
+/// result is answered after the name: `BackupNotFoundException` for the
+/// service's id shape in upper-case hex in this server's partition, which no
+/// build issues, or the rest of [`crate::backup_requests::check_backup_arn`].
+fn backup_arn_member<'a>(
+    body: &'a Value,
+    account_id: &str,
+) -> Result<Result<BackupArnParts<'a>, DynamoDbError>, DynamoDbError> {
     let backup_arn = body
         .get("BackupArn")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            DynamoDbError::ValidationException(
-                "1 validation error detected: Value null at 'backupArn' \
-                 failed to satisfy constraint: Member must not be null"
-                    .to_owned(),
-            )
-        })?;
-    let parts = check_backup_arn(backup_arn)?;
-    if parts.account_id != account_id {
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let trimmed = extenddb_core::backup_format::trim_backup_arn(backup_arn);
+    let fields = extenddb_core::arn::fields(trimmed);
+    if fields.is_some_and(|f| f.account != account_id) {
         return Err(DynamoDbError::AccessDeniedException(
             "Access is denied".to_owned(),
         ));
     }
-    Ok(BackupArnSpellings::new(&parts, region))
+    Ok(match extenddb_storage::util::check_backup_arn(backup_arn) {
+        Err(e @ BackupArnError::Invalid) => return Err(backup_arn_refusal(e)),
+        // In another partition the service answers the upper-case id as not
+        // valid (measured on DynamoDB in us-east-1 on 25 Nov 2026 for `aws-cn`).
+        Err(BackupArnError::Id)
+            if fields.is_some_and(|f| f.partition == extenddb_storage::util::ARN_PARTITION)
+                && extenddb_storage::util::backup_id_epoch_millis(
+                    &trimmed.to_ascii_lowercase(),
+                )
+                .is_some() =>
+        {
+            Err(backup_not_found(trimmed))
+        }
+        checked => checked
+            .map_err(backup_arn_refusal)
+            .and_then(check_partition),
+    })
+}
+
+/// The `BackupArn` answers a restore gives before its `TargetTableName`
+/// ([`backup_arn_member`]). Reads no storage.
+pub fn check_restore_backup_arn(body: &Value, account_id: &str) -> Result<(), DynamoDbError> {
+    backup_arn_member(body, account_id).map(drop)
 }
 
 /// The spellings of one `BackupArn` the engine looks a backup up under:
@@ -1237,12 +1271,12 @@ where
 
 /// One restore, returning the target name and the response body. Steps, in
 /// order: (1) parse the overrides and check their shape, with no storage
-/// read; (2) check `BackupArn`: missing or malformed is a
-/// `ValidationException`, another account's is an `AccessDeniedException`;
-/// (3) check `TargetTableName`'s syntax, then the `IndexName` of each index
-/// override ([`overrides::IndexOverrides::check_index_names`]); (4) read the
-/// backup: the catalog index's row first ([`check_catalog_row_status`]: a
-/// CREATING row is `BackupInUseException`, a DELETING, DELETED or FAILED row
+/// read; (2) check `BackupArn`'s account and shape ([`backup_arn_member`]);
+/// (3) check `TargetTableName`'s syntax, then the rest of the `BackupArn`
+/// checks, then the `IndexName` of each index override
+/// ([`overrides::IndexOverrides::check_index_names`]); (4) read the backup:
+/// the catalog index's row first ([`check_catalog_row_status`]: a CREATING
+/// row is `BackupInUseException`, a DELETING, DELETED or FAILED row
 /// `BackupNotFoundException`), else the legacy reader's restore source, a
 /// missing backup being `BackupNotFoundException` whatever the target
 /// name's state; (5) check the target name under the account through
@@ -1306,9 +1340,9 @@ where
     validate_override_shape(&overrides)?;
     let index_overrides = overrides::IndexOverrides::parse(body)?;
 
-    // 2. The ARN before the target name: the service checks the ARN's account
-    // first (measured on DynamoDB with two invalid inputs).
-    let backup_arn = backup_arn_field(body, account_id, region)?;
+    // 2. The ARN's account and shape before the target name, its region and
+    // id after (measured on DynamoDB on 21 Nov 2026; `backup_arn_member`).
+    let backup_arn = backup_arn_member(body, account_id)?;
 
     // 3. The names' syntax, before the backup is read: the target name with
     // the restore's checks, not CreateTable's, then each index override's
@@ -1320,6 +1354,7 @@ where
         "targetTableName",
         table_name_bounds(limits),
     )?;
+    let backup_arn = BackupArnSpellings::new(&backup_arn?, region);
     index_overrides.check_index_names()?;
 
     // 4. The catalog index first: a row of the healthy configured store is
