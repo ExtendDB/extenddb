@@ -236,3 +236,57 @@ fn function_operands_are_checked_by_type() {
         ],
     );
 }
+
+/// The expression, a name for each use of its key and a value for each use
+/// of its key take at most 1,048,576 bytes. The condition below uses `:v`
+/// 100 times, sized to each total. Measured on the live service in
+/// eu-north-1 on 2026-11-25, each request twice with the same answer:
+/// 1,048,576 bytes answer 200 and 1,048,577 the size refusal, with and
+/// without the name.
+#[test]
+fn the_combined_size_is_at_most_one_mebibyte() {
+    use std::collections::HashMap;
+
+    use super::parse_search_filter;
+    use super::tests_support::{message, p, s};
+    use crate::limits::LimitsConfig;
+
+    let uses = 100;
+    for (attribute, names) in [
+        ("Category", None),
+        (
+            "#c",
+            Some(HashMap::from([("#c".to_owned(), "Category".to_owned())])),
+        ),
+    ] {
+        let expr = format!(
+            "Country = :h AND {attribute} IN ({})",
+            vec![":v"; uses].join(", ")
+        );
+        let fixed = expr.len() + if names.is_some() { "Category".len() } else { 0 };
+        for (total, served) in [(1_048_576, true), (1_048_577, false)] {
+            let each = (total - fixed) / uses;
+            let head = total - fixed - uses * each;
+            let values = HashMap::from([
+                (":h".to_owned(), s(&"U".repeat(head))),
+                (":v".to_owned(), s(&"x".repeat(each))),
+            ]);
+            let got = parse_search_filter(
+                &expr,
+                names.as_ref(),
+                Some(&values),
+                50,
+                &LimitsConfig::default(),
+            );
+            if served {
+                assert!(got.is_ok(), "{total} {attribute}: {:?}", got.err());
+            } else {
+                assert_eq!(
+                    got.err().map(message),
+                    Some(p("Expression size has exceeded the maximum allowed size;")),
+                    "{total} {attribute}"
+                );
+            }
+        }
+    }
+}
