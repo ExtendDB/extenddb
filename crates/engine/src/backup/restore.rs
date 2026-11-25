@@ -280,11 +280,13 @@ where
         )));
     }
 
-    // The target's input, with the overrides, validated as CreateTable does.
+    // The target's input, with the overrides, validated as CreateTable does,
+    // less the two rules earlier releases did not apply at CreateTable
+    // (`validate_recorded_table`).
     validate_override_for_source(overrides, billing_mode_name(source_table.billing_mode))?;
     let mut input = restore_input_from_manifest(source_table, target_table_name, overrides);
     index_overrides.apply(&mut input, overrides.billing_mode)?;
-    extenddb_core::validation::validate_create_table(&input, limits)?;
+    extenddb_core::validation::validate_recorded_table(&input, limits)?;
     // The key schema the validator holds every item to: a pure function of
     // the manifest, resolved here with step 2's refusals rather than after
     // the client was told the target is CREATING.

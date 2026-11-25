@@ -1,10 +1,15 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
+mod key_definitions;
 pub mod number;
 pub mod restorable_item;
 pub mod vector_item;
 pub mod warm_throughput;
 
+pub use key_definitions::{
+    spread_hash, validate_definition_count, validate_hash_and_range_differ, validate_keys_defined,
+    validate_unique_attribute_definitions,
+};
 pub use restorable_item::{
     RestorableItemError, RestorableItemReason, RestorableKeySchema, RestorableLimits,
     SHOWN_VALUE_BYTES, validate_restorable_item,
@@ -112,12 +117,62 @@ pub fn validate_create_table(
     input: &CreateTableInput,
     limits: &LimitsConfig,
 ) -> Result<(), DynamoDbError> {
+    validate_table(input, limits, false)
+}
+
+/// Validate the table definition a backup records, before a restore creates
+/// the table from it. Every check of [`validate_create_table`] runs except two:
+/// a name defined twice in `AttributeDefinitions`, and a key schema with more
+/// keys than there are definitions. Earlier releases accepted both at
+/// `CreateTable` and stored them, so a backup can record them. Every key of
+/// each key schema still needs a definition.
+///
+/// # Errors
+///
+/// The `ValidationException` of the first check that fails.
+pub fn validate_recorded_table(
+    input: &CreateTableInput,
+    limits: &LimitsConfig,
+) -> Result<(), DynamoDbError> {
+    validate_table(input, limits, true)
+}
+
+fn validate_table(
+    input: &CreateTableInput,
+    limits: &LimitsConfig,
+    recorded: bool,
+) -> Result<(), DynamoDbError> {
+    // The request's member constraints come first. The service answers the
+    // keySchema length before the definition count and the key schema shape,
+    // and an index name before the billing rules and a name defined twice
+    // (measured 2026-11-25).
     validate_table_name(&input.table_name, limits)?;
+    validate_key_schema_size(input, limits.allow_multipart_table_keys)?;
+    for gsi in input.global_secondary_indexes.iter().flatten() {
+        validate_index_name(&gsi.index_name)?;
+    }
+    for lsi in input.local_secondary_indexes.iter().flatten() {
+        validate_index_name(&lsi.index_name)?;
+    }
+    // Then a table billing fault, then the table's key schema against the
+    // definitions and a name defined twice, all before the key schema shape
+    // checks (measured 2026-10-26 and 2026-11-25; see key_definitions.rs).
+    validate_provisioned_throughput(input)?;
+    if !recorded {
+        validate_definition_count(&input.key_schema, &input.attribute_definitions)?;
+    }
+    // A multi-part table key schema may name one attribute as HASH and RANGE,
+    // as in earlier releases, and a backup can record such a table.
+    if !limits.allow_multipart_table_keys {
+        validate_hash_and_range_differ(&input.key_schema)?;
+    }
+    if !recorded {
+        validate_unique_attribute_definitions(&input.attribute_definitions)?;
+    }
     validate_key_schema(input, limits.allow_multipart_table_keys)?;
     validate_gsi_key_schemas(input)?;
     validate_lsi_key_schemas(input)?;
-    validate_attribute_definitions(input)?;
-    validate_provisioned_throughput(input)?;
+    validate_attribute_definitions(input, recorded)?;
     validate_gsi_provisioned_throughput(input)?;
     validate_gsi_throughput_minimum(input)?;
     validate_gsi_count(input, limits)?;
@@ -716,7 +771,9 @@ fn format_key_schema_value(ks: &[KeySchemaElement]) -> String {
 /// Maximum number of HASH or RANGE elements in a multi-part key schema.
 const MAX_MULTIPART_KEY_ELEMENTS: usize = 4;
 
-fn validate_key_schema(
+/// The table key schema's member constraints: present, and at most two
+/// elements unless multi-part table keys are allowed.
+fn validate_key_schema_size(
     input: &CreateTableInput,
     allow_multipart: bool,
 ) -> Result<(), DynamoDbError> {
@@ -726,7 +783,28 @@ fn validate_key_schema(
             &[],
         )));
     }
-    if input.key_schema[0].key_type != KeyType::Hash {
+    if !allow_multipart && input.key_schema.len() > 2 {
+        let ks_repr = format_key_schema_value(&input.key_schema);
+        return Err(DynamoDbError::ValidationException(format!(
+            "1 validation error detected: Value '{ks_repr}' at 'keySchema' failed to satisfy constraint: \
+             Member must have length less than or equal to 2"
+        )));
+    }
+    Ok(())
+}
+
+/// The table key schema's shape, after [`validate_key_schema_size`]: a HASH
+/// element first, then a RANGE element when there are two (or the multi-part
+/// rules).
+fn validate_key_schema(
+    input: &CreateTableInput,
+    allow_multipart: bool,
+) -> Result<(), DynamoDbError> {
+    if input
+        .key_schema
+        .first()
+        .is_some_and(|k| k.key_type != KeyType::Hash)
+    {
         return Err(DynamoDbError::ValidationException(error_message(
             ErrorMessageKey::KeySchemaFirstNotHash,
             &[],
@@ -735,27 +813,15 @@ fn validate_key_schema(
 
     if allow_multipart {
         validate_multipart_key_schema(&input.key_schema, "table")?;
-    } else {
+    } else if input
+        .key_schema
+        .get(1)
+        .is_some_and(|k| k.key_type != KeyType::Range)
+    {
         // Standard DynamoDB: 1 HASH + optional 1 RANGE
-        if input.key_schema.len() > 2 {
-            let ks_repr = format_key_schema_value(&input.key_schema);
-            return Err(DynamoDbError::ValidationException(format!(
-                "1 validation error detected: Value '{ks_repr}' at 'keySchema' failed to satisfy constraint: \
-                 Member must have length less than or equal to 2"
-            )));
-        }
-        if input.key_schema.len() == 2 {
-            if input.key_schema[1].key_type != KeyType::Range {
-                return Err(DynamoDbError::ValidationException(
-                    "Second KeySchemaElement is not a RANGE type".to_owned(),
-                ));
-            }
-            if input.key_schema[0].attribute_name == input.key_schema[1].attribute_name {
-                return Err(DynamoDbError::ValidationException(
-                    "Invalid KeySchema: Some index key attribute have no definition".to_owned(),
-                ));
-            }
-        }
+        return Err(DynamoDbError::ValidationException(
+            "Second KeySchemaElement is not a RANGE type".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -817,7 +883,6 @@ fn validate_gsi_key_schemas(input: &CreateTableInput) -> Result<(), DynamoDbErro
         return Ok(());
     };
     for gsi in gsis {
-        validate_index_name(&gsi.index_name)?;
         if gsi.key_schema.is_empty() {
             return Err(DynamoDbError::ValidationException(format!(
                 "One or more parameter values were invalid: No defined key schema for index: {}",
@@ -843,7 +908,6 @@ fn validate_lsi_key_schemas(input: &CreateTableInput) -> Result<(), DynamoDbErro
     };
     let table_hash_key = &input.key_schema[0].attribute_name;
     for lsi in lsis {
-        validate_index_name(&lsi.index_name)?;
         match lsi.key_schema.as_slice() {
             [hash, range] => {
                 if hash.key_type != KeyType::Hash {
@@ -879,7 +943,10 @@ fn validate_lsi_key_schemas(input: &CreateTableInput) -> Result<(), DynamoDbErro
     Ok(())
 }
 
-fn validate_attribute_definitions(input: &CreateTableInput) -> Result<(), DynamoDbError> {
+fn validate_attribute_definitions(
+    input: &CreateTableInput,
+    recorded: bool,
+) -> Result<(), DynamoDbError> {
     // A vector attribute must NOT be declared in AttributeDefinitions, and this is
     // checked before anything else here because the attribute may simultaneously be
     // a legitimate key attribute: without this, naming the table's own partition key
@@ -964,14 +1031,29 @@ fn validate_attribute_definitions(input: &CreateTableInput) -> Result<(), Dynamo
         }
     }
 
-    // Every key attribute must have a definition
-    for attr in &key_attrs {
-        if !def_names.contains(attr) {
-            return Err(DynamoDbError::ValidationException(format!(
-                "One or more parameter values were invalid: Some index key attributes are not defined in AttributeDefinitions. Keys: [{attr}], AttributeDefinitions: [{}]",
-                format_attr_defs(&input.attribute_definitions)
-            )));
+    // Every key attribute must have a definition: the table's key schema, then
+    // each LSI's, then each GSI's (measured order, see key_definitions.rs). The
+    // table's definition count came first, in `validate_table`. A recorded
+    // table keeps only the rule that each key has a definition.
+    let defs = &input.attribute_definitions;
+    validate_keys_defined(&input.key_schema, defs)?;
+    let index_schemas = input
+        .local_secondary_indexes
+        .iter()
+        .flatten()
+        .map(|lsi| &lsi.key_schema)
+        .chain(
+            input
+                .global_secondary_indexes
+                .iter()
+                .flatten()
+                .map(|gsi| &gsi.key_schema),
+        );
+    for schema in index_schemas {
+        if !recorded {
+            validate_definition_count(schema, defs)?;
         }
+        validate_keys_defined(schema, defs)?;
     }
 
     // Every definition must be used by a key
@@ -985,13 +1067,6 @@ fn validate_attribute_definitions(input: &CreateTableInput) -> Result<(), Dynamo
     }
 
     Ok(())
-}
-
-fn format_attr_defs(defs: &[AttributeDefinition]) -> String {
-    defs.iter()
-        .map(|d| d.attribute_name.clone())
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 /// Validate table-level throughput against the effective billing mode.
@@ -2923,7 +2998,7 @@ mod tests {
             ],
         );
         input.vector_indexes = Some(vec![vi_spec("vidx")]);
-        let err = validate_attribute_definitions(&input)
+        let err = validate_attribute_definitions(&input, false)
             .expect_err("a declared vector attribute must be refused");
         assert_eq!(format!("{err}"), expected);
 
@@ -2936,7 +3011,7 @@ mod tests {
         let mut spec = vi_spec("vidx");
         spec.vector_attribute.attribute_name = "pk".to_owned();
         input.vector_indexes = Some(vec![spec]);
-        let err = validate_attribute_definitions(&input)
+        let err = validate_attribute_definitions(&input, false)
             .expect_err("the partition key must not double as the vector attribute");
         assert!(
             format!("{err}").contains("Conflicting attribute definition for 'pk'"),
@@ -2998,7 +3073,7 @@ mod tests {
             element_type: crate::types::SearchSchemaElementType::Hash,
         }]);
         input.vector_indexes = Some(vec![spec]);
-        let err = validate_attribute_definitions(&input)
+        let err = validate_attribute_definitions(&input, false)
             .expect_err("an undefined SearchSchema attribute must be refused");
         assert_eq!(
             format!("{err}"),
@@ -3097,6 +3172,29 @@ mod tests {
             ],
         );
         assert!(validate_create_table(&input, &limits).is_ok());
+    }
+
+    /// Earlier releases accepted a multi-part table key schema with a HASH and
+    /// a RANGE on one name, so a restore of such a table still passes.
+    /// `CreateTable` refuses the shape with one definition by the definition
+    /// count.
+    #[test]
+    fn a_multipart_table_hash_and_range_on_one_name_restores() {
+        let limits = LimitsConfig {
+            allow_multipart_table_keys: true,
+            ..Default::default()
+        };
+        let input = base_input(
+            vec![make_ks("a", KeyType::Hash), make_ks("a", KeyType::Range)],
+            vec![make_ad("a", ScalarAttributeType::S)],
+        );
+        validate_recorded_table(&input, &limits).unwrap();
+        assert_eq!(
+            validate_create_table(&input, &limits)
+                .unwrap_err()
+                .to_string(),
+            "Invalid KeySchema: Some index key attribute have no definition"
+        );
     }
 
     #[test]

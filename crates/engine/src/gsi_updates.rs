@@ -244,44 +244,20 @@ pub(crate) fn validate_gsi_updates(input: &UpdateTableInput) -> Result<(), Dynam
             }
             // Every key attribute must be in AttributeDefinitions. The
             // service's sentence depends on the member's shape (measured
-            // 2026-10-25 and 2026-11-25): absent names the index; fewer
-            // definitions than the index has keys has its own sentence;
-            // otherwise the sentence lists every key of the index and every
-            // definition (the CreateTable sentence, whose CreateTable copy
-            // lives in core's validation and is not shared with this path).
-            let defs = match &input.attribute_definitions {
-                None => {
-                    return Err(DynamoDbError::ValidationException(format!(
-                        "One or more parameter values were invalid: AttributeDefinitions is not specified for index: {}",
-                        create.index_name
-                    )));
-                }
-                Some(defs) if defs.len() < create.key_schema.len() => {
-                    return Err(DynamoDbError::ValidationException(
-                        "Invalid KeySchema: Some index key attribute have no definition".to_owned(),
-                    ));
-                }
-                Some(defs) => defs,
-            };
-            if !create
-                .key_schema
-                .iter()
-                .all(|ks| defs.iter().any(|ad| ad.attribute_name == ks.attribute_name))
-            {
-                let keys: Vec<&str> = create
-                    .key_schema
-                    .iter()
-                    .map(|ks| ks.attribute_name.as_str())
-                    .collect();
-                let defined: Vec<&str> = defs.iter().map(|ad| ad.attribute_name.as_str()).collect();
+            // 2026-10-25, 2026-10-26 and 2026-11-25): absent names the index;
+            // then come the four rules of core's key_definitions.rs, in its
+            // order: the definition count, the HASH and RANGE names, a name
+            // defined twice, then a key with no definition.
+            let Some(defs) = &input.attribute_definitions else {
                 return Err(DynamoDbError::ValidationException(format!(
-                    "One or more parameter values were invalid: Some index key attributes \
-                     are not defined in AttributeDefinitions. Keys: [{}], \
-                     AttributeDefinitions: [{}]",
-                    keys.join(", "),
-                    defined.join(", ")
+                    "One or more parameter values were invalid: AttributeDefinitions is not specified for index: {}",
+                    create.index_name
                 )));
-            }
+            };
+            extenddb_core::validation::validate_definition_count(&create.key_schema, defs)?;
+            extenddb_core::validation::validate_hash_and_range_differ(&create.key_schema)?;
+            extenddb_core::validation::validate_unique_attribute_definitions(defs)?;
+            extenddb_core::validation::validate_keys_defined(&create.key_schema, defs)?;
         }
         if let Some(delete) = &update.delete {
             validate_update_index_name(&delete.index_name, position, "delete")?;
@@ -559,16 +535,21 @@ mod tests {
 
     /// A created index whose key attribute is not in AttributeDefinitions is
     /// refused with the sentence the service picks by the member's shape
-    /// (measured 2026-10-25 and 2026-11-25): absent names the index, fewer
-    /// definitions than the index has keys has its own sentence, and
-    /// otherwise the sentence lists every key of the index and every
-    /// definition.
+    /// (measured 2026-10-25, 2026-10-26 and 2026-11-25): absent names the
+    /// index, then fewer definitions than the index has keys, a HASH and a
+    /// RANGE on one name, a name defined twice, and last the sentence that
+    /// lists every key of the index and every definition.
     #[test]
     fn a_created_gsi_on_an_undefined_key_attribute_is_refused_by_member_shape() {
         const FEWER: &str = "Invalid KeySchema: Some index key attribute have no definition";
+        const SAME_NAME: &str =
+            "Both the Hash Key and the Range Key element in the KeySchema have the same name";
         const LISTED: &str = "One or more parameter values were invalid: Some index key \
                               attributes are not defined in AttributeDefinitions. Keys: [r, g], \
                               AttributeDefinitions: [r, pk]";
+        const LISTED_PK_G: &str = "One or more parameter values were invalid: Some index key \
+                                   attributes are not defined in AttributeDefinitions. Keys: \
+                                   [r, g], AttributeDefinitions: [pk, g]";
         const ABSENT: &str = "One or more parameter values were invalid: AttributeDefinitions \
                               is not specified for index: gix";
         let input = |keys: [&str; 2], defs: Option<&str>| -> UpdateTableInput {
@@ -598,6 +579,11 @@ mod tests {
             (["g", "r"], Some("g"), FEWER),
             (["g", "r"], Some("other"), FEWER),
             (["r", "g"], Some("r pk"), LISTED),
+            (["g", "r"], Some("pk g"), LISTED_PK_G),
+            (["g", "r"], Some("g g"), "Attribute Name is duplicated: g"),
+            (["g", "g"], Some("g"), FEWER),
+            (["g", "g"], Some("g g"), SAME_NAME),
+            (["g", "g"], Some("g x"), SAME_NAME),
         ];
         for (keys, defs, expected) in cases {
             assert_eq!(
