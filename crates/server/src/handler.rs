@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Main `DynamoDB` request handler with per-segment latency instrumentation.
-//!
-//! Extracted from `lib.rs` to keep both files under the 500-line limit.
 
 use std::sync::Arc;
 
@@ -532,7 +530,9 @@ fn request_scope_for(
 const MAX_SDK_HEADER_LEN: usize = 256;
 
 /// The value of header `name` as an owned string, or `None` when the header is
-/// absent, is not visible ASCII, or is longer than [`MAX_SDK_HEADER_LEN`].
+/// absent, holds a byte outside printable ASCII (space through tilde) and tab,
+/// or is longer than [`MAX_SDK_HEADER_LEN`]. A header value cannot hold CR or
+/// LF, so a value that reads as present cannot split a log line.
 fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get(name)

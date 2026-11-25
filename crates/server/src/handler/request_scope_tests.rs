@@ -250,14 +250,22 @@ fn a_header_that_is_not_visible_ascii_reads_as_absent() {
         "amz-sdk-request",
         axum::http::HeaderValue::from_bytes(&[0xff, 0xfe]).expect("opaque header bytes"),
     );
-    // `HeaderValue::to_str` accepts visible ASCII only; UTF-8 above 0x7e is
-    // refused as well, so a value with an accented letter also reads as absent.
+    // `HeaderValue::to_str` accepts printable ASCII (space through tilde) and
+    // tab only; a byte above 0x7e is refused, so a value with an accented
+    // letter also reads as absent.
     headers.insert(
         "amz-sdk-invocation-id",
         axum::http::HeaderValue::from_bytes("caf\u{e9}".as_bytes()).expect("utf8 header bytes"),
     );
     assert_eq!(header_string(&headers, "amz-sdk-request"), None);
     assert_eq!(header_string(&headers, "amz-sdk-invocation-id"), None);
+    // A space and a tab are within what `to_str` accepts, so the value reads
+    // as sent.
+    headers.insert("amz-sdk-request", "a\tb c".parse().expect("header value"));
+    assert_eq!(
+        header_string(&headers, "amz-sdk-request").as_deref(),
+        Some("a\tb c")
+    );
 }
 
 #[test]
