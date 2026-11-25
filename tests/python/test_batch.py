@@ -16,8 +16,9 @@ from helpers import unique_name
 
 # The clause of a table with more than 25 requests. DynamoDB gave each such
 # table this clause, two tables in either order, in every answer measured on
-# 2026-11-20. On 2026-11-14 and 2026-11-16 it also quoted the request map in
-# a message that holds QUOTED_MAP, so the test accepts that from DynamoDB.
+# 2026-11-20. It quoted the request map instead in some answers of 2026-11-14
+# and 2026-11-16 and in every answer of 2026-11-25, in a message that holds
+# QUOTED_MAP, so the test accepts that from DynamoDB.
 OVER_LIMIT = (
     "Value at 'RequestItems.{}.member' failed to satisfy constraint: "
     "Member must have length less than or equal to 25"
