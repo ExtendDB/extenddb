@@ -442,7 +442,8 @@ const ACCOUNT: &str = "This request would have caused the WriteCapacityUnits lim
 /// JSON text, the write figure of an index `by-label` created beside the
 /// table, and the service's answer. Measured in us-east-1 on 2026-11-14,
 /// 2026-11-16 and 2026-11-18, on the account of [`measured_limits`], which
-/// held 152 write units on 2026-11-18.
+/// held 152 write units on 2026-11-18. The last row was measured on
+/// 2026-11-25.
 #[rustfmt::skip]
 const CAPACITY_FIGURES: &[(bool, &str, &str, Option<&str>, Answer)] = {
     use Answer::{Bounds, Limit, Minimum, Passes};
@@ -458,6 +459,7 @@ const CAPACITY_FIGURES: &[(bool, &str, &str, Option<&str>, Answer)] = {
         (true, "5", "1000000000000", None, Passes(1_000_000_000_000)),
         (true, "5", "1000000000001", None, Bounds("1000000000001", WRITE)),
         (false, "5", "5.5", None, Passes(5)),
+        (true, PAST_MAX, PAST_MAX, None, Bounds(MAX, READ)),
     ]
 };
 

@@ -71,6 +71,8 @@ ROWS = [
     ("CreateTable", 5, 5.5, None, None, None),
     ("RestoreTableFromBackup", 10**12 + 1, 5, None, "BackupNotFoundException",
      r"Backup not found: arn:\S+"),
+    # Measured on 2026-11-25: with both figures out of bounds, the read units.
+    ("UpdateTable", MAX + 1, MAX + 1, None, INVALID, bounds(MAX, "ReadCapacityUnits")),
 ]
 
 
