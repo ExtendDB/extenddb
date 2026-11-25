@@ -156,7 +156,7 @@ def _is_nesting_validation_error(err: dict) -> bool:
 
 
 def _is_messageless_serialization_error(err: dict) -> bool:
-    return err["__type"] == SERIALIZATION_TYPE and "message" not in err
+    return err == {"__type": SERIALIZATION_TYPE}
 
 
 def test_an_attribute_within_the_limit_is_stored(dynamodb_client, table):
@@ -293,12 +293,12 @@ def test_a_malformed_deep_body_is_refused_before_authentication(
     # Each body nests past the 127 levels ExtendDB parses before
     # authentication and has a syntax fault: `x` before the openers, the body
     # without its last byte, or the fault in the leaf. The service answers
-    # each with a 400 SerializationException, unsigned and badly signed (2 of 2
-    # sends per body and signing, us-east-1: the first five rows 2026-11-19,
-    # the control byte and the unknown escape 2026-11-20, the other five at 200
-    # wrappers 2026-11-24, and the last eight 2026-11-25: a number that starts
-    # with `+` or `.`, and `/` and `h`, the bytes on either side of the range
-    # the service takes after `\u`).
+    # each with a 400 SerializationException and no message field, unsigned
+    # and badly signed (2 of 2 sends per body and signing, us-east-1: the
+    # first five rows 2026-11-19, the control byte and the unknown escape
+    # 2026-11-20, the other five at 200 wrappers 2026-11-24, and the last
+    # eight 2026-11-25: a number that starts with `+` or `.`, and `/` and `h`,
+    # the bytes on either side of the range the service takes after `\u`).
     if wrappers is None:
         body = b"x" + b"[" * 6000
     elif leaf is None:
@@ -307,14 +307,7 @@ def test_a_malformed_deep_body_is_refused_before_authentication(
         body = _raw_put_body(table, "malformed", wrappers, leaf)
     resp = _unauthenticated_put(dynamodb_client, endpoint_url, body, signing)
     assert resp.status_code == 400, resp.text
-    err = resp.json()
-    assert err["__type"] == SERIALIZATION_TYPE, resp.text
-    if wrappers in (None, 20000):
-        # Nested past ExtendDB's 5200 level ceiling, both answers have no
-        # message field. Within the ceiling ExtendDB's refusal carries its usual
-        # wording, as for a shallow malformed body, where the service's has no
-        # message field.
-        assert "message" not in err, resp.text
+    assert _is_messageless_serialization_error(resp.json()), resp.text
 
 
 @pytest.mark.parametrize("signing", ["unsigned", "bad-signature"])

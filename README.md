@@ -449,11 +449,10 @@ that names the build:
   `ExecuteTransaction` — "… the PartiQL surface is not part of the browser build."
   This build refuses them by name, before it parses the body, so every body
   gets the refusal: a body that does not parse, which a server answers with
-  `SerializationException` "Start of structure or map found where not
-  expected: …", and a body that parses and that the handler would refuse,
-  such as an `ExecuteStatement` with no `Statement` (on a server, "1 validation
-  error detected: Value null at 'statement' failed to satisfy constraint:
-  Member must not be null").
+  `SerializationException` with no message, and a body that parses and that
+  the handler would refuse, such as an `ExecuteStatement` with no `Statement`
+  (on a server, "1 validation error detected: Value null at 'statement' failed
+  to satisfy constraint: Member must not be null").
 - `DescribeEndpoints` — "… it is called in-process and has no network endpoint
   to report." It is refused by name too, so a body that does not parse gets the
   refusal, where a server answers `SerializationException`.

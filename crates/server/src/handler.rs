@@ -111,7 +111,7 @@ pub(crate) async fn handle_request(
             Ok(v) => Some(v),
             Err(e) => return error_response(&e, &request_id),
         }
-    } else if let Err(e) = crate::request_parse::check_request_syntax(&body, depth) {
+    } else if let Err(e) = crate::request_parse::check_request_syntax(&body) {
         return error_response(&e, &request_id);
     } else {
         None
