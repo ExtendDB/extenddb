@@ -517,6 +517,13 @@ impl StreamEngine for FailingStore {
     ) -> BoxedFuture<'_, Result<Option<String>, StorageError>> {
         unimplemented!("not exercised")
     }
+    fn first_sequence_number_at_or_after(
+        &self,
+        _shard_id: &str,
+        _at_ms: i64,
+    ) -> BoxedFuture<'_, Result<Option<String>, StorageError>> {
+        unimplemented!("not exercised")
+    }
 }
 
 impl BackupCatalog for FailingStore {
