@@ -1286,6 +1286,12 @@ minutes after its last server stops. The Cassandra backend does not expire
 tokens, so there a later retry with such a token gets these answers at any time.
 No catalog migration is required.
 
+### v1.1.0: SQLite parallel Scan segments follow the partition key
+
+**What changed** (#1087). On SQLite, a parallel Scan puts an item in segment `crc32(partition key text) % TotalSegments`, the rule that the MongoDB backend uses. On a GSI, the rule uses the partition key of the index. 1.0.0 put a row in segment `rowid % TotalSegments`, so the items of one partition key could come back from two or more segments. ExtendDB now refuses a start key from another segment also when the item of the key no longer exists. 1.0.0 accepted such a key.
+
+**Who is affected.** A client that pages a parallel Scan of a SQLite deployment across the upgrade. The start keys that 1.0.0 returned follow the old rule. ExtendDB can refuse such a key as a key from another segment. When ExtendDB accepts it, the later pages follow the new rule, so the client can miss items or get items twice. Start such a Scan again after the upgrade. A Scan that pages across a rollback to 1.0.0 can get the same answers. PostgreSQL, MongoDB and Cassandra are not affected. No catalog migration or configuration change is required.
+
 ---
 
 ## License
