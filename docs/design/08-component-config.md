@@ -49,12 +49,13 @@ Environment variables use double-underscore (`__`) as a nesting separator, prefi
 | `server.port` | `EXTENDDB__SERVER__PORT` |
 | `server.bind_addr` | `EXTENDDB__SERVER__BIND_ADDR` |
 | `storage.postgres.connection_string` | `EXTENDDB__STORAGE__POSTGRES__CONNECTION_STRING` |
-| `storage.postgres.read_replica_url` | `EXTENDDB__STORAGE__POSTGRES__READ_REPLICA_URL` |
 | `storage.sqlite.path` | `EXTENDDB__STORAGE__SQLITE__PATH` |
 | `auth.provider` | `EXTENDDB__AUTH__PROVIDER` |
 | `auth.aws_iam.region` | `EXTENDDB__AUTH__AWS_IAM__REGION` |
 | `auth.aws_iam.identity_cache_ttl_seconds` | `EXTENDDB__AUTH__AWS_IAM__IDENTITY_CACHE_TTL_SECONDS` |
 | `auth.aws_iam.policy_cache_ttl_seconds` | `EXTENDDB__AUTH__AWS_IAM__POLICY_CACHE_TTL_SECONDS` |
+| `auth.encryption.key_file` | `EXTENDDB__AUTH__ENCRYPTION__KEY_FILE` |
+| `auth.encryption.require_locked_memory` | `EXTENDDB__AUTH__ENCRYPTION__REQUIRE_LOCKED_MEMORY` |
 | `limits.max_item_size_bytes` | `EXTENDDB__LIMITS__MAX_ITEM_SIZE_BYTES` |
 
 ### 2.3 Loading
@@ -110,21 +111,22 @@ backend = "postgres"     # "postgres" | future: "sqlite", "mysql"
 [storage.postgres]
 connection_string = "postgresql://localhost:5432/extenddb"  # Set credentials via env var in production
 pool_size = 20
-read_replica_url = ""    # Optional: PostgreSQL streaming replica for eventually consistent reads.
-                         # When set, ConsistentRead=false reads route here. When empty, all reads
-                         # use the primary (strongly consistent). Recommended for migration testing.
-read_replica_pool_size = 20  # Pool size for the read replica (defaults to pool_size if unset)
-connection_timeout_secs = 5
-statement_timeout_secs = 30
+# catalog_pool_size = 20   # management pool, defaults to pool_size; minimum 10
 
 [auth]
 provider = "builtin"     # "none" | "builtin" | "aws_iam" | future: "azure_ad"
 region = "us-east-1"     # Region for SigV4 validation
 # The credential encryption key is not read from this file: `extenddb init` generates it
 # and stores it in the catalog `settings` table (see docs/manuals/10-security-model.md).
+# With [auth.encryption] key_file set, the catalog holds that key wrapped under the
+# key-encryption key in the named file (see docs/manuals/05-admin-guide.md, Encryption Key).
 credential_cache_ttl_secs = 300
 policy_cache_ttl_secs = 300
 timestamp_skew_secs = 300
+
+[auth.encryption]
+# key_file = "/etc/extenddb/kek"   # set after `extenddb encryption-key switch --yes`; unset keeps the catalog key
+# require_locked_memory = true     # with key_file set, refuse to start when the key store cannot be locked
 
 [limits]
 # Item & attribute limits

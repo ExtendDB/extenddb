@@ -83,6 +83,21 @@ The node now listens on `127.0.0.1:9042` with password authentication enabled.
 ExtendDB creates its keyspaces under the configured `keyspace_prefix`, so one
 cluster can host more than one deployment by giving each a different prefix.
 
+`extenddb destroy` drops only the deployment's own keyspaces: the catalog
+keyspace and the account keyspaces (`<keyspace_prefix>_account_` followed by a
+12-digit account id). A keyspace that starts with `<keyspace_prefix>_` but is
+not one of these, such as the keyspaces of a second deployment whose prefix
+begins with this one (`extenddb_test` beside `extenddb`), stays in place.
+`destroy` prints its name. `destroy` decides by name only: a keyspace that
+another program made with the name `<keyspace_prefix>_catalog`, or with
+`<keyspace_prefix>_account_` and 12 digits, is dropped.
+`destroy` returns only after the nodes agree on the schema. It waits up to 30
+seconds, or longer when a node is slow to answer. The wait compares the schema version of
+the whole cluster, so schema changes by another deployment on the same cluster
+can delay it. If the nodes do not agree, `destroy` returns an error. When it had
+dropped keyspaces, the error says so, and `destroy` can be run again to wait
+again.
+
 ## Building with Cassandra Support
 
 The Cassandra backend is behind a feature flag. Backends are mutually exclusive
@@ -188,7 +203,14 @@ Fields:
 - `username` / `password` — the application credentials ExtendDB uses at serve
   time. Required against any authenticated node (which `init` requires anyway).
 - `keyspace_prefix` — prefix for this deployment's keyspaces (default
-  `extenddb`).
+  `extenddb`). It may hold ASCII letters, digits and `_`, and must start with a
+  letter (ExtendDB does not check this). It may hold at most 27 characters, so
+  that `<keyspace_prefix>_account_` and a 12-digit id stay within Cassandra's
+  48-character keyspace name limit. `init` refuses a longer prefix before it
+  creates the role or any keyspace. Cassandra stores a
+  keyspace name written without quotes in lower case, so ExtendDB lower-cases
+  the prefix in this file, in a connection string and in
+  `init --keyspace-prefix`. `Acme` and `acme` are the same prefix.
 - `replication_factor` — keyspace replication factor. `init` creates its own
   keyspaces with `--replication-factor` (default `1`), or with this file's value
   for `init --overwrite`, and writes the same value here; see
@@ -335,14 +357,34 @@ Logins read `system_auth` at `QUORUM` for the default superuser, so a
 `system_auth` replication factor above the node count makes those logins fail
 with `Cannot achieve consistency level QUORUM`.
 
+ExtendDB runs each read and write at `LOCAL_QUORUM` or `LOCAL_SERIAL`, so a
+request needs a quorum of its keyspace's replicas in the datacenter to be up.
+When fewer replicas are up, the request fails with HTTP 500 (`InternalServerError`).
+A replication factor of 3 keeps serving while one replica is down; a replication
+factor of 2 or 1, requests will fail when any replica is down. Use a replication
+factor of 3 on at least three nodes for any production deployment. For how Cassandra
+counts a quorum, see
+[Tunable Consistency](https://cassandra.apache.org/doc/4.1/cassandra/architecture/dynamo.html#tunable-consistency)
+in the Cassandra documentation.
+
+Run `extenddb backup migrate-legacy` only when every replica of every account
+keyspace is up. It reads the backup data that older versions wrote at `ALL`, so
+it fails when any replica is down, even with a replication factor of 3. See
+[Migrating legacy backups into the store](manuals/14-backup-and-restore.md#migrating-legacy-backups-into-the-store).
+
+Run the `extenddb encryption-key` commands only when every replica of the
+catalog keyspace is up. They read the key rows at `ALL`, and they write the key
+ring and the stored secrets at `ALL`. So they fail when any replica is down,
+even with a replication factor of 3.
+
 ExtendDB creates its keyspaces with `NetworkTopologyStrategy`, with
 `replication_factor` replicas in `datacenter`. Use the name your cluster's
 nodes report (`nodetool status` prints it); in the `ALTER KEYSPACE` statements
 above, replace `datacenter1` with it.
 
-ExtendDB supports one datacenter. A keyspace that also replicates to a second
-datacenter still works, but `serve` logs the start-up warning for it at every
-start.
+ExtendDB supports one Cassandra datacenter. A keyspace that also replicates to
+a second datacenter still works, but `serve` logs the start-up warning for it
+at every start.
 
 With a replication factor of 1, the catalog has one replica, so a restart of
 that node stops every request to it. A running server renews its serving
@@ -352,6 +394,7 @@ through an outage of 25 to 30 s, depending on when the outage starts. After
 that, 30 to 35 s after its last successful renewal, it answers new requests
 with `ServiceUnavailable`, stops its background workers, and tries to register
 again every second for up to 30 s.
+
 It registers again, starts its workers again and serves on only when the
 Cassandra driver has reconnected to the node within that time, which after a
 restart of 30 s or more it often has not; otherwise it stops with exit 1. Run
@@ -407,8 +450,9 @@ backend is experimental rather than production-ready.
   are known (observed as intermittent integration-test failures) and are being
   worked. Under concurrent load, outcomes may occasionally diverge from
   DynamoDB semantics.
-- **Single-datacenter writes per table.** Transaction and TTL lifecycle
-  operations use `LOCAL_QUORUM` / `LOCAL_SERIAL`, which are linearizable only
+- **Single-datacenter writes per table.** Reads and writes use `LOCAL_QUORUM`,
+  so a read sees each write that its datacenter acknowledged before the read
+  started. Lightweight transactions use `LOCAL_SERIAL`, and are linearizable
   within one datacenter. Serve writes for a given table from one Cassandra
   datacenter.
 - **Multi-node ExtendDB needs node-id configuration.** Running more than one

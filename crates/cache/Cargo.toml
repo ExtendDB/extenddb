@@ -16,11 +16,22 @@ homepage.workspace = true
 test-util = []
 
 [dependencies]
+web-time = { workspace = true }
 moka = { workspace = true }
 serde = { workspace = true }
-tokio = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
+
+# Native keeps the full tokio feature set inherited from the workspace. On
+# wasm32 the workspace's `full` feature pulls in `mio` (networking), which has
+# no wasm32 target and fails to compile. The cache's only production use of
+# tokio is the background-refresh `tokio::spawn`, which needs just `rt`.
+# The native entry below keeps the workspace feature set.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1", default-features = false, features = ["rt"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

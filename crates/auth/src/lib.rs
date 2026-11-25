@@ -4,21 +4,23 @@
 //! Authentication and authorization for extenddb.
 //!
 //! Defines the `AuthProvider` trait for pluggable auth backends. Ships with
-//! `BuiltinAuthProvider` (full `SigV4` verification with local credential store).
+//! `BuiltinAuthProvider` (full `SigV4` verification over the signing-key
+//! cache of a local credential store) and the locked key store (`secmem`).
 
 pub mod cache_registry;
 pub mod credential_cache;
 pub mod policy;
+pub mod secmem;
 pub mod sigv4;
 
 pub use cache_registry::{AuthCacheRegistry, AuthzCacheInvalidator, TableKeyInfoCacheInvalidator};
-pub use credential_cache::CachedCredentialStore;
+pub use credential_cache::{CachedCredential, CachedCredentialStore, ResolvedCredential};
 
-use axum::http::HeaderMap;
 use extenddb_core::error::DynamoDbError;
+use http::HeaderMap;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-/// Auth provider trait — pluggable authentication.
+/// Auth provider trait: pluggable authentication.
 ///
 /// `BuiltinAuthProvider` performs `SigV4` verification.
 /// Fix #11: Accept `&HeaderMap` directly to avoid per-request `HashMap` allocation.
@@ -102,33 +104,30 @@ pub trait CredentialStore: Send + Sync {
     ) -> Result<Option<StoredCredential>, DynamoDbError>;
 }
 
-/// `SigV4` auth provider with local credential store.
+/// `SigV4` auth provider over the signing-key cache.
 ///
 /// Parses the `Authorization` header, validates the request timestamp, checks
-/// the credential scope, looks up the access key, decrypts the secret and
-/// verifies the `SigV4` signature, in that order (the service's order).
-/// Handles both long-lived (AKIA*) and temporary (ASIA* + X-Amz-Security-Token)
-/// credentials. The credential scope must name this server's region.
-pub struct BuiltinAuthProvider<C: CredentialStore> {
-    credential_store: C,
-    region: String,
+/// the credential scope, looks the access key up in the cache and verifies the
+/// `SigV4` signature under the cached signing key, in that order (the
+/// service's order). Handles both long-lived (AKIA*) and temporary (ASIA* +
+/// X-Amz-Security-Token) credentials. The credential scope must name the
+/// cache's region, which is this server's region.
+pub struct BuiltinAuthProvider {
+    credentials: CachedCredentialStore,
 }
 
-impl<C: CredentialStore> BuiltinAuthProvider<C> {
-    /// Create a new `BuiltinAuthProvider` over `credential_store` for a server
-    /// deployed as `region`. A request whose credential scope names another
-    /// region is rejected, as the service rejects a scope for a region other
-    /// than the endpoint's.
-    pub fn new(credential_store: C, region: impl Into<String>) -> Self {
-        Self {
-            credential_store,
-            region: region.into(),
-        }
+impl BuiltinAuthProvider {
+    /// Create a new `BuiltinAuthProvider` over `credentials`. A request whose
+    /// credential scope names a region other than the cache's is rejected, as
+    /// the service rejects a scope for a region other than the endpoint's.
+    #[must_use]
+    pub fn new(credentials: CachedCredentialStore) -> Self {
+        Self { credentials }
     }
 }
 
 #[async_trait::async_trait]
-impl<C: CredentialStore + 'static> AuthProvider for BuiltinAuthProvider<C> {
+impl AuthProvider for BuiltinAuthProvider {
     async fn authenticate(
         &self,
         headers: &HeaderMap,
@@ -154,27 +153,28 @@ impl<C: CredentialStore + 'static> AuthProvider for BuiltinAuthProvider<C> {
         // Neither check reads the stored credential, so running them first
         // leaves the S-5 timing argument below unchanged.
         //
-        // Validate timestamp (±15 minute window). The X-Amz-Date value it
+        // Validate timestamp (within 15 minutes). The X-Amz-Date value it
         // returns is what the scope date is compared against.
         let timestamp = sigv4::verify::validate_timestamp(headers)?;
 
         // The credential scope must name this server's region, the dynamodb
         // service and the date of X-Amz-Date; the service reports every
         // complaint in one message when more than one is wrong.
-        sigv4::verify::check_scope(&parsed, &self.region, &timestamp)?;
+        sigv4::verify::check_scope(&parsed, self.credentials.region(), &timestamp)?;
 
-        let credential = self
-            .credential_store
-            .lookup_credential(&parsed.access_key_id)
+        let resolved = self
+            .credentials
+            .lookup(&parsed.access_key_id, &parsed.date)
             .await?
             .ok_or_else(|| {
                 DynamoDbError::UnrecognizedClientException(
                     "The security token included in the request is invalid.".to_owned(),
                 )
             })?;
+        let credential = resolved.credential();
 
         // S-5: Track inactive status but do NOT return early. Continue through
-        // signature verification to ensure constant-time failure paths — no
+        // signature verification to ensure constant-time failure paths: no
         // timing difference between inactive, invalid, and absent keys.
         let is_inactive = !credential.is_active;
 
@@ -183,11 +183,11 @@ impl<C: CredentialStore + 'static> AuthProvider for BuiltinAuthProvider<C> {
         // the service validates any presented token and a long-term key has
         // none, so the request fails as an invalid token.
         // CB-12: Session expiration is enforced at the credential store layer (fail-closed).
-        // Expired sessions are never returned — the storage layer returns
+        // Expired sessions are never returned: the storage layer returns
         // ExpiredTokenException on the cache-miss path, and CachedCredentialStore
         // re-validates `expires_at` on every cache hit before returning so cached
         // entries cannot survive past their issued lifetime.
-        // S-5: Compare the session token in constant time and defer the
+        // S-5: Compare the token's hash in constant time and defer the
         // rejection until after signature verification, so neither the token's
         // byte contents nor its presence changes the failure-path timing.
         // A header value that is not visible ASCII cannot be compared with
@@ -198,17 +198,15 @@ impl<C: CredentialStore + 'static> AuthProvider for BuiltinAuthProvider<C> {
             .get("x-amz-security-token")
             .and_then(|v| v.to_str().ok());
         let session_token_ok = if credential.is_session {
-            let token = presented_token.unwrap_or("");
-            let expected = credential.session_token.as_deref().unwrap_or("");
-            sigv4::verify::constant_time_eq(token.as_bytes(), expected.as_bytes())
+            credential.session_token_matches(presented_token.unwrap_or(""))
         } else {
             !token_header_present
         };
 
-        // Verify SigV4 signature — always, even for inactive keys (S-5).
+        // Verify the SigV4 signature, always, even for inactive keys (S-5).
         sigv4::verify::verify_signature(
             &parsed,
-            &credential.secret_key,
+            resolved.signing_key(),
             "POST", // DynamoDB is always POST
             "/",    // DynamoDB is always /
             "",     // DynamoDB has no query string
@@ -232,8 +230,7 @@ impl<C: CredentialStore + 'static> AuthProvider for BuiltinAuthProvider<C> {
             ));
         }
 
-        // Build identity from credential (clone fields because ZeroizeOnDrop
-        // prevents moving out of the struct).
+        // Build identity from the cached fields.
         if credential.is_session {
             Ok(AuthIdentity::RoleSession {
                 account_id: credential.account_id.clone(),
@@ -249,5 +246,9 @@ impl<C: CredentialStore + 'static> AuthProvider for BuiltinAuthProvider<C> {
     }
 }
 
+#[cfg(test)]
+mod scope_tests;
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tests;

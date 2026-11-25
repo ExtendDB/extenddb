@@ -3,6 +3,9 @@
 
 //! Catalog store implementation for `MongoDB`.
 
+use std::sync::Arc;
+
+use extenddb_storage::secret_keys::SecretKeys;
 use futures::future::BoxFuture;
 use mongodb::bson::doc;
 
@@ -10,7 +13,10 @@ use mongodb::bson::doc;
 pub struct MongoCatalogStore {
     client: mongodb::Client,
     catalog_db: mongodb::Database,
-    pub(crate) encryption_key: Option<String>,
+    /// The key holder that encrypts the stored secrets, shared with the
+    /// credential store; `None` for a store opened without a key, which
+    /// writes no credential.
+    pub(crate) keys: Option<Arc<SecretKeys>>,
 }
 
 impl MongoCatalogStore {
@@ -20,18 +26,16 @@ impl MongoCatalogStore {
         Self {
             client,
             catalog_db,
-            encryption_key: None,
+            keys: None,
         }
     }
 
+    /// Hold the key holder the factory loaded, shared with the credential
+    /// store. Without one the store writes no credential.
     #[must_use]
-    pub fn with_encryption_key(client: mongodb::Client, encryption_key: String) -> Self {
-        let catalog_db = client.database("extenddb_catalog");
-        Self {
-            client,
-            catalog_db,
-            encryption_key: Some(encryption_key),
-        }
+    pub fn with_secret_keys(mut self, keys: Option<Arc<SecretKeys>>) -> Self {
+        self.keys = keys;
+        self
     }
 
     /// A store on `catalog_db`, a handle the caller opened with its own
@@ -41,7 +45,7 @@ impl MongoCatalogStore {
         Self {
             client,
             catalog_db,
-            encryption_key: None,
+            keys: None,
         }
     }
 
@@ -62,8 +66,8 @@ impl MongoCatalogStore {
 
 // Implement CatalogStore supertrait
 impl extenddb_storage::CatalogStore for MongoCatalogStore {
-    fn cached_encryption_key(&self) -> Option<String> {
-        self.encryption_key.clone()
+    fn secret_keys(&self) -> Option<&SecretKeys> {
+        self.keys.as_deref()
     }
 }
 
@@ -112,6 +116,7 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for MongoCatalogStore {
 
     fn test_data_database_connection(
         &self,
+        _key: &extenddb_storage::server_components::KeySource,
     ) -> BoxFuture<'_, extenddb_storage::diagnostics::DiagResult<String>> {
         Box::pin(async {
             // Ping the data database to verify connectivity

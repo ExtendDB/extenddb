@@ -116,8 +116,9 @@ migration_ids! {
 
 /// Highest id that has shipped in a release. Bodies at or below it are frozen:
 /// each backend pins their checksums, kinds and convergent flags, and
-/// `forget` refuses them. The v1.0 release PR raises it to 12.
-pub const RELEASED_THROUGH: u32 = 0;
+/// `forget` refuses them. Each release PR raises it to the last id
+/// (CONTRIBUTING.md, "Adding a catalog migration", step 7).
+pub const RELEASED_THROUGH: u32 = 12;
 
 impl MigrationId {
     /// The highest id this binary carries.

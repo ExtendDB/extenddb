@@ -21,22 +21,31 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Mutex, PoisonError};
 
 use async_trait::async_trait;
 use extenddb_storage::management_store::ManagementStore;
 use extenddb_storage::migrations::{
     CatalogTraces, Done, HasManagementStore, LedgerColumns, LedgerRow, LedgerWrites, Migration,
-    MigrationBackend, MigrationError, MigrationId, Released, RunReport, Runner, Step, StoreKind,
-    StoreRef, in_transaction, record_rows, sql_ledger_ddl,
+    MigrationBackend, MigrationError, MigrationId, Released, Step, StoreKind, StoreRef,
+    in_transaction, record_rows, sql_ledger_ddl,
 };
-use sqlx::sqlite::SqlitePoolOptions;
-use sqlx::{ConnectOptions, Connection, SqlitePool};
+use sqlx::SqlitePool;
 
 use crate::catalog_store::SqliteCatalogStore;
-use crate::sqlite_util::{set_connection_pragmas, sqlite_url};
+
+// Used only by the file-database paths and `LockedCatalog`, compiled off wasm32.
+#[cfg(not(target_arch = "wasm32"))]
+use {
+    crate::sqlite_util::{set_connection_pragmas, sqlite_url},
+    extenddb_storage::management_store::SettingsStore,
+    extenddb_storage::migrations::{LockedStores, RunReport, Runner},
+    sqlx::sqlite::SqlitePoolOptions,
+    sqlx::{ConnectOptions, Connection},
+    std::str::FromStr,
+    std::sync::Arc,
+    std::sync::atomic::{AtomicUsize, Ordering},
+};
 
 /// What SQLite code bodies receive: the runner's connection, and a
 /// management store over it.
@@ -48,6 +57,34 @@ pub struct SqliteStores {
 impl HasManagementStore for SqliteStores {
     fn management_store(&self) -> &dyn ManagementStore {
         &self.management
+    }
+}
+
+/// The catalog's stores under a held migration lock, for `encryption-key
+/// switch`, `rotate` and `reset` (RFC-0000 section 8, common rules): the
+/// management store over the runner's one connection, holding no key.
+/// Dropping it closes the connection.
+// For the encryption-key commands, which wasm32 does not compile.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct LockedCatalog(SqliteMigrations);
+
+// For the encryption-key commands, which wasm32 does not compile.
+#[cfg(not(target_arch = "wasm32"))]
+impl LockedCatalog {
+    pub(crate) fn new(migrations: SqliteMigrations) -> Self {
+        Self(migrations)
+    }
+}
+
+// For the encryption-key commands, which wasm32 does not compile.
+#[cfg(not(target_arch = "wasm32"))]
+impl LockedStores for LockedCatalog {
+    fn management(&self) -> &dyn ManagementStore {
+        &self.0.stores.management
+    }
+
+    fn settings(&self) -> &dyn SettingsStore {
+        &self.0.stores.management
     }
 }
 
@@ -120,16 +157,48 @@ pub struct SqliteMigrations {
     stores: SqliteStores,
     location: String,
     /// The database file; `None` for an in-memory database.
+    #[cfg_attr(
+        target_arch = "wasm32",
+        expect(
+            dead_code,
+            reason = "set by with_pool, which both builds run, and read only by open_with and the \
+                      before_first_write that takes the copy, which wasm32 does not compile"
+        )
+    )]
     file: Option<PathBuf>,
     /// Whether the connection is this runner's own, closed by [`Self::close`].
     owned: bool,
     /// The copy this run took before its first write, if it took one.
+    #[cfg_attr(
+        target_arch = "wasm32",
+        expect(
+            dead_code,
+            reason = "set by with_pool, which both builds run, and read only on the file-database \
+                      paths, which wasm32 does not compile"
+        )
+    )]
     copy: Mutex<Option<PathBuf>>,
     /// The lines naming the earlier copies this run's copy replaced,
     /// reported with the run, also when it stops before its first commit.
+    #[cfg_attr(
+        target_arch = "wasm32",
+        expect(
+            dead_code,
+            reason = "set by with_pool, which both builds run, and read only on the file-database \
+                      paths, which wasm32 does not compile"
+        )
+    )]
     replaced: Mutex<Vec<String>>,
     /// The lines naming the partial copies of stopped runs that opening the
     /// database for writing removed, reported with the run.
+    #[cfg_attr(
+        target_arch = "wasm32",
+        expect(
+            dead_code,
+            reason = "set by with_pool, which both builds run, and read only on the file-database \
+                      paths, which wasm32 does not compile"
+        )
+    )]
     removed: Mutex<Vec<String>>,
     /// `PRAGMA foreign_keys = ON` failed after a step committed: the step is
     /// reported as applied, and the run stops with this error at its next
@@ -151,6 +220,8 @@ impl SqliteMigrations {
     /// # Errors
     ///
     /// The location does not parse, or the database cannot be opened.
+    // Opens a database file, which the browser build does not have.
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn open(location: &str) -> Result<Self, MigrationError> {
         Self::open_with(location, true).await
     }
@@ -162,10 +233,14 @@ impl SqliteMigrations {
     /// # Errors
     ///
     /// As [`Self::open`].
+    // Opens a database file, which the browser build does not have.
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn open_for_status(location: &str) -> Result<Self, MigrationError> {
         Self::open_with(location, false).await
     }
 
+    // Calls `super::open` and `super::copy`, which the browser build does not compile.
+    #[cfg(not(target_arch = "wasm32"))]
     async fn open_with(location: &str, write: bool) -> Result<Self, MigrationError> {
         let file = crate::serve_lock::database_file(location).map_err(MigrationError::Store)?;
         if write && let Some(path) = &file {
@@ -310,6 +385,8 @@ impl SqliteMigrations {
     /// # Errors
     ///
     /// As [`Runner::forget`]; the database is then as it was.
+    // The CLI's `migrate --forget` only.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn forget(&self, id: u32) -> Result<(), MigrationError> {
         self.forget_with(&Runner::new(self, ""), id).await
     }
@@ -320,6 +397,8 @@ impl SqliteMigrations {
     /// # Errors
     ///
     /// As [`SqliteMigrations::forget`].
+    // The CLI's `migrate --forget` only.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn forget_with(
         &self,
         runner: &Runner<'_, Self>,
@@ -360,6 +439,8 @@ impl SqliteMigrations {
     /// committed and whose pragma after it failed stops with that error and
     /// keeps its copy. A report starts with the partial copies of stopped
     /// runs that opening the database removed.
+    // File-database runs only: the browser build takes no copy.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn discard_unused_copy(
         &self,
         result: Result<RunReport, MigrationError>,
@@ -582,6 +663,11 @@ impl MigrationBackend for SqliteMigrations {
         Ok(tables == 0)
     }
 
+    // Calls `super::copy`, which wasm32 does not compile, so wasm32 has the
+    // method below. (A wasm32 stand-in for `copy` would compile this body
+    // there, with its `SystemTime::now()`, which panics on
+    // wasm32-unknown-unknown.)
+    #[cfg(not(target_arch = "wasm32"))]
     async fn before_first_write(
         &self,
         from: Option<u32>,
@@ -614,6 +700,20 @@ impl MigrationBackend for SqliteMigrations {
             .extend(replaced);
         *self.copy.lock().unwrap_or_else(PoisonError::into_inner) = Some(copy);
         Ok(lines)
+    }
+
+    // On wasm32 every database is in memory (`self.file` is `None`), and the
+    // method above returns `Ok(Vec::new())` for one. The test
+    // `an_in_memory_database_gets_no_lines_before_the_first_write`, at the end
+    // of this file, checks that answer of the method above, and its failure
+    // message names this method.
+    #[cfg(target_arch = "wasm32")]
+    async fn before_first_write(
+        &self,
+        _from: Option<u32>,
+        _to: u32,
+    ) -> Result<Vec<String>, MigrationError> {
+        Ok(Vec::new())
     }
 
     async fn apply(
@@ -671,5 +771,50 @@ impl MigrationBackend for SqliteMigrations {
             .await
             .map(|_| ())
             .map_err(|e| MigrationError::store(format!("forget migration {id}"), e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use extenddb_storage::migrations::{MigrationBackend, MigrationId, Runner};
+
+    use super::SqliteMigrations;
+
+    /// For an in-memory database, `before_first_write` reports no lines: on
+    /// an empty catalog, for a run from no version, and on a catalog holding
+    /// tables, for runs from no version, from version 1 and from the version
+    /// before the latest, each to the latest. The wasm32 build compiles
+    /// another `before_first_write` in place of this one, which returns no
+    /// lines for every database, since every database is in memory there; it
+    /// has to change with this answer.
+    #[tokio::test]
+    async fn an_in_memory_database_gets_no_lines_before_the_first_write() {
+        let engine = crate::SqliteEngine::new(":memory:", 1, "us-east-1", 400_000)
+            .await
+            .expect("engine");
+        let migrations =
+            SqliteMigrations::on_pool(engine.pool.clone(), ":memory:").expect("one connection");
+        let latest = MigrationId::LATEST.number();
+        let twin = "the wasm32 before_first_write returns no lines for every database, and has \
+                    to give the new answer too";
+        assert!(migrations.catalog_is_empty().await.expect("count tables"));
+        assert_eq!(
+            migrations.before_first_write(None, latest).await,
+            Ok(Vec::new()),
+            "an empty catalog: {twin}"
+        );
+        Runner::new(&migrations, "test")
+            .migrate()
+            .await
+            .expect("migrate");
+        assert!(!migrations.catalog_is_empty().await.expect("count tables"));
+        for from in [None, Some(1), Some(latest - 1)] {
+            assert_eq!(
+                migrations.before_first_write(from, latest).await,
+                Ok(Vec::new()),
+                "a catalog holding tables, from {from:?}: {twin}"
+            );
+        }
+        migrations.close().await;
     }
 }

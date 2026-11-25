@@ -114,7 +114,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::import_export::create_export_file;
+    use crate::import_export::files::create_export_file;
     use crate::import_export_io::ensure_account_dirs;
 
     /// A permission mode that prints in octal when an assertion fails.
