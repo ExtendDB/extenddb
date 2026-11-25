@@ -521,9 +521,7 @@ impl StreamEngine for PostgresEngine {
             let records: Vec<StreamRecord> = rows
                 .into_iter()
                 .filter_map(|(_, data)| data)
-                .map(|data| {
-                    serde_json::from_value(data).map_err(|e| StorageError::Internal(e.to_string()))
-                })
+                .map(crate::catalog_json::from_catalog_json)
                 .collect::<Result<Vec<_>, _>>()?;
 
             let last_seq = records.last().map(|r| r.dynamodb.sequence_number.clone());

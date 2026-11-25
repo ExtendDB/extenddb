@@ -12,10 +12,11 @@ use extenddb_core::types::{
 };
 use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{SortKeyValue, parse_sk, pk_to_text, sk_column, sk_info};
+use extenddb_storage::util::{SortKeyValue, sk_column, sk_info};
 
 use super::index::db_error;
-use super::{data_table_name, json_to_item};
+use super::key_text::{parse_sk, pk_to_text};
+use super::{data_table_name, item_to_json, json_to_item};
 
 /// Fetch a single item within an existing transaction.
 pub(super) async fn fetch_item_in_tx(
@@ -106,8 +107,7 @@ pub(super) async fn upsert_item_in_tx(
         .get(pk_name)
         .ok_or_else(|| StorageError::Internal("missing partition key".to_owned()))?;
     let pk_text = pk_to_text(pk_value)?;
-    let item_json =
-        serde_json::to_value(item).map_err(|e| StorageError::Internal(e.to_string()))?;
+    let item_json = item_to_json(item)?;
 
     if let Some((sk_name, sk_type)) = sk_info(&key_info.key_schema, &key_info.attribute_definitions)
     {
@@ -158,8 +158,7 @@ pub(super) async fn insert_item_if_absent_in_tx(
         .get(pk_name)
         .ok_or_else(|| StorageError::Internal("missing partition key".to_owned()))?;
     let pk_text = pk_to_text(pk_value)?;
-    let item_json =
-        serde_json::to_value(item).map_err(|e| StorageError::Internal(e.to_string()))?;
+    let item_json = item_to_json(item)?;
 
     let rows_affected = if let Some((sk_name, sk_type)) =
         sk_info(&key_info.key_schema, &key_info.attribute_definitions)
@@ -442,9 +441,10 @@ pub(super) async fn write_stream_record_to_shard_in_tx(
     // batch adds up that length (`NUMBER_BATCH_BYTES` in stream_engine.rs).
     // It is the record's size before TOAST compresses it, which is what the
     // numbering copies and rewrites; `pg_column_size` would give the
-    // compressed size.
-    let record_text =
-        serde_json::to_string(&record).map_err(|e| StorageError::Internal(e.to_string()))?;
+    // compressed size. The text is that of the stored form
+    // (`catalog_json::to_catalog_json`), since jsonb refuses the `\u0000`
+    // escape, so the length counts the escaped strings.
+    let record_text = crate::catalog_json::to_catalog_json(&record)?.to_string();
     let record_bytes = i64::try_from(record_text.len()).unwrap_or(i64::MAX);
 
     // The record waits in stream_pending, with no sequence number, until this

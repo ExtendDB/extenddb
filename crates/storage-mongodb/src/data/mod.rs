@@ -15,7 +15,10 @@ use extenddb_core::types::{
     AttributeDefinition, AttributeValue, Item, KeySchemaElement, ScalarAttributeType,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{composite_pk_to_text, encode_netstring_composite, sk_info};
+use extenddb_storage::util::{
+    composite_pk_to_text, encode_netstring_composite, escape_json_keys, needs_escape, sk_info,
+    unescape_json_keys,
+};
 
 /// Returns the `MongoDB` collection name for a `DynamoDB` table.
 pub fn data_collection_name(table_id: &str) -> String {
@@ -34,6 +37,95 @@ pub fn composite_id(pk_text: &str, sk_text: &str) -> String {
     encode_netstring_composite(&[pk_text.to_owned(), sk_text.to_owned()])
 }
 
+/// Top-level field of a document whose `item_data` field names are stored
+/// through the escape, set to `true`; a document without it holds its names
+/// as written.
+pub(crate) const NAMES_ESCAPED: &str = "names_escaped";
+
+/// Whether an object key of the JSON tree `v`, at any depth, satisfies `test`.
+fn any_name(v: &serde_json::Value, test: &dyn Fn(&str) -> bool) -> bool {
+    match v {
+        serde_json::Value::Object(map) => map.iter().any(|(k, val)| test(k) || any_name(val, test)),
+        serde_json::Value::Array(items) => items.iter().any(|item| any_name(item, test)),
+        _ => false,
+    }
+}
+
+/// Whether a field name of the JSON tree `v`, at any depth, holds U+0000 or
+/// U+0001, the characters the escape changes. A native update path refuses
+/// such a value: it cannot see whether the stored document is marked, so it
+/// cannot tell which form its names take there.
+pub(crate) fn names_need_escape(v: &serde_json::Value) -> bool {
+    any_name(v, &needs_escape)
+}
+
+/// Convert the JSON form of an item, or of a record that carries items, to
+/// the BSON stored for it, and say whether its field names were escaped.
+///
+/// BSON field names are C strings and cannot contain U+0000, while `DynamoDB`
+/// accepts it in attribute names and map keys. When a field name at any depth
+/// holds U+0000, every field name is run through the shared escape (U+0000
+/// and U+0001 become two-character sequences, see
+/// `extenddb_storage::util::escape_control`) and the caller marks the
+/// document with [`NAMES_ESCAPED`]. Any other tree is stored as it is, as a
+/// release before the escape stored it, so a name that holds U+0001 alone
+/// keeps its text. String values are never escaped; BSON strings are
+/// length-prefixed and hold U+0000 verbatim.
+///
+/// Every conversion of an item to `item_data` BSON goes through this
+/// function; a direct `bson::to_bson` on item JSON fails in the driver at
+/// write time when a name contains U+0000. [`item_data_to_json`] reverses the
+/// escape for a marked document.
+pub(crate) fn json_to_item_data(
+    json: serde_json::Value,
+) -> Result<(bson::Bson, bool), StorageError> {
+    let escaped = any_name(&json, &|name| name.contains('\0'));
+    let json = if escaped {
+        escape_json_keys(json)
+    } else {
+        json
+    };
+    let bson = bson::to_bson(&json).map_err(|e| StorageError::Internal(e.to_string()))?;
+    Ok((bson, escaped))
+}
+
+/// Insert the `item_data` of `item` into `doc`, and [`NAMES_ESCAPED`] when its
+/// field names were escaped ([`json_to_item_data`]).
+fn insert_item_data(doc: &mut Document, item: &Item) -> Result<(), StorageError> {
+    let json = serde_json::to_value(item).map_err(|e| StorageError::Internal(e.to_string()))?;
+    let (bson, escaped) = json_to_item_data(json)?;
+    doc.insert("item_data", bson);
+    if escaped {
+        doc.insert(NAMES_ESCAPED, true);
+    }
+    Ok(())
+}
+
+/// Whether `doc` is marked with [`NAMES_ESCAPED`].
+pub(crate) fn names_escaped(doc: &Document) -> bool {
+    doc.get_bool(NAMES_ESCAPED).unwrap_or(false)
+}
+
+/// Reverse of [`json_to_item_data`]: BSON read from storage back to JSON,
+/// with the field-name escape undone when the document is marked
+/// (`escaped`).
+///
+/// A document without the mark holds its names as they were written: every
+/// document a release before the escape wrote, and every document of this
+/// release whose names hold no U+0000. Its names read back unchanged.
+pub(crate) fn item_data_to_json(
+    value: &bson::Bson,
+    escaped: bool,
+) -> Result<serde_json::Value, StorageError> {
+    let json: serde_json::Value = bson::from_bson(value.clone())
+        .map_err(|e| StorageError::Internal(format!("BSON to JSON conversion error: {e}")))?;
+    Ok(if escaped {
+        unescape_json_keys(json)
+    } else {
+        json
+    })
+}
+
 /// Convert a `DynamoDB` Item to a `MongoDB` BSON document for storage.
 ///
 /// Document structure: `{ _id, pk, sk_s/sk_n/sk_b, item_data }`
@@ -43,11 +135,6 @@ pub fn item_to_document(
     attribute_definitions: &[AttributeDefinition],
 ) -> Result<Document, StorageError> {
     let pk_text = composite_pk_to_text(item, key_schema)?;
-
-    // Serialize the full item as item_data
-    let item_json =
-        serde_json::to_value(item).map_err(|e| StorageError::Internal(e.to_string()))?;
-    let item_bson = bson::to_bson(&item_json).map_err(|e| StorageError::Internal(e.to_string()))?;
 
     let mut doc = Document::new();
 
@@ -69,7 +156,9 @@ pub fn item_to_document(
         doc.insert("pk", pk_text);
     }
 
-    doc.insert("item_data", item_bson);
+    // The full item as item_data, its names escaped and the document marked
+    // when one holds U+0000 (see json_to_item_data).
+    insert_item_data(&mut doc, item)?;
     Ok(doc)
 }
 
@@ -194,10 +283,7 @@ pub fn index_document(
         insert_typed_sk(&mut doc, &field, sk_type, sk_value)?;
     }
 
-    let item_json =
-        serde_json::to_value(projected).map_err(|e| StorageError::Internal(e.to_string()))?;
-    let item_bson = bson::to_bson(&item_json).map_err(|e| StorageError::Internal(e.to_string()))?;
-    doc.insert("item_data", item_bson);
+    insert_item_data(&mut doc, projected)?;
 
     Ok(doc)
 }
@@ -256,8 +342,7 @@ pub fn document_to_item(doc: &Document) -> Result<Item, StorageError> {
         .get("item_data")
         .ok_or_else(|| StorageError::Internal("Document missing item_data field".to_string()))?;
 
-    let json_value: serde_json::Value = bson::from_bson(item_data.clone())
-        .map_err(|e| StorageError::Internal(format!("BSON to JSON conversion error: {e}")))?;
+    let json_value = item_data_to_json(item_data, names_escaped(doc))?;
 
     let item: Item = serde_json::from_value(json_value)
         .map_err(|e| StorageError::Internal(format!("JSON to Item conversion error: {e}")))?;
@@ -434,6 +519,140 @@ mod tests {
 
         let err = pk_filter(&key, &schema, &attrs).unwrap_err();
         assert!(matches!(err, StorageError::Validation(_)));
+    }
+
+    /// Walk a BSON tree and assert no document field name contains U+0000.
+    fn assert_no_nul_field_names(value: &bson::Bson) {
+        match value {
+            bson::Bson::Document(doc) => {
+                for (k, v) in doc {
+                    assert!(!k.contains('\u{0}'), "field name contains NUL: {k:?}");
+                    assert_no_nul_field_names(v);
+                }
+            }
+            bson::Bson::Array(items) => {
+                for item in items {
+                    assert_no_nul_field_names(item);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn item_document_round_trips_control_characters_in_names() {
+        use std::collections::BTreeMap;
+
+        let (schema, attrs) = schema_pk_str_sk_num();
+
+        let mut inner = BTreeMap::new();
+        inner.insert(
+            "deep\u{0}key".to_owned(),
+            AttributeValue::S("v\u{0}".to_owned()),
+        );
+        let mut mid = BTreeMap::new();
+        mid.insert("mid\u{1}key".to_owned(), AttributeValue::M(inner));
+        let mut in_list = BTreeMap::new();
+        in_list.insert(
+            "list\u{0}\u{1}key".to_owned(),
+            AttributeValue::S("w".to_owned()),
+        );
+
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), AttributeValue::S("p".to_owned()));
+        item.insert("sk".to_owned(), AttributeValue::N("1".to_owned()));
+        item.insert(
+            "top\u{0}\u{1}name".to_owned(),
+            AttributeValue::S("x".to_owned()),
+        );
+        item.insert("map".to_owned(), AttributeValue::M(mid));
+        item.insert(
+            "list".to_owned(),
+            AttributeValue::L(vec![AttributeValue::M(in_list)]),
+        );
+
+        let doc = item_to_document(&item, &schema, &attrs).unwrap();
+        assert_no_nul_field_names(&bson::Bson::Document(doc.clone()));
+        assert_eq!(doc.get_bool(NAMES_ESCAPED), Ok(true));
+
+        let back = document_to_item(&doc).unwrap();
+        assert_eq!(back, item);
+    }
+
+    /// A document without the mark holds its names as written, which is how
+    /// every release before the escape stored them: names that hold U+0001
+    /// followed by U+0001 or U+0002 read back unchanged, and two of them that
+    /// would decode to one name stay two. An item whose names hold U+0001 but
+    /// no U+0000 is stored the same way.
+    #[test]
+    fn a_document_without_the_mark_reads_back_its_names_as_written() {
+        let (schema, attrs) = schema_pk_str_sk_num();
+        let names = ["pk", "sk", "c\u{1}", "c\u{1}\u{2}", "a\u{1}\u{2}"];
+        let stored = doc! {
+            "_id": "2:p\u{1},1:1,",
+            "pk": "p\u{1}",
+            "item_data": {
+                "pk": {"S": "p\u{1}"},
+                "sk": {"N": "1"},
+                "c\u{1}": {"S": "one"},
+                "c\u{1}\u{2}": {"S": "two"},
+                "a\u{1}\u{2}": {"M": {"k\u{1}\u{1}": {"S": "v"}}},
+            },
+        };
+        let item = document_to_item(&stored).unwrap();
+        assert_eq!(item.keys().map(String::as_str).collect::<Vec<_>>(), {
+            let mut sorted = names.to_vec();
+            sorted.sort_unstable();
+            sorted
+        });
+        assert_eq!(item["c\u{1}"], AttributeValue::S("one".to_owned()));
+        assert_eq!(item["c\u{1}\u{2}"], AttributeValue::S("two".to_owned()));
+        let AttributeValue::M(map) = &item["a\u{1}\u{2}"] else {
+            panic!("a map");
+        };
+        assert_eq!(map.keys().collect::<Vec<_>>(), ["k\u{1}\u{1}"]);
+
+        let rewritten = item_to_document(&item, &schema, &attrs).unwrap();
+        assert_eq!(rewritten.get(NAMES_ESCAPED), None);
+        let mut stored_names: Vec<&str> = rewritten
+            .get_document("item_data")
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        stored_names.sort_unstable();
+        assert_eq!(
+            stored_names,
+            item.keys().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert_eq!(document_to_item(&rewritten).unwrap(), item);
+    }
+
+    #[test]
+    fn plain_item_document_stores_raw_field_names() {
+        use std::collections::BTreeMap;
+
+        let (schema, attrs) = schema_pk_str_sk_num();
+
+        let mut inner = BTreeMap::new();
+        inner.insert("k".to_owned(), AttributeValue::S("v".to_owned()));
+        let mut item = Item::new();
+        item.insert("pk".to_owned(), AttributeValue::S("p".to_owned()));
+        item.insert("sk".to_owned(), AttributeValue::N("1".to_owned()));
+        item.insert("attr".to_owned(), AttributeValue::M(inner));
+
+        let doc = item_to_document(&item, &schema, &attrs).unwrap();
+        assert_eq!(doc.get(NAMES_ESCAPED), None);
+        let item_data = doc.get_document("item_data").unwrap();
+        let names: Vec<&str> = item_data.keys().map(String::as_str).collect();
+        assert_eq!(names, vec!["attr", "pk", "sk"]);
+        let attr_m = item_data
+            .get_document("attr")
+            .unwrap()
+            .get_document("M")
+            .unwrap();
+        let map_keys: Vec<&str> = attr_m.keys().map(String::as_str).collect();
+        assert_eq!(map_keys, vec!["k"]);
     }
 
     #[test]

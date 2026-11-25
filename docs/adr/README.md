@@ -55,6 +55,7 @@ decision, write a new ADR.
 | [0026](0026-credential-crypto-on-aws-lc.md) | Credential cryptography uses AWS-LC through aws-lc-rs | Accepted |
 | [0027](0027-cassandra-index-row-version-stamps.md) | Cassandra: index rows carry the base-row version as their write timestamp | Accepted |
 | [0029](0029-crates-io-packaging.md) | The workspace crates go to crates.io together, at one version with exact pins | Accepted |
+| [0031](0031-u0000-on-postgresql-and-mongodb.md) | How the PostgreSQL and MongoDB backends store U+0000 | Accepted |
 
 ---
 

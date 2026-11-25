@@ -26,6 +26,9 @@ use crate::data::{data_collection_name, document_to_item, item_to_document, pk_f
 #[path = "data_engine_live_tests_create.rs"]
 mod create;
 
+#[path = "data_engine_live_tests_control_names.rs"]
+mod control_names;
+
 #[path = "data_engine_live_tests_key_names.rs"]
 mod key_names;
 

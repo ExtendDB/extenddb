@@ -326,6 +326,11 @@ pub fn migration(id: MigrationId) -> Migration<MongoStores> {
                 m0012_unique_access_key_ids::SOURCE,
             )],
         },
+        MigrationId::EscapeControlChars => Migration::NotApplicable(
+            "string values already held U+0000, and a document's field names are escaped only \
+             when one holds U+0000, which no earlier release could store, so every document an \
+             earlier release wrote reads back as written",
+        ),
     }
 }
 

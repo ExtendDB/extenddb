@@ -1795,3 +1795,8 @@ async fn sweep_keeps_a_progress_row_registered_between_the_two_reads() {
     drop(claim);
     s.cleanup().await;
 }
+
+// --- U+0000 and U+0001 in loaded items -----------------------------------------
+
+#[path = "restore_job/control_chars.rs"]
+mod control_chars;

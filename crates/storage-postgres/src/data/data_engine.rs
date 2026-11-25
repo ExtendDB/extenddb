@@ -7,10 +7,10 @@
 use extenddb_core::expression::{Expr, ExpressionMaps, KeyCondition, UpdateAction};
 use extenddb_core::types::{Item, TableKeyInfo};
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::pk_to_text;
 use extenddb_storage::{DataEngine, IdempotencyKey, StreamCapture, TransactGetOp, TransactWriteOp};
 use futures::future::BoxFuture;
 
+use super::key_text::pk_to_text;
 use crate::PostgresEngine;
 
 impl DataEngine for PostgresEngine {

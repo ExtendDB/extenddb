@@ -46,8 +46,8 @@ use futures::stream::BoxStream;
 use crate::PostgresEngine;
 use crate::backup_engine::{RestoreTarget, RowInsertError, insert_restore_rows};
 use crate::catalog_json::from_catalog_json;
-use crate::data::data_table_name;
 use crate::data::vector_index::{VectorInsertPlan, fetch_vector_indexes_for_table};
+use crate::data::{data_table_name, item_to_json};
 
 fn db_err(e: sqlx::Error) -> StorageError {
     StorageError::Internal(format!("Database error: {e}"))
@@ -162,8 +162,9 @@ impl RestoreEngine for PostgresEngine {
             let mut applied: u64 = 0;
             while let Some(item) = items.next().await {
                 let item = item?;
-                let item_json = serde_json::to_string(&item)
-                    .map_err(|e| StorageError::Internal(format!("item: {e}")))?;
+                // The stored form of the item, which `insert_restore_rows`
+                // writes to `item_data` as it is (`data::item_to_json`).
+                let item_json = item_to_json(&item)?.to_string();
                 batch_bytes += item_json.len();
                 batch.push((item, item_json));
                 if batch.len() == COPY_BATCH_ITEMS || batch_bytes >= COPY_BATCH_BYTES {

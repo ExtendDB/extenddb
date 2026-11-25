@@ -12,12 +12,12 @@ use extenddb_core::types::{
 };
 use extenddb_core::validation;
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::pk_to_text;
 use extenddb_storage::{IdempotencyKey, StreamCapture, TransactGetOp, TransactWriteOp};
 
 use super::index::{
     IndexMeta, db_error, enqueue_async_indexes, fetch_write_path_indexes, sync_indexes,
 };
+use super::key_text::{NUL_IN_KEY, pk_to_text, refuse_nul_index_keys, refuse_nul_key};
 use super::tx_helpers::{
     check_idempotency_token_in_tx, delete_item_in_tx, fetch_item_for_update, fetch_item_in_tx,
     insert_item_if_absent_in_tx, stream_record_shard_in_tx, upsert_item_in_tx,
@@ -175,6 +175,15 @@ impl PostgresEngine {
                     Ok(reasons) => StorageError::TransactionCanceled(reasons),
                     Err(message) => StorageError::Validation(message),
                 });
+            }
+        }
+        // A member key, or an index key of a Put item, that this backend
+        // cannot store refuses the request before any row is locked.
+        for op in ops {
+            let (key_info, key) = transact_op_key(op);
+            refuse_nul_key(key, &key_info.key_schema)?;
+            if let TransactWriteOp::Put { item, .. } = op {
+                refuse_nul_index_keys(item, &table_indexes[transact_op_table_name(op)])?;
             }
         }
 
@@ -400,12 +409,7 @@ fn execution_order(ops: &[TransactWriteOp<'_>]) -> Vec<usize> {
 
 /// The table and the primary key values of the item an op touches.
 fn lock_key<'a>(op: &'a TransactWriteOp<'_>) -> (&'a str, Vec<Cow<'a, str>>) {
-    let (key_info, key) = match op {
-        TransactWriteOp::Put { key_info, item, .. } => (key_info, *item),
-        TransactWriteOp::Delete { key_info, key, .. }
-        | TransactWriteOp::Update { key_info, key, .. }
-        | TransactWriteOp::ConditionCheck { key_info, key, .. } => (key_info, *key),
-    };
+    let (key_info, key) = transact_op_key(op);
     let values = key_info
         .key_schema
         .iter()
@@ -416,6 +420,17 @@ fn lock_key<'a>(op: &'a TransactWriteOp<'_>) -> (&'a str, Vec<Cow<'a, str>>) {
         })
         .collect();
     (&key_info.table_id, values)
+}
+
+/// The key info of an op and the item that carries its key: a Put's item, or
+/// the key of the other ops.
+fn transact_op_key<'a>(op: &'a TransactWriteOp<'_>) -> (&'a TableKeyInfo, &'a Item) {
+    match op {
+        TransactWriteOp::Put { key_info, item, .. } => (key_info, *item),
+        TransactWriteOp::Delete { key_info, key, .. }
+        | TransactWriteOp::Update { key_info, key, .. }
+        | TransactWriteOp::ConditionCheck { key_info, key, .. } => (key_info, *key),
+    }
 }
 
 /// Extract the table name from a transactional write operation.
@@ -784,6 +799,13 @@ async fn execute_transact_write_op(
                 .map_err(|e| {
                     TxnOpError::Cancel(CancellationReason::index_key_empty_abort(e.to_string()))
                 })?;
+                // An index key this backend cannot store, computed by the
+                // update.
+                if refuse_nul_index_keys(&item, indexes).is_err() {
+                    return Err(TxnOpError::Cancel(CancellationReason::validation_error(
+                        NUL_IN_KEY,
+                    )));
+                }
                 Ok(item)
             };
             // Evaluate condition against empty item if non-existent (DynamoDB semantics)

@@ -57,6 +57,10 @@ pub struct PostgresStores {
     lock: Option<LockHandle>,
     /// The `application_name` of this runner's sessions.
     pub(crate) application: String,
+    /// Whether migration 13's `detect` looks for other sessions: in a run, not
+    /// in a status read, and not for a target that allows them
+    /// ([`PostgresTarget::with_other_sessions_allowed`]).
+    pub(crate) checks_sessions: bool,
 }
 
 impl PostgresStores {
@@ -99,6 +103,23 @@ impl PostgresStores {
 impl HasManagementStore for PostgresStores {
     fn management_store(&self) -> &dyn ManagementStore {
         &self.management
+    }
+}
+
+#[cfg(test)]
+impl PostgresStores {
+    /// The stores of a run over `catalog` and `data`, which look for other
+    /// sessions, for a test that calls a body's `detect`.
+    pub(crate) fn for_detect(catalog: PgPool, data: PgPool) -> Self {
+        Self {
+            management: PostgresCatalogStore::new(catalog.clone()),
+            catalog,
+            data,
+            data_watch: None,
+            lock: None,
+            application: runner_application(),
+            checks_sessions: true,
+        }
     }
 }
 
@@ -239,6 +260,7 @@ impl PostgresMigrations {
                     data_watch: None,
                     lock,
                     application,
+                    checks_sessions: false,
                 },
                 catalog_name,
                 data_name: String::new(),
@@ -322,6 +344,7 @@ impl PostgresMigrations {
                 data_watch,
                 lock,
                 application,
+                checks_sessions: !read_only && !target.other_sessions_allowed,
             },
             catalog_name,
             data_name,

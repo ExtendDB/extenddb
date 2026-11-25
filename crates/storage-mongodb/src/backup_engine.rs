@@ -16,7 +16,7 @@
 //! appears in a collection name.
 //!
 //! `extenddb backup migrate-legacy` reads a backup through `items`, a cursor
-//! over that collection with a frozen copy of the decode, and ends with
+//! over that collection, decoded as the data path decodes it, and ends with
 //! `replace_with_index_row`: one session transaction that takes the lock
 //! below, inserts the catalog index document and writes DELETING marked
 //! `migrated_to_store`, then the delete's drop and DELETED. DeleteBackup
@@ -101,7 +101,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use extenddb_core::types::{
-    AttributeDefinition, BackupDescription, BackupDetails, BackupSummary, GsiInput, Item,
+    AttributeDefinition, BackupDescription, BackupDetails, BackupSummary, GsiInput,
     KeySchemaElement, LsiInput, Projection, ProvisionedThroughput, SourceTableDetails,
     StreamSpecification, TableDescription, TimeToLiveDescription, TimeToLiveStatus,
 };
@@ -123,7 +123,7 @@ use crate::backup_catalog::{
     RESTORE_JOB_GENERATION, RESTORE_JOB_HEARTBEAT, RESTORE_JOB_STATUS, backup_in_use,
     generation_field, unowned_insert,
 };
-use crate::data::data_collection_name;
+use crate::data::{data_collection_name, document_to_item};
 use crate::data_engine::{
     CommitOutcome, TRANSIENT_RETRY_ATTEMPTS, TxErr, backoff_sleep, is_duplicate_key,
 };
@@ -1984,11 +1984,14 @@ impl LegacyBackupReader for MongoEngine {
 
     /// The AVAILABLE backup document (its source as `restore_source` reads
     /// it), then a cursor over its `_backup_<backup_id>` collection in
-    /// batches of [`paging::DEFAULT_FETCH_BATCH`] documents, each decoded as
-    /// the data path decoded `item_data` when the backup was taken
-    /// ([`legacy_item_from_document`]). The collection is immutable while the
-    /// backup is AVAILABLE, so no snapshot is held; a DeleteBackup's drop
-    /// ends the cursor with an error.
+    /// batches of [`paging::DEFAULT_FETCH_BATCH`] documents. The collection
+    /// is a copy of the table's documents in their stored form, with the
+    /// field names and the `names_escaped` mark as the release that took it
+    /// stored them, so each is decoded as the data path decodes a stored
+    /// document ([`document_to_item`]). A backup taken before the escape
+    /// holds no mark, and its names read back as written. The collection
+    /// is immutable while the backup is AVAILABLE, so no snapshot is held; a
+    /// DeleteBackup's drop ends the cursor with an error.
     fn items(
         &self,
         account_id: &str,
@@ -2028,7 +2031,7 @@ impl LegacyBackupReader for MongoEngine {
                 let mut cursor = cursor?;
                 match cursor.try_next().await {
                     Ok(Some(doc)) => {
-                        let item = legacy_item_from_document(&doc);
+                        let item = document_to_item(&doc);
                         let next = item.is_ok().then_some(cursor);
                         Some((item, next))
                     }
@@ -2076,20 +2079,6 @@ impl LegacyBackupReader for MongoEngine {
 /// moved to DELETING: its backup lives on in the store under the same ARN, so
 /// the frozen DeleteBackup must not finish the deletion and answer DELETED.
 const MIGRATED_TO_STORE: &str = "migrated_to_store";
-
-/// A frozen copy of the data path's decode of a stored document
-/// (`crate::data::document_to_item`) as it was when the in-catalog `$out`
-/// copies were taken, so the data path can change without changing what a
-/// legacy backup reads as.
-fn legacy_item_from_document(doc: &Document) -> Result<Item, StorageError> {
-    let item_data = doc
-        .get("item_data")
-        .ok_or_else(|| StorageError::Internal("Document missing item_data field".to_string()))?;
-    let json_value: serde_json::Value = bson::from_bson(item_data.clone())
-        .map_err(|e| StorageError::Internal(format!("BSON to JSON conversion error: {e}")))?;
-    serde_json::from_value(json_value)
-        .map_err(|e| StorageError::Internal(format!("JSON to Item conversion error: {e}")))
-}
 
 /// A backup document as a [`LegacyBackupKey`]; a document without its
 /// `_id`, `account_id` or `backup_status`, or with a status no release
