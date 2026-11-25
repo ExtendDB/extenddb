@@ -738,9 +738,10 @@ mod tests {
         );
     }
 
-    /// The service's answer to each `B` value (measured 2026-11-20): the
-    /// decoded bytes, or the text of the refusal, empty for no message. A
-    /// `BS` member, and a value inside an `M` or an `L`, get the same text.
+    /// The service's answer to each `B` value (measured 2026-11-20, and
+    /// 2026-11-25 for `//==` and `++==`): the decoded bytes, or the text of
+    /// the refusal, empty for no message. A `BS` member, and a value inside
+    /// an `M` or an `L`, get the same text.
     #[test]
     fn a_value_that_is_not_base64_gets_the_service_text() {
         let short = || Err("Buffer is too short for base64 encoding".to_owned());
@@ -751,7 +752,7 @@ mod tests {
         };
         let last = || Err("Invalid last non-pad Base64 character dectected".to_owned());
         let none = || Err(String::new());
-        let rows: [(&str, Result<&str, String>); 48] = [
+        let rows: [(&str, Result<&str, String>); 50] = [
             ("YWJj", Ok("abc")),
             ("YQ==", Ok("a")),
             ("YWE=", Ok("aa")),
@@ -786,6 +787,8 @@ mod tests {
             ("A===", last()),
             ("AB==", last()),
             ("AAB=", last()),
+            ("//==", last()),
+            ("++==", last()),
             ("==", none()),
             ("!!!!", none()),
             ("!!==", none()),
