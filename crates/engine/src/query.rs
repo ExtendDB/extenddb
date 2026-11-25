@@ -639,39 +639,17 @@ fn refuse_begins_with_on_number(
     Ok(())
 }
 
-/// Refuse a key condition that skipped the classification in `handle_query`:
-/// a key condition with no equality clause, and on a schema with one HASH
-/// attribute an equality on another attribute paired with a non-equality on
-/// the HASH attribute. `handle_query` calls this for such a key condition
-/// only, after the expression validations. The parse has already refused an
-/// undefined `#name` or `:value` and two conditions on one attribute.
+/// Refuse a key condition with no equality on the HASH attribute, which
+/// `handle_query` passes here after the expression validations, in the
+/// service's two steps:
 ///
-/// The order, measured on 2026-11-01 on a schema with one HASH attribute,
-/// two samples each:
+/// 1. On a key schema with one HASH and at most one RANGE attribute, the
+///    clause on the HASH attribute: a value whose type differs from the
+///    attribute's definition, then `begins_with` when that attribute is a
+///    number.
+/// 2. The key schema's wording (`KeyCondition::refuse_without_hash_equality`).
 ///
-/// 1. When a clause names the HASH attribute of the key schema queried, a
-///    value in that clause whose type differs from the attribute's
-///    definition: `pk > :n AND sk > :y`, `sk = :x AND pk > :n` and
-///    `pk BETWEEN :n AND :m` answer `One or more parameter values were
-///    invalid: Condition parameter type does not match schema type`. Then
-///    `begins_with` on a number HASH attribute, alone or with another clause
-///    on either side (measured 2026-10-23 for `begins_with(pk, :n)`, and
-///    2026-11-01 for `begins_with(pk, :n) AND sk > :x` and
-///    `sk > :x AND begins_with(pk, :n)`: `Incorrect operand type for
-///    operator or function; operator or function: begins_with, operand type:
-///    N`). The parser keeps a `begins_with` whole in `sk_condition`, which
-///    is the clause read here. When both clauses are `begins_with` it keeps
-///    the first, so a `begins_with` on the HASH attribute in the second is
-///    not recognised.
-/// 2. The key schema's wording. A value on another attribute is not
-///    checked: `pk > :x AND sk > :n` answers `Query key condition not
-///    supported`, and `sk > :n`, with no clause on the HASH attribute,
-///    `Query condition missed key schema element: pk`.
-///
-/// On a multi-attribute key schema the HASH wording comes before any value
-/// check (measured 2026-10-23: `h > :n` with an N value on an S HASH
-/// attribute answers `HASH key attributes h must have equality conditions
-/// specified in the query`), so step 1 does not run there.
+/// `tests/python/test_query_lone_non_equality.py` lists the measured rows.
 fn refuse_without_hash_equality(
     key_condition: &extenddb_core::expression::KeyCondition,
     key_schema: &[extenddb_core::types::KeySchemaElement],
