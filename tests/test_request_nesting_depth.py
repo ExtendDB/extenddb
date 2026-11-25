@@ -53,11 +53,14 @@ NEST_FULL = (
 SERIALIZATION_TYPE = "com.amazon.coral.service#SerializationException"
 LEAF = '{"S":"leaf"}'
 
-# Leaves the service's check before authentication passes where JSON's grammar
-# refuses them: the numbers `01`, `1.`, `1e` and `-`, the escape `\u12G4`, and
-# form feed, NUL and vertical tab before a value (us-east-1, 2026-11-24, at 63
-# and 20000 wrappers, 2 of 2 sends each: unsigned
+# Leaves the service's check before authentication passes (us-east-1, at 63 and
+# 20000 wrappers, 2 of 2 sends each: unsigned
 # MissingAuthenticationTokenException, badly signed InvalidSignatureException).
+# On 2026-11-24, leaves JSON's grammar refuses: the numbers `01`, `1.`, `1e` and
+# `-`, the escape `\u12G4`, and form feed, NUL and vertical tab before a value.
+# On 2026-11-25, the edges of the looser rules: the numbers `1+`, `1e+5` and
+# `1.eE-+`, whose `+` is a number byte, and the escape `\ugggg`, whose `g` is
+# the highest byte the service takes after `\u`.
 LOOSE_LEAVES = {
     "number-01": '{"S":01}',
     "number-1.": '{"S":1.}',
@@ -67,6 +70,10 @@ LOOSE_LEAVES = {
     "form-feed-before-value": '{"S":\x0c"leaf"}',
     "nul-before-value": '{"S":\x00"leaf"}',
     "vertical-tab-before-value": '{"S":\x0b"leaf"}',
+    "number-1+": '{"S":1+}',
+    "number-1e+5": '{"S":1e+5}',
+    "number-1.eE-+": '{"S":1.eE-+}',
+    "escape-ugggg": '{"S":"le\\uggggaf"}',
 }
 
 
@@ -270,6 +277,14 @@ def _unauthenticated_put(dynamodb_client, endpoint_url, body: bytes, signing: st
         pytest.param(200, '{"S":"leaf" "T":"x"}', id="missing-comma"),
         pytest.param(200, '{"S":"le\x01af"}', id="control-byte-in-string"),
         pytest.param(200, '{"S":"le\\qaf"}', id="unknown-escape"),
+        pytest.param(63, '{"S":+1}', id="plus-sign-63"),
+        pytest.param(20000, '{"S":+1}', id="plus-sign-20000"),
+        pytest.param(63, '{"S":.5}', id="point-first-63"),
+        pytest.param(20000, '{"S":.5}', id="point-first-20000"),
+        pytest.param(63, '{"S":"le\\u000/af"}', id="escape-u000-slash-63"),
+        pytest.param(20000, '{"S":"le\\u000/af"}', id="escape-u000-slash-20000"),
+        pytest.param(63, '{"S":"le\\u000haf"}', id="escape-u000h-63"),
+        pytest.param(20000, '{"S":"le\\u000haf"}', id="escape-u000h-20000"),
     ],
 )
 def test_a_malformed_deep_body_is_refused_before_authentication(
@@ -280,8 +295,10 @@ def test_a_malformed_deep_body_is_refused_before_authentication(
     # without its last byte, or the fault in the leaf. The service answers
     # each with a 400 SerializationException, unsigned and badly signed (2 of 2
     # sends per body and signing, us-east-1: the first five rows 2026-11-19,
-    # the control byte and the unknown escape 2026-11-20, the other five
-    # 2026-11-24).
+    # the control byte and the unknown escape 2026-11-20, the other five at 200
+    # wrappers 2026-11-24, and the last eight 2026-11-25: a number that starts
+    # with `+` or `.`, and `/` and `h`, the bytes on either side of the range
+    # the service takes after `\u`).
     if wrappers is None:
         body = b"x" + b"[" * 6000
     elif leaf is None:
@@ -323,8 +340,8 @@ def test_a_complete_deep_body_reaches_authentication(
     # leaf of LOOSE_LEAVES: unsigned, each body is
     # MissingAuthenticationTokenException, and badly signed
     # InvalidSignatureException (2 of 2 sends each, us-east-1, 2026-11-19 for
-    # the first four rows and 2026-11-24 for the rest). ExtendDB's type for the
-    # first is MissingAuthenticationToken (#1075).
+    # the first four rows, and for the rest the dates LOOSE_LEAVES gives).
+    # ExtendDB's type for the first is MissingAuthenticationToken (#1075).
     body = _raw_put_body(table, "unauthenticated", wrappers, leaf) + tail
     resp = _unauthenticated_put(dynamodb_client, endpoint_url, body, signing)
     assert resp.status_code == 400, resp.text

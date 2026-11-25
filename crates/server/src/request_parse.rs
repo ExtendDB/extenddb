@@ -209,13 +209,16 @@ mod tests {
         body
     }
 
-    /// The leaves the service's check before authentication passes where
-    /// `serde_json`'s grammar refuses them (measured 2026-11-24, us-east-1, at
-    /// 63 and 20000 wrappers: unsigned, each is a
+    /// The leaves the service's check before authentication passes (measured
+    /// in us-east-1 at 63 and 20000 wrappers: unsigned, each is a
     /// `MissingAuthenticationTokenException`, and badly signed an
-    /// `InvalidSignatureException`): the numbers `01`, `1.`, `1e` and `-`, the
-    /// escape `\u12G4`, and FF, NUL and VT before a value.
-    const LOOSE_LEAVES: [&[u8]; 8] = [
+    /// `InvalidSignatureException`). On 2026-11-24: the numbers `01`, `1.`,
+    /// `1e` and `-`, the escape `\u12G4`, and FF, NUL and VT before a value,
+    /// which `serde_json`'s grammar refuses. On 2026-11-25, at the edges of the
+    /// looser rules: the numbers `1+`, `1e+5` and `1.eE-+`, whose `+` is a
+    /// number byte, and the escape `\ugggg`, whose `g` is the highest byte the
+    /// service takes after `\u`.
+    const LOOSE_LEAVES: [&[u8]; 12] = [
         br#"{"S":01}"#,
         br#"{"S":1.}"#,
         br#"{"S":1e}"#,
@@ -224,6 +227,10 @@ mod tests {
         b"{\"S\":\x0c\"leaf\"}",
         b"{\"S\":\x00\"leaf\"}",
         b"{\"S\":\x0b\"leaf\"}",
+        br#"{"S":1+}"#,
+        br#"{"S":1e+5}"#,
+        br#"{"S":1.eE-+}"#,
+        br#"{"S":"le\uggggaf"}"#,
     ];
 
     fn parse(body: &[u8]) -> Result<Value, DynamoDbError> {
@@ -411,7 +418,10 @@ mod tests {
         // control byte and the unknown escape in a string on 2026-11-20,
         // unsigned, badly signed and signed; the `\u` before the closing
         // quote, SOH before a value, `tru`, the missing colon and the missing
-        // comma on 2026-11-24, unsigned and badly signed). Within the ceiling
+        // comma on 2026-11-24, unsigned and badly signed; at 63 and 20000
+        // wrappers, a number that starts with `+` or `.`, and `/` and `h`,
+        // the bytes on either side of the range the service takes after
+        // `\u`, on 2026-11-25, unsigned and badly signed). Within the ceiling
         // the check's refusal carries the server's wording, and past it no
         // message. The unclosed rows of exactly 5200 and 5201 openers pin
         // that boundary. The check does not recurse, so the rows run on the
@@ -433,6 +443,14 @@ mod tests {
             deep_body_with_leaf(200, br#"{"S":"leaf" "T":"x"}"#),
             deep_body_with_leaf(200, b"{\"S\":\"le\x01af\"}"),
             deep_body_with_leaf(200, br#"{"S":"le\qaf"}"#),
+            deep_body_with_leaf(63, br#"{"S":+1}"#),
+            deep_body_with_leaf(20000, br#"{"S":+1}"#),
+            deep_body_with_leaf(63, br#"{"S":.5}"#),
+            deep_body_with_leaf(20000, br#"{"S":.5}"#),
+            deep_body_with_leaf(63, br#"{"S":"le\u000/af"}"#),
+            deep_body_with_leaf(20000, br#"{"S":"le\u000/af"}"#),
+            deep_body_with_leaf(63, br#"{"S":"le\u000haf"}"#),
+            deep_body_with_leaf(20000, br#"{"S":"le\u000haf"}"#),
         ];
         for body in &rows {
             let depth = nesting_depth(body);
@@ -456,7 +474,8 @@ mod tests {
         // an invalid UTF-8 byte in a string and a lone surrogate escape
         // (measured 2026-11-19, us-east-1: unsigned, each is a
         // MissingAuthenticationTokenException), and each leaf of
-        // `LOOSE_LEAVES` at 63 and at 20000 wrappers (measured 2026-11-24).
+        // `LOOSE_LEAVES` at 63 and at 20000 wrappers (measured 2026-11-24 and
+        // 2026-11-25).
         // This runs on the default test-thread stack, where a parse that
         // recursed a million levels would overflow, so it also shows that the
         // check does not recurse.
