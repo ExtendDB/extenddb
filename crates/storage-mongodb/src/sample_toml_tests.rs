@@ -13,8 +13,10 @@ fn storage_mongodb_section_matches_the_struct() {
     let root = support::sample();
     // The struct has no `Default`: `connection_string` is required and the
     // sample shows an example, so its value is not compared. `max_connections`
-    // and `max_catalog_connections` are `Option<u32>` whose fallbacks (50 and
-    // 20) the sample shows as examples, written as integers.
+    // and `max_catalog_connections` are `Option<u32>`; unset, the driver's pool
+    // size applies (the connection string's `maxPoolSize`, else 10), which no
+    // getter of the struct returns, so the sample shows production examples,
+    // written as integers.
     let expected: MongoStorageConfig =
         toml::from_str(r#"connection_string = "mongodb://example.invalid:27017""#)
             .expect("minimal MongoDB config deserializes");

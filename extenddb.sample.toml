@@ -35,8 +35,12 @@
 
 # These keys sit at the top level and must appear before the first [section]
 # header of the file. A top-level key placed after a header lands inside that
-# section, and every section refuses to start the server with "unknown field"
-# and the key named.
+# section. Every section except [storage], [storage.cassandra] and the sections
+# of the other backends then refuses to start the server with "unknown field"
+# and the key named. [storage] reads only `backend` and the section of the
+# binary's own backend, and drops any other key without an error. A binary does
+# not read the sections of the other backends. [storage.cassandra] ignores a
+# key it does not know.
 
 # Path to the rendered documentation directory (HTML and PDF files) produced
 # by `python3 docs/build-docs.py`. When set, the web console serves the
@@ -50,11 +54,11 @@
 # max_import_bytes = 10737418240
 
 # Deprecated: a single root for both import and export. It fills whichever of
-# the [import] and [export] lists is empty: with both sections present it does
-# nothing, with one present it supplies the other, and with neither present
-# it makes the import and export roots the same directory. The server logs
-# which of those happened at startup. Prefer the sections; this key will be
-# removed. No default.
+# the [import] and [export] path lists is empty: with both lists filled it does
+# nothing, with one filled it supplies the other, and with both empty (the
+# sections as this file ships them) it makes the import and export roots the
+# same directory. The server logs which of those happened at startup. Prefer
+# the sections: this key will be removed. No default.
 # import_export_root = "/var/lib/extenddb/data"
 
 [server]
@@ -64,7 +68,9 @@
 
 # Network interface to bind. The default listens on loopback only; bind
 # 0.0.0.0 to accept connections from other hosts. A dev-mode build refuses a
-# non-loopback address.
+# non-loopback address unless `EXTENDDB_DEV_ALLOW_ANY_BIND=1` is set in its
+# environment, as the dev image sets it, because a container's published port
+# decides exposure there.
 # bind_addr = "127.0.0.1"
 
 # Listening port for the DynamoDB API, the management API and the console.
@@ -176,19 +182,20 @@
 # connection_string = "postgresql://extenddb:extenddb-local-dev@localhost:5432/extenddb_catalog"
 
 # Maximum concurrent connections in each of the two data-operation pools.
-# Minimum 10: smaller values are raised to 10 with a startup warning, and a
-# value under 2 * `[backup] max_concurrent_jobs` + 10 is raised to that with a
-# warning naming both numbers. Increase for higher concurrency and raise
+# A value under 2 * `[backup] max_concurrent_jobs` + 10 (18 with the default
+# of 4 jobs, 12 at the least) is raised to that at startup with a warning
+# naming both numbers. Increase for higher concurrency and raise
 # PostgreSQL's max_connections to at least 2 * `pool_size` +
 # `catalog_pool_size` + `max_concurrent_jobs` + the number of vector index
 # builds you expect to overlap.
 # pool_size = 20
 
 # Maximum connections for the management and catalog pool (authorization,
-# Identity and Access Management (IAM), console). Minimum 10, raised with a
-# startup warning. With auth enabled each DynamoDB request makes concurrent
-# authorization queries, so size this to match the expected request
-# concurrency. Falls back to `pool_size` when absent. No default of its own.
+# Identity and Access Management (IAM), console). Raised to the same 2 *
+# `max_concurrent_jobs` + 10 floor with a warning. With auth enabled each
+# DynamoDB request makes concurrent authorization queries, so size this to
+# match the expected request concurrency. Falls back to `pool_size` when
+# absent. No default of its own.
 # catalog_pool_size = 20
 
 [storage.sqlite]
@@ -197,10 +204,11 @@
 # <path>`, written into this file) or set here; at serve time the
 # `EXTENDDB__STORAGE__SQLITE__PATH` environment variable overrides it.
 
-# Database file. A relative path is resolved against the working directory
-# when the configuration loads, before `serve` daemonizes. ":memory:" selects
-# an ephemeral in-memory database whose data is lost on shutdown and whose
-# catalog is new at every start: with [backup.store] configured the server
+# Database file. The default shown is the file build's. A `sqlite-memory`
+# build defaults to ":memory:". A relative path is resolved against the working
+# directory when the configuration loads, before `serve` daemonizes. ":memory:"
+# selects an ephemeral in-memory database whose data is lost on shutdown and
+# whose catalog is new at every start: with [backup.store] configured the server
 # adopts the root an earlier in-memory catalog owned and syncs its backups
 # into the new catalog before it serves, within 60 s (an S3 store in the
 # reconciler's first cycle; a sync not finished in 60 s, or one that met a
@@ -280,13 +288,16 @@
 # MongoDB connection string. Required; no default.
 # connection_string = "mongodb://localhost:27017/?replicaSet=rs0"
 
-# Maximum concurrent connections for data operations. Unset means 50. No
-# default of its own.
+# Maximum size of the data connection pool. Unset leaves the driver's pool
+# size: the connection string's `maxPoolSize` when it has one, else the
+# driver's default of 10 connections per server. The example is a production
+# value. No default of its own.
 # max_connections = 50
 
 # Shared catalog and authorization pool for management and authorization
-# traffic; size it for their combined concurrency. Unset means 20. No default
-# of its own.
+# traffic; size it for their combined concurrency. Unset leaves the driver's
+# pool size, as for `max_connections`. The example is a production value. No
+# default of its own.
 # max_catalog_connections = 20
 
 # Read concern for the multi-document transactions behind conditional writes,
@@ -336,13 +347,13 @@
 # provider = "builtin"
 
 [auth.cache]
-# In-memory stale-while-revalidate caches sit between the request path and
-# the catalog database. Without them each request issues about six catalog
-# queries during authentication and authorization; with them the steady state
-# is close to none. Changes made through this server's admin API propagate
-# at once by write-through invalidation. Changes made elsewhere (other nodes
-# of a multi-node deployment, or direct database writes) take up to
-# `ttl_seconds` to become visible. The server refuses to start when
+# In-memory stale-while-revalidate caches sit between the request path and the
+# catalog database. Without them each request issues about six catalog queries
+# during authentication and authorization; with them the steady state is close
+# to none. Changes made through this server's admin API propagate at once by
+# write-through invalidation. Changes made elsewhere (other nodes of a
+# multi-node deployment, or direct database writes) take up to `ttl_seconds` to
+# become visible. The server refuses to start when `ttl_seconds` is 0, when
 # `soft_ttl_seconds` or `negative_ttl_seconds` exceeds `ttl_seconds`, or when
 # `max_entries` is 0. The administration guide's section on
 # [cache statistics and invalidation timing](./manuals/05-admin-guide.md#auth-cache-statistics-and-invalidation-timing)
@@ -460,8 +471,10 @@
 # #name and :value substitution.
 # max_expression_length_bytes = 4096
 
-# Maximum nesting depth in condition expressions (parentheses, NOT, AND and
-# OR).
+# Maximum nesting depth of one expression. In a ConditionExpression or
+# FilterExpression a parenthesized group, a NOT and a `size` operand each nest
+# one level. AND and OR do not. In an UpdateExpression a parenthesized value
+# and a function call each nest one level.
 # max_expression_depth = 150
 
 # Accepted but not read. The policy document size limit is fixed at 6,144
