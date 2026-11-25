@@ -1280,7 +1280,7 @@ impl MongoEngine {
         let table_doc = tables_coll
             .find_one(filter.clone())
             .await
-            .map_err(|e| crate::error_class::catalog_read_err(&e))?
+            .map_err(|e| StorageError::Internal(e.to_string()))?
             .ok_or_else(|| StorageError::TableNotFound(table_name.to_owned()))?;
         if table_doc.get_str("table_status").unwrap_or("ACTIVE") != "ACTIVE" {
             return Err(StorageError::TableNotActive(table_name.to_owned()));
