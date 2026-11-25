@@ -45,8 +45,6 @@
 //! reported can differ from the service's, which walks the request's order
 //! (measured 2026-11-02).
 
-use std::collections::HashSet;
-
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Deserialize;
@@ -55,13 +53,8 @@ use serde_json::{Map, Value};
 use super::number::{check_number, parameter_message};
 use crate::types::AttributeValue;
 use crate::validation::MAX_ITEM_NESTING_DEPTH;
-use crate::validation::number::validate_and_normalize_number;
-
-/// The refusal of a number set parameter two of whose members have one
-/// value, the same at any depth and for members written alike (measured
-/// 2026-11-06: `{"NS": ["1", "1.0"]}`, `{"NS": ["1", "1"]}`, and inside a
-/// map and a list).
-pub const NUMBER_SET_DUPLICATES: &str = "Input collection contains duplicates";
+pub use crate::validation::number::NUMBER_SET_DUPLICATES;
+use crate::validation::number::has_equal_numbers;
 
 /// The service's nesting-depth message, the same for parameters as for items.
 pub const NESTING_MESSAGE: &str = "Nesting Levels have exceeded supported limits: \
@@ -296,14 +289,6 @@ fn content_refusal(tag: &str, payload: &Value) -> Result<(), String> {
     AttributeValue::deserialize(&value)
         .map(drop)
         .map_err(|e| e.to_string())
-}
-
-/// Whether two members of a number set have one value.
-fn has_equal_numbers(items: &[Value]) -> bool {
-    let mut values = HashSet::with_capacity(items.len());
-    items.iter().filter_map(Value::as_str).any(|text| {
-        !values.insert(validate_and_normalize_number(text).unwrap_or_else(|_| text.to_owned()))
-    })
 }
 
 fn enter(depth: usize) -> Result<usize, String> {

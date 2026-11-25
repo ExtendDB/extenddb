@@ -295,8 +295,10 @@ fn tag_resource_arn(arn: &str, region: &str, account_id: &str) -> String {
 
 /// Messages DynamoDB returns, before the IAM decision, for a request field
 /// whose ARN is not a valid resource ARN of the kind the field requires
-/// (measured live, `live-r2/arn-kinds-live.json`).
-const INVALID_STREAM_ARN_MESSAGE: &str = "Invalid StreamArn";
+/// (measured live, `live-r2/arn-kinds-live.json`). The stream text is the
+/// core constant, which the `GetShardIterator` handler also answers for an
+/// absent `StreamArn`.
+const INVALID_STREAM_ARN_MESSAGE: &str = extenddb_core::error::INVALID_STREAM_ARN;
 const INVALID_BACKUP_ARN_MESSAGE: &str = "Invalid Backup ARN";
 const INVALID_EXPORT_TABLE_ARN_MESSAGE: &str =
     "One or more parameter values were invalid: tableArn is not a valid ARN";
