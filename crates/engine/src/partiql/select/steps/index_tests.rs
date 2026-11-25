@@ -12,12 +12,17 @@ use crate::{handle_create_table, handle_put_item};
 
 /// Walks of lsi-all under `Limit` 1 and the pages the service gives, written
 /// as [`walk`] writes them. Partition lk holds r1 at a, and r2 and r3 at b
-/// (measured 2026-11-14 to 2026-11-19).
-const WALKS: [(&str, &str); 2] = [
-    ("(lsiSk = 'a' OR lsiSk = 'z')", "[r1] 0.5 next | [] 0.5"),
+/// (measured 2026-11-14 to 2026-11-19). The service ends the descending walk
+/// at [r1] on some sends, and sends a NextToken with [r1] and then an empty
+/// page on others.
+const WALKS: [(&str, &[&str]); 2] = [
+    ("(lsiSk = 'a' OR lsiSk = 'z')", &["[r1] 0.5 next | [] 0.5"]),
     (
         "(lsiSk = 'a' OR lsiSk = 'b') ORDER BY lsiSk DESC",
-        "[r3] 0.5 next | [r2] 0.5 next | [r1] 0.5 next | [] 0.5",
+        &[
+            "[r3] 0.5 next | [r2] 0.5 next | [r1] 0.5",
+            "[r3] 0.5 next | [r2] 0.5 next | [r1] 0.5 next | [] 0.5",
+        ],
     ),
 ];
 
@@ -44,10 +49,14 @@ fn a_query_that_stops_before_an_item_it_does_not_match_is_read_to_its_end() {
             let put = json!({ "TableName": "pages", "Item": item });
             let _ = handle_put_item(put, &ctx).await.unwrap();
         }
-        for (condition, pages) in WALKS {
+        for (condition, walks) in WALKS {
             let statement =
                 format!("SELECT * FROM \"pages\".\"lsi-all\" WHERE pk = 'lk' AND {condition}");
-            assert_eq!(walk(&ctx, &statement, 1).await, pages, "{statement}");
+            let pages = walk(&ctx, &statement, 1).await;
+            assert!(
+                walks.contains(&pages.as_str()),
+                "{statement}: {pages} is not in {walks:?}"
+            );
         }
     });
 }
