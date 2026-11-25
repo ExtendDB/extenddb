@@ -232,11 +232,7 @@ class TestSeveralConstraintsAtOnce:
             f"Value '{name}' at 'tableName' failed to satisfy constraint: {clause}"
             for clause in (length_clause, MEMBER_PATTERN)
         )
-        in_order = f"2 validation errors detected: {first}; {second}"
-        swapped = f"2 validation errors detected: {second}; {first}"
-        # The service lists the two clauses in either order.
-        message = exc.value.response["Error"]["Message"]
-        assert_validation(exc.value, swapped if message == swapped else in_order)
+        assert_validation(exc.value, f"2 validation errors detected: {first}; {second}")
 
 
 class TestIndexName:
