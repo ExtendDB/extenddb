@@ -162,7 +162,7 @@ export EXTENDDB__STORAGE__MONGODB__CONNECTION_STRING="mongodb://localhost:27017/
 
 ## Verifying the Connection
 
-`list-tables` needs an access key: the server answers `UnrecognizedClientException` without one. Create it as in the [post-init workflow](getting-started.md#post-init-workflow) of the full walkthrough, then:
+`list-tables` needs an access key that this server issued. The server answers `UnrecognizedClientException` to any other key. Create one as in the [post-init workflow](getting-started.md#post-init-workflow) of the full walkthrough, then:
 
 ```bash
 # Health check
