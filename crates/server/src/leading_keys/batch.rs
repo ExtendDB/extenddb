@@ -11,11 +11,12 @@ use extenddb_core::types::TableKeyInfo;
 use serde_json::Value;
 
 use super::{NumberForm, hash_attr, pk_from_map};
+use crate::parameter_keys::{self, ParameterKeys};
 use crate::request_attributes::{batch_table_attributes, transact_item_attributes};
 
 /// A single `(action, table)` authorization to perform for a batch or
-/// transaction operation, carrying the LeadingKeys and Attributes the service
-/// would evaluate.
+/// transaction operation, carrying the LeadingKeys, Attributes, Select,
+/// ReturnValues and ReturnConsumedCapacity values the service would evaluate.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct AuthzTarget {
     /// The bare operation string the action maps to (no `dynamodb:` prefix).
@@ -28,11 +29,14 @@ pub(crate) struct AuthzTarget {
     /// The `dynamodb:Attributes` names for this authorization, or `None` when
     /// it names no attribute. See `crate::request_attributes`.
     pub attributes: Option<Vec<String>>,
+    /// The `dynamodb:Select`, `dynamodb:ReturnValues` and
+    /// `dynamodb:ReturnConsumedCapacity` values. See `crate::parameter_keys`.
+    pub parameters: ParameterKeys,
 }
 
 /// The per-(action, table) or per-item authorizations for a batch or
-/// transaction operation, each carrying the LeadingKeys and Attributes the
-/// service evaluates.
+/// transaction operation, each carrying the condition key values the service
+/// evaluates.
 ///
 /// Returns `None` for non-batch/transact operations. Batch operations
 /// authorize once per table with the set of all keys for that table;
@@ -41,9 +45,10 @@ pub(crate) struct AuthzTarget {
 /// two (a batch of one own and one other key passes `ForAnyValue`; a
 /// transaction of the same two does not). Transaction items that give the same
 /// target are returned once, in the order of their first occurrence: the
-/// decision for a target depends only on its action, table, LeadingKeys and
-/// Attributes, so a hundred identical `ConditionCheck`s on one partition need
-/// one evaluation.
+/// decision for a target depends only on its action, table and condition key
+/// values, so a hundred identical `ConditionCheck`s on one partition need one
+/// evaluation. Two `Get`s of one partition that differ only in whether they
+/// project give two targets, since their `dynamodb:Select` values differ.
 ///
 /// `key_info_by_table` is the authorization snapshot; a `None` entry is a table
 /// that does not exist, whose targets carry no LeadingKeys and none of the
@@ -79,6 +84,7 @@ pub(crate) fn batch_transact_targets(
                     table: table.clone(),
                     leading_keys: keys,
                     attributes: batch_table_attributes(operation, body, key_info_of(table), limits),
+                    parameters: parameter_keys::batch_table(operation, body, input),
                 });
             }
             Some(out)
@@ -108,6 +114,7 @@ pub(crate) fn batch_transact_targets(
                                 key_info_of(table),
                                 limits,
                             ),
+                            parameters: parameter_keys::transact_item("Get", get, input),
                         },
                     );
                 }
@@ -145,6 +152,7 @@ pub(crate) fn batch_transact_targets(
                                     key_info_of(table),
                                     limits,
                                 ),
+                                parameters: parameter_keys::transact_item(sub, op, input),
                             },
                         );
                     }
