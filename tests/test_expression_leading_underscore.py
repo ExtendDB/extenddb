@@ -9,8 +9,8 @@ after it. PutItem, UpdateItem and DeleteItem put "1 validation error
 detected: " ahead of the text, and the other operations do not. A key
 condition, a filter and an update expression are checked before the table
 lookup. The same name through ExpressionAttributeNames is served, and so are
-`a_b`, `#_x` and `:_v`. Measured in us-east-1 on 2026-11-14 and 2026-11-18,
-each request twice.
+`a_b`, `#_x`, `:_v` and a PartiQL statement that names `_x`. Measured in
+us-east-1 on 2026-11-14 and 2026-11-18, each request twice.
 
 Dual-target against Amazon DynamoDB and extenddb.
 """
@@ -56,8 +56,8 @@ def _update(sk: str, update: str, **extra) -> tuple:
 
 
 # (id, (operation, request), expected message). `TableName` is the table
-# unless the request names one; BatchGetItem and the transactions name it
-# through the "<t>" key, filled in by the test.
+# unless the request names one. BatchGetItem, the transactions and the PartiQL
+# statements name it as "<t>", which the test fills in.
 REFUSED = [
     ("query-filter", _query(FilterExpression="attribute_exists(_x)"),
      _syntax("FilterExpression", "(_x")),
@@ -111,6 +111,22 @@ REFUSED = [
     ("transact-update", ("transact_write_items", {"TransactItems": [{"Update": {
         "TableName": "<t>", "Key": _key("t4"), "UpdateExpression": "SET _x = :v", **_v()}}]}),
      _syntax("UpdateExpression", "SET _x")),
+    ("transact-put", ("transact_write_items", {"TransactItems": [{"Put": {
+        "TableName": "<t>", "Item": _key("t1"), "ConditionExpression": "attribute_exists(_x)"}}]}),
+     _syntax("ConditionExpression", "(_x")),
+    ("transact-delete", ("transact_write_items", {"TransactItems": [{"Delete": {
+        "TableName": "<t>", "Key": _key("t2"), "ConditionExpression": "attribute_exists(_x)"}}]}),
+     _syntax("ConditionExpression", "(_x")),
+    ("transact-condition-check", ("transact_write_items", {"TransactItems": [{"ConditionCheck": {
+        "TableName": "<t>", "Key": _key("t3"), "ConditionExpression": "attribute_exists(_x)"}}]}),
+     _syntax("ConditionExpression", "(_x")),
+    ("update-condition", _update("u1", "SET a = :v", ConditionExpression="attribute_exists(_x)",
+                                 **_v()),
+     COUNT + _syntax("ConditionExpression", "(_x")),
+    ("query-projection-index-digit", _query(ProjectionExpression="a[1_]"),
+     _syntax("ProjectionExpression", "1_]")),
+    ("put-index-digit", _put("d2", "attribute_exists(a[1_])"),
+     COUNT + _syntax("ConditionExpression", "1_]")),
     ("transact-get-projection", ("transact_get_items", {"TransactItems": [{"Get": {
         "TableName": "<t>", "Key": _key("cond"), "ProjectionExpression": "_x"}}]}),
      _syntax("ProjectionExpression", "_x")),
@@ -133,6 +149,10 @@ SERVED = [
     ("put-name-placeholder", _put("p1", "attribute_not_exists(#_x)",
                                   ExpressionAttributeNames={"#_x": "a"})),
     ("put-value-placeholder", _put("p2", "attribute_not_exists(a) OR a = :_v", **_v(":_v"))),
+    ("partiql-select", ("execute_statement", {
+        "Statement": "SELECT _x, a._b FROM \"<t>\" WHERE pk = 'us-msg'"})),
+    ("partiql-update", ("execute_statement", {
+        "Statement": "UPDATE \"<t>\" SET _y = 1 WHERE pk = 'us-msg' AND sk = 'partiql'"})),
 ]
 
 
@@ -149,21 +169,23 @@ def table(dynamodb_client):
             {"AttributeName": "sk", "KeyType": "RANGE"},
         ],
     ) as name:
+        # The item that the PartiQL UPDATE of `SERVED` changes.
+        dynamodb_client.put_item(TableName=name, Item=_key("partiql"))
         yield name
 
 
 def _fill(value, table: str):
-    """`value` with each "<t>" key or value replaced by the table's name."""
+    """`value` with each "<t>" key, value or part of a string replaced by the table's name."""
     if isinstance(value, dict):
         return {table if k == "<t>" else k: _fill(v, table) for k, v in value.items()}
     if isinstance(value, list):
         return [_fill(v, table) for v in value]
-    return table if value == "<t>" else value
+    return value.replace("<t>", table) if isinstance(value, str) else value
 
 
 def _send(client, table: str, operation: str, request: dict):
     body = _fill(request, table)
-    if not ("RequestItems" in body or "TransactItems" in body):
+    if not ("RequestItems" in body or "TransactItems" in body or "Statement" in body):
         body = {"TableName": table, **body}
     return getattr(client, operation)(**body)
 
@@ -200,4 +222,6 @@ def test_valid_key_condition_on_a_missing_table_is_resource_not_found(
         dynamodb_client.query(
             TableName=MISSING, ExpressionAttributeValues={":v": {"S": "k"}}, **key_condition,
         )
-    assert exc_info.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    error = exc_info.value.response["Error"]
+    assert (error["Code"], error["Message"]) == (
+        "ResourceNotFoundException", "Requested resource not found")
