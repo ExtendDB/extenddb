@@ -13,7 +13,11 @@ on a base table, overlapping projection paths, an unused expression name, a
 FilterExpression syntax error and an unused expression value are all reported
 ahead of the size; an invalid ExclusiveStartKey is reported after it. On a
 KEYS_ONLY GSI, Select ALL_ATTRIBUTES is reported after the size, with and
-without an ExclusiveStartKey (measured 2026-11-20).
+without an ExclusiveStartKey (measured 2026-11-20). Without an
+ExclusiveStartKey it is also reported after Limit 0, a key condition on the
+base table's partition key, an N value on the S key, an unused expression
+value, an empty KeyConditionExpression and a FilterExpression syntax error
+(measured 2026-11-24, in the review of #481).
 
 Where ExtendDB words a syntax error differently from the service, the test
 checks the label that precedes the wording and that the size refusal did not
@@ -35,6 +39,12 @@ from query_key_size_support import (  # noqa: F401  (fixtures are used by name)
 )
 
 BIG = S(2049, "p")
+FILTER_LABEL = "Invalid FilterExpression: "
+LIMIT_MESSAGE = (
+    "1 validation error detected: Value at 'Limit' failed to satisfy constraint: "
+    "Member must have value greater than or equal to 1"
+)
+MISSED_G_MESSAGE = "Query condition missed key schema element: g"
 
 
 def _error(client, **query) -> dict:
@@ -96,8 +106,7 @@ def test_consistent_read_on_a_gsi_is_reported_first(dynamodb_client, index_table
 def test_limit_zero_is_reported_first(raw_client, index_table):
     refused(
         raw_client,
-        "1 validation error detected: Value at 'Limit' failed to satisfy constraint: "
-        "Member must have value greater than or equal to 1",
+        LIMIT_MESSAGE,
         TableName=index_table,
         Limit=0,
         KeyConditionExpression="pk = :p",
@@ -108,7 +117,7 @@ def test_limit_zero_is_reported_first(raw_client, index_table):
 def test_missed_key_schema_element_is_reported_first(dynamodb_client, index_table):
     refused(
         dynamodb_client,
-        "Query condition missed key schema element: g",
+        MISSED_G_MESSAGE,
         TableName=index_table,
         IndexName="gsi",
         KeyConditionExpression="gs = :v",
@@ -204,7 +213,7 @@ def test_filter_expression_syntax_is_reported_first(dynamodb_client, index_table
         ExpressionAttributeValues={":p": BIG},
     )
     assert err["Code"] == "ValidationException"
-    assert err["Message"].startswith("Invalid FilterExpression: ")
+    assert err["Message"].startswith(FILTER_LABEL)
     assert err["Message"] != HASH_MESSAGE
 
 
@@ -242,27 +251,78 @@ SELECT_ON_KEYS_ONLY_MESSAGE = (
     "supported for global secondary index gko because its projection type is not ALL"
 )
 START_KEY = {"g": S(1, "x"), "pk": S(1, "a"), "sk": S(1, "b")}
+ONE_BYTE = S(1, "x")
 
 
 @pytest.mark.parametrize(
-    ("value", "start_key", "message"),
+    ("values", "changes", "message"),
     [
-        pytest.param(BIG, None, HASH_MESSAGE, id="2049-bytes"),
-        pytest.param(BIG, START_KEY, HASH_MESSAGE, id="2049-bytes-with-a-start-key"),
-        pytest.param(S(1, "x"), START_KEY, SELECT_ON_KEYS_ONLY_MESSAGE, id="1-byte-with-a-start-key"),
+        pytest.param({":v": BIG}, {}, HASH_MESSAGE, id="2049-bytes"),
+        pytest.param(
+            {":v": BIG},
+            {"ExclusiveStartKey": START_KEY},
+            HASH_MESSAGE,
+            id="2049-bytes-with-a-start-key",
+        ),
+        pytest.param(
+            {":v": ONE_BYTE},
+            {"ExclusiveStartKey": START_KEY},
+            SELECT_ON_KEYS_ONLY_MESSAGE,
+            id="1-byte-with-a-start-key",
+        ),
+        pytest.param({":v": ONE_BYTE}, {"Limit": 0}, LIMIT_MESSAGE, id="limit-0"),
+        pytest.param(
+            {":v": ONE_BYTE},
+            {"KeyConditionExpression": "pk = :v"},
+            MISSED_G_MESSAGE,
+            id="base-partition-key",
+        ),
+        pytest.param(
+            {":v": {"N": "1"}},
+            {},
+            "One or more parameter values were invalid: "
+            "Condition parameter type does not match schema type",
+            id="n-value-on-the-s-key",
+        ),
+        pytest.param(
+            {":v": ONE_BYTE, ":w": ONE_BYTE},
+            {},
+            "Value provided in ExpressionAttributeValues unused in expressions: keys: {:w}",
+            id="unused-value",
+        ),
+        pytest.param(
+            {":v": ONE_BYTE},
+            {"KeyConditionExpression": ""},
+            "Invalid KeyConditionExpression: The expression can not be empty;",
+            id="empty-key-condition",
+        ),
+        # The service answers `Invalid FilterExpression: Syntax error; token:
+        # "#", near: "#"`, and ExtendDB answers `Invalid FilterExpression: empty
+        # name reference '#'` (#1419), so this row checks the label only.
+        pytest.param(
+            {":v": ONE_BYTE},
+            {"FilterExpression": "#"},
+            FILTER_LABEL,
+            id="filter-syntax-error",
+        ),
     ],
 )
 def test_select_all_attributes_on_a_keys_only_gsi_is_reported_after(
-    dynamodb_client, index_table, value, start_key, message
+    raw_client, index_table, values, changes, message
 ):
-    # Measured 2026-11-20 in us-east-1, each shape twice.
+    # Each shape measured twice: the first three rows on 2026-11-20 in
+    # us-east-1, the other six on 2026-11-24 (review of #481).
     query = {
         "TableName": index_table,
         "IndexName": "gko",
         "Select": "ALL_ATTRIBUTES",
         "KeyConditionExpression": "g = :v",
-        "ExpressionAttributeValues": {":v": value},
+        "ExpressionAttributeValues": values,
+        **changes,
     }
-    if start_key is not None:
-        query["ExclusiveStartKey"] = start_key
-    refused(dynamodb_client, message, **query)
+    if message == FILTER_LABEL:
+        err = _error(raw_client, **query)
+        assert err["Code"] == "ValidationException", err["Message"]
+        assert err["Message"].startswith(FILTER_LABEL), err["Message"]
+    else:
+        refused(raw_client, message, **query)
