@@ -15,7 +15,13 @@ import uuid
 
 import pytest
 from botocore.exceptions import ClientError
-from conftest import _is_real_dynamodb, config_value, configured_backend, wait_for_active
+from conftest import (
+    _is_real_dynamodb,
+    config_value,
+    configured_backend,
+    wait_for_active,
+    wait_for_deleted,
+)
 class TestCreateTable:
     """CreateTable operation tests."""
 
@@ -212,7 +218,6 @@ class TestDeleteTable:
                 assert desc["TableStatus"] == "DELETING"
                 assert desc["TableName"] == unique_table_name
                 assert desc["TableArn"].endswith(f"table/{unique_table_name}")
-                assert desc["KeySchema"] == [{"AttributeName": "pk", "KeyType": "HASH"}]
                 described = dynamodb_client.describe_table(TableName=unique_table_name)
                 assert described["Table"]["TableStatus"] == "DELETING"
                 assert _status_row(catalog, backend, unique_table_name) == before, (
@@ -220,6 +225,131 @@ class TestDeleteTable:
                 )
             finally:
                 # Back to ACTIVE, so the fixture's DeleteTable removes it.
+                _set_status(catalog, backend, unique_table_name, "ACTIVE")
+
+    # Members of a table's description that the service drops at the start of
+    # the DELETING window, in DeleteTable's answer and in DescribeTable
+    # (measured on DynamoDB 2026-11-23, on-demand and provisioned tables with
+    # and without indexes, a stream, a table class, KMS encryption and an
+    # on-demand throughput cap). boto3 hides TableThroughputModeSummary, so it
+    # is not named here.
+    DROPPED_WHILE_DELETING = (
+        "AttributeDefinitions",
+        "CreationDateTime",
+        "GlobalSecondaryIndexes",
+        "KeySchema",
+        "LocalSecondaryIndexes",
+        "WarmThroughput",
+    )
+    KEPT_WHILE_DELETING = (
+        "DeletionProtectionEnabled",
+        "ItemCount",
+        "ProvisionedThroughput",
+        "TableArn",
+        "TableId",
+        "TableName",
+        "TableSizeBytes",
+        "TableStatus",
+    )
+
+    SHAPES = {
+        "on_demand_with_indexes": (
+            {
+                "AttributeDefinitions": [
+                    {"AttributeName": "pk", "AttributeType": "S"},
+                    {"AttributeName": "sk", "AttributeType": "S"},
+                    {"AttributeName": "g", "AttributeType": "S"},
+                ],
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "sk", "KeyType": "RANGE"},
+                ],
+                "GlobalSecondaryIndexes": [
+                    {
+                        "IndexName": "gsi",
+                        "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+                        "Projection": {"ProjectionType": "ALL"},
+                    }
+                ],
+                "LocalSecondaryIndexes": [
+                    {
+                        "IndexName": "lsi",
+                        "KeySchema": [
+                            {"AttributeName": "pk", "KeyType": "HASH"},
+                            {"AttributeName": "g", "KeyType": "RANGE"},
+                        ],
+                        "Projection": {"ProjectionType": "KEYS_ONLY"},
+                    }
+                ],
+            },
+            ("BillingModeSummary",),
+        ),
+        "provisioned_with_stream_and_class": (
+            {
+                "BillingMode": "PROVISIONED",
+                "ProvisionedThroughput": {"ReadCapacityUnits": 3, "WriteCapacityUnits": 4},
+                "StreamSpecification": {
+                    "StreamEnabled": True,
+                    "StreamViewType": "NEW_AND_OLD_IMAGES",
+                },
+                "TableClass": "STANDARD_INFREQUENT_ACCESS",
+            },
+            ("LatestStreamArn", "LatestStreamLabel", "StreamSpecification", "TableClassSummary"),
+        ),
+    }
+
+    def _assert_deleting_shape(self, desc: dict, table_name: str, extra_kept: tuple) -> None:
+        assert desc["TableStatus"] == "DELETING"
+        assert desc["TableName"] == table_name
+        present = sorted(m for m in self.DROPPED_WHILE_DELETING if m in desc)
+        assert present == [], f"a DELETING description carries {present}"
+        missing = [m for m in self.KEPT_WHILE_DELETING + extra_kept if m not in desc]
+        assert missing == [], f"a DELETING description lacks {missing}"
+        if "BillingModeSummary" not in extra_kept:
+            assert "BillingModeSummary" not in desc
+
+    @pytest.mark.parametrize("shape", sorted(SHAPES))
+    def test_delete_table_answers_a_deleting_description(
+        self, shape, create_and_cleanup_table, dynamodb_client, unique_table_name
+    ):
+        """DeleteTable answers with the DELETING description: no key schema,
+        attribute definitions, creation time, warm throughput or indexes, and
+        the other members the table has."""
+        kwargs, extra_kept = self.SHAPES[shape]
+        create_and_cleanup_table(unique_table_name, **kwargs)
+        desc = dynamodb_client.delete_table(TableName=unique_table_name)["TableDescription"]
+        self._assert_deleting_shape(desc, unique_table_name, extra_kept)
+        wait_for_deleted(dynamodb_client, unique_table_name)
+
+    def test_describe_table_while_deleting_omits_the_same_members(
+        self, create_and_cleanup_table, dynamodb_client, unique_table_name
+    ):
+        """DescribeTable of a DELETING table carries the same members as
+        DeleteTable's answer.
+
+        On ExtendDB the DELETING state is written into the catalog directly
+        (see test_delete_of_a_deleting_table_returns_its_description), so the
+        test runs on PostgreSQL and SQLite only.
+        """
+        kwargs, extra_kept = self.SHAPES["on_demand_with_indexes"]
+        create_and_cleanup_table(unique_table_name, **kwargs)
+        if _is_real_dynamodb():
+            dynamodb_client.delete_table(TableName=unique_table_name)
+            described = dynamodb_client.describe_table(TableName=unique_table_name)
+            self._assert_deleting_shape(described["Table"], unique_table_name, extra_kept)
+            wait_for_deleted(dynamodb_client, unique_table_name)
+            return
+        backend = configured_backend() or (
+            "postgres" if config_value("storage.postgres", "connection_string") else None
+        )
+        if backend not in ("postgres", "sqlite"):
+            pytest.skip(f"backend {backend!r} never leaves a table DELETING")
+        with _catalog_connection(backend) as catalog:
+            _set_status(catalog, backend, unique_table_name, "DELETING")
+            try:
+                described = dynamodb_client.describe_table(TableName=unique_table_name)
+                self._assert_deleting_shape(described["Table"], unique_table_name, extra_kept)
+            finally:
                 _set_status(catalog, backend, unique_table_name, "ACTIVE")
 
 
