@@ -145,6 +145,19 @@ fn a_wrong_type_or_range_fails_with_serdes_wording_for_a_native_value() {
     }
 }
 
+/// TOML hands every integer to `visit_i64`; a deserializer with unsigned
+/// integers reaches `visit_u64`, which keeps serde's own error as well.
+#[test]
+fn an_unsigned_value_that_does_not_fit_keeps_serdes_error() {
+    use serde::de::IntoDeserializer;
+    let de: serde::de::value::U64Deserializer<serde::de::value::Error> =
+        4_294_967_296_u64.into_deserializer();
+    assert_eq!(
+        super::string_coerce::u32(de).unwrap_err().to_string(),
+        "invalid value: integer `4294967296`, expected a u32 or its string form"
+    );
+}
+
 /// The backends hand their `[storage.<backend>]` table to `parse_table`,
 /// whose deserializer has no source text to point at, so the message carries
 /// the key itself; an unknown or missing field names its key already.

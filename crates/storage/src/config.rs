@@ -185,7 +185,7 @@ pub mod string_coerce {
     {
         s.trim()
             .parse()
-            .map_err(|e| E::custom(format!("invalid {what} value \"{s}\": {e}")))
+            .map_err(|e| E::custom(format!("invalid {what} value {s:?}: {e}")))
     }
 
     /// Accepts a scalar as its native type (integer or boolean) or as a string
