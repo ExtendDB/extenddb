@@ -3,8 +3,9 @@
 mod messages;
 
 pub use messages::{
-    ErrorMessageKey, INVALID_STREAM_ARN, error_message, validation_error, validation_errors,
-    validation_errors_detected,
+    ErrorMessageKey, INVALID_STREAM_ARN, QUERY_KEY_CONDITION_NOT_SUPPORTED, error_message,
+    hash_attributes_without_equality, missed_key_schema_element, validation_error,
+    validation_errors, validation_errors_detected,
 };
 
 use crate::types::{CancellationReason, Item};

@@ -265,9 +265,9 @@ pub async fn handle_query(
         if !multipart {
             let pk_resolved = resolve_path_attr_name(&key_condition.pk_path, &effective_maps.names);
             if pk_resolved.as_deref() != Some(pk_attr.as_str()) {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "Query condition missed key schema element: {pk_attr}"
-                )));
+                return Err(DynamoDbError::ValidationException(
+                    extenddb_core::error::missed_key_schema_element(pk_attr),
+                ));
             }
         }
     }

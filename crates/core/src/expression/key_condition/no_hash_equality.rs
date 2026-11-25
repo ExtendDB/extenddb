@@ -48,13 +48,14 @@
 use std::collections::HashMap;
 
 use super::{CompareOp, Expr, KeyCondition, PathElement, SortKeyCondition};
-use crate::error::DynamoDbError;
+use crate::error::{
+    DynamoDbError, QUERY_KEY_CONDITION_NOT_SUPPORTED, hash_attributes_without_equality,
+    missed_key_schema_element,
+};
 use crate::types::{KeySchemaElement, hash_key_elements, is_multipart_key_schema};
 
 #[cfg(test)]
 mod tests;
-
-const NOT_SUPPORTED: &str = "Query key condition not supported";
 
 impl KeyCondition {
     /// The condition for one or two clauses, none of them an equality.
@@ -177,10 +178,9 @@ impl KeyCondition {
                 .iter()
                 .map(|ks| ks.attribute_name.as_str())
                 .collect();
-            return Err(DynamoDbError::ValidationException(format!(
-                "HASH key attributes {} must have equality conditions specified in the query",
-                hash_attrs.join(", ")
-            )));
+            return Err(DynamoDbError::ValidationException(
+                hash_attributes_without_equality(&hash_attrs),
+            ));
         }
 
         let Some(pk_attr) = single_hash_attr(key_schema) else {
@@ -189,9 +189,9 @@ impl KeyCondition {
             ));
         };
         let message = if self.operands_naming(pk_attr, names).is_empty() {
-            format!("Query condition missed key schema element: {pk_attr}")
+            missed_key_schema_element(pk_attr)
         } else {
-            NOT_SUPPORTED.to_owned()
+            QUERY_KEY_CONDITION_NOT_SUPPORTED.to_owned()
         };
         Err(DynamoDbError::ValidationException(message))
     }

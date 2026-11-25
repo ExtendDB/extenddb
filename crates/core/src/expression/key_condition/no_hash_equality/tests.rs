@@ -11,6 +11,7 @@ use super::*;
 use crate::expression::{collect_key_condition_refs, parse_key_condition, tokenize};
 use crate::types::KeyType;
 
+const NOT_SUPPORTED: &str = "Query key condition not supported";
 const MISSED_PK: &str = "Query condition missed key schema element: pk";
 const MISSED_G: &str = "Query condition missed key schema element: g";
 
