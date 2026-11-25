@@ -404,7 +404,6 @@ fn evaluate_size<'a>(
     Ok(Some(Cow::Owned(AttributeValue::N(sz.to_string()))))
 }
 
-/// Format an `AttributeValue` for error messages (e.g. `N:5`, `S:hello`).
 /// The fault of two BETWEEN bounds that are both values, without the
 /// expression prefix: bounds of different types, then a lower bound above the
 /// upper bound. Numbers compare exactly, whatever the precision of the
