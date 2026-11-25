@@ -4,9 +4,12 @@
 //! Database-backed credential store for SigV4 authentication.
 //!
 //! Implements `extenddb_auth::CredentialStore` by looking up access keys and
-//! session credentials from Cassandra, decrypting secrets with AES-256-GCM
-//! through `extenddb_storage::secret_cipher`, with the access key id as the AAD.
+//! session credentials from Cassandra, decrypting secrets through the key
+//! holder (`extenddb_storage::secret_keys`), which binds each secret to the
+//! fields of its row.
 
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -17,8 +20,7 @@ use cdrs_tokio::transport::TransportTcp;
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_auth::{CredentialStore, StoredCredential};
 use extenddb_core::error::DynamoDbError;
-use extenddb_storage::secret_cipher::decrypt_secret;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use extenddb_storage::secret_keys::{SecretKeys, SecretRow, require_keys};
 
 type CassandraSession = Session<
     TransportTcp,
@@ -26,30 +28,37 @@ type CassandraSession = Session<
     RoundRobinLoadBalancingStrategy<TransportTcp, TcpConnectionManager>,
 >;
 
-#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct CassandraCredentialStore {
-    #[zeroize(skip)]
     session: Arc<CassandraSession>,
-    #[zeroize(skip)]
     keyspace_prefix: String,
-    encryption_key: String,
+    /// The key holder, shared with the catalog store; `None` for a store
+    /// opened without a key, which opens no stored secret.
+    keys: Option<Arc<SecretKeys>>,
 }
 
 impl CassandraCredentialStore {
     pub fn new(
         session: Arc<CassandraSession>,
         keyspace_prefix: String,
-        encryption_key: String,
+        keys: Option<Arc<SecretKeys>>,
     ) -> Self {
         Self {
             session,
             keyspace_prefix,
-            encryption_key,
+            keys,
         }
     }
 
     fn catalog_keyspace(&self) -> String {
         format!("{}_catalog", self.keyspace_prefix)
+    }
+
+    /// The key holder, or the refusal of a store opened without one.
+    fn keys(&self) -> Result<&SecretKeys, DynamoDbError> {
+        require_keys(self.keys.as_deref()).map_err(|e| {
+            tracing::error!("Credential lookup: {e:?}");
+            DynamoDbError::InternalServerError("Internal error during authentication".to_owned())
+        })
     }
 
     /// Whether `account_id` has a row in `accounts`. Before account deletes
@@ -103,7 +112,7 @@ impl CassandraCredentialStore {
 
         let result = self
             .session
-            .query_with_values(&query, cdrs_tokio::query_values!(access_key_id))
+            .run(Stmt::Read, &query, cdrs_tokio::query_values!(access_key_id))
             .await
             .map_err(|e| {
                 tracing::error!("Credential lookup failed for access key {access_key_id}: {e}");
@@ -148,8 +157,13 @@ impl CassandraCredentialStore {
             return Ok(None);
         }
 
-        let secret_key =
-            decrypt_secret(&encrypted, &self.encryption_key, access_key_id).map_err(|e| {
+        let mut secret_key = self
+            .keys()?
+            .decrypt(
+                &SecretRow::access_key(access_key_id, &account_id, &user_name),
+                &encrypted,
+            )
+            .map_err(|e| {
                 tracing::error!("Secret key decryption failed for access key {access_key_id}: {e}");
                 DynamoDbError::InternalServerError(
                     "Internal error during authentication".to_owned(),
@@ -157,7 +171,9 @@ impl CassandraCredentialStore {
             })?;
 
         Ok(Some(StoredCredential {
-            secret_key,
+            // Moved out, not copied: the plaintext has one allocation, wiped
+            // when the credential drops.
+            secret_key: std::mem::take(&mut *secret_key),
             account_id,
             principal_name: user_name,
             session_name: None,
@@ -181,7 +197,7 @@ impl CassandraCredentialStore {
 
         let result = self
             .session
-            .query_with_values(&query, cdrs_tokio::query_values!(access_key_id))
+            .run(Stmt::Read, &query, cdrs_tokio::query_values!(access_key_id))
             .await
             .map_err(|e| {
                 tracing::error!(
@@ -250,8 +266,19 @@ impl CassandraCredentialStore {
             ));
         }
 
-        let secret_key =
-            decrypt_secret(&encrypted, &self.encryption_key, access_key_id).map_err(|e| {
+        let mut secret_key = self
+            .keys()?
+            .decrypt(
+                &SecretRow::session(
+                    access_key_id,
+                    &account_id,
+                    &role_name,
+                    &session_name,
+                    expires_at.unix_timestamp(),
+                ),
+                &encrypted,
+            )
+            .map_err(|e| {
                 tracing::error!(
                     "Session secret key decryption failed for access key {access_key_id}: {e}"
                 );
@@ -261,7 +288,9 @@ impl CassandraCredentialStore {
             })?;
 
         Ok(Some(StoredCredential {
-            secret_key,
+            // Moved out, not copied: the plaintext has one allocation, wiped
+            // when the credential drops.
+            secret_key: std::mem::take(&mut *secret_key),
             account_id,
             principal_name: role_name,
             session_name: Some(session_name),

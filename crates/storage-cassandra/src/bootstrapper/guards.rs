@@ -107,6 +107,37 @@ pub(super) fn check_name(
     )))
 }
 
+/// The most characters Cassandra 4.1 accepts in a keyspace name.
+const MAX_KEYSPACE_NAME_LEN: usize = 48;
+
+/// The most characters a keyspace prefix may hold. The longest keyspace
+/// name of a deployment is `<prefix>_account_` and a 12-digit account id,
+/// and it must fit in [`MAX_KEYSPACE_NAME_LEN`]. With 27 characters, it has 48.
+const MAX_PREFIX_LEN: usize = MAX_KEYSPACE_NAME_LEN - "_account_".len() - 12;
+
+/// Refuse a keyspace prefix that [`check_name`] refuses, and a prefix of
+/// more than [`MAX_PREFIX_LEN`] characters.
+///
+/// Without the length check, `init` creates the catalog keyspace and the
+/// admin role, and then fails at the first account keyspace, because
+/// Cassandra refuses its name. That leaves a half-made deployment.
+pub(super) fn check_keyspace_prefix(
+    what: &str,
+    value: &str,
+) -> Result<(), extenddb_storage::error::StorageError> {
+    check_name(what, value)?;
+    if value.len() > MAX_PREFIX_LEN {
+        return Err(extenddb_storage::error::StorageError::Internal(format!(
+            "{what} {value:?} has {} characters, and at most {MAX_PREFIX_LEN} are allowed: \
+             Cassandra refuses a keyspace name of more than {MAX_KEYSPACE_NAME_LEN} \
+             characters, and the account keyspace is named \
+             `<prefix>_account_` and a 12-digit account id",
+            value.len()
+        )));
+    }
+    Ok(())
+}
+
 /// Refuse a datacenter name holding anything other than ASCII letters,
 /// digits, `_`, `-` and `.`. The name is written between single quotes into
 /// every `CREATE KEYSPACE`, so a quote would break the statement. `what`
@@ -216,5 +247,45 @@ mod tests {
         for value in ["extenddb", "app_role_2", "A1", "_x"] {
             assert!(super::check_name("a name", value).is_ok(), "{value}");
         }
+    }
+
+    /// The account keyspace is named `<prefix>_account_` and a 12-digit id.
+    /// Cassandra 4.1 refuses a keyspace name of more than 48 characters, so
+    /// a prefix of 28 characters would let `init` create the catalog and the
+    /// admin role and then fail at the first account. `init` refuses the
+    /// flag before it connects. A prefix from the config file is refused
+    /// later, by `ensure_app_user`, so that `destroy` can still read it
+    /// (`tests/migrations.rs`).
+    #[tokio::test]
+    async fn a_prefix_flag_too_long_for_an_account_keyspace_is_refused_before_connecting() {
+        let longest = "a".repeat(27);
+        let too_long = "a".repeat(28);
+        assert!(super::check_keyspace_prefix("a prefix", &longest).is_ok());
+        let message = super::check_keyspace_prefix("a prefix", &too_long)
+            .expect_err("28 characters")
+            .to_string();
+        assert!(
+            message.contains("has 28 characters") && message.contains("at most 27"),
+            "{message}"
+        );
+
+        let flag_args: Vec<String> = [
+            "--cassandra-contact-points",
+            "127.0.0.1:1",
+            "--keyspace-prefix",
+            &too_long,
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        let from_flag = CassandraBootstrapper::from_config("/nonexistent/x.toml", &flag_args)
+            .await
+            .err()
+            .expect("the flag is refused")
+            .to_string();
+        assert!(
+            from_flag.contains("--keyspace-prefix") && from_flag.contains("at most 27"),
+            "{from_flag}"
+        );
     }
 }
