@@ -4,7 +4,7 @@
 //! Window and reference tests for [`SegmentStore`]; the bound and prune tests
 //! are in `segments_bound_tests.rs`.
 
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 use super::*;
 

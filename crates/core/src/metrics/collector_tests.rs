@@ -247,7 +247,7 @@ fn prune_keeps_recent_segments_and_drops_them_a_day_later() {
 fn segment_record_and_query_read_the_clock_under_the_lock() {
     use crate::metrics::types::LatencySegments;
     use std::sync::TryLockError;
-    use std::time::Instant;
+    use web_time::Instant;
 
     let c = MetricsCollector::new();
     let point = LatencySegments {
