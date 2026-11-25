@@ -17,12 +17,153 @@
 //!   full precision retained in the item JSON. See `docs/design-decisions.md`.
 //! - One file holds catalog and data (no separate catalog/data databases).
 //!
+//! # The WebAssembly build
+//!
+//! On `wasm32` the crate runs over the in-crate `sqlx` shim (`wasm_sqlx`),
+//! which opens only an in-memory database (`sqlite::memory:`); it runs no
+//! server, no command and no background worker. Code that build does not run
+//! is marked by one rule per concern:
+//!
+//! 1. **Does not compile for wasm32** (it calls `libsqlite3-sys`, `sqlx` API
+//!    the shim does not provide, or an item that rule 1 or 2 removes):
+//!    `#[cfg(not(target_arch = "wasm32"))]` on the smallest item that fails,
+//!    the `mod` line where a whole module does, with a one-line reason.
+//! 2. **Compiles for wasm32, and the dead-code lint reports it there** (no
+//!    wasm32 code calls it, and it is not part of the crate's public API):
+//!    removed the same way, together with its callers, with
+//!    a one-line reason. Only where removing it would put a `cfg` into code
+//!    both builds run, such as a field that a constructor both builds run
+//!    sets, does it carry
+//!    `#[cfg_attr(target_arch = "wasm32", expect(dead_code, reason = "..."))]`
+//!    instead, the reason naming that code.
+//! 3. **Compiled and called on wasm32, but reached by no wasm32 request**, and
+//!    calling a method the WebAssembly clippy step disallows: the allow of
+//!    `clippy::disallowed_methods` that the header of
+//!    `devtools/wasm-clippy/clippy.toml`, in the repository this crate's
+//!    manifest names, describes.
+//!
 //! NOTE: this is the catalog-layer build slice. The data-plane engine modules
 //! and the `ServerComponents` registration are added in the engine slice.
+
+// On wasm the backend cannot use `sqlx` + the C `libsqlite3-sys` (a dedicated
+// OS thread per connection, a C sysroot), so every `sqlx::` path in this crate
+// resolves instead to the in-crate `wasm_sqlx` module: aliasing this crate to
+// `sqlx` and re-exporting the shim at the crate root, crate-privately, makes
+// bare `sqlx::` paths resolve to it from every module without a per-module
+// import. Native keeps the real `sqlx` crate and is the behaviour this backend
+// is defined against.
+#[cfg(target_arch = "wasm32")]
+extern crate self as sqlx;
+#[cfg(target_arch = "wasm32")]
+pub(crate) use wasm_sqlx::*;
+
+/// The shim items `tests/wasm_shim.rs` drives on wasm, under the paths `sqlx`
+/// gives them. Not part of this crate's API.
+#[cfg(target_arch = "wasm32")]
+#[doc(hidden)]
+pub mod wasm_sqlx_for_tests {
+    pub use crate::wasm_sqlx::{
+        Error, Executor, FromRow, Row, SqlitePool, query, query_as, query_scalar, raw_sql, sqlite,
+    };
+
+    /// A fresh pool builder from the shim's crate-private
+    /// `SqlitePoolOptions::new()`. The tests call this where they call
+    /// `sqlx::sqlite::SqlitePoolOptions::new()` natively.
+    pub fn pool_options() -> sqlite::SqlitePoolOptions {
+        sqlite::SqlitePoolOptions::new()
+    }
+}
+
+/// Declare a catalog-row struct with a single field list that decodes the same
+/// way on both targets.
+///
+/// On native the struct derives `sqlx::FromRow`. On wasm, where `sqlx` is the
+/// in-crate shim and a derive macro is unavailable, the same field list
+/// generates a `FromRow` impl that reads each column through the shim's
+/// `try_get`, so a new or renamed column changes one place.
+///
+/// Every field decodes from the column with the field's own name, which is the
+/// derive's default mapping; as the derive does, the `r#` of a raw identifier
+/// is not part of the name, so `r#type` reads the column `type`. A
+/// `#[sqlx(...)]` attribute, on the struct (such as `rename_all`) or on a field
+/// (such as `rename`, `default` or `flatten`), would change that on native
+/// only, so the macro refuses one with a compile error, including one inside a
+/// `#[cfg_attr(...)]` at any depth.
+///
+/// Exported, and hidden from the documentation, only so that the crate's
+/// `tests/wasm_shim.rs` declares its row structs with this macro on both
+/// targets; it is not part of this crate's API. The expansion names `sqlx`,
+/// which resolves where the macro is invoked.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! sqlite_row_struct {
+    (
+        $(#[$($meta:tt)*])*
+        $vis:vis struct $name:ident {
+            $( $(#[$($fattr:tt)*])* $fvis:vis $field:ident : $ty:ty ),* $(,)?
+        }
+    ) => {
+        $( $crate::sqlite_row_attr!($($meta)*); )*
+        $( $( $crate::sqlite_row_attr!($($fattr)*); )* )*
+
+        $(#[$($meta)*])*
+        #[cfg_attr(not(target_arch = "wasm32"), derive(sqlx::FromRow))]
+        $vis struct $name {
+            $( $(#[$($fattr)*])* $fvis $field : $ty ),*
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        impl sqlx::FromRow for $name {
+            fn from_row(row: &sqlx::Row) -> ::core::result::Result<Self, sqlx::Error> {
+                ::core::result::Result::Ok(Self {
+                    $( $field: sqlx::Row::try_get(
+                        row,
+                        stringify!($field).trim_start_matches("r#"),
+                    )? ),*
+                })
+            }
+        }
+    };
+}
+
+/// Refuses a `#[sqlx(...)]` attribute of a `sqlite_row_struct!` struct or
+/// field, or one among the attributes of a `#[cfg_attr(...)]`, and passes
+/// every other attribute (doc comments, `allow`s). Exported with
+/// `sqlite_row_struct!`, which expands to it.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! sqlite_row_attr {
+    (sqlx $($rest:tt)*) => {
+        compile_error!(
+            "sqlite_row_struct! decodes every field from the column of the field's name on \
+             both targets; a #[sqlx(...)] attribute would change that on native only"
+        );
+    };
+    (cfg_attr ( $predicate:meta $(, $($attrs:tt)*)? )) => {
+        $( $crate::sqlite_row_attr!(@list [] $($attrs)*); )?
+    };
+    // The comma-separated attributes of a `cfg_attr`: each one is checked
+    // as an attribute of its own. The bracket holds the tokens of the
+    // attribute read so far.
+    (@list [$($attr:tt)*]) => {
+        $crate::sqlite_row_attr!($($attr)*);
+    };
+    (@list [$($attr:tt)*] , $($rest:tt)*) => {
+        $crate::sqlite_row_attr!($($attr)*);
+        $crate::sqlite_row_attr!(@list [] $($rest)*);
+    };
+    (@list [$($attr:tt)*] $next:tt $($rest:tt)*) => {
+        $crate::sqlite_row_attr!(@list [$($attr)* $next] $($rest)*);
+    };
+    ($($other:tt)*) => {};
+}
 
 mod admin_store;
 mod authorization_store;
 mod backup;
+mod backup_catalog;
+// `Bootstrapper`; its `destroy` takes the serve lock, compiled off wasm32.
+#[cfg(not(target_arch = "wasm32"))]
 mod bootstrapper;
 mod catalog_store;
 pub mod config;
@@ -30,36 +171,73 @@ mod create_table;
 mod credential_store;
 mod data;
 mod delete_table;
+// `ServerRuntimeHooks`: the server's background workers, not run on wasm32.
+#[cfg(not(target_arch = "wasm32"))]
 mod hooks;
 mod management_store;
 mod metadata;
+pub mod migrations;
 mod number_key;
+// `OperationsEngine`, which only `server_backend` installs.
+#[cfg(not(target_arch = "wasm32"))]
 mod operations;
+mod password_hash_store;
+mod restore_engine;
+#[cfg(test)]
+mod restore_job_tests;
 mod schema;
+// wasm32 calls only `database_file`; the module compiles its lock-taking
+// items off wasm32.
 mod serve_lock;
+// The server's registration and factories, which use the modules gated here.
+#[cfg(not(target_arch = "wasm32"))]
+mod server_backend;
+// Uses `sqlx` API the shim does not provide; on wasm32 `SnapshotEngine` answers `Unsupported`.
+#[cfg(not(target_arch = "wasm32"))]
+mod snapshot_engine;
 mod sqlite_util;
 mod store;
 mod stream;
+mod stream_at_timestamp;
+mod stream_lifecycle;
+#[cfg(test)]
+mod stream_tests;
 mod table_engine;
 mod table_helpers;
 mod update_table;
 mod vector_bench;
 mod vector_search;
+mod warm_throughput;
 mod worker;
+// The server's background worker loops, spawned only by `hooks`.
+#[cfg(not(target_arch = "wasm32"))]
 mod workers;
 
+// On wasm, the synchronous reimplementation of the slice of the `sqlx` API the
+// backend uses, over the SQLite that `sqlite-wasm-rs` bundles (in-memory VFS).
+// The crate root aliases it to `sqlx` (above), so the modules' `sqlx::` paths
+// resolve to it.
+#[cfg(target_arch = "wasm32")]
+mod wasm_sqlx;
+
 /// Default secondary-index propagation delay (milliseconds) when the
-/// `index_propagation_delay_ms` setting is absent. Mirrors the value seeded by
-/// the catalog schema, and is the single definition used by both the live read
-/// on the write path and the background refresh worker.
+/// `index_propagation_delay_ms` setting is absent, as it is on a catalog the
+/// migrations created (releases before 0.1.15 seeded the same value). The single
+/// definition used by both the live read on the write path and the background
+/// refresh worker.
 pub(crate) const DEFAULT_INDEX_PROPAGATION_DELAY_MS: u64 = 10;
+
+/// Default control-plane delay (seconds) when the `control_plane_delay_seconds`
+/// setting is absent or unparseable: CreateTable, DeleteTable, the
+/// control-plane worker and the console's default all read this one value.
+pub(crate) const DEFAULT_CONTROL_PLANE_DELAY_SECONDS: f64 = 0.25;
 
 /// Read the propagation-delay setting, preferring the canonical key and falling back
 /// to the pre-rename one.
 ///
 /// A catalog created before the rename holds the operator's value under the old name,
-/// and the server refuses to start on a catalog-version mismatch rather than migrating,
-/// so no upgrade step ever rewrites that row. Reading past it would silently reset a
+/// and no catalog migration rewrites that row yet, though one could. Reading past it
+/// would silently reset a
 /// configured delay to the default; since 0 means synchronous, the silent change would
 /// be from strict to eventually consistent. `ORDER BY ... DESC` makes the preference
 /// deterministic when both rows exist.
@@ -67,432 +245,10 @@ pub(crate) const INDEX_PROPAGATION_DELAY_QUERY: &str = "SELECT value FROM settin
      WHERE key IN ('index_propagation_delay_ms', 'gsi_propagation_delay_ms') \
      ORDER BY key = 'index_propagation_delay_ms' DESC LIMIT 1";
 
-pub use bootstrapper::SqliteBootstrapper;
 pub use catalog_store::SqliteCatalogStore;
 pub use config::SqliteConfig;
 pub use credential_store::SqliteCredentialStore;
-pub use schema::CATALOG_VERSION;
 pub use store::SqliteEngine;
-
-/// The SQLite backend, for installation via
-/// [`extenddb_storage::set_backend`] in a thin bin.
-///
-/// Bundles the bootstrapper, operations engine, config deserializer, and the
-/// settings/diagnostics/server-components factories under the `sqlite` name,
-/// which also selects the `[storage.sqlite]` config section.
-#[must_use]
-pub fn backend() -> extenddb_storage::Backend {
-    extenddb_storage::Backend {
-        name: "sqlite",
-        bootstrapper: sqlite_bootstrapper_factory,
-        storage_config: config::deserialize_config,
-        operations: &operations::SqliteOperationsEngine,
-        settings_store: sqlite_settings_store_factory,
-        management_store: sqlite_management_store_factory,
-        diagnostics_store: sqlite_diagnostics_store_factory,
-        server_components: sqlite_server_components_factory,
-    }
-}
-
-use extenddb_storage::diagnostics::DiagnosticsStore;
-use extenddb_storage::diagnostics_store::DiagnosticsStoreError;
-use extenddb_storage::management_store::{ManagementStore, SettingsStore};
-use extenddb_storage::management_store_factory::ManagementStoreError;
-use extenddb_storage::settings_store::SettingsStoreError;
-
-use crate::sqlite_util::sqlite_url;
-
-/// Open a small catalog-only pool for the settings/diagnostics factories,
-/// applying the same PRAGMAs as the engine.
-async fn catalog_pool(connection_string: &str) -> Result<sqlx::SqlitePool, sqlx::Error> {
-    sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(4)
-        .after_connect(|conn, _| {
-            Box::pin(async move {
-                use sqlx::Executor;
-                conn.execute("PRAGMA journal_mode = WAL").await?;
-                conn.execute("PRAGMA foreign_keys = ON").await?;
-                conn.execute("PRAGMA busy_timeout = 5000").await?;
-                Ok(())
-            })
-        })
-        .connect(&sqlite_url(connection_string))
-        .await
-}
-
-// ── Bootstrapper ───────────────────────────────────────────────────────
-
-fn sqlite_bootstrapper_factory(
-    config_path: String,
-    cli_args: Vec<String>,
-) -> futures::future::BoxFuture<
-    'static,
-    Result<
-        Box<dyn extenddb_storage::bootstrapper::Bootstrapper>,
-        extenddb_storage::error::StorageError,
-    >,
-> {
-    Box::pin(async move {
-        let store = SqliteBootstrapper::from_config(&config_path, &cli_args).await?;
-        Ok(Box::new(store) as Box<dyn extenddb_storage::bootstrapper::Bootstrapper>)
-    })
-}
-
-// ── Operations engine ──────────────────────────────────────────────────
-
-// ── Config deserializer ────────────────────────────────────────────────
-
-// ── Settings store factory ─────────────────────────────────────────────
-
-fn sqlite_settings_store_factory(
-    connection_string: &str,
-) -> futures::future::BoxFuture<'static, Result<Box<dyn SettingsStore>, SettingsStoreError>> {
-    let connection_string = connection_string.to_owned();
-    Box::pin(async move {
-        let pool = catalog_pool(&connection_string)
-            .await
-            .map_err(|e| SettingsStoreError::ConnectionFailed(e.to_string()))?;
-        Ok(Box::new(SqliteCatalogStore::new(pool)) as Box<dyn SettingsStore>)
-    })
-}
-
-// ── Management store factory ───────────────────────────────────────────
-
-fn sqlite_management_store_factory(
-    connection_string: &str,
-) -> futures::future::BoxFuture<'static, Result<Box<dyn ManagementStore>, ManagementStoreError>> {
-    let connection_string = connection_string.to_owned();
-    Box::pin(async move {
-        let pool = catalog_pool(&connection_string)
-            .await
-            .map_err(|e| ManagementStoreError::ConnectionFailed(e.to_string()))?;
-        Ok(Box::new(SqliteCatalogStore::new(pool)) as Box<dyn ManagementStore>)
-    })
-}
-
-// ── Diagnostics store factory ──────────────────────────────────────────
-
-fn sqlite_diagnostics_store_factory(
-    connection_string: &str,
-) -> futures::future::BoxFuture<'static, Result<Box<dyn DiagnosticsStore>, DiagnosticsStoreError>> {
-    let connection_string = connection_string.to_owned();
-    Box::pin(async move {
-        let pool = catalog_pool(&connection_string)
-            .await
-            .map_err(|e| DiagnosticsStoreError::ConnectionFailed(e.to_string()))?;
-        Ok(Box::new(SqliteCatalogStore::new(pool)) as Box<dyn DiagnosticsStore>)
-    })
-}
-
-// ── Server components factory ──────────────────────────────────────────
-
-use std::sync::Arc;
-
-use extenddb_auth::CredentialStore;
-use extenddb_storage::server_components::{BackendError, ServerComponents};
-
-use crate::hooks::SqliteRuntimeHooks;
-
-/// Maximum DynamoDB item size in bytes (post-update validation bound).
-const MAX_ITEM_SIZE_BYTES: usize = 400_000;
-
-fn sqlite_server_components_factory(
-    config: &(dyn extenddb_storage::config::StorageConfig + 'static),
-    region: &str,
-    options: extenddb_storage::server_components::ServerComponentsOptions,
-) -> futures::future::BoxFuture<'static, Result<ServerComponents, BackendError>> {
-    let db_path = config.connection_config().to_owned();
-    let pool_size = config.max_connections();
-    let region = region.to_owned();
-    Box::pin(async move {
-        // One server per database file, taken before the database is opened:
-        // startup recovery below assumes no other server is using it. A file
-        // database only; an in-memory one belongs to this process alone.
-        let serve_lock = serve_lock::ServeLock::acquire_for_location(&db_path)
-            .map_err(BackendError::InitializationFailed)?
-            .map(|lock| {
-                tracing::debug!("holding serve lock {}", lock.path().display());
-                std::sync::Arc::new(lock)
-            });
-        let mut engine = SqliteEngine::new(&db_path, pool_size, &region, MAX_ITEM_SIZE_BYTES)
-            .await
-            .map_err(|e| BackendError::ConnectionFailed {
-                backend: "sqlite".to_owned(),
-                details: e.to_string(),
-            })?;
-
-        // In-memory databases do not persist across the `init` process, so the
-        // catalog must be bootstrapped here, at serve time, on the engine's own
-        // shared connection (a second pool would open a separate empty DB).
-        // A dev-mode build extends the same bootstrap to an uninitialized FILE
-        // database (`bootstrap_if_uninitialized`), so zero-config dev serve
-        // works with a persistent path too; every bootstrap step is guarded
-        // (IF NOT EXISTS / INSERT OR IGNORE), so re-running on an initialized
-        // file is a no-op. Production builds keep the explicit-`init` contract.
-        let in_memory = engine.in_memory;
-        if in_memory || options.bootstrap_if_uninitialized {
-            let admin_user = std::env::var("EXTENDDB_ADMIN_USER").ok();
-            let admin_password = std::env::var("EXTENDDB_ADMIN_PASSWORD").ok();
-            if let Some(password) = engine
-                .bootstrap_ephemeral(admin_user.as_deref(), admin_password.as_deref())
-                .await
-                .map_err(|e| BackendError::InitializationFailed(e.to_string()))?
-            {
-                let user = admin_user.as_deref().unwrap_or("admin");
-                let durability = if in_memory {
-                    "In-memory backend: ephemeral admin credentials (lost on restart)"
-                } else {
-                    "Bootstrapped file backend: admin credentials (stored in the database)"
-                };
-                println!("\n  {durability}\n  Username: {user}\n  Password: {password}\n");
-            }
-        }
-
-        engine.check_catalog_version().await.map_err(|e| match e {
-            extenddb_storage::error::StorageError::CatalogVersionMismatch { expected, found } => {
-                BackendError::CatalogVersionMismatch { expected, found }
-            }
-            // The unreadable-version refusal: printed as is, not as
-            // "Internal error: ...".
-            extenddb_storage::error::StorageError::Internal(refusal) => {
-                BackendError::InitializationFailed(refusal)
-            }
-            other => BackendError::InitializationFailed(other.to_string()),
-        })?;
-
-        // The version string matches, but a table can still be in an earlier
-        // 0.0.4 build's shape (on which every DescribeTable fails). Refuse, as
-        // for a version mismatch: the steps can rewrite a table (the
-        // backup_items rebuild locks the database for writes while it runs),
-        // so they run under `extenddb migrate --yes`, not at startup.
-        let pending = schema::pending_shape_migrations(&engine.pool)
-            .await
-            .map_err(|e| {
-                use extenddb_storage::management_store::OpError;
-                let (OpError::Validation(m)
-                | OpError::AlreadyExists(m)
-                | OpError::NotFound(m)
-                | OpError::HasDependents(m)
-                | OpError::Internal(m)) = e;
-                BackendError::InitializationFailed(m)
-            })?;
-        if !pending.is_empty() {
-            return Err(BackendError::InitializationFailed(format!(
-                "the catalog's tables need migration steps this server does not run at \
-                 startup: {}. Stop the server and run 'extenddb migrate --yes'.",
-                pending.join(", ")
-            )));
-        }
-
-        // Recover any in-flight control-plane transitions from a prior run.
-        match engine.process_control_plane_transitions().await {
-            Ok(transitions) => {
-                for (name, transition) in &transitions {
-                    tracing::info!("Recovered table '{name}': {transition}");
-                }
-            }
-            Err(e) => tracing::error!("Failed to recover control plane transitions: {e}"),
-        }
-
-        // Remove any restore target a prior crash left mid-copy. Before the
-        // server takes requests, so no restore can be in flight.
-        match engine.sweep_abandoned_restores().await {
-            Ok(names) => {
-                for name in &names {
-                    tracing::warn!(
-                        "removed table '{name}': its restore did not finish before the last \
-                         shutdown"
-                    );
-                }
-            }
-            Err(e) => tracing::error!("Failed to sweep abandoned restores: {e}"),
-        }
-
-        // Likewise a backup a prior crash left CREATING: its items were only
-        // partly copied, and nothing will finish them.
-        match engine.sweep_incomplete_backups().await {
-            Ok(arns) => {
-                for arn in &arns {
-                    tracing::warn!(
-                        "removed backup {arn}: its copy did not finish before the last shutdown"
-                    );
-                }
-            }
-            Err(e) => tracing::error!("Failed to sweep incomplete backups: {e}"),
-        }
-
-        // Rebuild any GSI left mid-backfill (status CREATING) by a prior crash.
-        match engine.reconcile_incomplete_gsis().await {
-            Ok(n) if n > 0 => tracing::info!("Reconciled {n} incomplete GSI(s) at startup"),
-            Ok(_) => {}
-            Err(e) => tracing::error!("Failed to reconcile incomplete GSIs: {e}"),
-        }
-
-        // Same for a vector index. A separate pass rather than a shared one, because
-        // the two live in different catalog tables and are built by different code;
-        // a failure to reconcile one must not skip the other.
-        match engine.reconcile_incomplete_vector_indexes().await {
-            Ok(n) if n > 0 => {
-                tracing::info!("Reconciled {n} incomplete vector index(es) at startup");
-            }
-            Ok(_) => {}
-            Err(e) => tracing::error!("Failed to reconcile incomplete vector indexes: {e}"),
-        }
-
-        engine.serve_lock = serve_lock;
-        let control_plane_notify = engine.control_plane_notify();
-        let engine = Arc::new(engine);
-
-        // Catalog + auth queries: a file-backed database opens a dedicated
-        // catalog pool over the same file; an in-memory database must reuse the
-        // engine's single shared connection (its data lives only there).
-        let catalog_pool = if in_memory {
-            engine.pool.clone()
-        } else {
-            catalog_pool(&db_path)
-                .await
-                .map_err(|e| BackendError::ConnectionFailed {
-                    backend: "sqlite".to_owned(),
-                    details: format!("catalog pool: {e}"),
-                })?
-        };
-
-        let enc_key: Option<String> =
-            sqlx::query_scalar("SELECT value FROM settings WHERE key = 'encryption_key'")
-                .fetch_optional(&catalog_pool)
-                .await
-                .map_err(|e| {
-                    BackendError::InitializationFailed(format!("fetch encryption key: {e}"))
-                })?;
-        let enc_key = enc_key.ok_or(BackendError::MissingEncryptionKey)?;
-
-        // The catalog store writes through the second pool over the same
-        // file, so its writers must hold the SAME lock instance as the
-        // engine's (design decision D1); an unshared lock would leave the two
-        // pools contending at the SQLite level, where a slow commit exhausts
-        // a concurrent writer's busy_timeout ("database is locked" -> 500).
-        // For an in-memory database the pools are one and the sharing is
-        // harmless. The credential store only reads and needs no lock.
-        let catalog_store: Arc<dyn extenddb_storage::CatalogStore> =
-            Arc::new(SqliteCatalogStore::with_encryption_key(
-                catalog_pool.clone(),
-                enc_key.clone(),
-                Arc::clone(&engine.write_lock),
-            ));
-        let credential_store: Arc<dyn CredentialStore> =
-            Arc::new(SqliteCredentialStore::new(catalog_pool, enc_key));
-
-        let runtime_hooks = Box::new(SqliteRuntimeHooks {
-            engine: engine.clone(),
-            control_plane_notify,
-        });
-
-        Ok(ServerComponents {
-            engine,
-            catalog_store,
-            credential_store,
-            runtime_hooks: Some(runtime_hooks),
-        })
-    })
-}
-
-#[cfg(all(test, unix))]
-mod serve_lock_tests {
-    /// The server factory itself takes the lock: a second server on the same
-    /// file fails to start while the first is up, and starts once it is gone.
-    #[tokio::test]
-    async fn a_second_server_on_one_file_is_refused() {
-        let dir = std::env::temp_dir().join(format!(
-            "extenddb-serve-lock-factory-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&dir).expect("dir");
-        let config = crate::config::SqliteConfig {
-            path: dir.join("db.sqlite").to_string_lossy().into_owned(),
-            pool_size: 2,
-        };
-        let mut options = extenddb_storage::server_components::ServerComponentsOptions::default();
-        options.bootstrap_if_uninitialized = true;
-        let first = super::sqlite_server_components_factory(&config, "us-east-1", options)
-            .await
-            .expect("first server");
-        let Err(err) = super::sqlite_server_components_factory(&config, "us-east-1", options).await
-        else {
-            panic!("a second server on the same file started");
-        };
-        assert!(
-            err.to_string().contains("another extenddb process"),
-            "{err}"
-        );
-        drop(first);
-        let again = super::sqlite_server_components_factory(&config, "us-east-1", options)
-            .await
-            .expect("starts once the first is gone");
-        drop(again);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
-#[cfg(test)]
-mod shape_gate_tests {
-    /// `serve` on a file database whose catalog version matches but whose
-    /// `table_restores` is in the earlier 0.0.4 shape refuses to start,
-    /// naming the step and `extenddb migrate --yes`; after the migrate step
-    /// it starts.
-    #[tokio::test]
-    async fn serve_refuses_a_file_database_with_pending_shape_migrations() {
-        let dir = std::env::temp_dir().join(format!(
-            "extenddb-shape-gate-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&dir).expect("dir");
-        let config = crate::config::SqliteConfig {
-            path: dir.join("db.sqlite").to_string_lossy().into_owned(),
-            pool_size: 2,
-        };
-        let mut bootstrap = extenddb_storage::server_components::ServerComponentsOptions::default();
-        bootstrap.bootstrap_if_uninitialized = true;
-        let plain = extenddb_storage::server_components::ServerComponentsOptions::default();
-
-        // A current database, then the earlier shape: no source_table_arn.
-        drop(
-            super::sqlite_server_components_factory(&config, "us-east-1", bootstrap)
-                .await
-                .expect("bootstrap a file database"),
-        );
-        {
-            let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", config.path))
-                .await
-                .expect("open");
-            sqlx::query("ALTER TABLE table_restores DROP COLUMN source_table_arn")
-                .execute(&pool)
-                .await
-                .expect("the earlier table_restores shape");
-            pool.close().await;
-        }
-        let Err(err) = super::sqlite_server_components_factory(&config, "us-east-1", plain).await
-        else {
-            panic!("serve started on the earlier shape");
-        };
-        assert!(
-            err.to_string()
-                .contains("add table_restores.source_table_arn"),
-            "{err}"
-        );
-        assert!(err.to_string().contains("extenddb migrate --yes"), "{err}");
-
-        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", config.path))
-            .await
-            .expect("open");
-        crate::schema::apply_shape_migrations(&pool)
-            .await
-            .expect("migrate --yes");
-        pool.close().await;
-        drop(
-            super::sqlite_server_components_factory(&config, "us-east-1", plain)
-                .await
-                .expect("serve starts after migrate"),
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
+// From `bootstrapper` and `server_backend`, which wasm32 does not compile.
+#[cfg(not(target_arch = "wasm32"))]
+pub use {bootstrapper::SqliteBootstrapper, server_backend::backend};

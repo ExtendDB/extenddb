@@ -21,11 +21,11 @@ use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::{build_expression_maps, parse_optional_filter};
 use crate::index_helpers::{
     VectorIndexReadRefusal, classify_unresolved_index_read, combined_lek_key_schema,
-    validate_scan_exclusive_start_key,
 };
 use crate::legacy_filter::desugar_filter;
 use crate::read_helpers::{PostRead, read_page};
 use crate::serialize_output;
+use crate::start_key::validate_scan_exclusive_start_key;
 use crate::{DispatchMetrics, DispatchResult};
 
 /// Handle a `Scan` request.
@@ -106,12 +106,13 @@ pub async fn handle_scan(
         .projection_expression
         .as_ref()
         .is_some_and(|s| !s.is_empty());
+    // No values suffix when the request's AttributeValues parse.
     extenddb_core::expression::validate_expression_param_usage(
         input.expression_attribute_names.as_ref(),
         has_proj_expr || has_filter_expr,
         input.expression_attribute_values.as_ref(),
         has_filter_expr,
-        &[ExpressionKind::Filter],
+        &[],
     )?;
 
     // ConditionalOperator requires a ScanFilter with two or more conditions.
@@ -377,7 +378,8 @@ pub async fn handle_scan(
         && index_info.is_none()
     {
         return Err(DynamoDbError::ValidationException(
-            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName".to_owned(),
+            "1 validation error detected: ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName"
+                .to_owned(),
         ));
     }
     if let Some(Select::Count) = input.select

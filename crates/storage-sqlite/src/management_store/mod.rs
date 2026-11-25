@@ -14,12 +14,16 @@ mod accounts;
 mod groups;
 mod policies;
 mod roles;
+mod secret_rows;
 mod users;
 
+use extenddb_storage::CatalogStore as _;
 use extenddb_storage::management_store::{
     AccessKeyCreated, AccountDetail, GroupDetail, GroupListEntry, ManagementStore, OpError,
-    OpResult, RoleDetail, RoleListEntry, SessionPolicyEntry, UserDetail, UserListEntry,
+    OpResult, RoleDetail, RoleListEntry, SecretPage, SecretWrite, SessionPolicyEntry,
+    StoredDocument, UserDetail, UserListEntry,
 };
+use extenddb_storage::secret_keys::SecretTable;
 use futures::future::BoxFuture;
 use time::OffsetDateTime;
 
@@ -395,6 +399,23 @@ impl ManagementStore for SqliteCatalogStore {
         })
     }
 
+    fn list_policy_documents(
+        &self,
+        account_id: &str,
+        principal_type: &str,
+        principal_name: &str,
+    ) -> BoxFuture<'_, OpResult<Vec<(String, StoredDocument)>>> {
+        let (account_id, principal_type, principal_name) = (
+            account_id.to_owned(),
+            principal_type.to_owned(),
+            principal_name.to_owned(),
+        );
+        Box::pin(async move {
+            self.list_policy_documents_impl(&account_id, &principal_type, &principal_name)
+                .await
+        })
+    }
+
     // ── Permissions boundaries ─────────────────────────────────────
 
     fn set_user_boundary(
@@ -459,6 +480,23 @@ impl ManagementStore for SqliteCatalogStore {
     ) -> BoxFuture<'_, OpResult<Option<serde_json::Value>>> {
         let (account_id, role_name) = (account_id.to_owned(), role_name.to_owned());
         Box::pin(async move { self.get_role_boundary_impl(&account_id, &role_name).await })
+    }
+
+    fn boundary_document(
+        &self,
+        account_id: &str,
+        principal_type: &str,
+        principal_name: &str,
+    ) -> BoxFuture<'_, OpResult<Option<StoredDocument>>> {
+        let (account_id, principal_type, principal_name) = (
+            account_id.to_owned(),
+            principal_type.to_owned(),
+            principal_name.to_owned(),
+        );
+        Box::pin(async move {
+            self.boundary_document_impl(&account_id, &principal_type, &principal_name)
+                .await
+        })
     }
 
     fn delete_role_boundary(
@@ -552,8 +590,11 @@ impl ManagementStore for SqliteCatalogStore {
         let session_name = session_name.to_owned();
         let session_tags = session_tags.as_ref().map(ToString::to_string);
         let session_policy = session_policy.as_ref().map(ToString::to_string);
+        // AssumeRole truncated `expires_at` to whole seconds before its
+        // encrypt, so this text is the value in the secret's AAD.
         let expires = format_timestamp(expires_at);
         Box::pin(async move {
+            extenddb_storage::secret_keys::require_keys(self.secret_keys())?;
             // D1: every writer holds the write lock.
             let _writer = self.lock_writes().await;
             sqlx::query(
@@ -699,6 +740,44 @@ impl ManagementStore for SqliteCatalogStore {
             Ok(Vec::new())
         })
     }
+
+    // ── Encryption-key commands (in `secret_rows`) ─────────────────
+
+    fn read_secret_page(
+        &self,
+        table: SecretTable,
+        page: Option<&str>,
+        page_size: usize,
+    ) -> BoxFuture<'_, OpResult<SecretPage>> {
+        let page = page.map(ToOwned::to_owned);
+        Box::pin(async move {
+            self.read_secret_page_impl(table, page.as_deref(), page_size)
+                .await
+        })
+    }
+
+    fn write_secrets(
+        &self,
+        table: SecretTable,
+        rows: &[SecretWrite],
+    ) -> BoxFuture<'_, OpResult<()>> {
+        let rows = rows.to_vec();
+        Box::pin(async move { self.write_secrets_impl(table, &rows).await })
+    }
+
+    fn delete_secrets(&self, table: SecretTable, keys: &[String]) -> BoxFuture<'_, OpResult<()>> {
+        let keys = keys.to_vec();
+        Box::pin(async move { self.delete_secrets_impl(table, &keys).await })
+    }
+
+    fn delete_setting(&self, key: &str) -> BoxFuture<'_, OpResult<()>> {
+        let key = key.to_owned();
+        Box::pin(async move { self.delete_setting_impl(&key).await })
+    }
+
+    fn erase_free_space(&self) -> BoxFuture<'_, OpResult<()>> {
+        Box::pin(self.erase_free_space_impl())
+    }
 }
 
 #[cfg(test)]
@@ -720,8 +799,14 @@ mod migration_tests {
             .execute(&pool)
             .await
             .unwrap();
-        crate::schema::apply(&pool).await.expect("apply schema");
-        SqliteCatalogStore::new(pool)
+        crate::migrations::apply_for_tests(&pool).await;
+        // A key holder, so the store writes the session the tests store.
+        let keys = extenddb_storage::secret_keys::SecretKeys::dek_for_tests([7; 32], 1, "test");
+        SqliteCatalogStore::with_secret_keys(
+            pool,
+            Some(std::sync::Arc::new(keys)),
+            std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        )
     }
 
     fn policy(resource_tag_key: &str) -> serde_json::Value {
@@ -878,5 +963,79 @@ mod migration_tests {
             .unwrap();
         let p = stored.iter().find(|(n, ..)| n == "p").unwrap();
         assert_eq!(p.1, collide);
+    }
+
+    /// A stored document that does not decode is named with its account,
+    /// principal, policy and decode error, and the principal's other
+    /// policies and its boundary are still read and rewritten.
+    #[tokio::test]
+    async fn an_undecodable_policy_is_named_and_the_others_are_rewritten() {
+        let s = store().await;
+        s.create_account("333333333333", "acct").await.unwrap();
+        s.create_user("333333333333", "carol", None).await.unwrap();
+        for name in ["a_broken", "b_tagged"] {
+            s.put_policy(
+                "333333333333",
+                "user",
+                "carol",
+                name,
+                &policy("dynamodb:ResourceTag/env"),
+            )
+            .await
+            .unwrap();
+        }
+        s.set_user_boundary("333333333333", "carol", &policy("dynamodb:ResourceTag/env"))
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE iam_policies SET policy_document = '{not json' \
+             WHERE account_id = '333333333333' AND policy_name = 'a_broken'",
+        )
+        .execute(s.pool())
+        .await
+        .unwrap();
+
+        let report = migrate_resource_tag_condition_keys(&s, true).await;
+        assert_eq!(report.errors, 0, "{:?}", report.failures);
+        assert_eq!(report.unreadable.len(), 1, "{report:?}");
+        let broken = &report.unreadable[0];
+        assert_eq!(
+            (
+                broken.account_id.as_str(),
+                broken.principal.as_str(),
+                broken.policy_name.as_str()
+            ),
+            ("333333333333", "user/carol", "a_broken")
+        );
+        assert!(broken.error.contains("line 1"), "{}", broken.error);
+        let names: Vec<&str> = report
+            .rewritten
+            .iter()
+            .map(|r| r.policy_name.as_str())
+            .collect();
+        assert_eq!(names, ["b_tagged", "<permissions-boundary>"]);
+    }
+}
+
+#[cfg(test)]
+mod leftover_tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    #[tokio::test]
+    async fn deleted_principals_and_accounts_leave_nothing() {
+        // One connection keeps the in-memory database alive for the test.
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory sqlite");
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+        crate::migrations::apply_for_tests(&pool).await;
+        let store = SqliteCatalogStore::new(pool);
+        extenddb_storage::iam_leftovers_conformance::run(&store, "111111111111").await;
     }
 }

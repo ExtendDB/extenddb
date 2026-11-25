@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+"""The schema of a fresh MongoDB install, against docs/schema/mongodb.txt:
+
+    devtools/check-mongodb-schema <extenddb binary> <output file> [mongo port]
+
+Runs `init` on a mongo:7 replica set this script starts in the container
+extenddb-check-schema-<mongo port> (published on 127.0.0.1 only, removed at
+the end), then writes both databases' collections with their options and
+indexes with their keys and options, one object per line in a fixed order,
+to <output file>. A fresh install has no per-table collections. Exits 1
+with the diff when the file differs from docs/schema/mongodb.txt; the
+output file is then the one to commit there.
+"""
+import difflib
+import os
+import shutil
+import sys
+import tempfile
+
+from catalog_checks import docker, expect_exit, finish, mongosh, report, start_mongo
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+COMMITTED = os.path.join(HERE, "..", "docs", "schema", "mongodb.txt")
+
+SCHEMA = """
+const out = [];
+for (const name of ["extenddb_catalog", "extenddb_data"]) {
+  const d = db.getSiblingDB(name);
+  for (const spec of d.getCollectionInfos().sort((a, b) => (a.name < b.name ? -1 : 1))) {
+    out.push(`collection ${name}.${spec.name} type ${spec.type} options ${EJSON.stringify(spec.options)}`);
+    if (spec.type !== "collection") continue;
+    const indexes = d.getCollection(spec.name).getIndexes().sort((a, b) => (a.name < b.name ? -1 : 1));
+    for (const i of indexes) {
+      const o = Object.assign({}, i); delete o.v; delete o.ns; delete o.name;
+      const key = EJSON.stringify(o.key); delete o.key;
+      out.push(`index ${name}.${spec.name} ${i.name} key ${key} options ${EJSON.stringify(o)}`);
+    }
+  }
+}
+print(out.join("\\n"));
+"""
+
+
+def main(binary: str, output: str, port: int) -> int:
+    binary = os.path.realpath(binary)
+    container = f"extenddb-check-schema-{port}"
+    work = tempfile.mkdtemp()
+    try:
+        if not start_mongo(container, port):
+            return finish()
+        config = os.path.join(work, "extenddb.toml")
+        uri = f"mongodb://127.0.0.1:{port}/?replicaSet=rs0&directConnection=true"
+        with open(config, "w", encoding="utf-8") as f:
+            f.write(f'[storage]\nbackend = "mongodb"\n\n[storage.mongodb]\nconnection_string = "{uri}"\n')
+        env = dict(os.environ, HOME=os.path.join(work, "home"), EXTENDDB_ADMIN_PASSWORD="CheckAdminPassw0rd1")
+        expect_exit(0, "init", [binary, "init", "--backend", "mongodb", "--config", config, "--overwrite"],
+                    env, timeout=120)
+        code, schema = mongosh(container, port, SCHEMA)
+        if not report(code == 0, "read the schema", schema):
+            return finish()
+        with open(output, "w", encoding="utf-8") as f:
+            f.write(schema.strip() + "\n")
+        with open(COMMITTED, encoding="utf-8") as f:
+            committed = f.read()
+        diff = list(difflib.unified_diff(committed.splitlines(), schema.strip().splitlines(),
+                                         "docs/schema/mongodb.txt", "fresh install", lineterm=""))
+        report(not diff, f"a fresh install matches docs/schema/mongodb.txt (else commit {output} there)",
+               "\n".join(diff))
+    finally:
+        docker("rm", "-f", "-v", container)
+        shutil.rmtree(work, ignore_errors=True)
+    return finish()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) not in (3, 4):
+        sys.exit(__doc__)
+    sys.exit(main(sys.argv[1], sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 27071))

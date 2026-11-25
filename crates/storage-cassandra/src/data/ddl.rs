@@ -3,6 +3,7 @@
 
 //! DDL helpers for creating and dropping per-DynamoDB-table data tables in Cassandra.
 
+use crate::cassandra_util::PolicySession as _;
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_core::types::{
     AttributeDefinition, IndexInfo, IndexType, KeySchemaElement, ScalarAttributeType,
@@ -12,6 +13,7 @@ use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{sk_column, sk_column_n};
 
 use crate::CassandraEngine;
+use crate::cassandra_util::batch;
 
 /// CQL table name for a DynamoDB table in an account keyspace.
 pub(crate) fn data_table_name(table_id: &str) -> String {
@@ -56,27 +58,6 @@ impl CassandraEngine {
         account_id: &str,
         table_name: &str,
     ) -> Result<TableKeyInfo, StorageError> {
-        self.fetch_table_key_info_with_consistency(account_id, table_name, false)
-            .await
-    }
-
-    /// Fetch table identity at `LOCAL_QUORUM` when absence or name reuse would
-    /// otherwise allow a durable repair obligation to be discarded.
-    pub(crate) async fn fetch_table_key_info_quorum(
-        &self,
-        account_id: &str,
-        table_name: &str,
-    ) -> Result<TableKeyInfo, StorageError> {
-        self.fetch_table_key_info_with_consistency(account_id, table_name, true)
-            .await
-    }
-
-    async fn fetch_table_key_info_with_consistency(
-        &self,
-        account_id: &str,
-        table_name: &str,
-        quorum: bool,
-    ) -> Result<TableKeyInfo, StorageError> {
         let catalog_keyspace = format!("{}_catalog", self.keyspace_prefix);
 
         let query = format!(
@@ -84,18 +65,13 @@ impl CassandraEngine {
              FROM {catalog_keyspace}.tables WHERE account_id = ? AND table_name = ?"
         );
         let values = cdrs_tokio::query_values!(account_id, table_name);
-        let rows = if quorum {
-            crate::cassandra_util::query_rows_quorum(
-                &self.session,
-                &query,
-                values,
-                "fetch_table_key_info",
-            )
-            .await?
-        } else {
-            crate::cassandra_util::query_rows(&self.session, &query, values, "fetch_table_key_info")
-                .await?
-        };
+        let rows = crate::cassandra_util::query_rows(
+            &self.session,
+            &query,
+            values,
+            "fetch_table_key_info",
+        )
+        .await?;
 
         let row = rows
             .into_iter()
@@ -270,10 +246,12 @@ impl CassandraEngine {
             )
         };
 
-        self.session
-            .query(&ddl)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Failed to create data table: {e}")))?;
+        crate::cassandra_util::ddl::<StorageError>(
+            &self.session,
+            &ddl,
+            "Failed to create data table",
+        )
+        .await?;
 
         Ok(())
     }
@@ -287,10 +265,12 @@ impl CassandraEngine {
         let ddb_table = data_table_name(table_id);
         let ddl = format!("DROP TABLE IF EXISTS {account_keyspace}.{ddb_table}");
 
-        self.session
-            .query(&ddl)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Failed to drop data table: {e}")))?;
+        crate::cassandra_util::ddl::<StorageError>(
+            &self.session,
+            &ddl,
+            "Failed to drop data table",
+        )
+        .await?;
 
         Ok(())
     }
@@ -304,10 +284,12 @@ impl CassandraEngine {
         let idx_table = index_table_name(index_id);
         let ddl = format!("DROP TABLE IF EXISTS {account_keyspace}.{idx_table}");
 
-        self.session
-            .query(&ddl)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Failed to drop index data table: {e}")))?;
+        crate::cassandra_util::ddl::<StorageError>(
+            &self.session,
+            &ddl,
+            "Failed to drop index data table",
+        )
+        .await?;
 
         Ok(())
     }
@@ -409,10 +391,12 @@ impl CassandraEngine {
             primary_key
         );
 
-        self.session
-            .query(&ddl)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Failed to create index table: {e}")))?;
+        crate::cassandra_util::ddl::<StorageError>(
+            &self.session,
+            &ddl,
+            "Failed to create index table",
+        )
+        .await?;
 
         Ok(())
     }
@@ -443,8 +427,7 @@ pub(crate) async fn backfill_gsi(
     projection: &extenddb_core::types::Projection,
 ) -> Result<(), StorageError> {
     use crate::data::index::{insert_index_row_multi, item_has_index_keys, project_item_for_index};
-    use cdrs_tokio::consistency::Consistency;
-    use cdrs_tokio::query::BatchQueryBuilder;
+    use cdrs_tokio::types::IntoRustByName as _;
 
     const PAGE_SIZE: i64 = 500;
 
@@ -461,11 +444,11 @@ pub(crate) async fn backfill_gsi(
     // Token-based full-table scan matching the pattern used by scan_impl.
     // First page: no lower bound. Subsequent pages: token(pk) > last_token.
     let first_page_query = format!(
-        "SELECT pk, item_data FROM {account_keyspace}.{base_table} \
+        "SELECT pk, item_data, version FROM {account_keyspace}.{base_table} \
              LIMIT {PAGE_SIZE} ALLOW FILTERING"
     );
     let next_page_query = format!(
-        "SELECT pk, item_data FROM {account_keyspace}.{base_table} \
+        "SELECT pk, item_data, version FROM {account_keyspace}.{base_table} \
              WHERE token(pk) > ? LIMIT {PAGE_SIZE} ALLOW FILTERING"
     );
 
@@ -494,7 +477,7 @@ pub(crate) async fn backfill_gsi(
             break;
         }
 
-        let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+        let mut batch = batch();
         let mut batch_has_rows = false;
 
         for row in &rows {
@@ -516,6 +499,15 @@ pub(crate) async fn backfill_gsi(
             let projected =
                 project_item_for_index(&item, index_key_schema, base_key_schema, projection);
 
+            // A row this scheme versioned gets the stamp its own writes give
+            // its index rows: its version (`data::version`). A delete then
+            // removes the backfilled row with its version + 1 tombstone, and a
+            // write that commits a later version while the backfill runs wins
+            // over it in either arrival order. A row with a null or counter
+            // version keeps coordinator time, as its delete takes the clock.
+            let version: Option<i64> = row.get_by_name("version").ok().flatten();
+            let stamp = version.filter(|v| *v >= super::version::CLOCK_VERSION_FLOOR);
+
             insert_index_row_multi(
                 &mut batch,
                 account_keyspace,
@@ -526,13 +518,14 @@ pub(crate) async fn backfill_gsi(
                 base_key_schema,
                 &idx_sks,
                 &base_sks,
+                stamp,
             )?;
             batch_has_rows = true;
         }
 
         if batch_has_rows {
             session
-                .batch(
+                .run_batch(
                     batch
                         .build()
                         .map_err(|e| StorageError::Internal(e.to_string()))?,

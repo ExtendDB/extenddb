@@ -46,7 +46,7 @@ async fn put_pk_only_items(
 }
 
 /// Collect the `id` attribute (string) from a list of items.
-fn ids(items: &[BTreeMap<String, AttributeValue>]) -> Vec<String> {
+pub(crate) fn ids(items: &[BTreeMap<String, AttributeValue>]) -> Vec<String> {
     items
         .iter()
         .map(|item| match item.get("id") {

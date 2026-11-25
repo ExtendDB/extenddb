@@ -6,6 +6,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "SigV4 authentication and IAM-compatible authorization of the ExtendDB server. Internal crate of the extenddb binary, with no API stability promise."
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 extenddb-core = { workspace = true }
@@ -13,15 +16,25 @@ extenddb-cache = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 thiserror = { workspace = true }
-axum = { workspace = true }
-hmac = "0.12"
+# SigV4 verification needs an HTTP `HeaderMap`, which `axum` merely re-exports
+# as `axum::http`. Depending on `http` directly (the same types) drops axum's
+# hyper/tokio-net stack from this crate, which has no wasm32 target, so the
+# crate builds on wasm32 where the engine graph reaches it.
+http = { workspace = true }
+libc = { workspace = true }
 sha2 = "0.10"
 hex = "0.4"
 serde_json = { workspace = true }
 time = { workspace = true }
+web-time = { workspace = true }
 tracing = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
-extenddb-cache = { workspace = true, features = ["test-util"] }
+extenddb-cache = { path = "../cache", features = ["test-util"] }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+# The SigV4 differential tests (tests/sigv4_differential) sign requests with
+# the SDK's signer and generate them from a fixed seed.
+aws-credential-types = { workspace = true }
+aws-sigv4 = { workspace = true, features = ["sign-http", "http1"] }
+proptest = { workspace = true, features = ["std"] }

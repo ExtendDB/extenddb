@@ -4,8 +4,6 @@
 //! Helper functions for transforming and parsing partition key (pk) and sort key (sk) values.
 
 use crate::error::StorageError;
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use extenddb_core::types::{
     AttributeDefinition, AttributeValue, Item, KeySchemaElement, KeyType, ScalarAttributeType,
 };
@@ -76,14 +74,10 @@ pub fn parse_sk(
 /// Per design doc §5.1: partition keys are always stored as TEXT.
 /// S → direct (borrowed), N → string representation (borrowed), B → base64 (owned).
 pub fn pk_to_text(value: &AttributeValue) -> Result<Cow<'_, str>, StorageError> {
-    match value {
-        AttributeValue::S(s) => Ok(Cow::Borrowed(s)),
-        AttributeValue::N(n) => Ok(Cow::Borrowed(n)),
-        AttributeValue::B(b) => Ok(Cow::Owned(BASE64.encode(b))),
-        _ => Err(StorageError::Internal(
-            "partition key must be S, N, or B".to_owned(),
-        )),
-    }
+    // One encoding for the row key: the backup format's key order binds the
+    // same function, so an ORDER BY pk and the manifest's key ranges agree.
+    extenddb_core::backup_format::hash_key_text(value)
+        .ok_or_else(|| StorageError::Internal("partition key must be S, N, or B".to_owned()))
 }
 
 /// Determine which sort key column to use based on the attribute type.
@@ -127,6 +121,67 @@ pub fn sk_info<'a>(
         .iter()
         .find(|ad| ad.attribute_name == sk_element.attribute_name)?;
     Some((&sk_element.attribute_name, attr_def.attribute_type))
+}
+
+/// Refuse a Query key condition that a backend applying the sort key
+/// condition to the first RANGE attribute only cannot serve.
+///
+/// On a key schema with several RANGE attributes the engine classifies a
+/// condition on any of them; the MongoDB and Cassandra backends store and
+/// filter the first RANGE attribute only, so a condition on a later one has
+/// no column to apply to. Answering with the first attribute's filter alone
+/// would return items that do not satisfy the stated condition. `backend`
+/// names the backend in the message.
+pub fn refuse_conditions_beyond_first_range(
+    key_condition: &extenddb_core::expression::KeyCondition,
+    key_schema: &[KeySchemaElement],
+    names: &std::collections::HashMap<String, String>,
+    backend: &str,
+) -> Result<(), StorageError> {
+    let range_attrs: Vec<&str> = key_schema
+        .iter()
+        .filter(|ks| ks.key_type == KeyType::Range)
+        .map(|ks| ks.attribute_name.as_str())
+        .collect();
+    let attr_of = |path: &[extenddb_core::expression::PathElement]| -> Option<String> {
+        match path.first() {
+            Some(extenddb_core::expression::PathElement::Attribute(name)) => name
+                .strip_prefix('#')
+                .map_or_else(|| Some(name.clone()), |r| names.get(r).cloned()),
+            _ => None,
+        }
+    };
+    // Every RANGE attribute with a condition, whichever slot the classifier
+    // put it in; the one with the smallest key-schema position past the first
+    // names the refusal.
+    let mut conditioned: Vec<String> = key_condition
+        .extra_sk_conditions
+        .iter()
+        .filter_map(|(path, _)| attr_of(path))
+        .collect();
+    if let Some(sk) = &key_condition.sk_condition
+        && let Some(attr) = attr_of(sk.path())
+    {
+        conditioned.push(attr);
+    }
+    let beyond = conditioned
+        .into_iter()
+        .filter_map(|attr| {
+            range_attrs
+                .iter()
+                .position(|r| *r == attr)
+                .filter(|pos| *pos > 0)
+                .map(|pos| (pos, attr))
+        })
+        .min()
+        .map(|(_, attr)| attr);
+    match beyond {
+        Some(attr) => Err(StorageError::Validation(format!(
+            "Key condition on {attr}: the {backend} backend applies a key condition to the first \
+             RANGE attribute of a multi-attribute index only"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Merge the attribute definitions supplied by an `UpdateTable` request into the
@@ -642,5 +697,37 @@ mod tests {
             .map(|a| a.attribute_name.as_str())
             .collect();
         assert_eq!(names, vec!["pk", "gh", "gr"]);
+    }
+}
+
+#[cfg(test)]
+mod row_key_contract_tests {
+    //! The on-disk row key. Every `B`-keyed row on every backend is addressed
+    //! by this text; the expected strings are literals on purpose so a change
+    //! to the function this delegates to (`backup_format::hash_key_text`)
+    //! fails here rather than silently re-keying the data. Standard base64,
+    //! not URL-safe.
+    use extenddb_core::types::AttributeValue;
+
+    use super::pk_to_text;
+
+    #[test]
+    fn pk_to_text_is_the_row_key_contract() {
+        assert_eq!(
+            pk_to_text(&AttributeValue::S("a b/c".into())).unwrap(),
+            "a b/c"
+        );
+        assert_eq!(pk_to_text(&AttributeValue::N("10".into())).unwrap(), "10");
+        // Standard base64 with padding, not URL-safe: `+` and `/` appear.
+        assert_eq!(
+            pk_to_text(&AttributeValue::B(vec![0xfb, 0xff, 0xbf])).unwrap(),
+            "+/+/"
+        );
+        assert_eq!(
+            pk_to_text(&AttributeValue::B(vec![0xde, 0xad])).unwrap(),
+            "3q0="
+        );
+        assert_eq!(pk_to_text(&AttributeValue::B(vec![])).unwrap(), "");
+        assert!(pk_to_text(&AttributeValue::Bool(true)).is_err());
     }
 }

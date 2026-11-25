@@ -46,10 +46,17 @@ pub async fn flush_pending_drops(session: &Arc<CassandraSession>) {
         let _ = session.query(format!("DROP KEYSPACE IF EXISTS {ks}")).await;
     }
 }
+/// The node the tests use: `EXTENDDB_TEST_CASSANDRA_CONTACT_POINT`, else
+/// 127.0.0.1:9042, the port CI's service container publishes.
+pub fn test_contact_point() -> String {
+    std::env::var("EXTENDDB_TEST_CASSANDRA_CONTACT_POINT")
+        .unwrap_or_else(|_| "127.0.0.1:9042".to_string())
+}
+
 /// Returns a standard test configuration for Cassandra.
 pub fn test_config() -> CassandraStorageConfig {
     let mut config = CassandraStorageConfig {
-        contact_points: vec!["127.0.0.1:9042".to_string()],
+        contact_points: vec![test_contact_point()],
         username: Some("cassandra".to_string()),
         password: Some("cassandra".to_string()),
         keyspace_prefix: "extenddb_ttl_test".to_string(),
@@ -86,13 +93,15 @@ pub async fn ensure_test_account(
         engine.create_keyspace(catalog_keyspace).await?;
     }
     ensure_keyspace_rf(engine, catalog_keyspace).await?;
-    // Always run migrations — idempotent, guards against concurrent creation races.
-    extenddb_storage_cassandra::migrations::run_catalog_migrations(
-        &engine.session_arc(),
-        catalog_keyspace,
+    // Always run the migrations: the runner applies only what is missing.
+    extenddb_storage_cassandra::migrations::migrate_catalog_keyspace(
+        engine.session_arc(),
+        "extenddb_ttl_test",
+        "test",
+        std::time::Duration::from_secs(120),
     )
     .await
-    .map_err(|e| format!("Failed to run catalog migrations: {:?}", e))?;
+    .map_err(|e| format!("Failed to run catalog migrations: {e}"))?;
 
     if !engine.keyspace_exists(&account_keyspace).await? {
         engine.create_keyspace(&account_keyspace).await?;
@@ -100,13 +109,15 @@ pub async fn ensure_test_account(
     } else {
         ensure_keyspace_rf(engine, &account_keyspace).await?;
     }
-    // Always run migrations — idempotent, guards against concurrent creation races.
-    extenddb_storage_cassandra::migrations::run_data_migrations(
-        &engine.session_arc(),
+    // Always run the migrations: the runner applies only what is missing.
+    extenddb_storage_cassandra::migrations::migrate_account(
+        engine.session_arc(),
+        "extenddb_ttl_test",
         &account_keyspace,
+        "test",
     )
     .await
-    .map_err(|e| format!("Failed to run migrations: {:?}", e))?;
+    .map_err(|e| format!("Failed to run migrations: {e}"))?;
 
     let query = format!(
         "INSERT INTO {}.accounts (account_id, account_name, created_at) VALUES (?, ?, toTimestamp(now())) IF NOT EXISTS",
@@ -262,6 +273,7 @@ impl TestTable {
             tags: None,
             table_class: None,
             deletion_protection_enabled: None,
+            warm_throughput: None,
         };
 
         let table_desc = engine.create_table(account_id, input).await.unwrap();
@@ -326,6 +338,7 @@ impl TestTable {
                 non_key_attributes: None,
             },
             provisioned_throughput: None,
+            warm_throughput: None,
         };
 
         let input = extenddb_core::types::CreateTableInput {
@@ -344,6 +357,7 @@ impl TestTable {
             tags: None,
             table_class: None,
             deletion_protection_enabled: None,
+            warm_throughput: None,
         };
 
         let table_desc = engine.create_table(&account_id, input).await.unwrap();
@@ -419,6 +433,7 @@ impl TestTable {
                 non_key_attributes: None,
             },
             provisioned_throughput: None,
+            warm_throughput: None,
         };
 
         let input = extenddb_core::types::CreateTableInput {
@@ -437,6 +452,7 @@ impl TestTable {
             tags: None,
             table_class: None,
             deletion_protection_enabled: None,
+            warm_throughput: None,
         };
 
         let table_desc = engine.create_table(&account_id, input).await.unwrap();
@@ -534,6 +550,7 @@ impl TestTable {
             tags: None,
             table_class: None,
             deletion_protection_enabled: None,
+            warm_throughput: None,
         };
 
         let table_desc = engine.create_table(&account_id, input).await.unwrap();
@@ -612,15 +629,229 @@ pub async fn setup_engine() -> CassandraEngine {
     ensure_keyspace_rf(&engine, &catalog_keyspace)
         .await
         .unwrap();
-    // Always run migrations — idempotent, guards against concurrent creation races.
-    extenddb_storage_cassandra::migrations::run_catalog_migrations(
-        &engine.session_arc(),
-        &catalog_keyspace,
+    // Always run the migrations: the runner applies only what is missing.
+    extenddb_storage_cassandra::migrations::migrate_catalog_keyspace(
+        engine.session_arc(),
+        &config.keyspace_prefix,
+        "test",
+        std::time::Duration::from_secs(120),
     )
     .await
     .unwrap();
 
     engine
+}
+
+/// An engine on a keyspace prefix of its own, with a migrated catalog.
+///
+/// Background work that walks every account keyspace under a prefix (the GSI
+/// workers) sees only this engine's accounts, so other tests running at the
+/// same time cannot change what a test observes. The catalog and every
+/// account made with [`isolated_gsi_account`] are queued for dropping when
+/// this is dropped.
+pub struct IsolatedEngine {
+    pub engine: Arc<CassandraEngine>,
+    pub config: CassandraStorageConfig,
+    keyspaces: std::sync::Mutex<Vec<String>>,
+}
+
+impl IsolatedEngine {
+    /// The catalog's settings store, as `extenddb settings set` writes it.
+    pub fn settings(&self) -> CassandraCatalogStore {
+        create_catalog_store(&self.engine, &self.config)
+    }
+}
+
+impl Drop for IsolatedEngine {
+    fn drop(&mut self) {
+        if let Ok(mut keyspaces) = self.keyspaces.lock() {
+            for keyspace in keyspaces.drain(..) {
+                queue_keyspace_drop(keyspace);
+            }
+        }
+    }
+}
+
+/// Start an [`IsolatedEngine`] whose keyspace prefix begins with `tag`.
+pub async fn isolated_engine(tag: &str) -> IsolatedEngine {
+    let mut config = test_config();
+    config.keyspace_prefix = format!("{tag}_{}", &unique_test_id()[..10]);
+    config.cached_connection_string = None;
+    config.ensure_cached_connection_string();
+    let engine = Arc::new(CassandraEngine::new(&config, "us-east-1").await.unwrap());
+    // Keyspaces earlier tests in this process left queued for dropping.
+    flush_pending_drops(&engine.session_arc()).await;
+    let catalog_ks = engine.catalog_keyspace();
+    engine.create_keyspace(&catalog_ks).await.unwrap();
+    ensure_keyspace_rf(&engine, &catalog_ks).await.unwrap();
+    extenddb_storage_cassandra::migrations::migrate_catalog_keyspace(
+        engine.session_arc(),
+        &config.keyspace_prefix,
+        "test",
+        std::time::Duration::from_secs(120),
+    )
+    .await
+    .unwrap();
+    IsolatedEngine {
+        engine,
+        config,
+        keyspaces: std::sync::Mutex::new(vec![catalog_ks]),
+    }
+}
+
+/// An account of an [`IsolatedEngine`] with one table.
+pub struct IsolatedAccount {
+    pub keyspace: String,
+    pub key_info: TableKeyInfo,
+}
+
+/// Create a migrated account on `isolated`'s prefix, registered in its
+/// catalog, with table `table`: hash key `id` (S) and GSI `gsi` on `gsi_pk`
+/// (S), all attributes projected. The GSI sets no delay of its own, so it
+/// follows the system `index_propagation_delay_ms`.
+pub async fn isolated_gsi_account(
+    isolated: &IsolatedEngine,
+    table: &str,
+    gsi: &str,
+    gsi_pk: &str,
+) -> IsolatedAccount {
+    use extenddb_core::types::{CreateTableInput, GsiInput, Projection, ProjectionType};
+
+    let input = CreateTableInput {
+        table_name: table.to_string(),
+        key_schema: vec![KeySchemaElement {
+            attribute_name: "id".to_string(),
+            key_type: KeyType::Hash,
+        }],
+        attribute_definitions: vec![
+            AttributeDefinition {
+                attribute_name: "id".to_string(),
+                attribute_type: ScalarAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: gsi_pk.to_string(),
+                attribute_type: ScalarAttributeType::S,
+            },
+        ],
+        local_secondary_indexes: None,
+        global_secondary_indexes: Some(vec![GsiInput {
+            index_name: gsi.to_string(),
+            key_schema: vec![KeySchemaElement {
+                attribute_name: gsi_pk.to_string(),
+                key_type: KeyType::Hash,
+            }],
+            projection: Projection {
+                projection_type: ProjectionType::All,
+                non_key_attributes: None,
+            },
+            provisioned_throughput: None,
+            warm_throughput: None,
+        }]),
+        vector_indexes: None,
+        billing_mode: None,
+        table_throughput_mode: None,
+        provisioned_throughput: None,
+        on_demand_throughput: None,
+        stream_specification: None,
+        sse_specification: None,
+        tags: None,
+        table_class: None,
+        deletion_protection_enabled: None,
+        warm_throughput: None,
+    };
+    isolated_account(isolated, input).await
+}
+
+/// Create an account keyspace on `isolated`'s prefix that holds only an
+/// empty `gsi_pending` table, so a GSI worker pass reads one more keyspace.
+/// Cheaper than a migrated account: two schema changes. Returns its name.
+pub async fn isolated_queue_keyspace(isolated: &IsolatedEngine) -> String {
+    let engine = &isolated.engine;
+    let keyspace = engine.account_keyspace(&unique_test_account());
+    isolated.keyspaces.lock().unwrap().push(keyspace.clone());
+    engine.create_keyspace(&keyspace).await.unwrap();
+    ensure_keyspace_rf(engine, &keyspace).await.unwrap();
+    engine
+        .session()
+        .query(format!(
+            "CREATE TABLE IF NOT EXISTS {keyspace}.gsi_pending ( \
+                 worker_partition int, last_ready_at timestamp STATIC, \
+                 ready_at timestamp, id timeuuid, table_id text, old_item text, \
+                 new_item text, index_context text, \
+                 PRIMARY KEY ((worker_partition), ready_at, id) \
+             ) WITH CLUSTERING ORDER BY (ready_at ASC, id ASC)"
+        ))
+        .await
+        .unwrap();
+    keyspace
+}
+
+/// The account keyspaces on `isolated`'s prefix, in the order the GSI workers
+/// read them (`system_schema` order).
+pub async fn isolated_account_keyspaces(isolated: &IsolatedEngine) -> Vec<String> {
+    extenddb_storage_cassandra::workers::list_account_keyspaces_for_tests(&isolated.engine)
+        .await
+        .unwrap()
+}
+
+/// Create a migrated account on `isolated`'s prefix, registered in its
+/// catalog, with the table `input` describes.
+pub async fn isolated_account(
+    isolated: &IsolatedEngine,
+    input: extenddb_core::types::CreateTableInput,
+) -> IsolatedAccount {
+    let engine = &isolated.engine;
+    let account_id = unique_test_account();
+    let keyspace = engine.account_keyspace(&account_id);
+    // Queued first, so a failure below still cleans it up.
+    isolated.keyspaces.lock().unwrap().push(keyspace.clone());
+    engine.create_keyspace(&keyspace).await.unwrap();
+    ensure_keyspace_rf(engine, &keyspace).await.unwrap();
+    extenddb_storage_cassandra::migrations::migrate_account(
+        engine.session_arc(),
+        &isolated.config.keyspace_prefix,
+        &keyspace,
+        "test",
+    )
+    .await
+    .unwrap();
+    engine
+        .session()
+        .query_with_values(
+            format!(
+                "INSERT INTO {}.accounts (account_id, account_name, created_at) \
+                 VALUES (?, ?, toTimestamp(now()))",
+                engine.catalog_keyspace()
+            ),
+            cdrs_tokio::query_values!(account_id.as_str(), "Isolated Test Account"),
+        )
+        .await
+        .unwrap();
+
+    let table_name = input.table_name.clone();
+    let key_schema = input.key_schema.clone();
+    let attribute_definitions = input.attribute_definitions.clone();
+    let has_lsi = input
+        .local_secondary_indexes
+        .as_ref()
+        .is_some_and(|lsis| !lsis.is_empty());
+    let description = engine.create_table(&account_id, input).await.unwrap();
+    IsolatedAccount {
+        keyspace,
+        key_info: TableKeyInfo {
+            table_name,
+            account_id,
+            table_id: description.table_id,
+            key_schema: key_schema.clone(),
+            base_key_schema: key_schema,
+            attribute_definitions,
+            has_lsi,
+            global_secondary_indexes: Vec::new(),
+            local_secondary_indexes: Vec::new(),
+            vector_indexes: Vec::new(),
+            stream_specification: None,
+        },
+    }
 }
 
 /// Creates a CassandraCatalogStore from engine for tests.
@@ -634,6 +865,76 @@ pub fn create_catalog_store(
         config.datacenter.clone(),
         config.replication_factor,
     )
+}
+
+/// [`create_catalog_store`] with a new catalog key, for the tests that
+/// create access keys or store sessions.
+pub fn create_keyed_catalog_store(
+    engine: &CassandraEngine,
+    config: &CassandraStorageConfig,
+) -> CassandraCatalogStore {
+    let key = extenddb_storage::bootstrapper::helpers::generate_encryption_key().expect("a key");
+    let keys = extenddb_storage::secret_keys::SecretKeys::catalog_key(&key).expect("a key holder");
+    create_catalog_store(engine, config).with_secret_keys(Some(Arc::new(keys)))
+}
+
+/// Whether the cluster has one node. `system.paxos` is local to each node,
+/// so a test that reads it needs a cluster of one node.
+pub async fn is_one_node_cluster(engine: &CassandraEngine) -> bool {
+    extenddb_storage_cassandra::cassandra_util::system_read::<extenddb_storage::error::StorageError>(
+        &engine.session_arc(),
+        "SELECT peer FROM system.peers",
+        cdrs_tokio::query_values!(),
+        "count the peers",
+    )
+    .await
+    .expect("read system.peers")
+    .is_empty()
+}
+
+/// The id of the last Paxos commit that the node saved for partition `pk` of
+/// `keyspace.table`. The result is `None` when the node holds no Paxos state
+/// for that partition.
+///
+/// An LWT on the partition saves a new id. A plain write does not change it.
+/// The row in `system.paxos` is found by table id and partition key, so rows
+/// that other tests write do not change the result. Use it on a one-node
+/// cluster only (see [`is_one_node_cluster`]).
+pub async fn paxos_last_commit(
+    engine: &CassandraEngine,
+    keyspace: &str,
+    table: &str,
+    pk: &str,
+) -> Option<uuid::Uuid> {
+    use cdrs_tokio::types::IntoRustByName as _;
+    use extenddb_storage::error::StorageError;
+    use extenddb_storage_cassandra::cassandra_util::{get_column, system_read};
+
+    let session = engine.session_arc();
+    let ids = system_read::<StorageError>(
+        &session,
+        "SELECT id FROM system_schema.tables WHERE keyspace_name = ? AND table_name = ?",
+        cdrs_tokio::query_values!(keyspace, table),
+        "table id",
+    )
+    .await
+    .expect("read the table id");
+    let table_id: uuid::Uuid =
+        get_column::<_, StorageError>(&ids[0], "id", "table id").expect("the table id");
+    // `(text)` picks one of two `textAsBlob` overloads, as Cassandra needs.
+    let rows = system_read::<StorageError>(
+        &session,
+        "SELECT most_recent_commit_at FROM system.paxos \
+         WHERE row_key = textAsBlob((text) ?) AND cf_id = ?",
+        cdrs_tokio::query_values!(pk, table_id),
+        "last Paxos commit",
+    )
+    .await
+    .expect("read system.paxos");
+    rows.first().and_then(|row| {
+        row.get_by_name("most_recent_commit_at")
+            .expect("read most_recent_commit_at")
+    })
 }
 
 /// Helper: insert an item then manually set its `prepared_txn_id` via raw CQL,
@@ -725,15 +1026,200 @@ pub fn skip_without_cassandra() -> bool {
     if std::env::var("EXTENDDB_TEST_CASSANDRA").as_deref() == Ok("required") {
         return false;
     }
-    let reachable = std::net::TcpStream::connect_timeout(
-        &std::net::SocketAddr::from(([127, 0, 0, 1], 9042)),
-        std::time::Duration::from_secs(2),
-    )
-    .is_ok();
+    let contact_point = test_contact_point();
+    let reachable = contact_point
+        .parse::<std::net::SocketAddr>()
+        .is_ok_and(|address| {
+            std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(2))
+                .is_ok()
+        });
     if !reachable {
         eprintln!(
-            "skipping: no Cassandra at 127.0.0.1:9042 (set EXTENDDB_TEST_CASSANDRA=required to fail instead)"
+            "skipping: no Cassandra at {contact_point} (set EXTENDDB_TEST_CASSANDRA=required to fail instead)"
         );
     }
     !reachable
+}
+
+/// The key of an item of a test table: `id`, and `sort` on a table with a
+/// sort key.
+pub fn key(
+    id: &str,
+    sort: Option<extenddb_core::types::AttributeValue>,
+) -> extenddb_core::types::Item {
+    let mut key = std::collections::BTreeMap::from([(
+        "id".to_string(),
+        extenddb_core::types::AttributeValue::S(id.to_string()),
+    )]);
+    if let Some(sort) = sort {
+        key.insert("sort".to_string(), sort);
+    }
+    key
+}
+
+/// Puts the item with the key `key` and one more attribute, `v = "x"`.
+pub async fn put(engine: &CassandraEngine, table: &TestTable, key: extenddb_core::types::Item) {
+    use extenddb_storage::DataEngine;
+
+    let mut item = key;
+    item.insert(
+        "v".to_string(),
+        extenddb_core::types::AttributeValue::S("x".to_string()),
+    );
+    engine
+        .put_item(
+            &table.key_info,
+            item,
+            false,
+            None,
+            &Default::default(),
+            None,
+        )
+        .await
+        .expect("put_item");
+}
+
+/// The CQL name of `table`'s data table: `<keyspace>.items_<table id>`.
+pub fn data_table(engine: &CassandraEngine, table: &TestTable) -> String {
+    format!(
+        "{}.items_{}",
+        engine.account_keyspace(&table.key_info.account_id),
+        table.key_info.table_id.replace('-', "_")
+    )
+}
+
+/// The column that holds `table`'s sort key: `sk_s`, `sk_n` or `sk_b`.
+fn sort_key_column(table: &TestTable) -> &'static str {
+    let (_, sk_type) = extenddb_storage::util::sk_info(
+        &table.key_info.key_schema,
+        &table.key_info.attribute_definitions,
+    )
+    .expect("a table with a sort key");
+    extenddb_storage::util::sk_column(sk_type)
+}
+
+/// Writes with CQL the row a TTL claim on the absent key `pk` (and `sk`, on
+/// a table with a sort key) leaves: `prepared_txn_id` and
+/// `prepared_txn_timestamp` set, and no `item_data`.
+pub async fn claim_row(
+    engine: &CassandraEngine,
+    table: &TestTable,
+    pk: &str,
+    sk: Option<cdrs_tokio::types::value::Value>,
+) {
+    let set = format!(
+        "UPDATE {} SET prepared_txn_id = uuid(), prepared_txn_timestamp = 1 WHERE pk = ?",
+        data_table(engine, table)
+    );
+    let session = engine.session_arc();
+    match sk {
+        Some(sk) => {
+            let cql = format!("{set} AND {} = ?", sort_key_column(table));
+            session
+                .query_with_values(cql, cdrs_tokio::query_values!(pk, sk))
+                .await
+        }
+        None => {
+            session
+                .query_with_values(set, cdrs_tokio::query_values!(pk))
+                .await
+        }
+    }
+    .expect("claim row");
+}
+
+/// Writes with CQL partition `pk` as DeleteItem leaves it on a table with a
+/// sort key once its items are gone: the static delete timestamp, and a
+/// deleted row for each sort key in `deleted`.
+pub async fn emptied_partition(
+    engine: &CassandraEngine,
+    table: &TestTable,
+    pk: &str,
+    deleted: &[cdrs_tokio::types::value::Value],
+) {
+    use cdrs_tokio::types::value::Value;
+
+    let (t, col) = (data_table(engine, table), sort_key_column(table));
+    let mut cql = format!(
+        "BEGIN UNLOGGED BATCH UPDATE {t} SET partition_max_delete_timestamp = 1 WHERE pk = ?; "
+    );
+    let mut values = vec![Value::from(pk)];
+    for sk in deleted {
+        cql.push_str(&format!("DELETE FROM {t} WHERE pk = ? AND {col} = ?; "));
+        values.extend([Value::from(pk), sk.clone()]);
+    }
+    cql.push_str("APPLY BATCH");
+    engine
+        .session_arc()
+        .query_with_values(cql, cdrs_tokio::query::QueryValues::SimpleValues(values))
+        .await
+        .expect("emptied partition");
+}
+
+/// `column` of `system_views.<view>` for `table`'s data table: one of
+/// Cassandra's read metrics of that table, such as the `count` of
+/// `local_scan_latency` or the `max` of `tombstones_per_read`. `None` before
+/// the table's first read.
+pub async fn data_table_metric<T>(
+    engine: &CassandraEngine,
+    table: &TestTable,
+    view: &str,
+    column: &str,
+) -> Option<T>
+where
+    cdrs_tokio::types::rows::Row: cdrs_tokio::types::IntoRustByName<T>,
+{
+    use cdrs_tokio::types::IntoRustByName;
+
+    let keyspace = engine.account_keyspace(&table.key_info.account_id);
+    let name = format!("items_{}", table.key_info.table_id.replace('-', "_"));
+    let rows = engine
+        .session_arc()
+        .query_with_values(
+            format!(
+                "SELECT {column} FROM system_views.{view} \
+                 WHERE keyspace_name = ? AND table_name = ?"
+            ),
+            cdrs_tokio::query_values!(keyspace.as_str(), name.as_str()),
+        )
+        .await
+        .expect(view)
+        .response_body()
+        .expect(view)
+        .into_rows()
+        .unwrap_or_default();
+    rows.first()
+        .and_then(|row| IntoRustByName::<T>::get_by_name(row, column).expect(column))
+}
+
+/// Pages a Scan of `table` (or of one `(segment, total segments)` of it)
+/// with `limit` to the end, and returns the items in the order read.
+pub async fn scan_all(
+    engine: &CassandraEngine,
+    table: &TestTable,
+    limit: Option<i64>,
+    segment: Option<(i64, i64)>,
+) -> Vec<extenddb_core::types::Item> {
+    use extenddb_storage::DataEngine;
+
+    let (mut all, mut start) = (Vec::new(), None);
+    for _ in 0..3000 {
+        let (items, last_key) = engine
+            .scan(
+                &table.key_info,
+                limit,
+                start.as_ref(),
+                segment.map(|(s, _)| s),
+                segment.map(|(_, t)| t),
+                None,
+            )
+            .await
+            .expect("scan");
+        all.extend(items);
+        match last_key {
+            Some(k) => start = Some(k),
+            None => return all,
+        }
+    }
+    panic!("more than 3000 pages");
 }

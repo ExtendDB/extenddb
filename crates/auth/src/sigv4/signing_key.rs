@@ -11,41 +11,75 @@
 //! kSigning = HMAC(kService, "aws4_request")
 //! ```
 
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use zeroize::Zeroizing;
 
-type HmacSha256 = Hmac<Sha256>;
-
-/// Derive the `SigV4` signing key from a secret access key.
+/// Derive the `SigV4` signing key of `secret` into `out`.
+///
+/// The prefixed secret and the three intermediate keys live in `Zeroizing`
+/// buffers and are wiped before this returns. The caller passes `out` as a
+/// slot of the locked key store, or a `Zeroizing` buffer. Copies of key
+/// material this function cannot wipe are also left behind:
+///
+/// - the 32-byte array that `extenddb_core::crypto::hmac_sha256` returns for
+///   each step, and the tag its backend computes, on the stack;
+/// - copies of the key-derived state that the HMAC of each step can leave on
+///   the stack, with either backend, and on `wasm32` copies of its key as well
+///   (the README at the root of the repository this crate's manifest names,
+///   in its section "What it does not do", says what the `wasm32` backend can
+///   leave).
 ///
 /// # Arguments
-/// * `secret` — The plaintext secret access key.
-/// * `date` — Date string in `YYYYMMDD` format.
-/// * `region` — AWS region (e.g. `us-east-1`).
-/// * `service` — Service name (e.g. `dynamodb`).
+/// * `secret` - The plaintext secret access key.
+/// * `date` - Date string in `YYYYMMDD` format.
+/// * `region` - AWS region (e.g. `us-east-1`).
+/// * `service` - Service name (e.g. `dynamodb`).
+pub fn derive_signing_key_into(
+    secret: &[u8],
+    date: &str,
+    region: &str,
+    service: &str,
+    out: &mut [u8; 32],
+) {
+    let mut prefixed = Zeroizing::new(Vec::with_capacity(4 + secret.len()));
+    prefixed.extend_from_slice(b"AWS4");
+    prefixed.extend_from_slice(secret);
+    let mut k_date = Zeroizing::new([0u8; 32]);
+    hmac_sha256(&prefixed, date.as_bytes(), &mut k_date);
+    let mut k_region = Zeroizing::new([0u8; 32]);
+    hmac_sha256(&k_date[..], region.as_bytes(), &mut k_region);
+    let mut k_service = Zeroizing::new([0u8; 32]);
+    hmac_sha256(&k_region[..], service.as_bytes(), &mut k_service);
+    hmac_sha256(&k_service[..], b"aws4_request", out);
+}
+
+/// Derive the `SigV4` signing key from a secret access key, as
+/// [`derive_signing_key_into`], into a `Zeroizing` buffer.
 #[must_use]
-pub fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
-    let k_date = hmac_sha256(format!("AWS4{secret}").as_bytes(), date.as_bytes());
-    let k_region = hmac_sha256(&k_date, region.as_bytes());
-    let k_service = hmac_sha256(&k_region, service.as_bytes());
-    hmac_sha256(&k_service, b"aws4_request")
+pub fn derive_signing_key(
+    secret: &str,
+    date: &str,
+    region: &str,
+    service: &str,
+) -> Zeroizing<[u8; 32]> {
+    let mut out = Zeroizing::new([0u8; 32]);
+    derive_signing_key_into(secret.as_bytes(), date, region, service, &mut out);
+    out
 }
 
 /// Compute the final signature: HMAC-SHA256(signing_key, `string_to_sign`), hex-encoded.
 #[must_use]
-pub fn compute_signature(signing_key: &[u8], string_to_sign: &str) -> String {
-    hex::encode(hmac_sha256(signing_key, string_to_sign.as_bytes()))
+pub fn compute_signature(signing_key: &[u8; 32], string_to_sign: &str) -> String {
+    // The signature is sent on the wire, so it needs no wipe.
+    let mut mac = [0u8; 32];
+    hmac_sha256(signing_key, string_to_sign.as_bytes(), &mut mac);
+    hex::encode(mac)
 }
 
-fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    // HMAC-SHA256 accepts any key length per RFC 2104. `new_from_slice` only
-    // fails for `InvalidLength`, which cannot occur for HMAC (it hashes
-    // oversized keys). Using `expect` is safe here — an empty fallback would
-    // risk producing a predictable signing key.
-    #[allow(clippy::expect_used)]
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(data);
-    mac.finalize().into_bytes().to_vec()
+fn hmac_sha256(key: &[u8], data: &[u8], out: &mut [u8; 32]) {
+    // HMAC-SHA256 accepts a key of any length (RFC 2104). The shared crypto
+    // module chooses the backend (AWS-LC on the server, pure-Rust on wasm);
+    // what each can leave on the stack is listed on `derive_signing_key_into`.
+    out.copy_from_slice(&extenddb_core::crypto::hmac_sha256(key, data));
 }
 
 #[cfg(test)]
@@ -95,5 +129,41 @@ mod tests {
             signature,
             "5d672d79c15b13162d9279b0855cfba6789a8edb4c82c400e06b5924a6f2b5d7"
         );
+    }
+
+    /// A key derived into a caller's buffer equals the one `derive_signing_key`
+    /// returns, for the AWS test vector and the documentation example pair.
+    #[test]
+    fn derive_into_matches_derive() {
+        let cases = [
+            (
+                "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                "20150830",
+                "us-east-1",
+                "iam",
+            ),
+            (
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                "20260415",
+                "us-east-1",
+                "dynamodb",
+            ),
+            (
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                "20260416",
+                "eu-west-1",
+                "dynamodb",
+            ),
+        ];
+        for (secret, date, region, service) in cases {
+            let mut out = [0u8; 32];
+            derive_signing_key_into(secret.as_bytes(), date, region, service, &mut out);
+            // The message names the scope alone, so a failure prints no secret
+            // and no key.
+            assert!(
+                out == *derive_signing_key(secret, date, region, service),
+                "{date} {region} {service}"
+            );
+        }
     }
 }

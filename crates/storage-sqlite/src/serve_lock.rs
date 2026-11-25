@@ -12,9 +12,11 @@
 //! the process, and refuses to start if another process holds it.
 //!
 //! The commands that replace or rewrite the file take the same lock for their
-//! duration: `init` and `migrate` (through the bootstrapper's migration lock)
-//! and `destroy` (before it unlinks the file). Read-only commands (`settings`,
-//! `manage`, `verify`, `status`, ...) do not, and run alongside a server.
+//! duration: `init` and `migrate --yes` (through the migration runner's
+//! `migrations::lock_for_migration`, which retries until its timeout) and
+//! `destroy` (before it unlinks the file). Read-only commands (`settings`,
+//! `manage`, `verify`, `status`, the `migrate` preview, ...) do not, and run
+//! alongside a server.
 //!
 //! The lock file is named after the file SQLite actually opens, not after the
 //! configured string: the location is parsed exactly as sqlx parses it
@@ -30,7 +32,10 @@
 //! options; a database on NFS or similar is outside what this check promises.
 
 use std::fs::File;
-use std::path::{Path, PathBuf};
+// Only the lock-taking code below names `Path`; wasm32 compiles none of it.
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::Path;
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use sqlx::sqlite::SqliteConnectOptions;
@@ -99,13 +104,28 @@ pub(crate) fn database_file(location: &str) -> Result<Option<PathBuf>, String> {
     Ok(Some(PathBuf::from(path)))
 }
 
+/// Why [`ServeLock::try_acquire`] did not take the lock.
+// Off wasm32 with `ServeLock::try_acquire`, which returns it.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+pub(crate) enum LockFailure {
+    /// Another process holds it.
+    Held(String),
+    /// The lock file could not be opened or locked.
+    Failed(String),
+}
+
 /// Holds the lock until dropped.
 #[derive(Debug)]
 pub(crate) struct ServeLock {
     _file: File,
+    // Set and read only by the lock-taking code below.
+    #[cfg(not(target_arch = "wasm32"))]
     path: PathBuf,
 }
 
+// Called by the server, the CLI and the file-database migrations only.
+#[cfg(not(target_arch = "wasm32"))]
 impl ServeLock {
     /// Path of the lock file for a database file: `<canonical db path>.lock`.
     ///
@@ -145,6 +165,14 @@ impl ServeLock {
     /// lock file cannot be opened (for example, the database's directory is
     /// not writable; the lock file lives next to the database).
     pub(crate) fn acquire(db_path: &Path) -> Result<Self, String> {
+        Self::try_acquire(db_path).map_err(|failure| match failure {
+            LockFailure::Held(m) | LockFailure::Failed(m) => m,
+        })
+    }
+
+    /// As [`ServeLock::acquire`], telling a lock another process holds from
+    /// any other failure.
+    pub(crate) fn try_acquire(db_path: &Path) -> Result<Self, LockFailure> {
         let path = Self::lock_path(db_path);
         let file = open_options_0600()
             .read(true)
@@ -153,11 +181,11 @@ impl ServeLock {
             .truncate(false)
             .open(&path)
             .map_err(|e| {
-                format!(
+                LockFailure::Failed(format!(
                     "cannot open lock file {}: {e} (the directory holding a SQLite database \
                      must be writable so the server can create its lock file)",
                     path.display()
-                )
+                ))
             })?;
         // The database and its sidecars are 0600 so other local users cannot
         // read secrets out of them. The lock file must match: flock needs
@@ -165,17 +193,17 @@ impl ServeLock {
         // user hold the lock and keep the server from starting. `create`
         // honours the umask, and the file may predate this rule, so set the
         // mode explicitly on every open.
-        restrict_to_owner(&file, &path)?;
+        restrict_to_owner(&file, &path).map_err(LockFailure::Failed)?;
         try_lock_exclusive(&file).map_err(|e| {
             if e.kind() == std::io::ErrorKind::WouldBlock {
-                format!(
+                LockFailure::Held(format!(
                     "another extenddb process is already using {} (lock held on {}); \
                      stop it first, or point this command at a different database",
                     db_path.display(),
                     path.display()
-                )
+                ))
             } else {
-                format!("cannot lock {}: {e}", path.display())
+                LockFailure::Failed(format!("cannot lock {}: {e}", path.display()))
             }
         })?;
         Ok(Self { _file: file, path })
@@ -195,6 +223,15 @@ impl ServeLock {
         }
     }
 
+    /// As [`ServeLock::acquire_for_location`], telling a lock another
+    /// process holds from any other failure.
+    pub(crate) fn try_acquire_for_location(location: &str) -> Result<Option<Self>, LockFailure> {
+        match database_file(location).map_err(LockFailure::Failed)? {
+            Some(path) => Self::try_acquire(&path).map(Some),
+            None => Ok(None),
+        }
+    }
+
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
@@ -203,6 +240,8 @@ impl ServeLock {
 /// Follow symlinks along `path` as far as they go, by hand. `canonicalize`
 /// refuses a path whose final target does not exist; this returns that
 /// target instead, so a dangling link still names the file it will become.
+// Off wasm32 with `ServeLock::lock_path`, its only caller.
+#[cfg(not(target_arch = "wasm32"))]
 fn resolve_dangling_symlinks(path: &Path) -> PathBuf {
     let mut current = path.to_path_buf();
     // Bounded like the kernel's own symlink-loop limit.
@@ -231,7 +270,8 @@ fn open_options_0600() -> std::fs::OpenOptions {
     options
 }
 
-#[cfg(not(unix))]
+// Off wasm32 with `ServeLock::try_acquire`, its only caller.
+#[cfg(not(any(unix, target_arch = "wasm32")))]
 fn open_options_0600() -> std::fs::OpenOptions {
     std::fs::OpenOptions::new()
 }
@@ -243,7 +283,8 @@ fn restrict_to_owner(file: &File, path: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot set the mode of lock file {}: {e}", path.display()))
 }
 
-#[cfg(not(unix))]
+// Off wasm32 with `ServeLock::try_acquire`, its only caller.
+#[cfg(not(any(unix, target_arch = "wasm32")))]
 fn restrict_to_owner(_file: &File, _path: &Path) -> Result<(), String> {
     Ok(())
 }
@@ -262,7 +303,8 @@ fn try_lock_exclusive(file: &File) -> std::io::Result<()> {
     }
 }
 
-#[cfg(not(unix))]
+// Off wasm32 with `ServeLock::try_acquire`, its only caller.
+#[cfg(not(any(unix, target_arch = "wasm32")))]
 fn try_lock_exclusive(_file: &File) -> std::io::Result<()> {
     tracing::warn!(
         "no file lock is taken on this platform: nothing prevents a second extenddb \
