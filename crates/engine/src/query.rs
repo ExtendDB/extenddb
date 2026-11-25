@@ -115,9 +115,24 @@ pub async fn handle_query(
         ));
     }
 
+    // A key condition with no equality on the HASH attribute of the key schema
+    // queried skips the Select index check and the classification below, and
+    // `refuse_without_hash_equality` refuses it. Legacy KeyConditions always
+    // has that equality, or its desugar below refuses it.
+    let queried_key_schema = index_info
+        .as_ref()
+        .map_or(&key_info.key_schema, |idx| &idx.key_schema);
+    let lacks_hash_equality = matches!(
+        &key_condition_expression,
+        Some(Ok(kc)) if kc.lacks_hash_equality(queried_key_schema, &maps.names)
+    );
+
     // Select=ALL_ATTRIBUTES requires an ALL-projection GSI (shared with Scan).
     // With an ExclusiveStartKey this runs after the start key checks below.
-    if input.exclusive_start_key.is_none() {
+    // The service refuses a key condition with no HASH equality first
+    // (measured 2026-11-24: `g > :a` on a KEYS_ONLY index answers `Query key
+    // condition not supported`).
+    if input.exclusive_start_key.is_none() && !lacks_hash_equality {
         validate_query_select_index_support(input.select, index_info.as_ref())?;
     }
 
@@ -233,7 +248,7 @@ pub async fn handle_query(
     // invalid Select are reported ahead of it, and an unused value and an
     // invalid FilterExpression ahead of a wrong-typed value in its clause on
     // the HASH attribute). See `refuse_without_hash_equality`.
-    if !key_condition.lacks_hash_equality(&query_key_info.key_schema, &effective_maps.names) {
+    if !lacks_hash_equality {
         key_condition.resolve_key_schema_with(
             &query_key_info.key_schema,
             &effective_maps.names,
