@@ -24,9 +24,10 @@ const LIST_PAGE: i32 = 100;
 ///
 /// The service reports a taken name ahead of any limit (measured), so a name
 /// the account already holds is left for the backend to refuse. After that,
-/// the capacity a provisioned table asks for, then the table quota. Two
-/// concurrent requests can both pass the quota with one slot left, so an
-/// account can end one table over it.
+/// the capacity a provisioned table asks for, then the table quota.
+/// Concurrent requests can each pass the quota with one slot left, so the
+/// account can end over it by one table fewer than the number of those
+/// requests.
 ///
 /// # Errors
 ///
@@ -125,3 +126,7 @@ async fn reserved_capacity(
     }
     Ok(reserved)
 }
+
+#[cfg(test)]
+#[path = "table_limits_tests.rs"]
+mod tests;

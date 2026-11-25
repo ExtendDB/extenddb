@@ -17,9 +17,7 @@ use serde_json::Value;
 
 use super::ManagementState;
 use super::auth::authenticate_admin;
-use super::crypto::{
-    encrypt_secret, generate_secret_key, generate_session_key_id, generate_session_token,
-};
+use super::crypto::{generate_secret_key, generate_session_key_id, generate_session_token};
 use extenddb_auth::policy::arn_value::{
     fail_closed_trust_arn_value, invalid_trust_arn_value, trust_arn_value_message,
 };
@@ -28,6 +26,7 @@ use extenddb_auth::policy::context::AssumeRoleContext;
 use extenddb_auth::policy::document::{
     Condition, PolicyDocument, PolicyParseError, parse_conditions,
 };
+use extenddb_storage::secret_keys::SecretRow;
 
 #[derive(Deserialize)]
 pub struct AssumeRoleRequest {
@@ -228,11 +227,11 @@ pub async fn assume_role(
 /// that does not load, such as one with a malformed CIDR or one over the size
 /// limit the request path parses it with, made every request with those
 /// credentials fail. A session policy with such an Arn value worked, and
-/// AssumeRole now refuses it for parity with the identity write check. The
+/// `AssumeRole` now refuses it for parity with the identity write check. The
 /// `Version` and `Sid` checks of a policy write do not apply, so a session
-/// policy that AssumeRole accepted for those keeps getting credentials. What
+/// policy that `AssumeRole` accepted for those keeps getting credentials. What
 /// STS answers for these session policies was not measured; the text after
-/// the code is ExtendDB's own.
+/// the code is `ExtendDB`'s own.
 fn check_session_policy(session_policy: &Value, max_bytes: usize) -> Result<(), String> {
     PolicyDocument::from_json_for_session_policy(&session_policy.to_string(), max_bytes)
         .map(|_| ())
@@ -291,39 +290,39 @@ async fn generate_and_store_session(
     request: &AssumeRoleRequest,
     caller_arn: &str,
 ) -> Response {
-    // P119: Use cached encryption key if available, fall back to DB query.
-    let enc_key_b64: String =
-        if let Some(k) = extenddb_storage::CatalogStore::cached_encryption_key(store) {
-            k
-        } else {
-            match store.get_setting("encryption_key").await {
-                Ok(Some(k)) => k,
-                Ok(None) => {
-                    tracing::error!("Management API: encryption key not found in settings");
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                }
-                Err(e) => {
-                    tracing::error!("Management API: fetch encryption key failed: {e:?}");
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                }
-            }
-        };
+    // The store's one key holder (RFC-0000 section 6.2): the catalog key or
+    // the DEK. A store opened without a key creates no credential.
+    let Some(keys) = extenddb_storage::CatalogStore::secret_keys(store) else {
+        tracing::error!("Management API: the catalog store holds no encryption key");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
 
     // Generate ASIA* temporary credentials.
     let access_key_id = generate_session_key_id();
     let secret_key = generate_secret_key();
     let session_token = generate_session_token();
 
-    let encrypted = match encrypt_secret(&secret_key, &enc_key_b64, &access_key_id) {
+    // Fixed before the encrypt, in whole seconds: the AAD of a secret under a
+    // DEK binds `expires_at` in whole Unix seconds (RFC-0000 section 5), and
+    // the row stores the same value.
+    let expires_at =
+        time::OffsetDateTime::now_utc() + time::Duration::seconds(request.duration_seconds);
+    let expires_at = expires_at.replace_nanosecond(0).unwrap_or(expires_at);
+
+    let row = SecretRow::session(
+        &access_key_id,
+        account_id,
+        role_name,
+        &request.session_name,
+        expires_at.unix_timestamp(),
+    );
+    let encrypted = match keys.encrypt(&row, &secret_key) {
         Ok(e) => e,
         Err(msg) => {
             tracing::error!("Management API: encrypt session secret failed: {msg}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-
-    let expires_at =
-        time::OffsetDateTime::now_utc() + time::Duration::seconds(request.duration_seconds);
 
     match store
         .store_session(

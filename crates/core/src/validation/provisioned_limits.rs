@@ -15,7 +15,8 @@
 use crate::error::DynamoDbError;
 use crate::limits::LimitsConfig;
 use crate::types::{
-    BillingMode, CreateTableInput, ProvisionedThroughput, TableDescription, UpdateTableInput,
+    BillingMode, CreateTableInput, ProvisionedThroughput, ProvisionedThroughputDescription,
+    TableDescription, UpdateTableInput,
 };
 
 /// The closing sentence of every provisioned-capacity refusal.
@@ -46,6 +47,13 @@ impl CapacityUnits {
     }
 
     fn of(throughput: &ProvisionedThroughput) -> Self {
+        Self {
+            read: throughput.read_capacity_units,
+            write: throughput.write_capacity_units,
+        }
+    }
+
+    fn of_description(throughput: &ProvisionedThroughputDescription) -> Self {
         Self {
             read: throughput.read_capacity_units,
             write: throughput.write_capacity_units,
@@ -85,19 +93,21 @@ impl Unit {
     }
 
     fn table_max(self, limits: &LimitsConfig) -> i64 {
-        let max = match self {
-            Self::Read => limits.per_table_max_rcu,
-            Self::Write => limits.per_table_max_wcu,
-        };
-        i64::try_from(max).unwrap_or(i64::MAX)
+        self.limit(limits.per_table_max_rcu, limits.per_table_max_wcu)
     }
 
     fn account_max(self, limits: &LimitsConfig) -> i64 {
-        let max = match self {
-            Self::Read => limits.per_account_max_rcu,
-            Self::Write => limits.per_account_max_wcu,
+        self.limit(limits.per_account_max_rcu, limits.per_account_max_wcu)
+    }
+
+    /// `read` or `write`, whichever this unit is, as an `i64`. A limit above
+    /// `i64::MAX` is `i64::MAX`.
+    fn limit(self, read: u64, write: u64) -> i64 {
+        let limit = match self {
+            Self::Read => read,
+            Self::Write => write,
         };
-        i64::try_from(max).unwrap_or(i64::MAX)
+        i64::try_from(limit).unwrap_or(i64::MAX)
     }
 }
 
@@ -130,18 +140,12 @@ pub fn table_capacity(desc: &TableDescription) -> CapacityUnits {
     if is_on_demand(desc) {
         return CapacityUnits::default();
     }
-    let table = CapacityUnits {
-        read: desc.provisioned_throughput.read_capacity_units,
-        write: desc.provisioned_throughput.write_capacity_units,
-    };
+    let table = CapacityUnits::of_description(&desc.provisioned_throughput);
     desc.global_secondary_indexes
         .iter()
         .flatten()
         .filter_map(|gsi| gsi.provisioned_throughput.as_ref())
-        .map(|t| CapacityUnits {
-            read: t.read_capacity_units,
-            write: t.write_capacity_units,
-        })
+        .map(CapacityUnits::of_description)
         .fold(table, CapacityUnits::saturating_add)
 }
 
@@ -195,10 +199,7 @@ pub fn update_table_capacity(
             .any(|d| d.index_name == name)
     };
     let table = input.provisioned_throughput.as_ref().map_or(
-        CapacityUnits {
-            read: existing.provisioned_throughput.read_capacity_units,
-            write: existing.provisioned_throughput.write_capacity_units,
-        },
+        CapacityUnits::of_description(&existing.provisioned_throughput),
         CapacityUnits::of,
     );
     let kept = existing
@@ -207,10 +208,7 @@ pub fn update_table_capacity(
         .flatten()
         .filter(|gsi| !deleted(&gsi.index_name))
         .filter_map(|gsi| gsi.provisioned_throughput.as_ref())
-        .map(|t| CapacityUnits {
-            read: t.read_capacity_units,
-            write: t.write_capacity_units,
-        });
+        .map(CapacityUnits::of_description);
     let created = updates
         .iter()
         .filter_map(|u| u.create.as_ref())
@@ -319,7 +317,9 @@ pub fn check_table_capacity_bounds(pt: &ProvisionedThroughput) -> Result<(), Dyn
 /// `reserved` is what the account holds now, including `current`, what this
 /// table and its indexes hold now, which `after` replaces. A unit the request
 /// does not raise is not refused, so a table can still be lowered after an
-/// operator lowers a maximum below what it holds.
+/// operator lowers a maximum below what it holds. An on-demand table holds no
+/// units, whatever figures it kept from before its switch, so every figure of
+/// a switch back to `PROVISIONED` is a raise.
 ///
 /// # Errors
 ///
@@ -334,9 +334,10 @@ pub fn check_update_table_capacity(
 ) -> Result<(), DynamoDbError> {
     if let Some(request) = table_request {
         let requested = CapacityUnits::of(request);
-        let held = CapacityUnits {
-            read: existing.provisioned_throughput.read_capacity_units,
-            write: existing.provisioned_throughput.write_capacity_units,
+        let held = if is_on_demand(existing) {
+            CapacityUnits::default()
+        } else {
+            CapacityUnits::of_description(&existing.provisioned_throughput)
         };
         for unit in Unit::BOTH {
             let max = unit.table_max(limits);

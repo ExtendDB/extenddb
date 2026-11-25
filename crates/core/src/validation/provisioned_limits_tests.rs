@@ -6,10 +6,7 @@
 //! were both 150,000 read and 200,000 write units, holding 61 and 46.
 
 use super::*;
-use crate::types::{
-    BillingModeSummary, GsiDescription, Projection, ProjectionType,
-    ProvisionedThroughputDescription,
-};
+use crate::types::{BillingModeSummary, GsiDescription, Projection, ProjectionType};
 use serde_json::json;
 
 const REGION: &str = "us-east-1";
@@ -213,28 +210,29 @@ fn create_table_at_each_maximum_is_accepted_and_one_above_is_refused() {
          account in us-east-1. Per table maximum: 40000. Refer to the Amazon DynamoDB \
          Developer Guide for current limits and how to request higher limits."
     );
-    assert!(
+    assert_eq!(
         refusal(check_create_table_capacity(
             units(1, 40_001),
             CapacityUnits::default(),
             &limits,
             REGION
-        ))
-        .starts_with("The requested WriteCapacityUnits, 40001, is above the per table maximum")
+        )),
+        "The requested WriteCapacityUnits, 40001, is above the per table maximum for the \
+         account in us-east-1. Per table maximum: 40000. Refer to the Amazon DynamoDB \
+         Developer Guide for current limits and how to request higher limits."
     );
     // One unit over the account maximum, the table under its own.
-    assert!(
+    assert_eq!(
         refusal(check_create_table_capacity(
             units(40_000, 1),
             units(40_001, 0),
             &limits,
             REGION
-        ))
-        .starts_with(
-            "This request would have caused the ReadCapacityUnits limit to be exceeded for the \
-             account in us-east-1. Current ReadCapacityUnits reserved by the account: 40001. \
-             Limit: 80000. Requested: 40000."
-        )
+        )),
+        "This request would have caused the ReadCapacityUnits limit to be exceeded for the \
+         account in us-east-1. Current ReadCapacityUnits reserved by the account: 40001. \
+         Limit: 80000. Requested: 40000. Refer to the Amazon DynamoDB Developer Guide for \
+         current limits and how to request higher limits."
     );
 }
 
@@ -254,19 +252,23 @@ fn update_table_at_each_maximum_is_accepted_and_one_above_is_refused() {
         )
     };
     check(40_000, 40_000, units(10, 10)).expect("at the per-table maximum");
-    assert!(
-        refusal(check(40_001, 10, units(10, 10)))
-            .starts_with("The requested ReadCapacityUnits, 40001, is above the per table maximum")
+    assert_eq!(
+        refusal(check(40_001, 10, units(10, 10))),
+        "The requested ReadCapacityUnits, 40001, is above the per table maximum for the \
+         account in us-east-1. Per table maximum: 40000. Refer to the Amazon DynamoDB \
+         Developer Guide for current limits and how to request higher limits."
     );
     // The account holds 70,000 including this table's 10: raising it to 10,010
     // fills the account to 80,000, and 10,011 takes it one over.
     check(10_010, 10, units(70_000, 10)).expect("at the account maximum");
-    assert!(refusal(check(10_011, 10, units(70_000, 10))).starts_with(
+    assert_eq!(
+        refusal(check(10_011, 10, units(70_000, 10))),
         "This request would have caused the ReadCapacityUnits limit to be exceeded for the \
-             account in us-east-1. Current ReadCapacityUnits reserved by the account: 70000. \
-             Limit: 80000. Current ReadCapacityUnits provisioned for the table and indexes: 10. \
-             Requested: 10011."
-    ));
+         account in us-east-1. Current ReadCapacityUnits reserved by the account: 70000. \
+         Limit: 80000. Current ReadCapacityUnits provisioned for the table and indexes: 10. \
+         Requested: 10011. Refer to the Amazon DynamoDB Developer Guide for current limits \
+         and how to request higher limits."
+    );
 }
 
 #[test]
@@ -289,6 +291,34 @@ fn a_table_above_a_lowered_maximum_can_still_be_lowered() {
         REGION,
     )
     .expect("a decrease is not refused");
+    // An on-demand table keeps the figures it held before the switch, and
+    // holds none of them: a switch back to PROVISIONED at 300 raises it above
+    // the per-table maximum. The account maximum admits the 300.
+    let account_admits = LimitsConfig {
+        per_account_max_rcu: 2_000,
+        per_account_max_wcu: 2_000,
+        ..limits
+    };
+    let on_demand = TableDescription {
+        billing_mode_summary: Some(BillingModeSummary {
+            billing_mode: BillingMode::PayPerRequest,
+            last_update_to_pay_per_request_date_time: None,
+        }),
+        ..table(500, 500, Vec::new())
+    };
+    assert_eq!(
+        refusal(check_update_table_capacity(
+            Some(&request),
+            &on_demand,
+            units(1_000, 1_000),
+            units(300, 300),
+            &account_admits,
+            REGION,
+        )),
+        "The requested ReadCapacityUnits, 300, is above the per table maximum for the account \
+         in us-east-1. Per table maximum: 100. Refer to the Amazon DynamoDB Developer Guide for \
+         current limits and how to request higher limits."
+    );
 }
 
 #[test]

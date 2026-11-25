@@ -404,6 +404,21 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         tracing::warn!("{}", warning.log_message());
     }
 
+    // The key the factory loads (RFC-0000 section 7). With `[auth.encryption]
+    // key_file` set it is the KEK, read through the file rule; the factory's
+    // loader unwraps the ring's DEK with it and drops it, which wipes it.
+    let key_file = app_config.auth.encryption.key_file_path();
+    let key_source =
+        crate::key_file::key_source(&app_config.auth.encryption).map_err(anyhow::Error::msg)?;
+    // Before the factory, which puts the key in the store.
+    let workers = tokio::runtime::Handle::current().metrics().num_workers();
+    let protection = crate::key_file::init_key_store(
+        key_file.is_some(),
+        app_config.auth.encryption.require_locked_memory,
+        crate::key_file::serve_slots(app_config.auth.cache.max_entries, workers),
+    )
+    .map_err(anyhow::Error::msg)?;
+
     // Create server components via factory pattern. Dev mode asks the backend
     // to bootstrap an uninitialized catalog at serve time (zero-config use).
     let mut component_options =
@@ -413,6 +428,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     component_options.max_item_size_bytes = app_config.limits.max_item_size_bytes;
     component_options.release = build.version;
     component_options.max_concurrent_jobs = app_config.backup.max_concurrent_jobs;
+    component_options.key_source = key_source;
 
     // Wire the node's own bind address as the instance ID so each ExtendDB node
     // has a distinct node ID (to support logical clocks for sequences, etc.).
@@ -440,6 +456,28 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         }
         Err(other) => return Err(other.into()),
     };
+    // The options and the KEK they carried are dropped: the KEK is wiped.
+    // The catalog key warning is serve's alone, so the commands that open the
+    // catalog through the same factory print nothing new.
+    match key_file.as_deref() {
+        None => tracing::warn!(
+            "The stored secrets are encrypted under the catalog key, which the catalog holds, \
+             so a copy of the catalog decrypts every stored secret. `extenddb encryption-key \
+             switch --key-file <path>` moves the key to a KEK file outside the catalog."
+        ),
+        Some(path) => {
+            if let Some(database) = app_config.storage.database_file()
+                && crate::key_file::same_file_system(std::path::Path::new(path), &database)
+            {
+                tracing::warn!(
+                    "The KEK file {path} and the database file {} are on the same file \
+                     system, so one snapshot of it holds the key ring and the KEK that opens \
+                     it. Keep the KEK file on another file system.",
+                    database.display()
+                );
+            }
+        }
+    }
 
     let storage = components.engine;
     let catalog_store = components.catalog_store;
@@ -519,20 +557,28 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
 
     // Phase 2: Wrap the raw credential store. In pass-through mode the
     // wrapper bypasses the cache and forwards every lookup to the inner
-    // store; otherwise it caches per the TOML config.
+    // store; otherwise it caches per the TOML config. The cache derives
+    // signing keys for the server's region and reserves one temporary
+    // buffer per runtime worker thread (RFC-0000 section 6.1).
+    let region = app_config.server.region.as_str();
     let cached_cred_store = Arc::new(if cache_enabled {
-        extenddb_auth::CachedCredentialStore::with_arc(cred_store, make_cache_cfg("credential"))
+        extenddb_auth::CachedCredentialStore::with_arc(
+            cred_store,
+            make_cache_cfg("credential"),
+            region,
+            workers,
+        )
     } else {
         extenddb_auth::CachedCredentialStore::pass_through_arc(
             cred_store,
             make_cache_cfg("credential"),
+            region,
+            workers,
         )
     });
-    let auth: Arc<dyn extenddb_auth::AuthProvider> =
-        Arc::new(extenddb_auth::BuiltinAuthProvider::new(
-            (*cached_cred_store).clone(),
-            app_config.server.region.as_str(),
-        ));
+    let auth: Arc<dyn extenddb_auth::AuthProvider> = Arc::new(
+        extenddb_auth::BuiltinAuthProvider::new((*cached_cred_store).clone()),
+    );
 
     // Phase 3: Build the authorization cache.
     let authz_cache: Arc<crate::CachedAuthzStore> = {
@@ -580,10 +626,11 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         .and_then(|h| h.backend_info())
         .unwrap_or_else(|| "(unknown)".to_owned());
 
-    // REQ-LOG-001: Startup banner with effective configuration.
+    // REQ-LOG-001: Startup banner with effective configuration, and the
+    // protection of the locked key store (RFC-0000 section 6.2).
     // REQ-LOG-002: Connection strings redact passwords.
     tracing::info!(
-        "extenddb {} (catalog {}) starting — bind={}:{}, region={}, auth={}, catalog_db={}, data_db={}, log_output={}, log_level={}",
+        "extenddb {} (catalog {}) starting — bind={}:{}, region={}, auth={}, catalog_db={}, data_db={}, log_output={}, log_level={}, key_store={}",
         build.version,
         catalog_version,
         app_config.server.bind_addr,
@@ -594,6 +641,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         data_db_info,
         log_target.label(),
         app_config.logging.level,
+        protection,
     );
 
     // Convert pre-bound std listener to tokio (D-4: bind before fork).

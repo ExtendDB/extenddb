@@ -151,7 +151,7 @@ impl PolicyDocument {
     /// The server parses with the configured `max_policy_document_bytes`
     /// instead, through [`Self::from_json_with_size_limit`] on the read path,
     /// [`Self::from_json_for_write`] on the write path and
-    /// [`Self::from_json_for_session_policy`] at AssumeRole.
+    /// [`Self::from_json_for_session_policy`] at `AssumeRole`.
     ///
     /// # Errors
     ///
@@ -235,7 +235,7 @@ impl PolicyDocument {
     /// limit, is refused when the session is issued. The `Version`, `Sid` and
     /// `${...}` reference checks of `from_json_for_write` do not run: a
     /// session policy with another `Version`, such a `Sid` or such a reference
-    /// loads and evaluates on the request path, and AssumeRole accepted one
+    /// loads and evaluates on the request path, and `AssumeRole` accepted one
     /// before. What STS answers for these session policies was not measured.
     ///
     /// # Errors

@@ -786,28 +786,12 @@ pub async fn isolated_queue_keyspace(isolated: &IsolatedEngine) -> String {
     keyspace
 }
 
-/// The account keyspaces on `isolated`'s prefix, in the order the GSI
-/// workers read them (`system_schema` order).
+/// The account keyspaces on `isolated`'s prefix, in the order the GSI workers
+/// read them (`system_schema` order).
 pub async fn isolated_account_keyspaces(isolated: &IsolatedEngine) -> Vec<String> {
-    use cdrs_tokio::types::IntoRustByName as _;
-    let prefix = format!("{}_account_", isolated.config.keyspace_prefix);
-    isolated
-        .engine
-        .session()
-        .query("SELECT keyspace_name FROM system_schema.keyspaces")
+    extenddb_storage_cassandra::workers::list_account_keyspaces_for_tests(&isolated.engine)
         .await
         .unwrap()
-        .response_body()
-        .unwrap()
-        .into_rows()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|row| {
-            let name: Result<String, _> = row.get_r_by_name("keyspace_name");
-            name.ok()
-        })
-        .filter(|name| name.starts_with(&prefix))
-        .collect()
 }
 
 /// Create a migrated account on `isolated`'s prefix, registered in its
@@ -881,6 +865,76 @@ pub fn create_catalog_store(
         config.datacenter.clone(),
         config.replication_factor,
     )
+}
+
+/// [`create_catalog_store`] with a new catalog key, for the tests that
+/// create access keys or store sessions.
+pub fn create_keyed_catalog_store(
+    engine: &CassandraEngine,
+    config: &CassandraStorageConfig,
+) -> CassandraCatalogStore {
+    let key = extenddb_storage::bootstrapper::helpers::generate_encryption_key().expect("a key");
+    let keys = extenddb_storage::secret_keys::SecretKeys::catalog_key(&key).expect("a key holder");
+    create_catalog_store(engine, config).with_secret_keys(Some(Arc::new(keys)))
+}
+
+/// Whether the cluster has one node. `system.paxos` is local to each node,
+/// so a test that reads it needs a cluster of one node.
+pub async fn is_one_node_cluster(engine: &CassandraEngine) -> bool {
+    extenddb_storage_cassandra::cassandra_util::system_read::<extenddb_storage::error::StorageError>(
+        &engine.session_arc(),
+        "SELECT peer FROM system.peers",
+        cdrs_tokio::query_values!(),
+        "count the peers",
+    )
+    .await
+    .expect("read system.peers")
+    .is_empty()
+}
+
+/// The id of the last Paxos commit that the node saved for partition `pk` of
+/// `keyspace.table`. The result is `None` when the node holds no Paxos state
+/// for that partition.
+///
+/// An LWT on the partition saves a new id. A plain write does not change it.
+/// The row in `system.paxos` is found by table id and partition key, so rows
+/// that other tests write do not change the result. Use it on a one-node
+/// cluster only (see [`is_one_node_cluster`]).
+pub async fn paxos_last_commit(
+    engine: &CassandraEngine,
+    keyspace: &str,
+    table: &str,
+    pk: &str,
+) -> Option<uuid::Uuid> {
+    use cdrs_tokio::types::IntoRustByName as _;
+    use extenddb_storage::error::StorageError;
+    use extenddb_storage_cassandra::cassandra_util::{get_column, system_read};
+
+    let session = engine.session_arc();
+    let ids = system_read::<StorageError>(
+        &session,
+        "SELECT id FROM system_schema.tables WHERE keyspace_name = ? AND table_name = ?",
+        cdrs_tokio::query_values!(keyspace, table),
+        "table id",
+    )
+    .await
+    .expect("read the table id");
+    let table_id: uuid::Uuid =
+        get_column::<_, StorageError>(&ids[0], "id", "table id").expect("the table id");
+    // `(text)` picks one of two `textAsBlob` overloads, as Cassandra needs.
+    let rows = system_read::<StorageError>(
+        &session,
+        "SELECT most_recent_commit_at FROM system.paxos \
+         WHERE row_key = textAsBlob((text) ?) AND cf_id = ?",
+        cdrs_tokio::query_values!(pk, table_id),
+        "last Paxos commit",
+    )
+    .await
+    .expect("read system.paxos");
+    rows.first().and_then(|row| {
+        row.get_by_name("most_recent_commit_at")
+            .expect("read most_recent_commit_at")
+    })
 }
 
 /// Helper: insert an item then manually set its `prepared_txn_id` via raw CQL,
