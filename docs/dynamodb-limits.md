@@ -15,12 +15,12 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 
 | Limit | DynamoDB Value | Status | Notes |
 |-------|---------------|--------|-------|
-| Per-table RCU (provisioned) | 40,000 | Enforced | `LimitsConfig::per_table_max_rcu`, configurable |
-| Per-table WCU (provisioned) | 40,000 | Enforced | `LimitsConfig::per_table_max_wcu`, configurable |
+| Per-table RCU (provisioned) | 40,000 | Partial | `LimitsConfig::per_table_max_rcu`, configurable. CreateTable and UpdateTable check it. RestoreTableFromBackup and ImportTable do not check it. |
+| Per-table WCU (provisioned) | 40,000 | Partial | `LimitsConfig::per_table_max_wcu`, configurable. CreateTable and UpdateTable check it. RestoreTableFromBackup and ImportTable do not check it. |
 | Per-table read request units (on-demand) | 40,000 | N/A | ExtendDB does not throttle on-demand reads |
 | Per-table write request units (on-demand) | 40,000 | N/A | ExtendDB does not throttle on-demand writes |
-| Per-account RCU (provisioned) | 80,000 | Enforced | `LimitsConfig::per_account_max_rcu`, configurable |
-| Per-account WCU (provisioned) | 80,000 | Enforced | `LimitsConfig::per_account_max_wcu`, configurable |
+| Per-account RCU (provisioned) | 80,000 | Partial | `LimitsConfig::per_account_max_rcu`, configurable. CreateTable and UpdateTable check it. RestoreTableFromBackup and ImportTable do not check it. |
+| Per-account WCU (provisioned) | 80,000 | Partial | `LimitsConfig::per_account_max_wcu`, configurable. CreateTable and UpdateTable check it. RestoreTableFromBackup and ImportTable do not check it. |
 | Minimum throughput per table/GSI | 1 RCU / 1 WCU | Enforced | `validate_provisioned_throughput` rejects < 1 |
 | Provisioned capacity decrease limit | 27 per day (4 + 1/hour) | Not enforced | No decrease tracking implemented |
 | Reserved capacity per account | 1,000,000 units | N/A | ExtendDB has no reserved capacity concept |
@@ -29,7 +29,7 @@ Source: [AWS DynamoDB Service Quotas](https://docs.aws.amazon.com/amazondynamodb
 
 | Limit | DynamoDB Value | Status | Notes |
 |-------|---------------|--------|-------|
-| Maximum tables per account per region | 2,500 (adjustable to 10,000) | Enforced | `LimitsConfig::max_tables_per_account`, configurable |
+| Maximum tables per account per region | 2,500 (adjustable to 10,000) | Partial | `LimitsConfig::max_tables_per_account`, configurable. CreateTable checks it. RestoreTableFromBackup and ImportTable do not check it. |
 | Table size | No practical limit | Enforced | ExtendDB has no table size limit |
 | Table name length | 3–255 characters | Enforced | `validate_table_name`, `LimitsConfig` |
 | Table name character set | `[a-zA-Z0-9_.-]` | Enforced | `validate_table_name_chars` |
