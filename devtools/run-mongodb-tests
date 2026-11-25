@@ -50,7 +50,7 @@
 #   devtools/run-mongodb-tests
 #   devtools/run-mongodb-tests -- --pytest --filter test_put_item
 #   devtools/run-mongodb-tests --keep -- --pytest --filter test_rfc0003
-#   devtools/run-mongodb-tests --rust-live -- --rust --rust-integration
+#   devtools/run-mongodb-tests --rust-live -- --rust-integration
 #   devtools/run-mongodb-tests --backup-store none -- --pytest --filter test_mongodb_backup_restore
 #
 # Prerequisites:
