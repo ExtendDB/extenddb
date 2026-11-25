@@ -439,8 +439,10 @@ to 50 conditions, one `=` on the index's HASH attribute among them. A condition 
 an inline filter attribute takes `=`, `<>`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN`,
 `attribute_exists` or `attribute_not_exists`, and conditions combine with `AND`,
 `OR`, `NOT` and parentheses. The
-`search_inequality_filters` runtime setting can limit the conditions other than
-an AND of equalities to a list of accounts, or turn them off.
+`search_inequality_filters` runtime setting can limit this grammar to a list of
+accounts, or turn it off. Without it, a condition is an AND of at most 19
+equalities, one per attribute, each written as `attribute = :value`, and a Number
+compares exactly.
 
 Four things are worth knowing before building on it.
 
