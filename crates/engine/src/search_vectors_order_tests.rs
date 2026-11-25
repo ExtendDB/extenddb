@@ -8,7 +8,8 @@
 //! `ExpressionAttributeValues` or `ExpressionAttributeNames` answers
 //! "<map> must not be empty" against a missing table and with a two-element
 //! `SearchVector` on a four-dimension index; with valid maps the same
-//! requests answer ResourceNotFoundException and the dimension message.
+//! requests answer ResourceNotFoundException and the dimension message. The
+//! combined size check answers ahead of a missing table too.
 
 use std::time::Duration;
 
@@ -160,5 +161,36 @@ async fn an_empty_map_answers_before_a_dimension_mismatch() {
             &mismatch
         ),
         "{mismatch:?}"
+    );
+}
+
+/// The combined size of the condition and its substitutions counts a name at
+/// each use, and answers ahead of the table lookup. Measured on DynamoDB in
+/// us-east-1 on 2026-11-25 on a table name that does not exist, each request
+/// twice with the same answer: one 65,533-byte name `#x0` in 17 conditions
+/// `#x0 = :s AND ...` (1,114,277 bytes) answers the size refusal, and in 15
+/// conditions (983,185 bytes) ResourceNotFoundException.
+#[tokio::test]
+async fn the_size_counts_a_name_at_each_use_before_a_missing_table() {
+    let dir = TempDir::new().unwrap();
+    let ctx = context(&dir).await;
+    let body = |conditions: usize| {
+        let mut body = request("missing", 4, us(), Some(json!({"#x0": "x".repeat(65_533)})));
+        body["ExpressionAttributeValues"] = json!({":s": {"S": "US"}});
+        body["SearchConditionExpression"] = json!(vec!["#x0 = :s"; conditions].join(" AND "));
+        body
+    };
+    let refused = answer(&ctx, body(17)).await;
+    assert!(
+        validation(
+            "Invalid SearchConditionExpression: Expression size has exceeded the maximum \
+             allowed size;"
+        )(&refused),
+        "{refused:?}"
+    );
+    let missing = answer(&ctx, body(15)).await;
+    assert!(
+        matches!(missing, DynamoDbError::ResourceNotFoundException(_)),
+        "{missing:?}"
     );
 }

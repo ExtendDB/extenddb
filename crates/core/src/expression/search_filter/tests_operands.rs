@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use super::parse_search_filter;
-use super::tests_support::{OK, n, p, s, used_values};
+use super::tests_support::{OK, message, n, p, s, used_values};
 use crate::error::DynamoDbError;
 use crate::types::AttributeValue;
 
@@ -287,6 +287,38 @@ fn the_combined_size_is_at_most_one_mebibyte() {
                     "{total} {attribute}"
                 );
             }
+        }
+    }
+}
+
+/// A name is counted at each of its uses. One 65,533-byte name `#x0` in
+/// `#x0 = :s AND ...`: 17 conditions take 216 + 17 * 65,533 = 1,114,277
+/// bytes and 15 conditions 190 + 15 * 65,533 = 983,185. Measured on the live
+/// service in us-east-1 on 2026-11-25 on a table name that does not exist,
+/// each request twice with the same answer: 17 conditions answer the size
+/// refusal and 15 answer ResourceNotFoundException, the answer of the table
+/// lookup that follows a condition that passes.
+#[test]
+fn the_combined_size_counts_a_name_at_each_use() {
+    let names = HashMap::from([("#x0".to_owned(), "x".repeat(65_533))]);
+    let values = HashMap::from([(":s".to_owned(), s("US"))]);
+    for (conditions, served) in [(17, false), (15, true)] {
+        let expr = vec!["#x0 = :s"; conditions].join(" AND ");
+        let got = parse_search_filter(
+            &expr,
+            Some(&names),
+            Some(&values),
+            50,
+            &crate::limits::LimitsConfig::default(),
+        );
+        if served {
+            assert!(got.is_ok(), "{conditions}: {:?}", got.err());
+        } else {
+            assert_eq!(
+                got.err().map(message),
+                Some(p("Expression size has exceeded the maximum allowed size;")),
+                "{conditions}"
+            );
         }
     }
 }
