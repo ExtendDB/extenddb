@@ -282,9 +282,10 @@ class TestPrecedence:
     def test_query_vector_refusal_fires_before_the_hash_equality_check(
         self, vector_table, expression
     ):
-        # Measured 2026-11-25 on a table with HASH pk and RANGE sk: with no
-        # equality on pk, the service answers the vector refusal ahead of the
-        # messages for a key condition with no HASH equality.
+        # Measured 2026-11-25 on a table keyed on pk alone, as here, and on
+        # one keyed on pk and sk: with no equality on pk, the service answers
+        # the vector refusal ahead of the messages for a key condition with no
+        # HASH equality.
         resp = _signed_post(
             "Query",
             {
