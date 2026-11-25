@@ -205,6 +205,27 @@ pub(crate) async fn handle_request(
     if let Some(ref tn) = table_name
         && (is_read_op || is_write_op)
     {
+        // The table name rules (length and pattern) apply before any bucket
+        // is read: the service refuses a name outside them with
+        // ValidationException however much capacity is left (measured
+        // 2026-11-25 with GetItem and PutItem on `ab`, an empty name, 256
+        // characters and the ARN of a table in another Region). The ARN of a
+        // table in this account and Region is checked by the name it
+        // carries, and a throttle refusal names that table.
+        let name = crate::authz_resource::key_lookup_name(tn, &state.region, &ctx.account_id);
+        if let Err(e) = extenddb_core::validation::validate_table_name(&name, &state.limits) {
+            record_error_metrics(
+                &state.metrics,
+                &e,
+                &ctx.account_id,
+                metric_table.as_deref(),
+                &operation,
+            );
+            state
+                .metrics
+                .record_request_count(&ctx.account_id, &operation);
+            return error_response(&e, &request_id);
+        }
         if !state.throttle.is_registered(&ctx.account_id, tn)
             && let Ok(desc) = ctx
                 .storage
@@ -259,16 +280,11 @@ pub(crate) async fn handle_request(
             // throttle: one reason with the table ARN, the same string
             // DescribeTable returns as TableArn. The error class, the message
             // and the limit follow the bucket that refused and the table's
-            // billing mode. The account bucket can refuse before the engine
-            // has seen the name, so an ARN naming a table in this account is
-            // reduced to the bare name first, and a name the engine would
-            // refuse gets no resource at all.
-            let name = crate::authz_resource::key_lookup_name(tn, &state.region, &ctx.account_id);
-            let table_arn = extenddb_core::validation::validate_table_name_chars(&name)
-                .is_ok()
-                .then(|| extenddb_storage::util::table_arn(&state.region, &ctx.account_id, &name));
+            // billing mode.
+            let table_arn =
+                extenddb_storage::util::table_arn(&state.region, &ctx.account_id, &name);
             return error_response(
-                &throttle_error(cause, throttled_read, table_arn),
+                &throttle_error(cause, throttled_read, &table_arn),
                 &request_id,
             );
         }
