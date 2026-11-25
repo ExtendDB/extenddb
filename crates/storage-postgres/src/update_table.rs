@@ -248,6 +248,13 @@ impl PostgresEngine {
             }
         }
 
+        // The description parses the same value. A value it cannot parse
+        // stops the request here, before any write.
+        let stored_throughput: Option<TableThroughputRecord> = stored_throughput
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+
         // No-op rejection: setting same billing mode to PROVISIONED with same
         // throughput values is rejected by DynamoDB. This check runs under the
         // FOR UPDATE lock to eliminate the TOCTOU race that existed when the
@@ -255,25 +262,13 @@ impl PostgresEngine {
         if matches!(input.billing_mode, Some(BillingMode::Provisioned))
             && let Some(ref pt) = input.provisioned_throughput
         {
-            let current_pt = stored_throughput
-                .as_ref()
-                .unwrap_or(&serde_json::Value::Null);
             let is_provisioned = stored_billing_mode.as_deref() == Some("PROVISIONED")
                 || stored_billing_mode.is_none();
-            let current_rcu = current_pt
-                .get("ReadCapacityUnits")
-                .or_else(|| current_pt.get("read_capacity_units"))
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
-            let current_wcu = current_pt
-                .get("WriteCapacityUnits")
-                .or_else(|| current_pt.get("write_capacity_units"))
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
+            let current = stored_throughput.unwrap_or_default();
 
             if is_provisioned
-                && current_rcu == pt.read_capacity_units
-                && current_wcu == pt.write_capacity_units
+                && current.read_capacity_units == pt.read_capacity_units
+                && current.write_capacity_units == pt.write_capacity_units
             {
                 return Err(StorageError::NoOpUpdate(format!(
                     "The provisioned throughput for the table will not change. \
@@ -282,7 +277,10 @@ impl PostgresEngine {
                          Requested ReadCapacityUnits: {}. \
                          Current WriteCapacityUnits provisioned for the table: {}. \
                          Requested WriteCapacityUnits: {}.",
-                    current_rcu, pt.read_capacity_units, current_wcu, pt.write_capacity_units
+                    current.read_capacity_units,
+                    pt.read_capacity_units,
+                    current.write_capacity_units,
+                    pt.write_capacity_units
                 )));
             }
         }
@@ -317,7 +315,7 @@ impl PostgresEngine {
         // Apply provisioned throughput change.
         if let Some(pt) = &input.provisioned_throughput {
             let record = TableThroughputRecord::for_update(
-                stored_throughput.and_then(|v| serde_json::from_value(v).ok()),
+                stored_throughput,
                 stored_billing_mode.as_deref() != Some("PAY_PER_REQUEST"),
                 pt,
                 updating_until,

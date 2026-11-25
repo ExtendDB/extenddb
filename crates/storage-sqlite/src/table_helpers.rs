@@ -120,7 +120,10 @@ pub(crate) const TABLE_COLUMNS: &str = "table_name, key_schema, attribute_defini
 pub(crate) const INDEX_COLUMNS: &str = "index_name, index_id, index_type, key_schema, \
      projection, index_status, provisioned_throughput, warm_throughput";
 
-fn parse_json<T: serde::de::DeserializeOwned>(s: &str, ctx: &str) -> Result<T, StorageError> {
+pub(crate) fn parse_json<T: serde::de::DeserializeOwned>(
+    s: &str,
+    ctx: &str,
+) -> Result<T, StorageError> {
     serde_json::from_str(s).map_err(|e| StorageError::Internal(format!("{ctx}: {e}")))
 }
 
@@ -545,5 +548,32 @@ mod stored_value_tests {
                 if m == "Parse status_transition_at: the 'year' component could not be parsed"),
             "{err:?}"
         );
+    }
+
+    /// A `provisioned_throughput` that does not parse refuses an UpdateTable
+    /// before it writes, as the description refuses the row.
+    #[tokio::test]
+    async fn a_provisioned_throughput_that_does_not_parse_refuses_an_update() {
+        let engine = table_with("provisioned_throughput", r#"{"x":1}"#).await;
+        let update = serde_json::from_value(json!({
+            "TableName": "t",
+            "ProvisionedThroughput": {"ReadCapacityUnits": 6, "WriteCapacityUnits": 6}
+        }))
+        .expect("update");
+        let err = engine
+            .update_table(ACCOUNT, update)
+            .await
+            .expect_err("the row is reported");
+        assert!(
+            matches!(&err, StorageError::Internal(m)
+                if m == "provisioned_throughput: missing field `ReadCapacityUnits` at line 1 column 7"),
+            "{err:?}"
+        );
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT provisioned_throughput FROM tables WHERE table_name = 't'")
+                .fetch_one(&engine.pool)
+                .await
+                .expect("the row");
+        assert_eq!(stored.as_deref(), Some(r#"{"x":1}"#));
     }
 }

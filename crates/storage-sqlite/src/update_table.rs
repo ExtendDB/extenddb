@@ -231,35 +231,35 @@ impl SqliteEngine {
             }
         }
 
+        // The description parses the same value. A value it cannot parse
+        // stops the request here, before any write.
+        let stored_throughput: Option<TableThroughputRecord> = stored_throughput
+            .as_deref()
+            .map(|s| crate::table_helpers::parse_json(s, "provisioned_throughput"))
+            .transpose()?;
+
         // No-op rejection: same PROVISIONED throughput.
         if matches!(input.billing_mode, Some(BillingMode::Provisioned))
             && let Some(ref pt) = input.provisioned_throughput
         {
             let is_prov = stored_billing_mode.as_deref() == Some("PROVISIONED")
                 || stored_billing_mode.is_none();
-            let cur: serde_json::Value = stored_throughput
-                .as_deref()
-                .and_then(|s| serde_json::from_str(s).ok())
-                .unwrap_or_else(|| serde_json::json!({}));
-            let cur_rcu = cur
-                .get("ReadCapacityUnits")
-                .or_else(|| cur.get("read_capacity_units"))
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
-            let cur_wcu = cur
-                .get("WriteCapacityUnits")
-                .or_else(|| cur.get("write_capacity_units"))
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
-            if is_prov && cur_rcu == pt.read_capacity_units && cur_wcu == pt.write_capacity_units {
+            let cur = stored_throughput.unwrap_or_default();
+            if is_prov
+                && cur.read_capacity_units == pt.read_capacity_units
+                && cur.write_capacity_units == pt.write_capacity_units
+            {
                 return Err(StorageError::NoOpUpdate(format!(
                     "The provisioned throughput for the table will not change. \
                      The requested value equals the current value. \
-                     Current ReadCapacityUnits provisioned for the table: {cur_rcu}. \
+                     Current ReadCapacityUnits provisioned for the table: {}. \
                      Requested ReadCapacityUnits: {}. \
-                     Current WriteCapacityUnits provisioned for the table: {cur_wcu}. \
+                     Current WriteCapacityUnits provisioned for the table: {}. \
                      Requested WriteCapacityUnits: {}.",
-                    pt.read_capacity_units, pt.write_capacity_units
+                    cur.read_capacity_units,
+                    pt.read_capacity_units,
+                    cur.write_capacity_units,
+                    pt.write_capacity_units
                 )));
             }
         }
@@ -286,7 +286,7 @@ impl SqliteEngine {
         }
         if let Some(pt) = &input.provisioned_throughput {
             let record = TableThroughputRecord::for_update(
-                stored_throughput.and_then(|s| serde_json::from_str(&s).ok()),
+                stored_throughput,
                 stored_billing_mode.as_deref() != Some("PAY_PER_REQUEST"),
                 pt,
                 updating_until.as_deref().map(timestamp_epoch_seconds),
