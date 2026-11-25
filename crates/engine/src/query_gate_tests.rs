@@ -62,6 +62,7 @@ async fn context(
         local_secondary_indexes: Vec::new(),
         stream_specification: None,
         vector_indexes: Vec::new(),
+        creation_date_time: 0.0,
     };
     let mut authorized_key_info = AuthorizedKeyInfo::new();
     authorized_key_info.insert("kvt".to_owned(), Some(info));
