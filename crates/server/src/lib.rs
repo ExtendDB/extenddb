@@ -15,6 +15,7 @@ pub(crate) mod authz_resource;
 pub mod backup_store;
 pub mod console;
 pub mod dev_credentials;
+pub mod extensions;
 mod handler;
 mod import_export_paths;
 mod import_export_roots;
@@ -37,6 +38,11 @@ mod table_name_gate;
 mod throttle_helpers;
 mod workers;
 
+/// The `axum` this server is built with, for a thin binary's extension routers.
+pub use axum;
+pub use extensions::{
+    ExtensionMountError, Extensions, RequestObserver, RequestRecord, validate_extension_prefixes,
+};
 pub use serve::{
     BuildInfo, CatalogRefusal, JOB_DRAIN_TIMEOUT, LogTarget, RegistrationLost, ServeParams,
     WORKER_STOP_TIMEOUT, catalog_refusal, log_to_syslog_raw, serve,
@@ -112,10 +118,35 @@ pub struct AppState {
     pub config_entries: Vec<(String, String)>,
     /// Runtime documentation store. `None` if `docs_dir` is not configured.
     pub docs_store: Option<console::docs_embed::DocsStore>,
+    /// Called once per request after the response is built, when a thin
+    /// binary installed one through [`Extensions::request_observer`]. `None`
+    /// leaves the request path as it was and builds no record.
+    pub request_observer: Option<Arc<dyn extensions::RequestObserver>>,
     /// Whether new requests are admitted, and whether the server must stop:
     /// set while the backend's serving registration is lost
     /// ([`registration`]).
     pub(crate) admission: registration::Admission,
+}
+
+/// The response security headers over the whole app: `X-Content-Type-Options`,
+/// `X-Frame-Options` and `Referrer-Policy`. HSTS is added in [`start_server`]
+/// when TLS is on. A function of its own so the extension mount tests apply
+/// the layer the server applies.
+fn apply_security_headers(app: Router) -> Router {
+    let security_layers = ServiceBuilder::new()
+        .layer(SetResponseHeaderLayer::overriding(
+            axum::http::header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            axum::http::header::X_FRAME_OPTIONS,
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            axum::http::header::REFERRER_POLICY,
+            HeaderValue::from_static("strict-origin-when-cross-origin"),
+        ));
+    app.layer(security_layers)
 }
 
 /// TLS configuration passed from the binary crate.
@@ -142,6 +173,13 @@ pub const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// When `tls` is `Some`, the server serves HTTPS using `axum-server` with rustls.
 /// When `tls` is `None`, the server serves plaintext HTTP.
 ///
+/// `extension_routers` are a thin binary's HTTP routers (see
+/// [`Extensions::http`]). Each is mounted after the built-in routes and before
+/// the response security layer, so an extension response carries the security
+/// headers too. A prefix that is not absolute, is `/`, or collides with a
+/// built-in route or an earlier extension is an error and the server does not
+/// start.
+///
 /// It stops on SIGINT or SIGTERM, or when `state`'s admission asks for a
 /// stop after the serving registration was lost; both drain the listener
 /// the same way and remove the PID file.
@@ -150,6 +188,7 @@ pub async fn start_server(
     state: AppState,
     pid_file: Option<PathBuf>,
     tls: Option<ServerTlsConfig>,
+    extension_routers: Vec<(String, Router)>,
 ) -> Result<(), anyhow::Error> {
     // SP-WIRE-007: DynamoDB request body limit is 16 MB.
     const DYNAMODB_BODY_LIMIT: usize = 16 * 1024 * 1024;
@@ -173,21 +212,6 @@ pub async fn start_server(
     let config_entries = state.config_entries.clone();
     let admission = state.admission.clone();
     let shared = Arc::new(state);
-
-    // Security headers applied to all responses.
-    let security_layers = ServiceBuilder::new()
-        .layer(SetResponseHeaderLayer::overriding(
-            axum::http::header::X_CONTENT_TYPE_OPTIONS,
-            HeaderValue::from_static("nosniff"),
-        ))
-        .layer(SetResponseHeaderLayer::overriding(
-            axum::http::header::X_FRAME_OPTIONS,
-            HeaderValue::from_static("DENY"),
-        ))
-        .layer(SetResponseHeaderLayer::overriding(
-            axum::http::header::REFERRER_POLICY,
-            HeaderValue::from_static("strict-origin-when-cross-origin"),
-        ));
 
     let mut app = Router::new()
         .route("/", post(handler::handle_request))
@@ -239,6 +263,12 @@ pub async fn start_server(
             );
     }
 
+    // Thin-bin extension routers go after the built-in nests and before the
+    // security layer, so their responses carry the security headers too. A
+    // refused prefix is a startup error.
+    let app =
+        extensions::mount_extensions(app, extension_routers).map_err(|e| anyhow::anyhow!("{e}"))?;
+
     // While the serving registration is lost, every route answers
     // ServiceUnavailable before its handler runs.
     let app = app.layer(axum::middleware::from_fn_with_state(
@@ -247,16 +277,15 @@ pub async fn start_server(
     ));
 
     // Refuse a repeated host or authorization header on every route, then
-    // apply security headers to all routes (the refusal carries them too).
-    // A body that stops delivering data for `request_timeout` errors out, so a
-    // client that announces a Content-Length it never sends cannot hold the
-    // connection open. The handler answers that error with 408.
-    let app = app
-        .layer(axum::middleware::from_fn(
-            repeated_headers::refuse_repeated_headers,
-        ))
-        .layer(security_layers)
-        .layer(RequestBodyTimeoutLayer::new(request_timeout));
+    // apply security headers to all routes, built-in and extension (the
+    // refusal carries them too). A body that stops delivering data for
+    // `request_timeout` errors out, so a client that announces a
+    // Content-Length it never sends cannot hold the connection open. The
+    // handler answers that error with 408.
+    let app = app.layer(axum::middleware::from_fn(
+        repeated_headers::refuse_repeated_headers,
+    ));
+    let app = apply_security_headers(app).layer(RequestBodyTimeoutLayer::new(request_timeout));
 
     // Add HSTS header only when TLS is enabled.
     let app = if tls_enabled {

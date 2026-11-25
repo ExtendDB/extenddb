@@ -57,7 +57,7 @@ fn cache_cfg(name: &'static str) -> extenddb_cache::SwrCacheConfig {
 /// `dev_mode` on. Returns the state and the account id the stub answers with,
 /// so the expected ARN can be formed.
 pub(super) async fn build_state() -> (Arc<AppState>, String) {
-    build_state_with(None, stub_auth).await
+    build_state_with(None, stub_auth, None).await
 }
 
 /// The stub auth provider bound to `account_id`: `build_state`'s provider,
@@ -68,11 +68,13 @@ pub(super) fn stub_auth(account_id: String) -> Arc<dyn AuthProvider> {
 
 /// `build_state` with `storage`, when given, in place of the SQLite engine
 /// for the table and item calls (the catalog and the authorization stores
-/// stay on SQLite), and with the auth provider built by `auth` from the
-/// bootstrapped default account id, for a test that needs its own provider.
+/// stay on SQLite), with the auth provider built by `auth` from the
+/// bootstrapped default account id, and with an optional request observer,
+/// for a test that needs its own provider or observer.
 pub(super) async fn build_state_with(
     storage: Option<Arc<dyn extenddb_storage::StorageEngine>>,
     auth: impl FnOnce(String) -> Arc<dyn AuthProvider>,
+    request_observer: Option<Arc<dyn crate::extensions::RequestObserver>>,
 ) -> (Arc<AppState>, String) {
     let _ = extenddb_storage::set_backend(extenddb_storage_sqlite::backend());
     let config = extenddb_storage_sqlite::SqliteConfig {
@@ -137,6 +139,7 @@ pub(super) async fn build_state_with(
         table_key_info_cache,
         config_entries: Vec::new(),
         docs_store: None,
+        request_observer,
         admission: crate::registration::Admission::default(),
     });
     (state, account_id)
@@ -169,7 +172,7 @@ pub(super) async fn call(state: &Arc<AppState>, operation: &str, body: Value) ->
 /// Create `table` with the given billing fields and wait for ACTIVE. No
 /// worker runs in this test, so the CREATING to ACTIVE transition is driven
 /// here.
-async fn create_table(state: &Arc<AppState>, table: &str, billing: Value) {
+pub(super) async fn create_table(state: &Arc<AppState>, table: &str, billing: Value) {
     let mut create = json!({
         "TableName": table,
         "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
@@ -539,7 +542,7 @@ async fn a_batch_a_backend_throttled_records_the_throttle_metrics() {
         let store = failing_store::FailingStore::throttling()
             .with_items(&["k1", "k2", "k3"])
             .failing_on(&["k2", "k3"]);
-        let (state, account_id) = build_state_with(Some(Arc::new(store)), stub_auth).await;
+        let (state, account_id) = build_state_with(Some(Arc::new(store)), stub_auth, None).await;
         let (got, body) = call(&state, operation, request).await;
         assert_eq!(got, status, "{operation}: {body}");
         for (metric, want) in [

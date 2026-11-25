@@ -62,6 +62,14 @@ pub fn parse_request<'a>(
 }
 
 impl ParsedRequest<'_> {
+    /// The parsed body, for what the server reads from it before `admit`:
+    /// the table name of a request observer's record, which a request that
+    /// authentication refuses also carries.
+    #[must_use]
+    pub fn body(&self) -> &Value {
+        &self.body
+    }
+
     /// The second step: refuse the requests no deployment serves, then return
     /// the body to dispatch.
     ///

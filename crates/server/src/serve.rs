@@ -112,6 +112,10 @@ pub struct ServeParams {
     /// Only a `dev-mode` build of the app crate ever sets this, and it enforces
     /// the loopback-only bind before handing over the listener.
     pub dev_mode: bool,
+    /// A thin binary's extension points: HTTP routers to mount and an optional
+    /// per-request observer. The empty default leaves the server as it is
+    /// without them.
+    pub extensions: crate::Extensions,
     /// The config file `serve` was started with, named in the command a
     /// catalog refusal prints. `None` when it started from built-in defaults.
     pub config_path: Option<String>,
@@ -133,8 +137,17 @@ impl ServeParams {
             log_target: LogTarget::Syslog,
             build,
             dev_mode: false,
+            extensions: crate::Extensions::default(),
             config_path: None,
         }
+    }
+
+    /// Install a thin binary's [`Extensions`](crate::Extensions): HTTP routers
+    /// to mount and an optional per-request observer.
+    #[must_use]
+    pub fn with_extensions(mut self, extensions: crate::Extensions) -> Self {
+        self.extensions = extensions;
+        self
     }
 
     /// Send log output to `target` instead of the syslog default.
@@ -318,8 +331,15 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         log_target,
         build,
         dev_mode,
+        extensions,
         config_path,
     } = params;
+    // The observer goes into AppState for the handler; the routers go to
+    // start_server, which mounts them.
+    let crate::Extensions {
+        http: extension_http,
+        request_observer,
+    } = extensions;
     let catalog_version = extenddb_storage::migrations::binary_catalog_label();
 
     // Write the PID file, when the caller asked for one, so `extenddb status`,
@@ -807,6 +827,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         table_key_info_cache,
         config_entries,
         docs_store,
+        request_observer,
         admission: admission.clone(),
     };
 
@@ -935,7 +956,8 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         None
     };
 
-    let server_result = crate::start_server(listener, state, pid_file, tls_config).await;
+    let server_result =
+        crate::start_server(listener, state, pid_file, tls_config, extension_http).await;
 
     // The HTTP server has stopped accepting.
     drain_then_release(
