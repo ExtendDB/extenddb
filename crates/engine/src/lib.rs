@@ -23,7 +23,7 @@ pub use backup::{
     read_identity_bounded, reconciler, store_identity, store_maintenance, sync,
 };
 mod backup_requests;
-pub use backup_requests::refuse_point_in_time_recovery;
+pub use backup_requests::{check_restore_table_name, refuse_point_in_time_recovery};
 mod batch_get_item;
 mod batch_write_item;
 pub mod capacity_helpers;

@@ -50,8 +50,8 @@ pub use runtime::{
 pub use store_identity::{STORE_IDENTITY_KEY, StoreIdentityFile, StoreProblem};
 
 use crate::backup_requests::{
-    canonical_backup_arn, check_backup_arn, create_backup_table_name, required_str,
-    storage_err_to_dynamo,
+    canonical_backup_arn, check_backup_arn, create_backup_table_name, pitr, required_str,
+    storage_err_to_dynamo, table_name_bounds,
 };
 use crate::{OperationContext, serialize_output};
 
@@ -1285,11 +1285,16 @@ where
     // first (measured on DynamoDB with two invalid inputs).
     let backup_arn = backup_arn_field(body, account_id, region)?;
 
-    // 3. The names' syntax, before the backup is read: the target name, then
-    // each index override's name. DynamoDB answers a bad override name only
-    // after the ARN's account and the target name (measured on 20 Nov 2026).
-    let target_table_name = required_str(body, "TargetTableName", "targetTableName")?;
-    extenddb_core::validation::validate_table_name(target_table_name, limits)?;
+    // 3. The names' syntax, before the backup is read: the target name with
+    // the restore's checks, not CreateTable's, then each index override's
+    // name. DynamoDB answers a bad override name only after the ARN's
+    // account and the target name (measured on 20 Nov 2026).
+    let target_table_name = pitr::table_name_member(body, "TargetTableName")?;
+    pitr::check_restore_table_name(
+        target_table_name,
+        "targetTableName",
+        table_name_bounds(limits),
+    )?;
     index_overrides.check_index_names()?;
 
     // 4. The catalog index first: a row of the healthy configured store is

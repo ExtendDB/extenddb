@@ -90,7 +90,7 @@ pub(crate) fn required_str<'a>(
 /// The length bounds for a `TableName` member: the deployment's, which
 /// default to the model's 3 to 255. `CreateTable` takes the same bounds, so a
 /// table the deployment could create can be backed up and listed.
-fn table_name_bounds(limits: &LimitsConfig) -> (usize, usize) {
+pub(crate) fn table_name_bounds(limits: &LimitsConfig) -> (usize, usize) {
     (limits.min_table_name_length, limits.max_table_name_length)
 }
 
@@ -536,8 +536,11 @@ pub(crate) fn storage_err_to_dynamo(e: StorageError) -> DynamoDbError {
     }
 }
 
-mod pitr;
+// The restore in `crate::backup` reads its `TargetTableName` with
+// `pitr::table_name_member` and `pitr::check_restore_table_name`.
+pub(crate) mod pitr;
 
+pub use pitr::check_restore_table_name;
 pub use pitr::refuse_before_authorization as refuse_point_in_time_recovery;
 pub(crate) use pitr::{
     handle_describe_continuous_backups, handle_restore_table_to_point_in_time,
