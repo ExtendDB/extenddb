@@ -480,8 +480,8 @@ class TestScanEdgeCases:
         assert "greater than or equal to 0" in err["Message"]
 
 
-# Index start keys of the wrong type (issue #1033), measured on Amazon
-# DynamoDB in us-east-1 on 2026-11-14, 2026-11-16 and 2026-11-19.
+# Index start keys of the wrong type, measured on Amazon DynamoDB in
+# us-east-1 on 2026-11-14, 2026-11-16 and 2026-11-19.
 INVALID_START_KEY = "The provided starting key is invalid"
 INDEX_HASH_KEY = {"gsi2": "lsi1sk", "lsi1": "pk"}
 GSI2, LSI1 = ("lsi1sk", "lsi2sk", "pk", "sk"), ("pk", "sk", "lsi1sk")
@@ -497,7 +497,7 @@ def _key(keys, **changes):
 # (operation, index, ExclusiveStartKey, expected): the key and sent type that the
 # index key type sentence names, the short sentence, or the count of an accepted read.
 INDEX_START_KEY_ROWS = [
-    # The rows of the issue.
+    # The rows first measured on 2026-11-14 and 2026-11-16.
     ("scan", "gsi2", _key(GSI2, lsi2sk=SS), ("lsi2sk", "SS")),
     ("scan", "lsi1", _key(LSI1, lsi1sk=SS), ("lsi1sk", "SS")),
     ("query", "gsi2", _key(GSI2, lsi2sk=SS), INVALID_START_KEY),

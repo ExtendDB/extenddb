@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Tests for [`validate_query_start_key_bounds`] (issue #440), and for the
-//! start key schema checks of an index Scan and Query (issue #1033).
+//! start key schema checks of an index Scan and Query.
 
 use std::collections::HashMap;
 
@@ -323,7 +323,7 @@ fn every_attribute_of_a_multi_attribute_partition_is_compared() {
     );
 }
 
-// --- Start key schema checks of an index read (issue #1033, measured) ---
+// --- Start key schema checks of an index read (measured) ---
 
 #[derive(Clone, Copy, Debug)]
 enum Read {
@@ -351,8 +351,8 @@ enum Answer {
     Names(&'static str, &'static str),
 }
 
-/// The table of issue #1033, every key a string.
-fn issue_1033_table() -> (TableKeyInfo, IndexInfo, IndexInfo) {
+/// The measured table, every key a string.
+fn measured_table() -> (TableKeyInfo, IndexInfo, IndexInfo) {
     let table = TableKeyInfo {
         key_schema: schema("pk", Some("sk")),
         attribute_definitions: ["pk", "sk", "lsi1sk", "lsi2sk"]
@@ -386,17 +386,17 @@ fn sent_as(type_tag: &str) -> AttributeValue {
     }
 }
 
-/// The rows of issue #1033 (2026-11-14 and 2026-11-16) and the answers
+/// The rows first measured on 2026-11-14 and 2026-11-16, and the answers
 /// measured on 2026-11-19, plus a start key with every key of its type.
 #[test]
 fn index_start_key_faults_answer_as_dynamodb_does() {
     use Answer::{Accepted, Invalid, Names};
     use Edit::{Omit, Set};
     use Read::{Query, Scan};
-    let (table, lsi1, gsi2) = issue_1033_table();
+    let (table, lsi1, gsi2) = measured_table();
     let (lsi1, gsi2) = (&lsi1, &gsi2);
     let rows: &[(Read, &IndexInfo, &[Edit], Answer)] = &[
-        // The rows of the issue.
+        // The rows first measured on 2026-11-14 and 2026-11-16.
         (Scan, gsi2, &[Set("lsi2sk", "SS")], Names("lsi2sk", "SS")),
         (Scan, lsi1, &[Set("lsi1sk", "SS")], Names("lsi1sk", "SS")),
         (Query, gsi2, &[Set("lsi2sk", "SS")], Invalid),

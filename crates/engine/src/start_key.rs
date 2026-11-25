@@ -21,7 +21,7 @@ use crate::index_helpers::combined_lek_key_schema;
 /// use the short one.
 ///
 /// An index Scan names a key of another type, table keys included, ahead of a key
-/// left out or an extra attribute (measured 2026-11-14 to 2026-11-19, issue #1033).
+/// left out or an extra attribute (measured 2026-11-14 to 2026-11-19).
 ///
 /// # Errors
 ///
