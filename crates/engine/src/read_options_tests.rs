@@ -8,8 +8,9 @@
 //! and `Scan`; that a global secondary index read reaches storage with
 //! `consistent_read: false` because the handler refuses `ConsistentRead:
 //! true` on a GSI before storage is called, on `Query` and on `Scan`; that
-//! the export scan asks for a consistent read; and, in [`partiql`], the
-//! value of the three reads the PartiQL layer makes on its own.
+//! the export scan asks for a consistent read on every page; and, in
+//! [`partiql`], the value of the three reads the PartiQL layer makes on its
+//! own.
 //!
 //! The storage double in [`recording`] records every read call with the
 //! options it received; the handlers run end to end above it.
@@ -338,11 +339,22 @@ impl Drop for ExportRoot {
 }
 
 /// An export reflects every write acknowledged before the export time, so the
-/// engine asks storage for a consistent read on every page.
+/// engine asks storage for a consistent read on every page. The double
+/// answers two pages, so the second one is a read the test sees too.
 #[tokio::test]
 async fn export_scan_asks_for_a_consistent_read() {
     let root = ExportRoot::new();
     let storage = recording::storage();
+    let order = |id: &str| {
+        extenddb_core::types::Item::from([(
+            "pk".to_owned(),
+            extenddb_core::types::AttributeValue::S(id.to_owned()),
+        )])
+    };
+    storage.read_pages.lock().unwrap().extend([
+        (vec![order("order-1")], Some(order("order-1"))),
+        (vec![order("order-2")], None),
+    ]);
     let ctx = context_with_export_paths(&storage, vec![Arc::new(root.0.clone())]);
     let file_path = root.0.join(ACCOUNT).join("orders.json");
     let body = json!({
@@ -354,7 +366,7 @@ async fn export_scan_asks_for_a_consistent_read() {
         .expect("export failed before storage");
 
     let reads = storage.reads();
-    assert!(!reads.is_empty(), "the export made no storage read");
+    assert_eq!(reads.len(), 2, "one scan per page: {reads:?}");
     assert!(
         reads
             .iter()
