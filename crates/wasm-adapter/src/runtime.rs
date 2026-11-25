@@ -332,4 +332,16 @@ mod tests {
             );
         }
     }
+
+    /// An error answer is the body the server sends, with `__type` first. In
+    /// name order, the `Message` of a `SerializationException` would come
+    /// before `__type`.
+    #[tokio::test]
+    async fn an_error_answer_writes_type_first() {
+        let out = engine().await.submit("ListTables", "not json").await;
+        assert_eq!(
+            out,
+            r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"Start of structure or map found where not expected: expected ident at line 1 column 2"}"#
+        );
+    }
 }
