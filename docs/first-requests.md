@@ -19,17 +19,18 @@ AKIAIOSFODNN7EXAMPLE
 wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 ```
 
-Set the endpoint once with `AWS_ENDPOINT_URL_DYNAMODB` (the AWS CLI version 2 and the current SDKs read it), or pass `--endpoint-url <endpoint>` on each command. The commands below assume the variable is set. For a TLS server, `AWS_CA_BUNDLE` points at the certificate:
+Set the endpoint once with `AWS_ENDPOINT_URL_DYNAMODB` (the AWS CLI version 2 and the current SDKs read it), or pass `--endpoint-url <endpoint>` on each command. The commands below assume the variable is set. Set both region variables, so a region already set in your shell does not win. For a TLS server, `AWS_CA_BUNDLE` points at the certificate:
 
 ```bash
 export AWS_CA_BUNDLE=~/.extenddb/tls/cert.pem
 export AWS_ENDPOINT_URL_DYNAMODB=https://127.0.0.1:18443
 export AWS_DEFAULT_REGION=us-east-1
+export AWS_REGION=us-east-1
 export AWS_ACCESS_KEY_ID=<access-key-id>
 export AWS_SECRET_ACCESS_KEY=<secret-access-key>
 ```
 
-The same settings as an AWS config profile, in `~/.aws/config`:
+The same settings as an AWS config profile, in `~/.aws/config`; the `dynamodb_streams` entry gives the `dynamodbstreams` commands below their endpoint:
 
 ```ini
 [profile extenddb]
@@ -39,6 +40,8 @@ services = extenddb-services
 
 [services extenddb-services]
 dynamodb =
+  endpoint_url = https://127.0.0.1:18443
+dynamodb_streams =
   endpoint_url = https://127.0.0.1:18443
 ```
 
@@ -212,34 +215,33 @@ aws dynamodb create-table \
     --stream-specification StreamEnabled=true,StreamViewType=NEW_AND_OLD_IMAGES
 ```
 
-**SDK users need a separate `dynamodbstreams` client.** In every AWS SDK, DynamoDB and DynamoDB Streams are separate services. Both clients point at the same ExtendDB endpoint URL. The Python examples on this page use boto3 (`python3 -m pip install boto3`):
+**SDK users need a separate `dynamodbstreams` client.** In every AWS SDK, DynamoDB and DynamoDB Streams are separate services. Both clients point at the same ExtendDB endpoint URL. The Python examples on this page use boto3 (`python3 -m pip install boto3`) and read the endpoint from the variable set above; boto3 reads `AWS_CA_BUNDLE` and the key pair from the environment:
 
 ```python
 import os
 import boto3
 
-# Trust the self-signed certificate
-os.environ["AWS_CA_BUNDLE"] = os.path.expanduser("~/.extenddb/tls/cert.pem")
+endpoint = os.environ["AWS_ENDPOINT_URL_DYNAMODB"]
 
 # DynamoDB client, for table and item operations
-dynamodb = boto3.client("dynamodb", endpoint_url="https://127.0.0.1:18443")
+dynamodb = boto3.client("dynamodb", endpoint_url=endpoint)
 
 # DynamoDB Streams client, for stream operations
-streams = boto3.client("dynamodbstreams", endpoint_url="https://127.0.0.1:18443")
+streams = boto3.client("dynamodbstreams", endpoint_url=endpoint)
 ```
 
 On the CLI, `AWS_ENDPOINT_URL_DYNAMODB` does not apply to the `dynamodbstreams` service, so pass the endpoint explicitly (or set `AWS_ENDPOINT_URL_DYNAMODB_STREAMS`):
 
 ```bash
 aws dynamodbstreams list-streams \
-    --endpoint-url https://127.0.0.1:18443
+    --endpoint-url "$AWS_ENDPOINT_URL_DYNAMODB"
 ```
 
 Describe a stream (use the `LatestStreamArn` from `DescribeTable`; the label after `stream/` is the creation time with milliseconds):
 
 ```bash
 aws dynamodbstreams describe-stream \
-    --endpoint-url https://127.0.0.1:18443 \
+    --endpoint-url "$AWS_ENDPOINT_URL_DYNAMODB" \
     --stream-arn \
       "arn:aws:dynamodb:us-east-1:<account-id>:table/StreamTable/stream/2026-04-08T07:00:00.000"
 ```
@@ -249,7 +251,7 @@ Get a shard iterator and read records:
 ```bash
 # Get an iterator for a shard (use a ShardId from DescribeStream)
 aws dynamodbstreams get-shard-iterator \
-    --endpoint-url https://127.0.0.1:18443 \
+    --endpoint-url "$AWS_ENDPOINT_URL_DYNAMODB" \
     --stream-arn \
       "arn:aws:dynamodb:us-east-1:<account-id>:table/StreamTable/stream/2026-04-08T07:00:00.000" \
     --shard-id "<shard-id>" \
@@ -257,7 +259,7 @@ aws dynamodbstreams get-shard-iterator \
 
 # Read records with the iterator
 aws dynamodbstreams get-records \
-    --endpoint-url https://127.0.0.1:18443 \
+    --endpoint-url "$AWS_ENDPOINT_URL_DYNAMODB" \
     --shard-iterator "<iterator-from-above>"
 ```
 
@@ -266,11 +268,13 @@ aws dynamodbstreams get-records \
 The usual way to consume a stream is a polling loop:
 
 ```python
+import os
 import time
 import boto3
 
-streams = boto3.client("dynamodbstreams", endpoint_url="https://127.0.0.1:18443")
-dynamodb = boto3.client("dynamodb", endpoint_url="https://127.0.0.1:18443")
+endpoint = os.environ["AWS_ENDPOINT_URL_DYNAMODB"]
+streams = boto3.client("dynamodbstreams", endpoint_url=endpoint)
+dynamodb = boto3.client("dynamodb", endpoint_url=endpoint)
 
 # Get the stream ARN from the table.
 table = dynamodb.describe_table(TableName="StreamTable")
@@ -311,10 +315,10 @@ curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
 ```
 
 ```json
-{"status":"healthy"}
+{"components":{},"status":"healthy"}
 ```
 
-For the development image the endpoint is `http://127.0.0.1:18080/health` with no certificate.
+For the development image the endpoint is `http://127.0.0.1:18080/health` with no certificate, and the body names its backup store: `{"components":{"backup_store":{"kind":"filesystem","status":"healthy"}},"status":"healthy"}`.
 
 ## Delete the tables
 
