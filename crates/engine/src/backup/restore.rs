@@ -227,7 +227,7 @@ where
                 if let Some(metrics) = runtime.metrics() {
                     metrics.record_backup_store_error("get");
                 }
-                tracing::error!("backup {arn_text}: reading {name} from the store failed: {e}");
+                log_storage_fault!(e, "backup {arn_text}: reading {name} from the store failed");
                 Err(DynamoDbError::InternalServerError(
                     "Internal server error".to_owned(),
                 ))

@@ -19,6 +19,10 @@ pub mod docs_embed;
 pub mod html;
 mod pages;
 pub mod session;
+#[cfg(test)]
+mod tab_gate_tests;
+#[cfg(test)]
+mod test_catalog;
 
 use std::sync::Arc;
 
@@ -72,18 +76,20 @@ pub struct ConsoleState {
 /// the arguments the built-in pages pass to [`html::nav_bar`] and
 /// [`html::layout_with_version_csrf`]. Every console user reaches a tab, an
 /// admin or an IAM user with a console password; `is_admin` tells them apart.
-/// A POST handler on the tab checks the `_csrf` form field with
-/// [`csrf_matches`](Self::csrf_matches) before acting. Read by field; the
-/// struct may gain fields in a minor release, so build one for a test with
-/// [`ConsoleIdentity::new`].
-#[derive(Debug, Clone)]
+/// A request that may change state reaches the tab only with the session's
+/// CSRF token in its `_csrf` form field (see [`require_console_session`]).
+/// Read by field; the struct may gain fields in a minor release, so build one
+/// for a test with [`ConsoleIdentity::new`]. It has no `Debug`, so that no log
+/// line prints the token.
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct ConsoleIdentity {
     /// What the navigation bar shows for the user (`Admin: name` or
     /// `account/user`).
     pub label: String,
-    /// The session's CSRF token, which the layout writes into every form on
-    /// the page as the `_csrf` field.
+    /// The session's CSRF token, which the layout writes into the page's
+    /// `csrf-token` meta tag. A script in the layout adds it as the `_csrf`
+    /// field to each POST form on the page when the page loads.
     pub csrf_token: String,
     /// Whether the session is an admin login (full management access) rather
     /// than an IAM user's self-service session. The session check admits
@@ -116,41 +122,42 @@ impl ConsoleIdentity {
             version_info,
         }
     }
-
-    /// Whether `submitted`, the `_csrf` field of a form on the tab's page, is
-    /// the session's token. Constant time in the token length. A POST handler
-    /// that acts on the request refuses it with 403 when this is false, as
-    /// the built-in pages do.
-    #[must_use]
-    pub fn csrf_matches(&self, submitted: &str) -> bool {
-        pages::validate_csrf(submitted, &self.csrf_token)
-    }
 }
 
 /// Middleware for extension tabs: the session check of the built-in pages. A
 /// request without a live console session is redirected to the login page,
-/// and one whose session the catalog cannot check gets 503; one with a
-/// session carries a [`ConsoleIdentity`] extension for the page to render the
+/// and one whose session the catalog cannot check gets 503. A request that
+/// may change state (any method but GET, HEAD, OPTIONS and TRACE) gets 403
+/// unless its body is a form whose `_csrf` field is the session's CSRF token,
+/// the check a built-in page makes on its own forms. A request that passes
+/// carries a [`ConsoleIdentity`] extension for the page to render the
 /// navigation bar.
 pub async fn require_console_session(
     axum::extract::State(state): axum::extract::State<Arc<ConsoleState>>,
-    mut req: axum::extract::Request,
+    req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    match pages::require_session(req.headers(), &state).await {
-        Ok(session) => {
-            let nav = pages::identity_label(&session.identity);
-            req.extensions_mut().insert(ConsoleIdentity {
-                label: nav.label,
-                csrf_token: session.csrf_token,
-                is_admin: nav.is_admin,
-                tabs: Arc::clone(&state.tabs),
-                version_info: Arc::clone(&state.version_info),
-            });
-            next.run(req).await
+    let session = match pages::require_session(req.headers(), &state).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let mut req = if req.method().is_safe() {
+        req
+    } else {
+        match pages::require_form_csrf(req, &session).await {
+            Ok(req) => req,
+            Err(response) => return response,
         }
-        Err(response) => response,
-    }
+    };
+    let nav = pages::identity_label(&session.identity);
+    req.extensions_mut().insert(ConsoleIdentity {
+        label: nav.label,
+        csrf_token: session.csrf_token,
+        is_admin: nav.is_admin,
+        tabs: session.tabs,
+        version_info: Arc::clone(&state.version_info),
+    });
+    next.run(req).await
 }
 
 /// Build the console router.

@@ -9,15 +9,23 @@
 
 #[macro_use]
 mod fault_log;
+// The store-backed backup subsystem depends on an S3/filesystem store,
+// networking and background threads that have no wasm32 target, so it is
+// compiled only off wasm; on wasm32 `dispatch` refuses its four operations
+// with a ValidationException. `backup_requests` holds the backup and point-in-time
+// recovery requests that read no store, and compiles on both targets.
+#[cfg(not(target_arch = "wasm32"))]
 mod backup;
+#[cfg(not(target_arch = "wasm32"))]
 pub use backup::{
     BackupRuntime, ConfiguredStore, HeldClaim, JobSettings, KillPoint, LOCAL_CHECK_TIMEOUT,
     OTHER_STORE, RESTORE_REGISTRATION_TIMEOUT, S3_CHECK_TIMEOUT, STORE_IDENTITY_KEY, Spool,
     StoreFence, StoreHealth, StoreHealthReport, StoreIdentityFile, StoreProblem, TARGET_NOT_EMPTY,
     check_configured_store, check_configured_store_read_only, maintenance, migrate_legacy,
-    read_identity_bounded, reconciler, refuse_point_in_time_recovery, store_identity,
-    store_maintenance, sync,
+    read_identity_bounded, reconciler, store_identity, store_maintenance, sync,
 };
+mod backup_requests;
+pub use backup_requests::refuse_point_in_time_recovery;
 mod batch_get_item;
 mod batch_write_item;
 pub mod capacity_helpers;
@@ -32,13 +40,23 @@ mod expression_helpers;
 mod get_item;
 mod gsi_updates;
 mod import_export;
+// The filesystem helpers of import/export; the WebAssembly build has no
+// filesystem, and `import_export` keeps its file I/O off that target.
+#[cfg(not(target_arch = "wasm32"))]
 mod import_export_io;
 mod index_helpers;
+mod int32_member;
 mod item_authorizer;
 mod legacy_filter;
 mod list_tables;
 #[cfg(feature = "partiql")]
 mod partiql;
+mod pre_dispatch;
+pub use pre_dispatch::{ParsedRequest, parse_request};
+// `private_fs` creates the private directories the filesystem-backed
+// import/export use; it has no wasm32 consumer and uses unix/windows file
+// APIs, so it is compiled only off wasm.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod private_fs;
 mod put_item;
 mod query;
@@ -53,7 +71,10 @@ mod service_error_log_tests;
 mod start_key;
 pub mod stream_capture;
 mod streams;
+mod streams_iterator_params;
 mod tagging;
+#[cfg(test)]
+mod test_tracing;
 mod transact_get_items;
 mod transact_write_helpers;
 mod transact_write_items;
@@ -106,7 +127,8 @@ use extenddb_core::types::TableKeyInfo;
 ///
 /// Real `DynamoDB` validates the operation name before checking authentication.
 /// An unknown operation with no auth headers returns `UnknownOperationException`,
-/// not `MissingAuthenticationToken`. The server layer calls this before auth.
+/// not `MissingAuthenticationToken`. `parse_request` applies this check, and
+/// the server calls it before auth.
 #[must_use]
 pub fn is_known_operation(operation: &str) -> bool {
     matches!(
@@ -187,10 +209,11 @@ pub(crate) fn serialize_output(
 /// Use this for storage calls that don't go through `storage_err_to_dynamo`
 /// (e.g., tagging, metadata operations that return `StorageError` directly).
 /// A [`StorageError::Service`] error is the backend's own classification of
-/// the failure and reaches the client unchanged, without the fault log line.
+/// the failure and reaches the client through
+/// [`create_table::service_err_to_dynamo`], without the fault log line.
 pub(crate) fn sanitize_storage_error(e: extenddb_storage::error::StorageError) -> DynamoDbError {
     if let extenddb_storage::error::StorageError::Service(e) = e {
-        return e;
+        return create_table::service_err_to_dynamo(e);
     }
     log_storage_fault!(e, "storage internal error");
     DynamoDbError::InternalServerError("Internal server error".to_owned())
@@ -308,13 +331,9 @@ pub(crate) fn validate_enum_fields(
     if errors.is_empty() {
         return Ok(());
     }
-    let count = errors.len();
-    let msg = format!(
-        "{count} validation error{} detected: {}",
-        if count == 1 { "" } else { "s" },
-        errors.join("; ")
-    );
-    Err(DynamoDbError::ValidationException(msg))
+    Err(DynamoDbError::ValidationException(
+        extenddb_core::error::validation_errors_detected(&errors),
+    ))
 }
 
 /// Validate the `ReturnValues` field for `PutItem` / `DeleteItem`, which accept
@@ -365,10 +384,10 @@ pub struct DispatchMetrics {
     /// GSI/LSI name when the operation targets a secondary index.
     /// Used to attribute metrics to the specific index.
     pub index_name: Option<String>,
-    /// The tables of a batch that answered 200 with requests or keys a
-    /// backend throttled left unprocessed, by table name, once each. The
-    /// server records a throttle for each: its own bucket never saw them.
-    pub throttled_tables: Vec<String>,
+    /// The requests or keys a backend throttled in a batch that answered 200,
+    /// counted per table by its catalog name. The server records each count
+    /// as read or write throttle events: its own bucket never saw them.
+    pub throttled_tables: std::collections::BTreeMap<String, u32>,
 }
 
 /// Result of an engine dispatch: the JSON response body plus sideband metrics.
@@ -410,8 +429,11 @@ pub type AuthorizedKeyInfo = std::collections::HashMap<String, Option<TableKeyIn
 /// the discussion file and principal reviewer approval.
 pub struct OperationContext {
     pub storage: Arc<dyn extenddb_storage::StorageEngine>,
-    /// The process's job slots and configured backup store, which the backup
-    /// operations read.
+    /// The process's job slots and configured backup store, which the
+    /// store-backed backup operations read. That subsystem is compiled only
+    /// off wasm, so this field is absent in the wasm build, where
+    /// [`dispatch`] refuses those operations.
+    #[cfg(not(target_arch = "wasm32"))]
     pub backup: Arc<BackupRuntime>,
     pub limits: Arc<LimitsConfig>,
     pub region: Arc<str>,
@@ -583,36 +605,63 @@ pub async fn dispatch(
         "ExportTableToPointInTime" => handle_export_table(body, ctx)
             .await
             .map(DispatchResult::body_only),
+        #[cfg(not(target_arch = "wasm32"))]
         "CreateBackup" => backup::handle_create_backup(body, ctx)
             .await
             .map(DispatchResult::body_only),
+        #[cfg(not(target_arch = "wasm32"))]
         "DescribeBackup" => backup::handle_describe_backup(body, ctx)
             .await
             .map(DispatchResult::body_only),
-        "ListBackups" => backup::handle_list_backups(body, ctx)
+        "ListBackups" => backup_requests::handle_list_backups(body, ctx)
             .await
             .map(DispatchResult::body_only),
+        #[cfg(not(target_arch = "wasm32"))]
         "DeleteBackup" => backup::handle_delete_backup(body, ctx)
             .await
             .map(DispatchResult::body_only),
+        #[cfg(not(target_arch = "wasm32"))]
         "RestoreTableFromBackup" => backup::handle_restore_table_from_backup(body, ctx)
             .await
             .map(DispatchResult::body_only),
-        "DescribeContinuousBackups" => backup::handle_describe_continuous_backups(body, ctx)
+        "DescribeContinuousBackups" => {
+            backup_requests::handle_describe_continuous_backups(body, ctx)
+                .await
+                .map(DispatchResult::body_only)
+        }
+        "UpdateContinuousBackups" => backup_requests::handle_update_continuous_backups(body, ctx)
             .await
             .map(DispatchResult::body_only),
-        "UpdateContinuousBackups" => backup::handle_update_continuous_backups(body, ctx)
-            .await
-            .map(DispatchResult::body_only),
-        "RestoreTableToPointInTime" => backup::handle_restore_table_to_point_in_time(body, ctx)
-            .await
-            .map(DispatchResult::body_only),
+        "RestoreTableToPointInTime" => {
+            backup_requests::handle_restore_table_to_point_in_time(body, ctx)
+                .await
+                .map(DispatchResult::body_only)
+        }
         #[cfg(feature = "partiql")]
         "ExecuteStatement" => ctx.execute_statement(body).await,
         #[cfg(feature = "partiql")]
         "BatchExecuteStatement" => ctx.batch_execute_statement(body).await,
         #[cfg(feature = "partiql")]
         "ExecuteTransaction" => ctx.execute_transaction(body).await,
+        // An arm above that is compiled only off wasm32 leaves its operation
+        // known on wasm32 (`is_known_operation` is the same on every target)
+        // but unserved there. Today these are the four store-backed backup
+        // operations: the `backup` module does not build for wasm32, because
+        // it uses the backup store's S3 client, whose network stack needs mio,
+        // and tokio's file I/O. Such an operation is refused with a
+        // ValidationException that names the build, not answered as unknown,
+        // and an arm gated the same way later is refused here too. This arm
+        // is compiled for wasm32 only because its message names wasm32: off
+        // wasm32, a known operation without an arm (an arm with a cfg of its
+        // own can leave one) answers UnknownOperationException from the last
+        // arm.
+        #[cfg(target_arch = "wasm32")]
+        _ if is_known_operation(operation) => Err(DynamoDbError::ValidationException(
+            extenddb_core::error::webassembly_unsupported_message(
+                operation,
+                "the code that serves it is not compiled for wasm32",
+            ),
+        )),
         _ => Err(DynamoDbError::UnknownOperationException(String::new())),
     }
 }
@@ -622,19 +671,6 @@ mod sanitize_storage_error_tests {
     use super::sanitize_storage_error;
     use extenddb_core::error::DynamoDbError;
     use extenddb_storage::error::StorageError;
-
-    // The metadata and tagging paths map through this function; a
-    // backend-classified error keeps its variant and message there too.
-    #[test]
-    fn service_error_passes_through() {
-        let err = sanitize_storage_error(StorageError::Service(DynamoDbError::ServiceUnavailable(
-            "retry shortly".to_owned(),
-        )));
-        match err {
-            DynamoDbError::ServiceUnavailable(msg) => assert_eq!(msg, "retry shortly"),
-            other => panic!("expected ServiceUnavailable, got {other:?}"),
-        }
-    }
 
     // Control: every other variant is still redacted behind the fixed string.
     #[test]

@@ -85,18 +85,20 @@ impl Extensions {
 ///
 /// The router is nested at `/console/<slug>` inside the console and wrapped in
 /// the console's session check: a request without a live session is redirected
-/// to the login page before it reaches the router, and one with a session
-/// carries a [`crate::console::ConsoleIdentity`] request extension, so the
+/// to the login page before it reaches the router, a request that may change
+/// state needs the session's CSRF token in its `_csrf` form field (see
+/// [`crate::console::require_console_session`]), and one that passes carries
+/// a [`crate::console::ConsoleIdentity`] request extension, so the
 /// page can render the console's navigation bar and layout through
 /// [`crate::console::html`]. Every path under the slug meets the session
 /// check, including paths the router has no route for: the server installs a
 /// plain 404 fallback on the tab router inside the check, and a fallback the
 /// extension set on its router is replaced by it. `/console/<slug>/` redirects
 /// to `/console/<slug>`, behind the same check. `slug` is one path segment of
-/// `[a-z0-9-]` that is not a built-in console route and not another tab's;
-/// `label` is the link text. Build it through
-/// [`Extensions::with_console_tab`]; the struct may gain fields in a minor
-/// release.
+/// `[a-z0-9-]` that is not the first segment of a built-in console route and
+/// not another tab's; `label` is the link text, and may not be empty. Build it
+/// through [`Extensions::with_console_tab`]; the struct may gain fields in a
+/// minor release.
 #[non_exhaustive]
 pub struct ConsoleTab {
     /// The link text in the navigation bar.
@@ -107,8 +109,10 @@ pub struct ConsoleTab {
     pub router: Router,
 }
 
-/// Console paths the server owns at the first segment under `/console/`; a
-/// tab may not take one.
+/// The first path segments of the console router
+/// ([`crate::console::router`]), each a built-in route under `/console/`; a
+/// tab may not take one. A test reads the router's routes and checks that
+/// this list is their first segments.
 const CONSOLE_RESERVED_SLUGS: &[&str] = &[
     "login",
     "logout",
@@ -118,11 +122,6 @@ const CONSOLE_RESERVED_SLUGS: &[&str] = &[
     "settings",
     "cache",
     "accounts",
-    "users",
-    "groups",
-    "roles",
-    "policies",
-    "access-keys",
 ];
 
 /// Check one tab slug against the rule and the slugs already taken.
@@ -146,12 +145,16 @@ pub(crate) fn validate_console_slug(
     Ok(())
 }
 
-/// Check every tab slug in `tabs` as the server will at startup, without
-/// mounting.
+/// Check every tab in `tabs` as the server will at startup, without mounting:
+/// its slug against the rule and the earlier tabs' slugs, and its label for
+/// link text.
 pub fn validate_console_slugs(tabs: &[ConsoleTab]) -> Result<(), ExtensionMountError> {
     let mut taken: Vec<String> = Vec::with_capacity(tabs.len());
     for tab in tabs {
         validate_console_slug(&tab.slug, &taken)?;
+        if tab.label.trim().is_empty() {
+            return Err(ExtensionMountError::EmptyLabel(tab.slug.clone()));
+        }
         taken.push(tab.slug.clone());
     }
     Ok(())
@@ -232,6 +235,9 @@ pub enum ExtensionMountError {
     ReservedSlug(String),
     /// A console tab slug repeats an earlier tab's.
     RepeatedSlug(String),
+    /// A console tab's label, the link text, is empty or only white space.
+    /// Holds the tab's slug.
+    EmptyLabel(String),
     /// The prefix ends with `/`, has an empty segment (`//`), has a parameter
     /// or wildcard segment (`{`, `}`, `*`), or has a byte no request path can
     /// carry (`?`, `#`, a space, a control byte). `Router::nest` refuses or
@@ -270,6 +276,11 @@ impl std::fmt::Display for ExtensionMountError {
             Self::RepeatedSlug(slug) => {
                 write!(f, "console tab slug '{slug}' is used by an earlier tab")
             }
+            Self::EmptyLabel(slug) => write!(
+                f,
+                "console tab '{slug}' has an empty label, which would show as an empty \
+                 link in the navigation bar"
+            ),
             Self::BadShape(prefix) => write!(
                 f,
                 "extension router prefix '{prefix}' must be one or more non-empty \

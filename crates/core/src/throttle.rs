@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use web_time::Instant;
 
 mod bucket;
 mod index;

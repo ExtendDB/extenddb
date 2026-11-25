@@ -120,14 +120,11 @@ async fn a_connection_error_leaves_the_rest_of_the_batch_unattempted() {
 /// A connection error with nothing applied answers 503 after one attempt.
 #[tokio::test]
 async fn a_connection_error_with_nothing_applied_answers_503_after_one_attempt() {
-    let down = StorageError::Connection("refused".to_owned());
-    let data = Scripted::new(vec![Err(down)]);
-    let items = json!({"t": [put("a"), put("b")]});
-
-    let err = rejected(run(&data, items, &["t"], found(&["t"])).await);
+    let (err, writes) =
+        super::scripted::batch_that_applies_nothing_after_a_connection_error().await;
 
     assert_eq!(err.status_code(), 503, "{err:?}");
-    assert_eq!(data.writes(), ["t/a"]);
+    assert_eq!(writes, ["t/a"]);
 }
 
 /// An error a replay would not clear fails the batch with 500, also after an

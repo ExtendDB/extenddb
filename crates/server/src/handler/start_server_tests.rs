@@ -157,6 +157,7 @@ async fn serve_with_tabs(
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let installed = observer.map(|o| o as Arc<dyn RequestObserver>);
     let (state, _) = build_state_with(
+        None,
         move |account_id| {
             Arc::new(SlowAuth {
                 account_id,
@@ -332,12 +333,12 @@ async fn a_client_that_goes_away_mid_request_is_recorded_once_with_status_zero()
 
 /// A tab page that renders the console layout from the identity the session
 /// check inserted, so the test can read the navigation bar, plus a POST route
-/// that acts only when the form's `_csrf` field is the session's token.
+/// that answers with a field of its form. The session check refuses a POST
+/// without the session's CSRF token before the route runs.
 fn tab_router() -> Router {
     #[derive(serde::Deserialize)]
     struct Act {
-        #[serde(rename = "_csrf", default)]
-        csrf: String,
+        x: String,
     }
     Router::new()
         .route(
@@ -367,16 +368,7 @@ fn tab_router() -> Router {
         )
         .route(
             "/act",
-            post(
-                |identity: axum::Extension<crate::console::ConsoleIdentity>,
-                 axum::Form(form): axum::Form<Act>| async move {
-                    if identity.csrf_matches(&form.csrf) {
-                        (axum::http::StatusCode::OK, "acted")
-                    } else {
-                        (axum::http::StatusCode::FORBIDDEN, "CSRF token mismatch")
-                    }
-                },
-            ),
+            post(|axum::Form(form): axum::Form<Act>| async move { format!("acted x={}", form.x) }),
         )
 }
 
@@ -428,11 +420,19 @@ async fn a_console_tab_is_behind_the_session_check_and_listed_in_the_nav_bar() {
     let (addr, task) = serve_with_tabs(Vec::new(), tabs, None, 0).await;
 
     // Without a session: the page, a non-route under it and the slash form
-    // all redirect to the login page, so the slug is not confirmed.
-    for path in ["/console/chaos", "/console/chaos/other", "/console/chaos/"] {
+    // all redirect to the login page, as a built-in page does; an unmounted
+    // slug is 404, as an unknown console path is.
+    for (path, status) in [
+        ("/console/chaos", 303),
+        ("/console/chaos/other", 303),
+        ("/console/chaos/", 303),
+        ("/console/accounts", 303),
+        ("/console/nothere", 404),
+    ] {
         let r = raw(addr, &get_req(path)).await;
-        assert_eq!(r.status, 303, "{path}: {}", r.body);
-        assert_eq!(r.header("location"), Some("/console/login"), "{path}");
+        assert_eq!(r.status, status, "{path}: {}", r.body);
+        let location = (status == 303).then_some("/console/login");
+        assert_eq!(r.header("location"), location, "{path}");
     }
 
     let cookie = login(addr).await;
@@ -465,7 +465,8 @@ async fn a_console_tab_is_behind_the_session_check_and_listed_in_the_nav_bar() {
     );
 
     // The page's meta tag carries the session's CSRF token; a POST with it
-    // acts, a POST without it is refused as the built-in pages refuse.
+    // reaches the route with its form, a POST without it is refused before
+    // the route as the built-in pages refuse it.
     let token = page
         .body
         .split(r#"name="csrf-token" content=""#)
@@ -483,12 +484,14 @@ async fn a_console_tab_is_behind_the_session_check_and_listed_in_the_nav_bar() {
     )
     .await;
     assert_eq!(act.status, 200, "{}", act.body);
+    assert_eq!(act.body, "acted x=1");
     let refused = raw(
         addr,
         &post_req_with_cookie("/console/chaos/act", &cookie, b"x=1"),
     )
     .await;
     assert_eq!(refused.status, 403, "{}", refused.body);
+    assert_eq!(refused.body, "CSRF token mismatch");
     let no_session = raw(addr, &post_req("/console/chaos/act", "", b"x=1")).await;
     assert_eq!(no_session.status, 303, "{}", no_session.body);
     assert_eq!(no_session.header("location"), Some("/console/login"));
@@ -511,9 +514,23 @@ async fn a_console_tab_is_behind_the_session_check_and_listed_in_the_nav_bar() {
 #[tokio::test]
 async fn without_tabs_the_console_nav_bar_and_routes_are_unchanged() {
     let (addr, task) = serve_with_tabs(Vec::new(), Vec::new(), None, 0).await;
-    let r = raw(addr, &get_req("/console/chaos")).await;
-    // No tab mounted: the console's own fallback answers, behind no gate.
-    assert_eq!(r.status, 404, "{}", r.body);
+    // No tab mounted: an unmatched console path gets the server's own 404,
+    // the answer an unmatched path outside the console gets, headers
+    // included (HEAD carries no content-length).
+    for method in ["GET", "HEAD"] {
+        let request = |path: &str| {
+            format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                .into_bytes()
+        };
+        let console = raw(addr, &request("/console/chaos")).await;
+        assert_eq!(console.status, 404, "{method}: {}", console.body);
+        let outside = raw(addr, &request("/nope")).await;
+        assert_eq!(
+            normalised(&console, addr),
+            normalised(&outside, addr),
+            "{method}"
+        );
+    }
     let login_page = raw(addr, &get_req("/console/login")).await;
     assert_eq!(login_page.status, 200);
     assert!(!login_page.body.contains("/console/chaos"));
@@ -543,6 +560,7 @@ async fn start_server_refuses_a_reserved_slug_and_a_reserved_prefix_before_servi
         ),
     ] {
         let (state, _) = build_state_with(
+            None,
             |account_id| {
                 Arc::new(SlowAuth {
                     account_id,

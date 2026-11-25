@@ -15,24 +15,26 @@ applications point their AWS SDKs at extenddb and get identical DynamoDB behavio
 
 ## Cargo Workspace
 
-The project is structured as a Cargo workspace with 13 crates. Crate boundaries enforce dependency rules at compile time.
+The project is structured as a Cargo workspace with 15 crates. Crate boundaries enforce dependency rules at compile time.
 
 ```
 extenddb/
 ├── crates/
 │   ├── app/                Application/CLI library the bin crate dispatches to
 │   ├── auth/               AuthProvider trait, SigV4 verification, IAM policy engine
+│   ├── backup-store/       Backup object store (filesystem and S3)
 │   ├── bin/                CLI entry point, config loading, daemon lifecycle
 │   ├── cache/              Stale-while-revalidate cache used by the auth and server layers
 │   ├── config/             Configuration types and loading
-│   ├── core/               Pure sync Rust: types, expressions, validation, errors
+│   ├── core/               Sync Rust: types, expressions, validation, errors, crypto
 │   ├── engine/             Async operation handlers (PutItem, Query, etc.)
 │   ├── server/             HTTP server (axum), management API, web console
 │   ├── storage/            Storage trait definitions and backend-agnostic utilities
 │   ├── storage-cassandra/  Cassandra backend implementation (experimental)
 │   ├── storage-mongodb/    MongoDB backend implementation
 │   ├── storage-postgres/   PostgreSQL backend implementation (default)
-│   └── storage-sqlite/     SQLite backend implementation (embedded)
+│   ├── storage-sqlite/     SQLite backend implementation (embedded)
+│   └── wasm-adapter/       Experimental WebAssembly build of the engine (publish = false)
 ```
 
 ## Crate Dependency Graph
@@ -47,18 +49,22 @@ bin ──→ server ──→ engine ──→ core
  │
  ├──→ storage-{postgres,sqlite,mongodb,cassandra} ──→ storage ──→ core
  └──→ core
+
+wasm-adapter ──→ engine, storage-sqlite, storage, auth, core
 ```
 
 Exactly one `storage-*` backend is linked per binary, selected by mutually exclusive Cargo features at build time.
 
-Key principle: `core` depends on nothing in the workspace and has no async runtime. It contains pure sync Rust: types,
-expression parsing and evaluation, input validation, capacity calculation, and error types. Every other crate depends on `core`.
+Key principle: `core` depends on nothing in the workspace and has no async runtime. It contains sync Rust: types,
+expression parsing and evaluation, input validation, capacity calculation, error types, and the crypto module, which
+links AWS-LC through `aws-lc-rs` natively. Every crate but `cache` and `backup-store` depends on `core`, directly or
+through another crate.
 
 ## Crate Roles
 
 ### core
 
-Pure sync Rust library. No async runtime, no database drivers, no HTTP framework.
+Sync Rust library. No async runtime, no database drivers, no HTTP framework.
 
 - **types**: `AttributeValue`, `KeySchema`, `TableMetadata`, `StreamRecord`, and all DynamoDB data types
 - **expression**: Parser and evaluator for `ConditionExpression`, `FilterExpression`, `UpdateExpression`, `ProjectionExpression`, and `KeyConditionExpression`
@@ -66,6 +72,9 @@ Pure sync Rust library. No async runtime, no database drivers, no HTTP framework
 - **error**: `DynamoDbError` enum mapping every DynamoDB error code to its HTTP status and message
 - **limits**: Configurable limits matching real DynamoDB defaults (item size, batch sizes, expression depth/tokens)
 - **capacity**: RCU/WCU calculation logic
+- **crypto**: SHA-256, HMAC-SHA256, constant-time comparison, AES-256-GCM `seal`/`open` and a random fill; AWS-LC
+  through `aws-lc-rs` natively; on `wasm32`, the RustCrypto `sha2`, `hmac` and `aes-gcm` crates, `subtle` for the
+  comparison and `getrandom` over the browser's Web Crypto for randomness
 
 ### engine
 
@@ -162,6 +171,13 @@ Thin binary that wires everything together:
 - Daemon lifecycle (bind socket → fork → syslog → serve)
 - Background tasks (log level polling, throttling polling, GSI delay polling, stream record cleanup, TTL expiry, metrics persistence)
 
+### wasm-adapter
+
+Experimental WebAssembly build of the engine (`publish = false`). It compiles the engine, `storage-sqlite` over an
+in-memory database, and the crates they depend on to `wasm32-unknown-unknown`, and exposes a `wasm-bindgen` surface
+that answers a DynamoDB request by calling `engine`'s `dispatch` in process, with no server. The README section
+"Experimental: WebAssembly build" lists what it does not do and what it refuses.
+
 ## Request Lifecycle
 
 1. AWS SDK sends `POST /` with `X-Amz-Target` header and JSON body
@@ -224,13 +240,13 @@ Auth providers implement the `AuthProvider` trait using `#[async_trait]` for obj
 
 ### Request scope
 
-The server sets `extenddb_storage::request_scope::RequestScope` around each request from authentication through dispatch. It holds the request id the client receives in the `x-amzn-RequestId` response header, the operation name from `X-Amz-Target`, and the `amz-sdk-invocation-id` and `amz-sdk-request` headers when the client sent them. A storage backend or an engine error mapper running inline on the request task reads it with `request_scope::current()` or `request_scope::with_current()`. The scope is a Tokio task-local, absent in background workers and in tasks started with `tokio::spawn`. The detached restore of `RestoreTableFromBackup` carries it across by hand, and the TTL index backfill that `UpdateTimeToLive` spawns runs without it.
+The server sets `extenddb_storage::request_scope::RequestScope` around each request from authentication through dispatch. It holds the request id the client receives in the `x-amzn-RequestId` response header, the operation name from `X-Amz-Target`, and the `amz-sdk-invocation-id` and `amz-sdk-request` headers when the client sent them. A storage backend or an engine error mapper running inline on the request task reads it with `request_scope::current()` or `request_scope::with_current()`. The scope is a Tokio task-local, absent in background workers and in tasks started with `tokio::spawn`. The detached restore of `RestoreTableFromBackup` carries it across by hand. The job tasks of a store-backed `CreateBackup` and of `RestoreTableFromBackup`'s registration answer the request from a task without it, and the TTL index backfill that `UpdateTimeToLive` spawns runs without it.
 
-The engine's fault log lines (`storage internal error`, `backup storage error`, and the create_table arm for an idempotency fault) carry `request_id` and `operation` from the scope next to the redacted error text, so an operator can match the line to the request id the client received. Outside a request the line carries neither field. At trace level the engine writes one `dispatch` event per request under the target `extenddb_engine::dispatch`, inside the scope, with the operation.
+The engine's fault log lines carry `request_id` and `operation` from the scope next to the redacted error text, so an operator can match the line to the request id the client received: `storage internal error` and `backup storage error`, the shared error mapper's lines for an unexpected already-exists error, an idempotency fault, a transient error, an expired snapshot and a connection error, the restore's line for a backup store read that fails, DeleteBackup's line for a catalog id that cannot be read and the BatchWriteItem line for the requests a batch did not apply. Outside a request the line carries neither field. At trace level the engine writes one `dispatch` event per request under the target `extenddb_engine::dispatch`, inside the scope, with the operation.
 
 ### Thin binary extensions
 
-A backend's `main` passes an `extenddb_app::Extensions` value to `extenddb_app::run_with`; `run` is the same call with the empty default. `Extensions::http` is a list of axum routers with absolute prefixes of literal segments; `start_server` nests each after the built-in routes and before the response security layer, so an extension response carries the same security headers. The layers in front of every route apply to it too: a `ServiceUnavailable` answer while the serving registration is lost, the refusal of a repeated `host` or `authorization` header, and the request body timeout. Nothing else of the server's applies (no authentication, no rate limit, axum's default body limit). A prefix that is `/`, is not absolute, ends with `/`, has an empty segment, a parameter or wildcard segment or a byte no request path carries, is at or under `/health`, `/metrics`, `/management` or `/console`, or is at, under or above an earlier prefix is a startup error, reported before the backend connects. `Extensions::request_observer` is an optional `RequestObserver`; the handler calls it once per request that reached authentication, after the response is built and outside the request scope, with a `RequestRecord` (request id, operation, table, account, status, error type, latency, a hash of the raw body, and the two SDK correlation headers). A request the client abandons in flight is reported with status 0. Without an observer the handler builds no record and hashes no body. `Extensions::console_tabs` are pages added to the console: each is a router nested at `/console/<slug>` behind the console's session check, which inserts a `ConsoleIdentity` request extension (the user's label, the CSRF token, whether the session is an admin rather than an IAM user's, the tab links and the version line) for the page to render the console's layout through `extenddb_app::console_html`, and a link in the navigation bar after the built-in ones. The check admits every console user; a tab checks `is_admin` for an admin-only page and `csrf_matches` on its own POST handlers, as the built-in pages do. A slug is one segment of `[a-z0-9-]` that is not a built-in console route and not another tab's; a violation is a startup error whether or not the console is mounted.
+A backend's `main` passes an `extenddb_app::Extensions` value to `extenddb_app::run_with`; `run` is the same call with the empty default. `Extensions::http` is a list of axum routers with absolute prefixes of literal segments; `start_server` nests each after the built-in routes and before the response security layer, so an extension response carries the same security headers. The layers in front of every route apply to it too: a `ServiceUnavailable` answer while the serving registration is lost, the refusal of a repeated `host` or `authorization` header, and the request body timeout. Nothing else of the server's applies (no authentication, no rate limit, axum's default body limit). A prefix that is `/`, is not absolute, ends with `/`, has an empty segment, a parameter or wildcard segment or a byte no request path carries, is at or under `/health`, `/metrics`, `/management` or `/console`, or is at, under or above an earlier prefix is a startup error, reported before the backend connects. `Extensions::request_observer` is an optional `RequestObserver`; the handler calls it once per request that reached authentication, after the response is built and outside the request scope, with a `RequestRecord` (request id, operation, table, account, status, error type, latency, a hash of the raw body, and the two SDK correlation headers). A request the client abandons in flight is reported with status 0. Without an observer the handler builds no record and hashes no body. `Extensions::console_tabs` are pages added to the console: each is a router nested at `/console/<slug>` behind the console's session check, which inserts a `ConsoleIdentity` request extension (the user's label, the CSRF token, whether the session is an admin rather than an IAM user's, the tab links and the version line) for the page to render the console's layout through `extenddb_app::console_html`, and a link in the navigation bar after the built-in ones. The check admits every console user, and a tab checks `is_admin` for an admin-only page, as the built-in pages do. The check also answers with 403 a request that may change state unless its form carries the session's CSRF token in `_csrf`. A slug is one segment of `[a-z0-9-]` that is not the first segment of a built-in console route and not another tab's, and a label is not empty; a violation is a startup error whether or not the console is mounted.
 
 ## Security Architecture
 

@@ -3,7 +3,7 @@
 
 //! The token bucket every throttle limit is built from.
 
-use std::time::Instant;
+use web_time::Instant;
 
 /// Default burst window: 300 seconds of accumulated capacity.
 const BURST_SECONDS: f64 = 300.0;
@@ -72,9 +72,14 @@ impl TokenBucket {
         let old_max = self.max_tokens;
         self.max_tokens = new_rate * BURST_SECONDS;
         self.refill_rate = new_rate;
-        // Scale current tokens proportionally.
         if old_max > 0.0 {
-            self.tokens = (self.tokens / old_max * self.max_tokens).min(self.max_tokens);
+            // A positive balance keeps its share of the burst window. A debt
+            // (the balance below zero that an operation larger than the
+            // balance leaves) keeps its token count and is repaid at the new
+            // rate.
+            if self.tokens > 0.0 {
+                self.tokens = (self.tokens / old_max * self.max_tokens).min(self.max_tokens);
+            }
         } else {
             self.tokens = self.max_tokens;
         }

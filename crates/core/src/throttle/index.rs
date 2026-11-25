@@ -10,7 +10,7 @@
 //! 2026-10-25). A local secondary index shares the table's capacity and has
 //! no buckets here.
 
-use std::time::Instant;
+use web_time::Instant;
 
 use super::bucket::TokenBucket;
 

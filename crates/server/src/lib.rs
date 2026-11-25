@@ -20,6 +20,7 @@ mod handler;
 mod import_export_paths;
 mod import_export_roots;
 mod item_authz;
+pub mod key_file;
 pub mod key_info_cache;
 mod leading_keys;
 mod listener;
@@ -269,13 +270,17 @@ pub async fn start_server(
             metrics: metrics_for_console,
             secure_cookies: tls_enabled,
         });
-        // The console's own fallback is explicit so that the fallbacks nested
-        // below it (each tab's, inside its session layer) are kept when the
-        // console is nested into the app; axum drops a child's fallback when
-        // its parent still has the default one.
-        let mut console_router = console::router()
-            .fallback(|| async { StatusCode::NOT_FOUND })
-            .with_state(console_state.clone());
+        // With a tab mounted, the console's own fallback is explicit so that
+        // the fallbacks nested below it (each tab's, inside its session layer)
+        // are kept when the console is nested into the app; axum drops a
+        // child's fallback when its parent still has the default one. With no
+        // tab the console keeps the default, so an unmatched console path gets
+        // the app's 404, headers included.
+        let mut console_router = console::router();
+        if !console_tabs.is_empty() {
+            console_router = console_router.fallback(|| async { StatusCode::NOT_FOUND });
+        }
+        let mut console_router = console_router.with_state(console_state.clone());
         for tab in console_tabs {
             let gate = axum::middleware::from_fn_with_state(
                 console_state.clone(),
@@ -288,8 +293,10 @@ pub async fn start_server(
                 .fallback(|| async { StatusCode::NOT_FOUND })
                 .layer(gate.clone());
             // The trailing-slash form redirects to the page, as /console/ does
-            // below, behind the same check so a slug is not confirmed to a
-            // client without a session.
+            // below, behind the same check. Without a session every path under
+            // the slug answers 303 to the login page, as a built-in page such
+            // as /console/accounts does, and an unmounted slug answers 404, as
+            // an unknown console path does.
             let page = format!("/console/{}", tab.slug);
             let slash = Router::new()
                 .route("/", get(move || async move { Redirect::permanent(&page) }))

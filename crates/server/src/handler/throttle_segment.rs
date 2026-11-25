@@ -18,7 +18,8 @@ use crate::throttle_helpers::{
 /// Check the throttle buckets for `operation` on `table_name`, registering
 /// the table and its provisioned global secondary indexes from its
 /// description first when the manager has no buckets for it. A control-plane
-/// operation, or a request with no table name, is not throttled. `index_name`
+/// operation, a request with no table name, and a name the table name rules
+/// refuse are not throttled. `index_name`
 /// is the index a `Query` or `Scan` names; a provisioned global secondary
 /// index is checked on its own read bucket, and a write is checked on every
 /// registered index's write bucket after the table's. A refusal carries the
@@ -35,8 +36,17 @@ pub(super) async fn check(
     index_name: Option<&str>,
 ) -> Result<(), Refused> {
     let (is_read_op, is_write_op) = classify_data_operation(operation);
+    // A name the table name rules refuse (length or pattern), and the ARN of
+    // a table in another Region, are not throttled: the engine answers them
+    // as it does with capacity left. The service refuses such a name before
+    // any throttle (measured 2026-11-25 with GetItem and PutItem on `ab`, an
+    // empty name, 256 characters and the ARN of a table in another Region).
+    // The ARN of a table in this account and Region is checked by the name it
+    // carries, and a throttle refusal names that table.
     if let Some(tn) = table_name
         && (is_read_op || is_write_op)
+        && let name = crate::authz_resource::key_lookup_name(tn, &state.region, &ctx.account_id)
+        && extenddb_core::validation::validate_table_name(&name, &state.limits).is_ok()
     {
         if !state.throttle.is_registered(&ctx.account_id, tn)
             && let Ok(desc) = ctx
@@ -105,26 +115,15 @@ pub(super) async fn check(
             // DescribeTable returns as TableArn, or the index ARN (its
             // IndexArn) when an index's bucket refused. The error class, the
             // message and the limit follow the bucket that refused and the
-            // table's billing mode. The account bucket can refuse before the
-            // engine has seen the name, so an ARN naming a table in this
-            // account is reduced to the bare name first, and a name the
-            // engine would refuse gets no resource at all.
-            let name = crate::authz_resource::key_lookup_name(tn, &state.region, &ctx.account_id);
-            let resource_arn = extenddb_core::validation::validate_table_name_chars(&name)
-                .is_ok()
-                .then(|| match &refused_index {
-                    Some(index) => extenddb_storage::util::index_arn(
-                        &state.region,
-                        &ctx.account_id,
-                        &name,
-                        index,
-                    ),
-                    None => {
-                        extenddb_storage::util::table_arn(&state.region, &ctx.account_id, &name)
-                    }
-                });
+            // table's billing mode.
+            let resource_arn = match &refused_index {
+                Some(index) => {
+                    extenddb_storage::util::index_arn(&state.region, &ctx.account_id, &name, index)
+                }
+                None => extenddb_storage::util::table_arn(&state.region, &ctx.account_id, &name),
+            };
             return Err(Refused {
-                error: throttle_error(cause, throttled_read, resource_arn),
+                error: throttle_error(cause, throttled_read, &resource_arn),
                 account_id: Some(ctx.account_id.to_string()),
             });
         }

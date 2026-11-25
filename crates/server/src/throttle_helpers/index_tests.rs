@@ -140,8 +140,7 @@ fn index_name_is_read_from_query_and_scan_only() {
 
 /// The two measured index bodies: the provisioned class for both; the table
 /// message on a read and the index message (no trailing period) on a write;
-/// the reason in the `Index` scope; the resource as given. Without a resource
-/// there is no reasons list, as for the table arms.
+/// the reason in the `Index` scope; the resource as given.
 #[test]
 fn index_cause_maps_to_the_two_measured_bodies() {
     const INDEX_ARN: &str = "arn:aws:dynamodb:us-east-1:123456789012:table/T/index/I";
@@ -160,7 +159,7 @@ fn index_cause_maps_to_the_two_measured_bodies() {
             "IndexWriteProvisionedThroughputExceeded",
         ),
     ] {
-        let err = throttle_error(&cause, read, Some(INDEX_ARN.to_owned()));
+        let err = throttle_error(&cause, read, INDEX_ARN);
         assert!(
             matches!(
                 err,
@@ -173,9 +172,6 @@ fn index_cause_maps_to_the_two_measured_bodies() {
         assert_eq!(reasons.len(), 1, "read={read}");
         assert_eq!(reasons[0].reason, reason, "read={read}");
         assert_eq!(reasons[0].resource, INDEX_ARN, "read={read}");
-
-        let without = throttle_error(&cause, read, None);
-        assert_eq!(without.throttling_reasons(), Some(&[][..]), "read={read}");
     }
     assert!(!INDEX_WRITE_PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE.ends_with('.'));
     assert!(PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE.ends_with('.'));
