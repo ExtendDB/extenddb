@@ -278,9 +278,11 @@ impl Reader<'_> {
     /// reads such a disjunct to its end (measured 2026-11-14 to 2026-11-19:
     /// with r1 at a and r2 at b, `lsiSk = 'a' OR lsiSk = 'z'` with `Limit` 1
     /// gives [r1] and a NextToken, then an empty page of 0.5, as the table
-    /// read `pk = 'lk' AND (sk < 'r2' OR sk = 'r9')` does on 2026-11-19). At
-    /// a partition's end it reads the disjunct again on some walks only, so
-    /// the Query goes on there as before. Neither read made here is charged.
+    /// read `pk = 'lk' AND (sk < 'r2' OR sk = 'r9')` does on 2026-11-19).
+    /// At a partition's end the Query keeps `key` as before, so a later page
+    /// reads the disjunct again and charges that read. A later page skips
+    /// that read only when another item follows `key` in its partition.
+    /// Neither read made here is charged.
     async fn next_item_unmatched(
         &self,
         read: &KeyRead<'_>,
