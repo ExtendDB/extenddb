@@ -142,6 +142,11 @@ pub(crate) type TtlConfigCache = Arc<
 impl CassandraEngine {
     /// Create a new Cassandra storage engine.
     pub async fn new(config: &CassandraStorageConfig, region: &str) -> Result<Self, StorageError> {
+        debug_assert_eq!(
+            config.keyspace_prefix,
+            crate::config::fold_keyspace_prefix(&config.keyspace_prefix),
+            "the keyspace prefix must be lower case: see fold_keyspace_prefix"
+        );
         // Build Cassandra session
         let session = Self::create_session(config).await?;
 

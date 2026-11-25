@@ -786,28 +786,12 @@ pub async fn isolated_queue_keyspace(isolated: &IsolatedEngine) -> String {
     keyspace
 }
 
-/// The account keyspaces on `isolated`'s prefix, in the order the GSI
-/// workers read them (`system_schema` order).
+/// The account keyspaces on `isolated`'s prefix, in the order the GSI workers
+/// read them (`system_schema` order).
 pub async fn isolated_account_keyspaces(isolated: &IsolatedEngine) -> Vec<String> {
-    use cdrs_tokio::types::IntoRustByName as _;
-    let prefix = format!("{}_account_", isolated.config.keyspace_prefix);
-    isolated
-        .engine
-        .session()
-        .query("SELECT keyspace_name FROM system_schema.keyspaces")
+    extenddb_storage_cassandra::workers::list_account_keyspaces_for_tests(&isolated.engine)
         .await
         .unwrap()
-        .response_body()
-        .unwrap()
-        .into_rows()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|row| {
-            let name: Result<String, _> = row.get_r_by_name("keyspace_name");
-            name.ok()
-        })
-        .filter(|name| name.starts_with(&prefix))
-        .collect()
 }
 
 /// Create a migrated account on `isolated`'s prefix, registered in its
