@@ -285,7 +285,7 @@
 # MongoDB requires a replica set, even a single-node one, because conditional
 # writes and transactions use multi-document transactions.
 
-# MongoDB connection string. Required; no default.
+# MongoDB connection string. Required. No default.
 # connection_string = "mongodb://localhost:27017/?replicaSet=rs0"
 
 # Maximum size of the data connection pool. Unset leaves the driver's pool
@@ -314,7 +314,7 @@
 # Cassandra backend. Keyspaces are created with NetworkTopologyStrategy in the
 # configured datacenter. One connection pool serves catalog and data traffic.
 
-# Contact points as host:port strings. Required; no default.
+# Contact points as host:port strings. Required. No default.
 # contact_points = ["localhost:9042"]
 
 # Username for authentication. Omit for an unauthenticated cluster. No

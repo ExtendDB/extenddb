@@ -14,10 +14,11 @@
 //   - A comment block directly under a header, ended by a blank line, is the
 //     section's introduction and becomes prose.
 //   - `# key = value` is a key line. The comment lines directly above it are
-//     its description. A description containing "no default" marks a key whose
-//     value is an example: the Default column shows "none", the trailing
-//     "No default." sentence is dropped and the value is appended to the
-//     description as an example. A value may not carry a trailing ` #`
+//     its description. A description whose last sentence is "No default." or
+//     "No default of its own." marks a key whose value is an example: the
+//     Default column shows "none", that sentence is dropped and the value is
+//     appended to the description as an example. The Rust tests read the
+//     same two sentences (`no_default_keys`). A value may not carry a trailing ` #`
 //     comment outside a string literal; the value is the whole rest of the
 //     line.
 //   - Markdown links and code spans in comments pass through to the page.
@@ -37,6 +38,10 @@ const outputPath = resolve(root, 'docs', 'configuration.md');
 const KEY_LINE = /^# ([A-Za-z_][A-Za-z0-9_]*) = (.+)$/;
 const HEADER_LINE = /^(?:# )?\[([A-Za-z0-9_.]+)\]$/;
 const COMMENT_LINE = /^#(?: (.*))?$/;
+// The marker sentence that ends the description of a key without a default,
+// with the separator before it; `no_default_keys` in
+// crates/config/src/sample_toml_support.rs tests the same two sentences.
+const NO_DEFAULT = /[;,]?\s*\bno default( of its own)?\.$/i;
 
 /** Parse the sample into [{name, intro: string[], keys: [{name, value, description, hasDefault}]}]. */
 function parseSample(text) {
@@ -69,9 +74,9 @@ function parseSample(text) {
       if (hasInlineComment(value)) throw new Error(`${samplePath}:${lineNo}: key ${key[1]} has a trailing comment on its value line; put it in the description above`);
       let description = joinComment(pending);
       if (!description) throw new Error(`${samplePath}:${lineNo}: key ${key[1]} has no description`);
-      const hasDefault = !/\bno default\b/i.test(description);
+      const hasDefault = !NO_DEFAULT.test(description);
       if (!hasDefault) {
-        description = description.replace(/[;,]?\s*\bNo default( of its own)?\.\s*$/i, '');
+        description = description.replace(NO_DEFAULT, '');
         if (!/[.!?]$/.test(description)) description += '.';
         description += ` Example: \`${key[1]} = ${value}\``;
       }

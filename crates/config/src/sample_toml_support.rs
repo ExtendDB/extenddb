@@ -279,8 +279,10 @@ pub fn assert_integers(root: &Table, path: &str, keys: &[&str]) {
 }
 
 /// Dotted paths of the keys whose description (the `#` lines directly above
-/// the key line) carries the "no default" marker the generator reads, sorted.
-/// Follows the sample's comment convention the same way the generator does.
+/// the key line) ends with the marker sentence the generator reads, "No
+/// default." or "No default of its own.", sorted. Follows the sample's
+/// comment convention the same way the generator does (`NO_DEFAULT` in
+/// `website/scripts/gen-config-reference.mjs`).
 pub fn no_default_keys() -> Vec<String> {
     let text =
         std::fs::read_to_string(SAMPLE_PATH).unwrap_or_else(|e| panic!("read {SAMPLE_PATH}: {e}"));
@@ -296,7 +298,7 @@ pub fn no_default_keys() -> Vec<String> {
         } else if let Some(key) = key_line(line) {
             let name = key.split_once(" = ").map_or(key.as_str(), |(k, _)| k);
             let marker = description.join(" ").to_ascii_lowercase();
-            if marker.contains("no default") {
+            if marker.ends_with("no default.") || marker.ends_with("no default of its own.") {
                 found.push(if section.is_empty() {
                     name.to_owned()
                 } else {
