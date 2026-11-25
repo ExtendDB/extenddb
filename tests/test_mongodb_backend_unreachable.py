@@ -8,10 +8,9 @@ server's authorization path reads it to evaluate ``dynamodb:LeadingKeys``, and
 the engine reads it again for the operation itself. A MongoDB deployment that
 cannot be reached makes that read fail, and the status the client sees is
 whatever the backend classified the driver error as. A transient backend fault
-is a retryable ``ServiceUnavailable`` (503), which is what the SQL backends
-produce for the same fault; before the fix this backend answered 500
-``InternalServerError``, so a client saw a non-retryable error for a retryable
-condition (#441).
+is a ``ServiceUnavailable`` (503), the status of a fault that clears when the
+deployment comes back. Before the fix this backend answered 500
+``InternalServerError``, the status of a server fault.
 
 The fault is induced by stopping the MongoDB container, so every other request
 to the same server fails while this test runs. ``devtools/run-tests

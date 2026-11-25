@@ -4,12 +4,13 @@
 //! Classification of mongodb driver errors raised by catalog reads.
 //!
 //! A read that cannot reach the deployment is [`StorageError::Transient`],
-//! which `storage_err_to_dynamo` answers as `ServiceUnavailable` (503,
-//! retryable by the SDKs). Everything else stays [`StorageError::Internal`]
-//! and answers as `InternalServerError` (500). This matches what the SQL
-//! backends do for the same faults: `map_sqlx_err` in the SQLite backend and
-//! `read_err` in the PostgreSQL backend both classify I/O errors, pool
-//! trouble and the server's own connection-class replies as `Transient`.
+//! which `storage_err_to_dynamo` answers as `ServiceUnavailable` (503), the
+//! status of a fault that clears when the deployment comes back. Everything
+//! else stays [`StorageError::Internal`] and answers as `InternalServerError`
+//! (500), the status of a server fault. Two SQL classifiers answer the same
+//! fault the same way: `map_sqlx_err` on the SQLite index paths and `read_err`
+//! on the PostgreSQL DescribeBackup definition read. The SQL backends' own
+//! key-info reads map every driver error to `Internal`.
 //!
 //! The driver has predicates for this (`is_network_error`, `is_read_retryable`)
 //! but they are `pub(crate)` to the driver, so the classification is written
@@ -61,7 +62,7 @@ fn is_unreachable(e: &DriverError) -> bool {
 /// status on two paths: the server's authorization path reads key info before
 /// dispatch (`key_info_for_authz`) and the engine reads it again for the
 /// operation itself. Both run the result through `storage_err_to_dynamo`, so
-/// this classification is what the client sees (#441).
+/// this classification is what the client sees.
 pub(crate) fn catalog_read_err(e: &DriverError) -> StorageError {
     if is_unreachable(e) {
         StorageError::Transient(e.to_string())
