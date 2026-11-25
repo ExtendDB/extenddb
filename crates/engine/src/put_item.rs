@@ -224,10 +224,13 @@ pub async fn handle_put_item(
     let return_old = input.return_values == ReturnValues::AllOld;
     let capacity_requested =
         input.return_consumed_capacity != extenddb_core::types::ReturnConsumedCapacity::None;
-    let needs_index_capacity = capacity_requested
-        && (!key_info.global_secondary_indexes.is_empty()
-            || !key_info.local_secondary_indexes.is_empty()
-            || !key_info.vector_indexes.is_empty());
+    // The server charges a write to each global secondary index the write
+    // touched, so a table with one needs the old and the new item.
+    let has_gsi = !key_info.global_secondary_indexes.is_empty();
+    let needs_index_capacity = has_gsi
+        || (capacity_requested
+            && (!key_info.local_secondary_indexes.is_empty()
+                || !key_info.vector_indexes.is_empty()));
 
     // Preserve the new item only when per-index accounting needs to compare it
     // with the replaced item after storage takes ownership.
@@ -254,7 +257,7 @@ pub async fn handle_put_item(
     // deleted by an overwrite, so request the old item whenever capacity is
     // requested. Indexed writes already read it inside the storage transaction.
     let need_old_for_stream = stream.is_some();
-    let need_old_for_capacity = capacity_requested;
+    let need_old_for_capacity = capacity_requested || has_gsi;
 
     let old_item = ctx
         .storage
@@ -294,6 +297,13 @@ pub async fn handle_put_item(
             capacity_helpers::write_capacity(input.return_consumed_capacity, &input.table_name, wcu)
         }
     };
+    let index_write_units = capacity_helpers::index_write_units(
+        old_item.as_ref(),
+        new_item_for_capacity.as_ref(),
+        false,
+        &key_info,
+    )
+    .0;
 
     let output = PutItemOutput {
         attributes: if return_old { old_item } else { None },
@@ -305,6 +315,7 @@ pub async fn handle_put_item(
         body,
         metrics: DispatchMetrics {
             write_capacity_units: wcu,
+            index_write_units,
             ..Default::default()
         },
     })

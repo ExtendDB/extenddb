@@ -199,11 +199,11 @@ pub(super) async fn create_table(state: &Arc<AppState>, table: &str, billing: Va
     panic!("table {table} did not become ACTIVE");
 }
 
-fn arn(account_id: &str, table: &str) -> String {
+pub(super) fn arn(account_id: &str, table: &str) -> String {
     format!("arn:aws:dynamodb:us-east-1:{account_id}:table/{table}")
 }
 
-fn item(size: usize) -> Value {
+pub(super) fn item(size: usize) -> Value {
     json!({"pk": {"S": "k"}, "v": {"S": "x".repeat(size)}})
 }
 
@@ -289,7 +289,7 @@ async fn on_demand_hot_key_write_names_the_key_range_and_read_carries_no_reasons
     state.throttle.remove_table(&account_id, table);
     state
         .throttle
-        .consume_with_partition(&account_id, table, 1.0e9, 1.0e9, Some("k"));
+        .consume_with_partition(&account_id, table, 1.0e9, 1.0e9, Some("k"), None);
     let (status, body) = call(
         &state,
         "PutItem",

@@ -138,6 +138,19 @@ fn parse_gsi_throughput(s: &str) -> Result<ProvisionedThroughputDescription, Sto
     })
 }
 
+/// A GSI's `pt` as the stored `provisioned_throughput` that
+/// [`parse_gsi_throughput`] reads: the description with zero decreases.
+pub(crate) fn gsi_throughput_json(pt: &ProvisionedThroughput) -> Result<String, StorageError> {
+    serde_json::to_string(&ProvisionedThroughputDescription {
+        read_capacity_units: pt.read_capacity_units,
+        write_capacity_units: pt.write_capacity_units,
+        number_of_decreases_today: 0,
+        last_increase_date_time: None,
+        last_decrease_date_time: None,
+    })
+    .map_err(|e| StorageError::Internal(e.to_string()))
+}
+
 impl SqliteEngine {
     /// Build a `TableDescription` by reading the catalog.
     pub(crate) async fn build_table_description(

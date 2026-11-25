@@ -15,10 +15,10 @@ fn partition_throttle_carries_the_billing_mode() {
         let mgr = ThrottleManager::new(1_000_000, 1_000_000, true);
         // Drain the partition bucket before the table is registered, so the
         // table bucket starts full.
-        mgr.consume_with_partition("acct", "tbl", 0.0, 1.0e9, Some("k"));
+        mgr.consume_with_partition("acct", "tbl", 0.0, 1.0e9, Some("k"), None);
         mgr.register_table("acct", "tbl", throughput);
         assert_eq!(
-            mgr.check_capacity_with_partition("acct", "tbl", false, true, Some("k")),
+            mgr.check_capacity_with_partition("acct", "tbl", false, true, Some("k"), None),
             ThrottleResult::ThrottledWrite(ThrottleCause::Partition { on_demand }),
             "on_demand={on_demand}"
         );
@@ -57,7 +57,7 @@ fn on_demand_caps_size_the_table_bucket() {
     );
     assert_eq!(
         mgr.check_capacity("acct", "tbl", false, true).cause(),
-        Some(ThrottleCause::Table {
+        Some(&ThrottleCause::Table {
             on_demand: true,
             capped: true,
         })

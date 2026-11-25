@@ -42,6 +42,45 @@ async fn release_taken_holds(
     }
 }
 
+/// Store the `ProvisionedThroughput` of each `GlobalSecondaryIndexUpdates`
+/// `Update` as the index's throughput, in the shape the create path writes,
+/// inside the caller's catalog transaction. The engine has checked the units,
+/// that the table is PROVISIONED before and after the request, and that the
+/// index exists. An `Update` naming no GSI of the table (one removed since
+/// that check) is `IndexNotFound`.
+async fn store_index_throughput_updates(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table_id: &str,
+    input: &extenddb_core::types::UpdateTableInput,
+) -> Result<(), StorageError> {
+    for update in input
+        .global_secondary_index_updates
+        .iter()
+        .flatten()
+        .filter_map(|u| u.update.as_ref())
+    {
+        let Some(pt) = update.provisioned_throughput_units() else {
+            continue;
+        };
+        let stored =
+            serde_json::to_value(&pt).map_err(|e| StorageError::Internal(e.to_string()))?;
+        let written = sqlx::query(
+            "UPDATE indexes SET provisioned_throughput = $1 \
+             WHERE table_id = $2 AND index_name = $3 AND index_type = 'GSI'",
+        )
+        .bind(&stored)
+        .bind(table_id)
+        .bind(&update.index_name)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        if written.rows_affected() == 0 {
+            return Err(StorageError::IndexNotFound(update.index_name.clone()));
+        }
+    }
+    Ok(())
+}
+
 /// Refuse a GSI Create, or a Delete of a GSI other than the one building, while
 /// a GSI on the table is `CREATING`.
 async fn refuse_while_building(
@@ -382,6 +421,7 @@ impl PostgresEngine {
         // WarmThroughput on the table and on updated indexes: stored as sent,
         // nothing acts on it. Validated by the engine against the current values.
         Self::store_warm_throughput_updates(&mut tx, account_id, &table_id, &input).await?;
+        store_index_throughput_updates(&mut tx, &table_id, &input).await?;
 
         // Apply GSI updates (create/delete).
         // The WarmThroughput record each created GSI was inserted with, so the

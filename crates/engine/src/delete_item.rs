@@ -168,9 +168,12 @@ pub async fn handle_delete_item(
     let need_old_for_stream = stream.is_some();
     // Consumed capacity — when requested, the total includes base + affected
     // GSIs; INDEXES additionally returns the per-index breakdown. The deleted
-    // (old) item is needed to determine which indexes the delete propagated to.
-    let need_old_for_capacity =
-        input.return_consumed_capacity != extenddb_core::types::ReturnConsumedCapacity::None;
+    // (old) item is needed to determine which indexes the delete propagated
+    // to, and so is it for the server's charge to each global secondary index
+    // the delete touched.
+    let need_old_for_capacity = input.return_consumed_capacity
+        != extenddb_core::types::ReturnConsumedCapacity::None
+        || !key_info.global_secondary_indexes.is_empty();
 
     let old_item = ctx
         .storage
@@ -214,6 +217,8 @@ pub async fn handle_delete_item(
             capacity_helpers::write_capacity(input.return_consumed_capacity, &input.table_name, wcu)
         }
     };
+    let index_write_units =
+        capacity_helpers::index_write_units(old_item.as_ref(), None, false, &key_info).0;
 
     let output = DeleteItemOutput {
         attributes: if return_old { old_item } else { None },
@@ -230,6 +235,7 @@ pub async fn handle_delete_item(
         body,
         metrics: DispatchMetrics {
             write_capacity_units: wcu,
+            index_write_units,
             ..Default::default()
         },
     })

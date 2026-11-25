@@ -1010,7 +1010,22 @@ impl MongoEngine {
         self.store_warm_throughput_updates(account_id, &input)
             .await?;
 
-        if clear_provisioned_throughput {
+        // A provisioned index's new ProvisionedThroughput, in the shape the
+        // create path writes. The engine has checked the units, that the
+        // table is PROVISIONED before and after the request, and that the
+        // index exists. An Update naming no GSI of the table (one removed
+        // since that check) is IndexNotFound, as for WarmThroughput.
+        let throughput_updates: Vec<_> = input
+            .global_secondary_index_updates
+            .iter()
+            .flatten()
+            .filter_map(|u| u.update.as_ref())
+            .filter_map(|u| {
+                u.provisioned_throughput_units()
+                    .map(|pt| (&u.index_name, pt))
+            })
+            .collect();
+        if clear_provisioned_throughput || !throughput_updates.is_empty() {
             let table_doc = tables_coll
                 .find_one(doc! {
                     "_id": { "account_id": account_id, "table_name": &input.table_name },
@@ -1021,14 +1036,33 @@ impl MongoEngine {
             let table_id = table_doc
                 .get_str("table_id")
                 .map_err(|_| StorageError::Internal("missing table_id".to_owned()))?;
-            self.catalog_db
-                .collection::<Document>("indexes")
-                .update_many(
-                    doc! { "_id.table_id": table_id, "index_type": "GSI" },
-                    doc! { "$set": { "provisioned_throughput": bson::Bson::Null } },
-                )
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let indexes = self.catalog_db.collection::<Document>("indexes");
+            if clear_provisioned_throughput {
+                indexes
+                    .update_many(
+                        doc! { "_id.table_id": table_id, "index_type": "GSI" },
+                        doc! { "$set": { "provisioned_throughput": bson::Bson::Null } },
+                    )
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+            }
+            for (index_name, pt) in throughput_updates {
+                let pt_bson =
+                    bson::to_bson(&pt).map_err(|e| StorageError::Internal(e.to_string()))?;
+                let written = indexes
+                    .update_one(
+                        doc! {
+                            "_id": { "table_id": table_id, "index_name": index_name },
+                            "index_type": "GSI",
+                        },
+                        doc! { "$set": { "provisioned_throughput": pt_bson } },
+                    )
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                if written.matched_count == 0 {
+                    return Err(StorageError::IndexNotFound(index_name.clone()));
+                }
+            }
         }
 
         // Handle GSI updates

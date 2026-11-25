@@ -90,7 +90,7 @@ fn throttling_reason_serializes_with_the_measured_field_names() {
 /// The error document of each throttle class: the namespace, the reasons
 /// field and its casing (`ThrottlingReasons` on the provisioned class and
 /// `RequestLimitExceeded`, `throttlingReasons` on `ThrottlingException`), the
-/// list omitted when empty, and the message. The three measured messages are
+/// list omitted when empty, and the message. The four measured messages are
 /// written out here, so a change to a message constant fails this test.
 #[test]
 fn throttle_error_documents_match_the_service() {
@@ -103,6 +103,7 @@ fn throttle_error_documents_match_the_service() {
     let measured_hot_key = "Throughput exceeds the current capacity of your table or index. DynamoDB is automatically scaling your table or index so please try again shortly. If exceptions persist, check if you have a hot key: https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-partition-key-design.html";
     let measured_caps =
         "Throughput exceeds the maximum OnDemandThroughput configured on table or index";
+    let measured_index_write = "The level of configured provisioned throughput for one or more global secondary indexes of the table was exceeded. Consider increasing your provisioning level for the under-provisioned global secondary indexes with the UpdateTable API";
     let cases = [
         (
             DynamoDbError::provisioned_throughput_exceeded(
@@ -113,6 +114,17 @@ fn throttle_error_documents_match_the_service() {
                 "__type": provisioned,
                 "message": measured_provisioned,
                 "ThrottlingReasons": listed("TableWriteProvisionedThroughputExceeded"),
+            }),
+        ),
+        (
+            DynamoDbError::provisioned_throughput_exceeded(
+                INDEX_WRITE_PROVISIONED_THROUGHPUT_EXCEEDED_MESSAGE,
+                one("IndexWriteProvisionedThroughputExceeded"),
+            ),
+            serde_json::json!({
+                "__type": provisioned,
+                "message": measured_index_write,
+                "ThrottlingReasons": listed("IndexWriteProvisionedThroughputExceeded"),
             }),
         ),
         (

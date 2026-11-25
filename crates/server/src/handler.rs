@@ -19,10 +19,11 @@ use crate::request_helpers::{
 };
 use crate::response::{error_response, record_error_metrics, success_response};
 use crate::throttle_helpers::{
-    batch_entry_counts, classify_data_operation, extract_partition_value,
-    record_partial_batch_throttle, table_description_to_throughput, throttle_error,
+    batch_entry_counts, extract_index_name, extract_partition_value, record_partial_batch_throttle,
     update_throttle_buckets,
 };
+
+mod throttle_segment;
 
 /// Main Virtual `DynamoDB` request handler.
 /// REQ-WIRE-001: Accept HTTP POST to `/`.
@@ -152,6 +153,7 @@ pub(crate) async fn handle_request(
         table_name,
         metric_table,
         partition_value,
+        index_name,
         batch_entries,
         dispatch_result,
         auth_us,
@@ -250,7 +252,11 @@ pub(crate) async fn handle_request(
                     m.read_capacity_units,
                     m.write_capacity_units,
                     partition_value.as_deref(),
+                    index_name.as_deref(),
                 );
+                state
+                    .throttle
+                    .consume_index_writes(&account_id, tn, &m.index_write_units);
             }
 
             succeeded = true;
@@ -387,6 +393,9 @@ struct Served {
     table_name: Option<String>,
     metric_table: Option<String>,
     partition_value: Option<String>,
+    /// The index a `Query` or `Scan` named, charged in place of the table on
+    /// a read when it is a provisioned global secondary index.
+    index_name: Option<String>,
     /// The entries of a batch by table, for the throttle events of a batch
     /// whose every entry a backend throttled; `None` for any other request.
     batch_entries: Option<std::collections::BTreeMap<String, u32>>,
@@ -524,83 +533,18 @@ async fn serve_request(
 
     // --- Throttle segment ---
     let throttle_start = std::time::Instant::now();
-    let (is_read_op, is_write_op) = classify_data_operation(operation);
     let partition_value = extract_partition_value(&input, operation);
-    // A name the table name rules refuse (length or pattern), and the ARN of
-    // a table in another Region, are not throttled: the engine answers them
-    // as it does with capacity left. The service refuses such a name before
-    // any throttle (measured 2026-11-25 with GetItem and PutItem on `ab`, an
-    // empty name, 256 characters and the ARN of a table in another Region).
-    // The ARN of a table in this account and Region is checked by the name it
-    // carries, and a throttle refusal names that table.
-    if let Some(ref tn) = table_name
-        && (is_read_op || is_write_op)
-        && let name = crate::authz_resource::key_lookup_name(tn, &state.region, &ctx.account_id)
-        && extenddb_core::validation::validate_table_name(&name, &state.limits).is_ok()
-    {
-        if !state.throttle.is_registered(&ctx.account_id, tn)
-            && let Ok(desc) = ctx
-                .storage
-                .describe_table(
-                    &ctx.account_id,
-                    extenddb_core::types::DescribeTableInput {
-                        table_name: tn.clone(),
-                    },
-                )
-                .await
-        {
-            let throughput = table_description_to_throughput(&desc);
-            state
-                .throttle
-                .register_table(&ctx.account_id, tn, throughput);
-        }
-
-        let result = state.throttle.check_capacity_with_partition(
-            &ctx.account_id,
-            tn,
-            is_read_op,
-            is_write_op,
-            partition_value.as_deref(),
-        );
-        if let Some(cause) = result.cause() {
-            let throttled_read = matches!(
-                result,
-                extenddb_core::throttle::ThrottleResult::ThrottledRead(_)
-            );
-            let metric = if throttled_read {
-                extenddb_core::metrics::MetricName::ReadThrottleEvents
-            } else {
-                extenddb_core::metrics::MetricName::WriteThrottleEvents
-            };
-            state.metrics.record(
-                metric,
-                1.0,
-                Some(&ctx.account_id),
-                metric_table.as_deref(),
-                None,
-                Some(operation),
-            );
-            state.metrics.record(
-                extenddb_core::metrics::MetricName::ThrottledRequests,
-                1.0,
-                Some(&ctx.account_id),
-                metric_table.as_deref(),
-                None,
-                Some(operation),
-            );
-            // The service names the throttled resource and the limit on a
-            // throttle: one reason with the table ARN, the same string
-            // DescribeTable returns as TableArn. The error class, the message
-            // and the limit follow the bucket that refused and the table's
-            // billing mode.
-            let table_arn =
-                extenddb_storage::util::table_arn(&state.region, &ctx.account_id, &name);
-            return Err(Refused {
-                error: throttle_error(cause, throttled_read, &table_arn),
-                account_id: Some(ctx.account_id.to_string()),
-            });
-        }
-    }
+    let index_name = extract_index_name(&input, operation);
+    throttle_segment::check(
+        state,
+        &ctx,
+        operation,
+        table_name.as_deref(),
+        metric_table.as_deref(),
+        partition_value.as_deref(),
+        index_name.as_deref(),
+    )
+    .await?;
     #[allow(clippy::cast_precision_loss)]
     let throttle_us = throttle_start.elapsed().as_micros() as f64;
 
@@ -644,6 +588,7 @@ async fn serve_request(
         table_name,
         metric_table,
         partition_value,
+        index_name,
         batch_entries,
         dispatch_result,
         auth_us,
@@ -695,3 +640,6 @@ mod request_scope_tests;
 mod start_server_tests;
 #[cfg(test)]
 mod throttle_wire_tests;
+
+#[cfg(test)]
+mod index_throttle_wire_tests;

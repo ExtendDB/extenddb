@@ -136,6 +136,98 @@ class TestGsiUpdateElements:
                 )
             _validation(exc, ON_DEMAND_UPDATE_MEMBERS)
 
+    def test_an_update_of_a_provisioned_index_throughput_is_stored(self, dynamodb_client, tables):
+        """An Update carrying ProvisionedThroughput on a PROVISIONED table changes the
+        index's throughput: once the table and the index are ACTIVE, DescribeTable
+        shows the new units."""
+        name, _ = _create(
+            dynamodb_client,
+            tables,
+            BillingMode="PROVISIONED",
+            ProvisionedThroughput=PROVISIONED_5,
+            GlobalSecondaryIndexes=[
+                {**GSI, "ProvisionedThroughput": {"ReadCapacityUnits": 1, "WriteCapacityUnits": 1}}
+            ],
+        )
+        _wait_all_active(dynamodb_client, name)
+        dynamodb_client.update_table(
+            TableName=name,
+            GlobalSecondaryIndexUpdates=[{
+                "Update": {
+                    "IndexName": "gsi",
+                    "ProvisionedThroughput": {"ReadCapacityUnits": 5, "WriteCapacityUnits": 7},
+                }
+            }],
+        )
+        t = _wait_all_active(dynamodb_client, name)
+        pt = t["GlobalSecondaryIndexes"][0]["ProvisionedThroughput"]
+        assert (pt["ReadCapacityUnits"], pt["WriteCapacityUnits"]) == (5, 7)
+
+    def test_an_update_of_an_index_the_table_does_not_have_changes_nothing(
+        self, dynamodb_client, tables
+    ):
+        """An Update of an index the table does not have answers
+        ResourceNotFoundException, and the table's own ProvisionedThroughput in the
+        same request is not applied."""
+        name, _ = _create(
+            dynamodb_client,
+            tables,
+            BillingMode="PROVISIONED",
+            ProvisionedThroughput=PROVISIONED_5,
+            GlobalSecondaryIndexes=[{**GSI, "ProvisionedThroughput": PROVISIONED_5}],
+        )
+        _wait_all_active(dynamodb_client, name)
+        with pytest.raises(ClientError) as exc:
+            dynamodb_client.update_table(
+                TableName=name,
+                ProvisionedThroughput={"ReadCapacityUnits": 10, "WriteCapacityUnits": 10},
+                GlobalSecondaryIndexUpdates=[
+                    {"Update": {"IndexName": "missing", "ProvisionedThroughput": PROVISIONED_5}}
+                ],
+            )
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        pt = dynamodb_client.describe_table(TableName=name)["Table"]["ProvisionedThroughput"]
+        assert (pt["ReadCapacityUnits"], pt["WriteCapacityUnits"]) == (5, 5)
+
+    @pytest.mark.parametrize(
+        "throughput,expected",
+        [
+            ({"ReadCapacityUnits": 0, "WriteCapacityUnits": 5}, [("0", "readCapacityUnits", "ge1")]),
+            ({"ReadCapacityUnits": 5, "WriteCapacityUnits": 0}, [("0", "writeCapacityUnits", "ge1")]),
+            ({"ReadCapacityUnits": -1, "WriteCapacityUnits": 5}, [("-1", "readCapacityUnits", "ge1")]),
+            ({"ReadCapacityUnits": 5}, [(None, "writeCapacityUnits", "null")]),
+            ({}, [(None, "writeCapacityUnits", "null"), (None, "readCapacityUnits", "null")]),
+        ],
+    )
+    def test_the_units_of_an_index_update_are_checked_before_the_table(
+        self, raw_client, throughput, expected
+    ):
+        """Measured 2026-11-25 on a table name that does not exist, each twice: the
+        member-path clauses, write units before read units, ahead of the
+        ResourceNotFoundException the same request answers with valid units. The
+        SDK's own checks are off, so the server answers."""
+        path = "globalSecondaryIndexUpdates.1.member.update.provisionedThroughput."
+        rules = {
+            "ge1": "Member must have value greater than or equal to 1",
+            "null": "Member must not be null",
+        }
+        clauses = []
+        for value, unit, rule in expected:
+            shown = "null" if value is None else f"'{value}'"
+            clauses.append(
+                f"Value {shown} at '{path}{unit}' failed to satisfy constraint: {rules[rule]}"
+            )
+        count = len(clauses)
+        message = f"{count} validation error{'s' if count > 1 else ''} detected: " + "; ".join(clauses)
+        with pytest.raises(ClientError) as exc:
+            raw_client.update_table(
+                TableName=unique_name("wt-absent"),
+                GlobalSecondaryIndexUpdates=[
+                    {"Update": {"IndexName": "gsi", "ProvisionedThroughput": throughput}}
+                ],
+            )
+        _validation(exc, message)
+
 
 INDEX_CHANGE_WITH_STREAM = (
     "One or more parameter values were invalid: You cannot create or delete index while "

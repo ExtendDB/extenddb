@@ -384,6 +384,12 @@ pub struct DispatchMetrics {
     /// GSI/LSI name when the operation targets a secondary index.
     /// Used to attribute metrics to the specific index.
     pub index_name: Option<String>,
+    /// The write units each global secondary index of the table consumed, by
+    /// index name: only an index the old or the new item projects into, as
+    /// `capacity_helpers::index_write_units` counts them. Filled by
+    /// `PutItem`, `UpdateItem` and `DeleteItem`, the writes the server's
+    /// throttle buckets see; empty for any other operation.
+    pub index_write_units: std::collections::HashMap<String, f64>,
     /// The requests or keys a backend throttled in a batch that answered 200,
     /// counted per table by its catalog name. The server records each count
     /// as read or write throttle events: its own bucket never saw them.

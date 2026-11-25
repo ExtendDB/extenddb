@@ -14,8 +14,8 @@
 //! backfill lifecycle the service was measured to report.
 
 use extenddb_core::types::{
-    AttributeDefinition, BillingMode, KeySchemaElement, ProvisionedThroughputDescription,
-    TableDescription, UpdateTableInput, VectorIndexSpecification,
+    AttributeDefinition, BillingMode, KeySchemaElement, TableDescription, UpdateTableInput,
+    VectorIndexSpecification,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{
@@ -24,6 +24,7 @@ use extenddb_storage::util::{
 };
 
 use crate::store::SqliteEngine;
+use crate::table_helpers::gsi_throughput_json;
 
 /// Refuse a GSI Create, or a Delete of a GSI other than the one building, while
 /// a GSI on the table is `CREATING`.
@@ -43,6 +44,44 @@ async fn refuse_while_building(
         return Err(StorageError::LimitExceeded(
             extenddb_core::types::ONLINE_INDEX_LIMIT.to_owned(),
         ));
+    }
+    Ok(())
+}
+
+/// Store the `ProvisionedThroughput` of each `GlobalSecondaryIndexUpdates`
+/// `Update` as the index's throughput, in the shape the create path writes,
+/// inside the caller's catalog transaction. The engine has checked the units,
+/// that the table is PROVISIONED before and after the request, and that the
+/// index exists. An `Update` naming no GSI of the table (one removed since
+/// that check) is `IndexNotFound`.
+async fn store_index_throughput_updates(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: &str,
+    input: &UpdateTableInput,
+) -> Result<(), StorageError> {
+    for update in input
+        .global_secondary_index_updates
+        .iter()
+        .flatten()
+        .filter_map(|u| u.update.as_ref())
+    {
+        let Some(pt) = update.provisioned_throughput_units() else {
+            continue;
+        };
+        let stored = gsi_throughput_json(&pt)?;
+        let written = sqlx::query(
+            "UPDATE indexes SET provisioned_throughput = ? \
+             WHERE table_id = ? AND index_name = ? AND index_type = 'GSI'",
+        )
+        .bind(&stored)
+        .bind(table_id)
+        .bind(&update.index_name)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        if written.rows_affected() == 0 {
+            return Err(StorageError::IndexNotFound(update.index_name.clone()));
+        }
     }
     Ok(())
 }
@@ -336,6 +375,7 @@ impl SqliteEngine {
         // WarmThroughput on the table and on updated indexes: stored as sent,
         // nothing acts on it. Validated by the engine against the current values.
         Self::store_warm_throughput_updates(&mut tx, account_id, &table_id, &input).await?;
+        store_index_throughput_updates(&mut tx, &table_id, &input).await?;
 
         // GSI create/delete.
         let mut created: Vec<String> = Vec::new();
@@ -373,17 +413,8 @@ impl SqliteEngine {
                     let pt = create
                         .provisioned_throughput
                         .as_ref()
-                        .map(|pt| {
-                            serde_json::to_string(&ProvisionedThroughputDescription {
-                                read_capacity_units: pt.read_capacity_units,
-                                write_capacity_units: pt.write_capacity_units,
-                                number_of_decreases_today: 0,
-                                last_increase_date_time: None,
-                                last_decrease_date_time: None,
-                            })
-                        })
-                        .transpose()
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
+                        .map(gsi_throughput_json)
+                        .transpose()?;
                     let warm = warm_throughput_record_for_create(
                         create.warm_throughput.as_ref(),
                         Self::control_plane_delay_secs(&mut tx).await?,
@@ -1309,10 +1340,12 @@ mod gsi_throughput_tests {
     /// A GSI added by UpdateTable with ProvisionedThroughput on a PROVISIONED
     /// table is stored as the throughput description DescribeTable reads, so
     /// DescribeTable keeps working and reports the index's units with
-    /// NumberOfDecreasesToday 0. A row an earlier build wrote in the request's
-    /// shape (no NumberOfDecreasesToday) is read the same way.
+    /// NumberOfDecreasesToday 0, and so is the throughput of a later Update of
+    /// the index; an Update naming no index is IndexNotFound. A row an earlier
+    /// build wrote in the request's shape (no NumberOfDecreasesToday) is read
+    /// the same way.
     #[tokio::test]
-    async fn describe_table_works_after_adding_a_provisioned_gsi() {
+    async fn describe_table_works_after_adding_and_raising_a_provisioned_gsi() {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
@@ -1372,6 +1405,50 @@ mod gsi_throughput_tests {
                 pt.number_of_decreases_today
             ),
             (3, 4, 0)
+        );
+
+        let raise = |index: &str| -> extenddb_core::types::UpdateTableInput {
+            serde_json::from_value(json!({
+                "TableName": "t",
+                "GlobalSecondaryIndexUpdates": [{"Update": {
+                    "IndexName": index,
+                    "ProvisionedThroughput": {"ReadCapacityUnits": 5, "WriteCapacityUnits": 7}
+                }}]
+            }))
+            .expect("update")
+        };
+        let returned = engine
+            .update_table(account, raise("gsi"))
+            .await
+            .expect("UpdateTable raising the GSI");
+        let described = engine
+            .describe_table(
+                account,
+                extenddb_core::types::DescribeTableInput {
+                    table_name: "t".to_owned(),
+                },
+            )
+            .await
+            .expect("DescribeTable after raising the GSI");
+        for desc in [returned, described] {
+            let gsi = &desc.global_secondary_indexes.expect("gsis")[0];
+            let pt = gsi.provisioned_throughput.as_ref().expect("gsi throughput");
+            assert_eq!(
+                (
+                    pt.read_capacity_units,
+                    pt.write_capacity_units,
+                    pt.number_of_decreases_today
+                ),
+                (5, 7, 0)
+            );
+        }
+        let err = engine
+            .update_table(account, raise("missing"))
+            .await
+            .expect_err("an Update naming no index is refused");
+        assert!(
+            matches!(&err, extenddb_storage::error::StorageError::IndexNotFound(n) if n == "missing"),
+            "{err:?}"
         );
 
         // The shape earlier builds stored for the same UpdateTable.
