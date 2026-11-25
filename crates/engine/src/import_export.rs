@@ -54,11 +54,12 @@ mod files {
 ///
 /// Creates a new table from `TableCreationParameters`, then reads items from
 /// the local filesystem path in `FileSource` and inserts them. The table must
-/// not already exist.
+/// not already exist. A line the import cannot read or an item it refuses is
+/// one error in the description, not an error of the request.
 ///
 /// # Errors
 ///
-/// Returns `DynamoDbError` for validation failures, I/O errors, or parse errors.
+/// Returns `DynamoDbError` for validation failures of the request and I/O errors.
 pub async fn handle_import_table(
     body: Value,
     ctx: &OperationContext,

@@ -100,7 +100,7 @@ pub(super) async fn import_table(
     let format = input.input_format;
     let format_options = input.input_format_options.clone();
     let max_items = ctx.limits.max_import_item_count;
-    let items = tokio::task::spawn_blocking(move || {
+    let read = tokio::task::spawn_blocking(move || {
         read_items(&source_path, format, format_options.as_ref(), max_items)
     })
     .await
@@ -117,8 +117,26 @@ pub(super) async fn import_table(
     let import_arn = format!("{}:import/{}", table_arn, uuid::Uuid::new_v4());
     let table_name = tcp.table_name.as_str();
 
-    for item in items {
+    // The line the reader could not read follows the items before it, so a
+    // file that ends earlier at a value that is not a number never reaches
+    // it, as on the service.
+    let rows = read.items.into_iter().map(Ok).chain(read.unread.map(Err));
+    for row in rows {
         processed_count += 1;
+        let item = match row {
+            Ok(item) => item,
+            Err((line, fault)) => {
+                tracing::warn!(
+                    import_arn = ?import_arn,
+                    table_name = ?table_name,
+                    line,
+                    error = fault,
+                    "import: a line cannot be read; the rest of the file is not imported"
+                );
+                error_count += 1;
+                break;
+            }
+        };
         // Numbers before the other checks: a row holding a value that is not
         // a number ends the import of the file whatever else the row holds,
         // and a row holding a number out of range is skipped (see
@@ -221,7 +239,8 @@ pub(super) async fn import_table(
 
     // An import that refused any row is FAILED with `ItemValidationError`,
     // and the rows it accepted stay in the table (measured 2026-11-03 with
-    // number rows, and 2026-11-11 with a row whose key has the wrong type).
+    // number rows, 2026-11-11 with a row whose key has the wrong type, and
+    // 2026-11-22 with lines the import cannot read).
     // The service's message sends the reader to its error log in CloudWatch;
     // ExtendDB writes each refused row to the server log instead.
     let (import_status, failure_code, failure_message) = if error_count > 0 {

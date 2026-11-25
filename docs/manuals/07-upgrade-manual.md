@@ -1288,6 +1288,42 @@ No catalog migration is required.
 
 ---
 
+### v1.1.0: an ImportTable line that cannot be read ends its file, and each line needs an `Item` member
+
+**What changed.** Two changes apply to an ImportTable of `DYNAMODB_JSON`, and
+of `ION`, which uses the same reader.
+
+- A line without an `Item` member, such as `{"pk": {"S": "J1"}}`, is no longer
+  read as a bare item. Earlier releases imported a file of such lines. Now the
+  first such line ends the import of its file, so a file of bare lines imports
+  nothing.
+- A line that the import cannot read no longer fails the request. Earlier
+  releases answered HTTP 400 `ValidationException` with `Invalid JSON at line
+  N` or `Invalid DynamoDB item at line N`, imported nothing and left the new
+  table empty. Now the request answers HTTP 200. The items before the line
+  stay imported, the line counts as one error, and the lines after it are not
+  read. The `ImportTableDescription` reports `ImportStatus` `FAILED` with
+  `FailureCode` `ItemValidationError`, and the server log gives the line
+  number and the fault. Such a line is not a JSON object, has no `Item`
+  member or holds a `B` value that is not padded base64. A line whose `Item`
+  the reader cannot read, such as one with an unknown type descriptor, ends
+  the file too.
+
+Amazon DynamoDB reads a file in the same way (measured 2026-11-22). The
+measured lines were not JSON, had no `Item` member, or held a `B` value that
+is not padded base64. The service kept the items before each such line and
+imported nothing from it or the lines after it. A line whose `Item` the reader
+cannot read was not measured. A line that is not UTF-8 still fails the
+request, as in earlier releases.
+
+**Who is affected.** A client that imports files of bare item lines, the form
+that earlier releases of the troubleshooting guide allowed: write each line as
+`{"Item": {...}}`. A client that finds a bad file from the HTTP 400 of
+ImportTable: read `ImportStatus`, `FailureCode` and the counts in the
+ImportTable response. No catalog migration is required.
+
+---
+
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.

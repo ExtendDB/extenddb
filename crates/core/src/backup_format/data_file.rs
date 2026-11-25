@@ -39,14 +39,14 @@
 //! (`read_dynamodb_json` in `crates/engine/src/import_export_io.rs`), which
 //! reads `ExtendDB`'s own exports. It is laxer than the contract above and is
 //! not bound to it: it skips blank and whitespace-only lines and trims
-//! Unicode whitespace around each line; it reads an object without an `Item`
-//! member as a bare item, and ignores other members beside `Item`; it keeps
-//! the last of two top-level attributes with one name (and the last of two
-//! `Item` members); it has no line cap, and reads the whole file into
-//! memory through a `serde_json::Value` and a clone of the item; its errors
-//! name the line but not the cause. Nothing here changes it; a restore reads
-//! data files only through [`DataFileDecoder`], which
-//! [`super::ExtenddbManifest::reader`] wraps.
+//! Unicode whitespace around each line; it ignores other members beside
+//! `Item`; it keeps the last of two top-level attributes with one name (and
+//! the last of two `Item` members); it has no line cap, and reads the whole
+//! file into memory through a `serde_json::Value`; a line it cannot read
+//! ends its reading of the file and is one error of the import, not of the
+//! request (a line that is not UTF-8 is still an I/O error of the request).
+//! Nothing here changes it; a restore reads data files only through
+//! [`DataFileDecoder`], which [`super::ExtenddbManifest::reader`] wraps.
 //!
 //! Checksums: `sha256` and `md5` are computed over the compressed bytes, the
 //! object as stored, which is what `extenddb-manifest.json` records per data

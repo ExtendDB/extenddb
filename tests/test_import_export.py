@@ -555,12 +555,66 @@ NOT_A_NUMBER = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# ImportTable lines the import cannot read
+#
+# Measured against DynamoDB ImportTable from S3 on 2026-11-22 (us-east-1), one
+# import of eight files, twice, with the same answers. A line the import
+# cannot read (not JSON, no "Item" member, a B value that is not padded
+# base64) is one error and ends the reading of its file: the items before it
+# stay imported and the lines after it are neither imported nor counted. An
+# item that fails a check (no key, a key of another type) is one error and the
+# next line is read. An empty line is skipped. ProcessedItemCount is the
+# imported items plus the errors; the import of all eight files was FAILED
+# with ItemValidationError, ProcessedItemCount 14, ImportedItemCount 8 and
+# ErrorCount 6. Here each file is one import. Two of the eight are left out:
+# test_a_row_whose_key_has_the_wrong_type_fails_the_import and
+# test_import_dynamodb_json already cover them. A row given as a dict is an
+# item; a row given as text is written as it is.
+# ---------------------------------------------------------------------------
+
+LINE_FILES = [
+    pytest.param(
+        [{"pk": {"S": "A1"}}, {"pk": {"S": "A2"}, "b": {"B": "YQ"}}, {"pk": {"S": "A3"}}],
+        ["A1"], (2, 1, 1), id="unpadded-base64-ends-the-file",
+    ),
+    pytest.param(
+        [{"pk": {"S": "C1"}}, '{"Item": {"pk": {"S": "C2"}', {"pk": {"S": "C3"}}],
+        ["C1"], (2, 1, 1), id="not-json-ends-the-file",
+    ),
+    pytest.param(
+        [{"x": {"S": "D1"}}, {"pk": {"S": "D2"}}], ["D2"], (2, 1, 1), id="missing-key-is-skipped",
+    ),
+    pytest.param(
+        [{"pk": {"S": "G1"}, "b": {"B": "YQ"}}, {"pk": {"S": "G2"}}], [], (1, 0, 1),
+        id="first-line-ends-the-file",
+    ),
+    pytest.param(
+        [{"pk": {"S": "I1"}}, "", {"pk": {"S": "I3"}}], ["I1", "I3"], (2, 2, 0),
+        id="empty-line-skipped",
+    ),
+    pytest.param(
+        ['{"pk": {"S": "J1"}}', {"pk": {"S": "J2"}}], [], (1, 0, 1),
+        id="no-item-member-ends-the-file",
+    ),
+    # Not measured as one file: a skipped item, then a line that ends the file.
+    pytest.param(
+        [{"pk": {"S": "A1"}}, {"x": {"S": "D1"}}, {"pk": {"S": "A2"}, "b": {"B": "YQ"}},
+         {"pk": {"S": "A3"}}],
+        ["A1"], (3, 1, 2), id="skipped-item-then-unread-line",
+    ),
+]
+
+
 class TestImportTableNumbers:
-    """ImportTable refuses rows holding numbers the service cannot store."""
+    """ImportTable refuses rows holding numbers the service cannot store, and
+    lines it cannot read."""
 
     @staticmethod
-    def _import(table: str, rows: list[dict], key_type: str = "S") -> dict:
-        path = import_source("".join(json.dumps({"Item": row}) + "\n" for row in rows))
+    def _import(table: str, rows: list, key_type: str = "S") -> dict:
+        # A row given as text is written as it is; a dict is an item.
+        lines = [row if isinstance(row, str) else json.dumps({"Item": row}) for row in rows]
+        path = import_source("".join(line + "\n" for line in lines))
         try:
             return extenddb_request("ImportTable", {
                 "FileSource": {"Path": path},
@@ -720,3 +774,16 @@ class TestImportTableNumbers:
             if "NS" in got:
                 got = {"NS": sorted(got["NS"])}
             assert got == stored, name
+
+    @pytest.mark.parametrize("lines,imported,counts", LINE_FILES)
+    def test_a_line_the_import_cannot_read_ends_the_import_of_its_file(
+        self, dynamodb_client, unique_table_name, cleanup_table, lines, imported, counts
+    ):
+        cleanup_table(unique_table_name)
+        desc = self._import(unique_table_name, lines)
+        assert self._counts(desc) == counts
+        if counts[2]:
+            self._assert_failed(desc)
+        else:
+            assert (desc["ImportStatus"], desc.get("FailureCode")) == ("COMPLETED", None)
+        assert sorted(self._items(dynamodb_client, unique_table_name)) == imported
