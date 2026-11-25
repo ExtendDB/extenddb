@@ -1,8 +1,17 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! The condition grammar a search condition shares with ConditionExpression,
-//! parsed into a tree that keeps the operands as written.
+//! The condition grammar of a search condition, parsed into a tree that
+//! keeps the operands as written.
+//!
+//! The service answers a SearchConditionExpression and a Scan
+//! FilterExpression of the same text alike, apart from the expression name
+//! in the message prefix: measured in eu-north-1 on 2026-11-25, each text
+//! twice, `(Cat) = :s`, `attribute_exists((Cat))` and `Price IN ((:p))`
+//! pass both, and `_x = :s` is a syntax error at `_` in both. The
+//! FilterExpression and ConditionExpression parser of this crate
+//! (`parser.rs`) is a separate parser and refuses the first three and
+//! accepts the fourth.
 //!
 //! ```text
 //! condition := and ( OR and )*
