@@ -5,16 +5,15 @@
 > a clean-room implementation that speaks the DynamoDB wire protocol. Behavioral differences from the real service are
 > documented in [Differences from DynamoDB](docs/differences-from-dynamodb.md).
 
-A DynamoDB-compatible API adapter, ExtendDB speaks the DynamoDB wire protocol — any AWS SDK, CLI, or tool that works
-with DynamoDB works with ExtendDB, unchanged.
+ExtendDB is a DynamoDB-compatible API adapter. It speaks the DynamoDB wire protocol, so any AWS SDK, CLI, or tool that works with DynamoDB works with ExtendDB, unchanged.
 
 ## Use Cases
 
-- **Local development** — run DynamoDB workloads on your laptop with zero cloud dependency
-- **CI/CD pipelines** — deterministic integration tests against a DynamoDB-compatible backend
-- **Self-hosted deployments** — run DynamoDB workloads on your own infrastructure (on-premises, private cloud, edge)
-- **Multi-cloud** — use DynamoDB semantics on any cloud that runs an ExtendDB-supported database backend
-- **Air-gapped environments** — DynamoDB functionality with no internet connectivity
+- **Local development**: run DynamoDB workloads on your laptop with zero cloud dependency
+- **CI/CD pipelines**: deterministic integration tests against a DynamoDB-compatible backend
+- **Self-hosted deployments**: run DynamoDB workloads on your own infrastructure (on-premises, private cloud, edge)
+- **Multi-cloud**: use DynamoDB semantics on any cloud that runs one of the supported databases
+- **Air-gapped environments**: DynamoDB functionality with no internet connectivity
 
 ## Scope
 
@@ -36,7 +35,7 @@ ExtendDB 1.0 is not:
 ## Features
 
 - Full DynamoDB wire protocol: CRUD, Query, Scan, Batch, Transactions, Streams, TTL, Import/Export
-- Pluggable storage: PostgreSQL (default), SQLite, MongoDB, and Cassandra
+- Pluggable storage: PostgreSQL (default), SQLite, MongoDB and Cassandra, with the database's own backup and replication tools
 - SigV4 authentication with IAM compatibility: users, groups, roles, policies, permissions boundaries
 - Web management console for account and credential administration
 - TLS with automatic self-signed certificate generation (replaceable with CA-signed certs)
@@ -56,8 +55,8 @@ A backend moves up one tier in a minor release. Before that release, the maintai
 
 | Backend | Tier | Topology | Data across upgrades | API coverage | CI | Known limits |
 |---|---|---|---|---|---|---|
-| PostgreSQL | Stable | PostgreSQL 14 or later, on the same host, on another host or as a managed service. | `extenddb migrate --yes` migrates the catalog in place. CI upgrades catalogs that 0.1.14 and earlier releases created. | The operations in [Supported Operations](#supported-operations). Vector search needs the pgvector extension. | `integration`, required, on PostgreSQL 16 | Time to Live (TTL) removes about 100 expired items per table per minute. |
-| SQLite | Stable (single node) | SQLite runs in the server process. A lock file allows one server for each database file. There is no production image, so build from source. | As PostgreSQL. `migrate --yes` copies the database file before its first change. | The operations in Supported Operations. | `integration`, required | One write transaction at a time. TTL as PostgreSQL. |
+| PostgreSQL | Stable | PostgreSQL 14 or later, on the same host, on another host or as a managed service. | `extenddb migrate --yes` migrates the catalog in place. CI upgrades catalogs that 0.1.14 and earlier releases created. | The operations in [Feature Status](docs/differences-from-dynamodb.md#feature-status). Vector search needs the pgvector extension. | `integration`, required, on PostgreSQL 16 | Time to Live (TTL) removes about 100 expired items per table per minute. |
+| SQLite | Stable (single node) | SQLite runs in the server process. A lock file allows one server for each database file. There is no production image, so build from source. | As PostgreSQL. `migrate --yes` copies the database file before its first change. | The operations in [Feature Status](docs/differences-from-dynamodb.md#feature-status). | `integration`, required | One write transaction at a time. TTL as PostgreSQL. |
 | MongoDB | Beta | MongoDB 7.0 or later, as a replica set, also for one node. | As PostgreSQL. | No vector search. On a global secondary index (GSI) with more than one RANGE attribute, `Query` takes a key condition on the first one only. | `mongodb-integration`, required, on MongoDB 7 | A number in a key attribute has at most 34 significant digits. The database names are fixed, so one replica set holds one catalog. TTL as PostgreSQL. |
 | Cassandra | Experimental | Cassandra 4.1 or later, with `PasswordAuthenticator`. Each table takes its writes in one datacenter. | `migrate --yes` migrates the catalog. No rollback procedure is tested. | No vector search. CreateBackup keeps each backup in the catalog, with or without a backup store. The `Query` limit of MongoDB on a GSI with more than one RANGE attribute. | `cassandra-integration`, required, on Cassandra 4.1 | Some management operations are not atomic. A few known race conditions are open. TTL removes about 1,000 expired items per table per minute. See [Known Limitations](docs/cassandra-setup.md#known-limitations). |
 
@@ -77,7 +76,7 @@ cargo build --release
 # Start
 ./target/release/extenddb serve --config extenddb.toml
 
-# Use with any AWS SDK (TLS with self-signed cert — trust via AWS_CA_BUNDLE)
+# Use with any AWS SDK (TLS with a self-signed certificate; trust it via AWS_CA_BUNDLE)
 export AWS_CA_BUNDLE=~/.extenddb/tls/cert.pem
 
 # Requests must be signed with an access key this server issued. Create an IAM
@@ -191,7 +190,7 @@ Use this with Docker, Kubernetes, `systemd Type=simple`, runit, s6, or any other
 In `--foreground` mode extenddb writes no PID file and never creates `run_dir`, so the container can run with a read-only root filesystem. Two consequences:
 
 - `extenddb status` still works (it probes the port) but reports the PID as unknown.
-- `extenddb stop` cannot signal the process — there is no PID file to read. Stop it through your supervisor, which delivers `SIGTERM` and triggers the same graceful shutdown.
+- `extenddb stop` cannot signal the process, because there is no PID file to read. Stop it through your supervisor, which delivers `SIGTERM` and triggers the same graceful shutdown.
 
 Pass `--write-pid-file` to opt back in when you do want `stop` and `status` to work against a foreground server, for example when running it from a shell rather than under a supervisor. The file goes to the usual `run_dir` path, so neither command needs extra arguments, and `run_dir` has to be writable.
 
@@ -205,7 +204,7 @@ extenddb healthcheck --endpoint https://127.0.0.1:18443 # explicit target
 This is a liveness check, which is what a container `HEALTHCHECK` wants. The `/health` path does not query the storage
 backend, so it will report healthy even if the storage backend becomes unreachable after startup. That is deliberate,
 since a liveness probe that failed on a database outage would restart every replica at once. A backend that is
-unreachable at startup does stop the server from listening. There is no separate readiness endpoint yet.
+unreachable at startup does stop the server from listening. There is no separate readiness endpoint.
 
 ### One instance per database
 
@@ -213,12 +212,12 @@ Run one `extenddb serve` per catalog. On SQLite this is enforced: the server tak
 next to the database file and a second server on the same file will refuse to start (`init`, `migrate --yes`,
 `migrate --forget` and `destroy` take the same lock while they run; the `migrate` preview and `verify` take none). On
 PostgreSQL, MongoDB and Cassandra nothing prevents a second ExtendDB instance from running, but running more than one
-against the same catalog is not supported in this release: every instance runs every background worker, credential and
+against the same catalog is not supported: every instance runs every background worker, credential and
 policy caches are per instance with no cross-instance invalidation (a revoked key stays valid on the other instance for
 up to the cache TTL), and `/health` does not check the database.
 See the [deployment guide](docs/manuals/11-deployment-guide.md#multi-instance-considerations).
 
-To make the generated self-signed certificate valid for the name clients use — an in-cluster service DNS name, for example — pass `--tls-san` to `init` (repeatable):
+To make the generated self-signed certificate valid for the name clients use (an in-cluster service DNS name, for example), pass `--tls-san` to `init` (repeatable):
 
 ```bash
 extenddb init --catalog-db extenddb_catalog \
@@ -267,26 +266,7 @@ See [Admin Guide](docs/manuals/05-admin-guide.md) for the full CLI and managemen
 
 ## Supported Operations
 
-### Table Operations
-CreateTable, DeleteTable, DescribeTable, ListTables, UpdateTable, DescribeEndpoints, DescribeLimits
-
-### Item Operations
-PutItem, GetItem, DeleteItem, UpdateItem (SET, REMOVE, ADD, DELETE actions; condition expressions; all ReturnValues modes)
-
-### Query & Scan
-Query, Scan (key conditions, filters, projections, pagination, index selection)
-
-### Batch & Transactions
-BatchGetItem (100 keys), BatchWriteItem (25 ops), TransactGetItems (100 items), TransactWriteItems (100 ops)
-
-### Vector Search
-SearchVectors, and vector indexes on CreateTable and UpdateTable (cosine, Euclidean and dot product; on-demand tables only). On PostgreSQL this requires the pgvector extension on the data database; without it every vector operation is refused and nothing else is affected.
-
-### Streams
-ListStreams, DescribeStream, GetShardIterator, GetRecords
-
-### Other
-UpdateTimeToLive, DescribeTimeToLive, TagResource, UntagResource, ListTagsOfResource, ImportTable, ExportTableToPointInTime
+The [Feature Status](docs/differences-from-dynamodb.md#feature-status) table on the Differences from DynamoDB page is the record of the operations ExtendDB serves.
 
 ## Experimental: WebAssembly build
 
@@ -433,8 +413,8 @@ Operations that need a facility the in-browser build lacks return a
 `ValidationException` (HTTP 400, which an SDK does not retry), with a message
 that names the build:
 
-- The store-backed backup operations — `CreateBackup`, `DescribeBackup`,
-  `DeleteBackup`, `RestoreTableFromBackup` — "… the code that serves it is not
+- The store-backed backup operations (`CreateBackup`, `DescribeBackup`,
+  `DeleteBackup`, `RestoreTableFromBackup`): "… the code that serves it is not
   compiled for wasm32." The engine's backup subsystem does not build for
   `wasm32`, so the engine refuses these four there, after the body parse, as
   it refuses any other known operation whose handler is compiled only off
@@ -445,8 +425,8 @@ that names the build:
   natively, the adapter runs the engine's backup handlers instead, and with no
   backup store `CreateBackup` backs a table up in the catalog, as a server
   without one does.
-- The PartiQL operations — `ExecuteStatement`, `BatchExecuteStatement`,
-  `ExecuteTransaction` — "… the PartiQL surface is not part of the browser build."
+- The PartiQL operations (`ExecuteStatement`, `BatchExecuteStatement`,
+  `ExecuteTransaction`): "… the PartiQL surface is not part of the browser build."
   This build refuses them by name, before it parses the body, so every body
   gets the refusal: a body that does not parse, which a server answers with
   `SerializationException` "Start of structure or map found where not
@@ -454,10 +434,10 @@ that names the build:
   such as an `ExecuteStatement` with no `Statement` (on a server, "1 validation
   error detected: Value null at 'statement' failed to satisfy constraint:
   Member must not be null").
-- `DescribeEndpoints` — "… it is called in-process and has no network endpoint
+- `DescribeEndpoints`: "… it is called in-process and has no network endpoint
   to report." It is refused by name too, so a body that does not parse gets the
   refusal, where a server answers `SerializationException`.
-- An `UpdateTable` that creates a vector index — "… it cannot build a vector
+- An `UpdateTable` that creates a vector index: "… it cannot build a vector
   index; create the table with its vector indexes instead." The SQLite backend
   refuses it after the engine has validated the request, so a request for a
   missing table or with a malformed `Create` gets the engine's own answer

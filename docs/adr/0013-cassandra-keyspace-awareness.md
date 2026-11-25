@@ -16,11 +16,11 @@ Early implementations hardcoded keyspace names like `extenddb_catalog` directly 
 
 ## Options Considered
 
-1. **Dynamic keyspace construction** — Store `keyspace_prefix` in config, construct keyspace names dynamically via helper methods like `catalog_keyspace()`. Pass keyspace prefix through initialization chain.
+1. **Dynamic keyspace construction**: Store `keyspace_prefix` in config, construct keyspace names dynamically via helper methods like `catalog_keyspace()`. Pass keyspace prefix through initialization chain.
 
-2. **USE statement per connection** — Execute `USE extenddb_catalog` on each session, then write queries without keyspace prefix. Mimics PostgreSQL behavior.
+2. **USE statement per connection**: Execute `USE extenddb_catalog` on each session, then write queries without keyspace prefix. Mimics PostgreSQL behavior.
 
-3. **Query-time keyspace override** — Allow each query to specify keyspace as a parameter, defaulting to config value.
+3. **Query-time keyspace override**: Allow each query to specify keyspace as a parameter, defaulting to config value.
 
 ## Decision
 

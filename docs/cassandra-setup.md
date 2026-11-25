@@ -280,7 +280,7 @@ topologies, containers, the production checklist, systemd, multi-instance
 limits), see the [deployment guide](manuals/11-deployment-guide.md). This
 section covers only what is specific to Cassandra.
 
-> **Not recommended for production yet.** As of October 2026 the Cassandra
+> **Not recommended for production.** As of October 2026 the Cassandra
 > backend is experimental. It has known limitations: some multi-entity
 > management operations are not atomic, and a few concurrency issues are still
 > open (see Known Limitations below). Treat a Cassandra deployment as
@@ -326,7 +326,7 @@ last.
 
 Cassandra's own `system_auth` keyspace, which holds the roles ExtendDB logs in
 with, starts at `SimpleStrategy` with replication factor 1 whatever `init` is
-given. To raise replication on a cluster — `system_auth` after any `init`, or
+given. To raise replication on a cluster, for `system_auth` after any `init` or for
 the deployment's keyspaces after an `init` at replication factor 1:
 
 1. Set `replication_factor` in `extenddb.toml` (example below), before you
@@ -459,9 +459,12 @@ backend is experimental rather than production-ready.
   started. Lightweight transactions use `LOCAL_SERIAL`, and are linearizable
   within one datacenter. Serve writes for a given table from one Cassandra
   datacenter.
-- **Multi-node ExtendDB needs node-id configuration.** Running more than one
-  ExtendDB instance against the cluster requires a distinct node ID per
-  instance (used to derive stream sequence numbers).
+- **One instance per catalog.** Running more than one ExtendDB instance against
+  one catalog is not supported; see the deployment guide's
+  [Multi-Instance Considerations](manuals/11-deployment-guide.md#multi-instance-considerations).
+  Stream sequence numbers carry a node component derived from each instance's
+  bind address and port, so two instances with the same bind address and port
+  on different hosts would derive the same one.
 - **TTL throughput.** The TTL sweeper is sized for roughly 1,000 expirations
   per table per minute; a table expiring faster accumulates backlog. Enable TTL
   before opening a table to writes, or quiesce it briefly while enable and

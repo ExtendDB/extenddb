@@ -91,11 +91,11 @@ function QuickStarts(): ReactNode {
         <div className="row">
           <div className="col col--6">
             <div className={styles.panel}>
-              <Heading as="h3">For local development and CI</Heading>
+              <Heading as="h3">For local development and continuous integration</Heading>
               <p>
                 One container over SQLite, plain HTTP, a seeded example credential. Nothing to initialize and no
-                certificate to trust. Bound to the loopback interface; not for anything reachable from other
-                machines.
+                certificate to trust. The command publishes its port on 127.0.0.1 only, so only this machine reaches
+                it. Do not publish it on another interface.
               </p>
               <CodeBlock language="bash">{devImage}</CodeBlock>
               <Link to="/dev-image/">About the development image</Link>
