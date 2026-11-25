@@ -147,6 +147,11 @@ pub async fn handle_update_time_to_live(
             let account_id = ctx.account_id.clone();
             let table_name = input.table_name.clone();
             let attr = input.time_to_live_specification.attribute_name.clone();
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "reached only when the backend reports Enabling; the SQLite backend, \
+                          the only one in the wasm build, reports Enabled or Disabled"
+            )]
             tokio::spawn(async move {
                 if let Err(e) = storage
                     .create_ttl_index(&account_id, &table_name, &attr)

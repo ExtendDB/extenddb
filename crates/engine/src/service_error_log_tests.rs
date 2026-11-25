@@ -54,8 +54,8 @@ fn sites() -> Vec<Site> {
             crate::create_table::storage_err_to_dynamo,
         ),
         (
-            "backup::storage_err_to_dynamo",
-            crate::backup::storage_err_to_dynamo,
+            "backup_requests::storage_err_to_dynamo",
+            crate::backup_requests::storage_err_to_dynamo,
         ),
         ("update_table::update_table_err_to_dynamo", |e| {
             crate::update_table::update_table_err_to_dynamo(e, "t")
