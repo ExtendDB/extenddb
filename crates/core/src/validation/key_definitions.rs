@@ -20,13 +20,13 @@
 //!
 //! An `UpdateTable` GSI `Create` runs the four in that order. `CreateTable`
 //! runs the first three on the table's key schema, after the table billing
-//! rules and before the key schema shape checks. After every shape check it
-//! runs rule 4 on the table's key schema, then rules 1 and 4 on each LSI's and
-//! each GSI's in turn. The service checks each index's definitions before that
-//! index's shape (measured 2026-11-25), so a request with both faults in one
-//! index gets the shape sentence here. A restore runs `CreateTable`'s checks
-//! without rules 1 and 3, which earlier releases did not apply
-//! (`validate_recorded_table`).
+//! rules and before the key schema shape checks, with rule 2 only outside the
+//! multi-part table key preview. After every shape check it runs rule 4 on the
+//! table's key schema, then rules 1 and 4 on each LSI's and each GSI's in turn.
+//! The service checks each index's definitions before that index's shape
+//! (measured 2026-11-25), so a request with both faults in one index gets the
+//! shape sentence here. A restore runs `CreateTable`'s checks without rules 1
+//! and 3, which earlier releases did not apply (`validate_recorded_table`).
 
 use std::collections::HashSet;
 

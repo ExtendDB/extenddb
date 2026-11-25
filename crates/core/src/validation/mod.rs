@@ -161,7 +161,11 @@ fn validate_table(
     if !recorded {
         validate_definition_count(&input.key_schema, &input.attribute_definitions)?;
     }
-    validate_hash_and_range_differ(&input.key_schema)?;
+    // Main checked a table HASH and RANGE on one name only outside the
+    // multi-part preview, and a backup can record such a multi-part table.
+    if !limits.allow_multipart_table_keys {
+        validate_hash_and_range_differ(&input.key_schema)?;
+    }
     if !recorded {
         validate_unique_attribute_definitions(&input.attribute_definitions)?;
     }
@@ -3168,6 +3172,28 @@ mod tests {
             ],
         );
         assert!(validate_create_table(&input, &limits).is_ok());
+    }
+
+    /// Main accepted a multi-part table key schema with a HASH and a RANGE on
+    /// one name, so a restore of such a table still passes. `CreateTable`
+    /// refuses the shape with one definition by the definition count.
+    #[test]
+    fn a_multipart_table_hash_and_range_on_one_name_restores() {
+        let limits = LimitsConfig {
+            allow_multipart_table_keys: true,
+            ..Default::default()
+        };
+        let input = base_input(
+            vec![make_ks("a", KeyType::Hash), make_ks("a", KeyType::Range)],
+            vec![make_ad("a", ScalarAttributeType::S)],
+        );
+        validate_recorded_table(&input, &limits).unwrap();
+        assert_eq!(
+            validate_create_table(&input, &limits)
+                .unwrap_err()
+                .to_string(),
+            "Invalid KeySchema: Some index key attribute have no definition"
+        );
     }
 
     #[test]
