@@ -244,7 +244,7 @@ fn the_sdk_headers_are_absent_from_the_scope_when_the_client_sent_none() {
 }
 
 #[test]
-fn a_header_that_is_not_visible_ascii_reads_as_absent() {
+fn a_header_reads_as_absent_unless_it_is_printable_ascii_or_tab() {
     let mut headers = HeaderMap::new();
     headers.insert(
         "amz-sdk-request",
