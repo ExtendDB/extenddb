@@ -161,8 +161,8 @@ fn validate_table(
     if !recorded {
         validate_definition_count(&input.key_schema, &input.attribute_definitions)?;
     }
-    // Main checked a table HASH and RANGE on one name only outside the
-    // multi-part preview, and a backup can record such a multi-part table.
+    // A multi-part table key schema may name one attribute as HASH and RANGE,
+    // as in earlier releases, and a backup can record such a table.
     if !limits.allow_multipart_table_keys {
         validate_hash_and_range_differ(&input.key_schema)?;
     }
@@ -3174,9 +3174,10 @@ mod tests {
         assert!(validate_create_table(&input, &limits).is_ok());
     }
 
-    /// Main accepted a multi-part table key schema with a HASH and a RANGE on
-    /// one name, so a restore of such a table still passes. `CreateTable`
-    /// refuses the shape with one definition by the definition count.
+    /// Earlier releases accepted a multi-part table key schema with a HASH and
+    /// a RANGE on one name, so a restore of such a table still passes.
+    /// `CreateTable` refuses the shape with one definition by the definition
+    /// count.
     #[test]
     fn a_multipart_table_hash_and_range_on_one_name_restores() {
         let limits = LimitsConfig {

@@ -131,16 +131,16 @@ pub fn validate_keys_defined(
 /// is the Java `String.hashCode` of the name over its UTF-16 code units,
 /// combined by XOR with itself shifted right by 16 bits. The table doubles
 /// when it holds more names than three quarters of its buckets, and when a
-/// bucket that holds eight names takes a ninth while the table has fewer than
-/// 64 buckets. The names come out bucket by bucket, in insertion order within a
-/// bucket (measured 2026-11-25, with lists of up to nine names in one bucket).
-/// A repeated name keeps its first position, as `HashMap::put` does. No
-/// measured list repeats a name.
+/// bucket that holds eight or more names takes another while the table has
+/// fewer than 64 buckets. The names come out bucket by bucket, in insertion
+/// order within a bucket (measured 2026-11-25, with lists of up to nine names
+/// in one bucket). A repeated name keeps its first position, as
+/// `HashMap::put` does. No measured list repeats a name.
 ///
-/// Not modelled: a bucket that takes its ninth name in a table of 64 or more
-/// buckets. `HashMap` turns that bucket into a tree, which it iterates in
-/// another order. That needs at least 11 names, nine or more of them in one
-/// bucket.
+/// Not modelled: a bucket that holds eight or more names and takes another
+/// while the table has 64 or more buckets. `HashMap` turns that bucket into a
+/// tree, which it iterates in another order. That needs at least 11 names,
+/// nine or more of them in one bucket.
 fn listed<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
     let mut seen = HashSet::new();
     let mut entries: Vec<(&str, u32)> = Vec::new();
