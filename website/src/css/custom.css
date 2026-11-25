@@ -52,7 +52,7 @@
   --ifm-blockquote-border-color: var(--accent);
   --ifm-blockquote-color: var(--ink);
 
-  --ifm-navbar-background-color: rgba(250, 250, 247, 0.92);
+  --ifm-navbar-background-color: var(--paper);
   --ifm-navbar-shadow: 0 1px 0 var(--subtle);
   --ifm-footer-background-color: #f4f1ea;
   --ifm-footer-color: var(--muted);
@@ -92,7 +92,7 @@
   --ifm-font-color-base: var(--ink);
   --ifm-link-color: #f5b040;
   --ifm-link-hover-color: #fbe0b0;
-  --ifm-navbar-background-color: rgba(12, 17, 24, 0.92);
+  --ifm-navbar-background-color: var(--paper);
   --ifm-footer-background-color: #0a0e14;
   --ifm-footer-link-color: var(--ink);
   --ifm-footer-title-color: var(--ink);
@@ -106,10 +106,6 @@
 
 html {
   -webkit-font-smoothing: antialiased;
-}
-
-.navbar {
-  backdrop-filter: saturate(140%) blur(8px);
 }
 
 .navbar__title {
@@ -160,7 +156,7 @@ html {
 
 .markdown pre code {
   border: none;
-  padding: 0;
+  padding: var(--ifm-pre-padding);
 }
 
 .theme-code-block {
@@ -169,8 +165,6 @@ html {
 }
 
 .markdown table {
-  display: table;
-  width: 100%;
   font-size: 0.92rem;
 }
 
@@ -287,8 +281,6 @@ html {
 
 @media (max-width: 600px) {
   .markdown table {
-    display: block;
-    overflow-x: auto;
     font-size: 0.82rem;
   }
   .markdown td,

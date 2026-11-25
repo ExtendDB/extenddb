@@ -33,14 +33,15 @@ extenddb/
 │   ├── bin/              # CLI, config, daemon lifecycle (extenddb binary)
 │   ├── cache/            # Auth and authz caches
 │   ├── config/           # Config parsing shared by the CLI and the server
-│   ├── core/             # Pure sync types, validation, expression parsing (no async)
+│   ├── core/             # Sync types, validation, expression parsing (no async)
 │   ├── engine/           # DynamoDB operation handlers (PutItem, Query, etc.)
 │   ├── server/           # HTTP server, management API, web console
 │   ├── storage/          # Storage trait definitions (TableEngine trait)
 │   ├── storage-cassandra/ # Cassandra implementation (experimental; feature flag)
 │   ├── storage-mongodb/  # MongoDB implementation (feature flag)
 │   ├── storage-postgres/ # PostgreSQL implementation (default/reference)
-│   └── storage-sqlite/   # SQLite implementation (dev, CI, and embedded use)
+│   ├── storage-sqlite/   # SQLite implementation (dev, CI, and embedded use)
+│   └── wasm-adapter/     # Experimental WebAssembly build (publish = false)
 ├── tests/                # Python integration tests (pytest)
 ├── docs/
 │   ├── design/           # Architecture and component design docs
@@ -72,16 +73,21 @@ All operations are **account-scoped** via `account_id` parameter for multi-tenan
 extenddb (bin)
   └─> extenddb-server
        ├─> extenddb-engine
-       │    ├─> extenddb-core (pure sync, no async)
+       │    ├─> extenddb-core (sync, no async runtime)
        │    └─> extenddb-storage (trait definitions)
        ├─> extenddb-auth
        ├─> extenddb-storage-postgres  (feature: postgres)
        ├─> extenddb-storage-sqlite    (feature: sqlite / sqlite-memory)
        ├─> extenddb-storage-mongodb   (feature: mongodb)
        └─> extenddb-storage-cassandra (feature: cassandra)
+
+extenddb-wasm-adapter (experimental WebAssembly build; publish = false)
+  └─> extenddb-engine, extenddb-storage-sqlite, extenddb-storage, extenddb-auth, extenddb-core
 ```
 
-- **extenddb-core:** Pure synchronous Rust. No async, no I/O. Types, validation, expression parsing.
+- **extenddb-core:** Synchronous Rust. No async runtime. Types, validation, expression parsing, and the crypto
+  module (AWS-LC through `aws-lc-rs` natively; on `wasm32`, the RustCrypto `sha2`, `hmac` and `aes-gcm` crates,
+  `subtle` and `getrandom`).
 - **extenddb-storage:** Trait definitions only. No implementation.
 - **extenddb-storage-postgres:** Concrete PostgreSQL implementation.
 - **extenddb-storage-sqlite:** Concrete SQLite implementation, the dev and CI backend.
@@ -92,6 +98,8 @@ extenddb (bin)
 - **extenddb-server:** HTTP server, management API, web console.
 - **extenddb-auth:** SigV4 signature verification, IAM policy evaluation.
 - **extenddb (bin):** CLI, config parsing, daemon lifecycle.
+- **extenddb-wasm-adapter:** Experimental WebAssembly build of the engine over in-memory SQLite, called
+  in process from JavaScript. Not published.
 
 ## Building and Running
 
@@ -276,6 +284,18 @@ devtools/run-coverage
 ```bash
 devtools/check-licenses
 ```
+
+### WebAssembly Build
+
+The WebAssembly workflow (`.github/workflows/wasm.yml`) builds, lints and tests the code for
+`wasm32-unknown-unknown`. Run one of its steps locally as the header of
+`devtools/run-wasm-step` describes:
+
+```bash
+devtools/run-wasm-step <step>
+```
+
+The README's "Experimental: WebAssembly build" says what that build is.
 
 ## Configuration
 

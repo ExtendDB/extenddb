@@ -32,7 +32,7 @@ ExtendDB is a standalone async Rust application structured as a Cargo workspace.
 │                     Engine (async operation handlers)               │
 │  Operation dispatch · response formatting · stream record assembly  │
 ├─────────────────────────────────────────────────────────────────────┤
-│                     Core (pure sync — no async runtime)             │
+│                       Core (sync — no async runtime)                │
 │  Types · expression parsing/evaluation · validation · capacity      │
 │  error types · configurable limits                                  │
 └──────────────┬───────────────────────────────────┬──────────────────┘
@@ -56,7 +56,7 @@ extenddb/
 ├── docs/                         # Design documentation (this folder)
 │
 ├── crates/
-│   ├── core/                     # DynamoDB types, expressions, validation (pure sync, no async runtime)
+│   ├── core/                     # DynamoDB types, expressions, validation (sync, no async runtime)
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs
@@ -156,6 +156,7 @@ graph TD
 
     ENGINE --> CORE
     ENGINE --> STORAGE
+    ENGINE --> AUTH
 
     AUTH --> CORE
 
@@ -163,9 +164,10 @@ graph TD
     STORAGE_PG --> CORE
 
     STORAGE --> CORE
+    STORAGE --> AUTH
 ```
 
-**Key principle:** `core` depends on nothing in the workspace and has no async runtime; it is pure sync Rust (types, expressions, validation, capacity, errors). `storage` depends only on `core`. `engine` depends on `core` + `storage` and contains the async operation handlers. Backend crates depend on `storage` + `core`. `auth` depends on `core`. `server` depends on `core` + `storage` + `auth` + `engine`. `bin` wires everything together.
+**Key principle:** `core` depends on nothing in the workspace and has no async runtime; it is sync Rust (types, expressions, validation, capacity, errors, and the crypto primitives that `auth` and `storage` share). `auth` depends on `core` and `cache`. `storage` depends on `core` and `auth`. `engine` depends on `core`, `auth` and `storage` (and on `backup-store`, except on wasm32) and contains the async operation handlers. Backend crates depend on `storage`, `auth` and `core`. `server` depends on `core`, `storage`, `auth` and `engine`, and on `cache`, `config` and `backup-store`. `bin` wires everything together. The graph is a simplified view and does not follow the manifests: `bin` reaches `server`, `auth`, `engine` and `core` through `extenddb-app`, which the graph leaves out; `cargo metadata` gives the dependencies.
 
 ## 3. Request Lifecycle
 
@@ -207,7 +209,7 @@ sequenceDiagram
 
 **Rationale:**
 - Compile-time enforcement of dependency boundaries: the storage trait crate physically cannot depend on PostgreSQL
-- `core` is pure sync Rust with no async runtime: types, expressions, validation, capacity, errors
+- `core` is sync Rust with no async runtime: types, expressions, validation, capacity, errors
 - `engine` contains async operation handlers that depend on `core` + `storage`, keeping the async boundary explicit
 - Independent testing: `cargo test -p dynamodb-core` needs no database and no async runtime
 - Faster incremental builds: changing the Postgres backend doesn't recompile the expression parser
@@ -268,18 +270,18 @@ sequenceDiagram
 - sqlx provides native async PostgreSQL support
 - The storage trait being async allows backends that use network I/O (e.g., a future DynamoDB-backed backend for testing, or a distributed storage backend)
 
-### 4.7 Read Consistency via Optional Read Replica
+### 4.7 Read Consistency and the Proposed PostgreSQL Read Replica
 
-**Decision:** All reads are strongly consistent by default. Eventually consistent reads (`ConsistentRead=false`) are supported by routing to an optional PostgreSQL streaming replica.
+**Decision:** The PostgreSQL backend serves every item read from `data_pool`, the pool that takes the writes, so its base table and local secondary index reads are strongly consistent whatever `ConsistentRead` says. Global secondary index rows are maintained through the propagation queue (`index_propagation_delay_ms`, default 10 ms; design document 04, section 6), so a read on a GSI can lag the base table, as on the service. The flag is accepted and charged (0.5 RCU for eventually consistent, 1.0 RCU for strongly consistent). Routing `ConsistentRead=false` reads to a PostgreSQL streaming replica is a proposal (design document 04, section 5.3; REQ-PG-008; design document 11, Stage 2) and not code that exists.
 
 **Rationale:**
 - DynamoDB's eventual consistency is a consequence of reading from storage replicas that haven't received the latest write yet; it's not artificial delays or queues
 - Strongly consistent is strictly stronger than eventually consistent: any application that works against eventually consistent DynamoDB also works against a strongly consistent backend
-- For migration testing (relational → DynamoDB), teams need to surface bugs where application code assumes strong consistency on default reads. A read replica provides the staleness of a replica that has not yet received the write, without synthetic delays
-- The read replica is opt-in via `storage.postgres.read_replica_url`. When unset, all reads hit the primary: simple, correct, and matching what DynamoDB Local and other emulators do
-- Writes always go to the primary. `ConsistentRead=true` always reads from the primary. Only `ConsistentRead=false` reads route to the replica
-- Capacity calculations always reflect the consistency mode (0.5 RCU for eventually consistent, 1.0 RCU for strongly consistent) regardless of whether a replica is configured
-- This requires zero changes to the storage trait, engine, or server; it's entirely contained in the PostgreSQL backend's pool selection logic
+- For migration testing (relational → DynamoDB), teams need to surface bugs where application code assumes strong consistency on default reads. A read replica would return values that lag the primary without synthetic delays
+- In the proposal the replica is opt-in; when it is unset, all reads go to the primary, which is what the backend does today
+- Writes always go to the primary. `ConsistentRead=true` always reads from the primary. In the proposal only `ConsistentRead=false` reads route to the replica
+- Capacity calculations always reflect the consistency mode (0.5 RCU for eventually consistent, 1.0 RCU for strongly consistent) whether or not a replica exists
+- The proposal routes on the flag inside the PostgreSQL backend, so it depends on the storage trait carrying the flag to the backend (design document 11, Stage 1); with the flag in the trait it needs no change to the engine or server and is contained in the backend's pool selection
 
 ## 5. Data Flow
 
@@ -448,8 +450,8 @@ This section records the design space as it stood when the document was written 
 | TLS | rustls | No OpenSSL dependency; cryptography from AWS-LC through aws-lc-rs |
 | PostgreSQL driver | sqlx | Async, compile-time query checking, migrations |
 | Serialization | serde + serde_json | Standard, zero-copy where possible |
-| Crypto (SigV4) | aws-lc-rs | HMAC-SHA256, SHA-256 and the constant-time signature compare from AWS-LC, the library rustls already uses ([ADR-0026](../adr/0026-credential-crypto-on-aws-lc.md)) |
-| Crypto (encryption) | aws-lc-rs | AES-256-GCM for credential encryption, in one module (`extenddb_storage::secret_cipher`) |
+| Crypto (SigV4) | aws-lc-rs; on wasm32, `sha2`, `hmac` and `subtle` | HMAC-SHA256, SHA-256 and the constant-time signature compare from AWS-LC, the library rustls already uses ([ADR-0026](../adr/0026-credential-crypto-on-aws-lc.md)); AWS-LC does not build for wasm32. Both backends sit in one module, `extenddb_core::crypto` (`crates/core/src/crypto.rs`) |
+| Crypto (encryption) | aws-lc-rs; on wasm32, `aes-gcm` and `getrandom` | AES-256-GCM for credential encryption, from the same `extenddb_core::crypto` module; `extenddb_storage::secret_cipher` calls it |
 | Compression | flate2 | gzip support |
 | CRC32 | crc32fast | SIMD-accelerated |
 | CLI | clap | Standard Rust CLI framework |

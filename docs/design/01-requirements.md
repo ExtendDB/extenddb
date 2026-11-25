@@ -104,7 +104,7 @@ Error responses must be byte-for-byte compatible with DynamoDB:
 
 **Requirements:**
 - REQ-ERR-001: Error JSON must contain `__type` field with `com.amazonaws.dynamodb.v20120810#` prefix
-- REQ-ERR-002: Error JSON must contain `message` field with descriptive text
+- REQ-ERR-002: Error JSON must contain a message field with descriptive text, under the key DynamoDB uses for that error. Raw bodies measured in us-east-1 between 2026-10-29 and 2026-11-19 carry `Message` on `TransactionCanceledException`, `IdempotentParameterMismatchException`, `TransactionInProgressException`, `AccessDeniedException` and `SerializationException`. They carry `message` on `ValidationException`, `ConditionalCheckFailedException`, `ResourceNotFoundException`, `ResourceInUseException`, `TableNotFoundException`, `BackupNotFoundException`, `PointInTimeRecoveryUnavailableException`, `TransactionConflictException`, `LimitExceededException`, `ProvisionedThroughputExceededException`, `InternalServerError`, `UnrecognizedClientException`, `InvalidSignatureException`, `MissingAuthenticationTokenException` and `IncompleteSignatureException`
 - REQ-ERR-003: HTTP status codes must match DynamoDB exactly (see error catalog below)
 - REQ-ERR-004: SDK retry behavior must work identically (throttling errors return 400, not 429)
 
@@ -170,7 +170,7 @@ These are the core CRUD operations. All must be fully implemented.
 - REQ-DATA-012: TransactGetItems must be atomic: consistent snapshot of up to 100 items
 - REQ-DATA-013: All data operations must support legacy `Expected` and `ConditionalOperator` parameters (converted internally to expressions)
 - REQ-DATA-014: All write operations must trigger stream event capture when streams are enabled on the table
-- REQ-DATA-015: `ConsistentRead` parameter must be accepted on GetItem, Query, Scan, and BatchGetItem. When a read replica is configured, `ConsistentRead=false` reads must route to the replica; `ConsistentRead=true` reads must route to the primary. When no replica is configured, all reads are strongly consistent. Capacity calculations must reflect the consistency mode regardless of replica configuration (0.5 RCU for eventually consistent, 1.0 RCU for strongly consistent).
+- REQ-DATA-015: `ConsistentRead` parameter must be accepted on GetItem, Query, Scan, and BatchGetItem. Capacity calculations must reflect the consistency mode (0.5 RCU for eventually consistent, 1.0 RCU for strongly consistent). No in-tree backend routes a read on the parameter. Routing `ConsistentRead=false` reads to a follower is proposed for the PostgreSQL backend (REQ-PG-008) and not implemented.
 
 ### 3.2 Control Plane Operations (In Scope)
 
@@ -226,7 +226,7 @@ These are the core CRUD operations. All must be fully implemented.
 **Key requirements:**
 - REQ-STREAM-001: Support all four stream view types: KEYS_ONLY, NEW_IMAGE, OLD_IMAGE, NEW_AND_OLD_IMAGES
 - REQ-STREAM-002: Stream records must capture changes from PutItem, UpdateItem, DeleteItem, BatchWriteItem, TransactWriteItems
-- REQ-STREAM-003: Support shard iterator types: TRIM_HORIZON, LATEST, AT_SEQUENCE_NUMBER, AFTER_SEQUENCE_NUMBER
+- REQ-STREAM-003: Support shard iterator types: TRIM_HORIZON, LATEST, AT_SEQUENCE_NUMBER, AFTER_SEQUENCE_NUMBER, AT_TIMESTAMP
 - REQ-STREAM-004: Stream records must be ordered by sequence number within a shard
 - REQ-STREAM-005: Detailed shard management and retention design is deferred
 
@@ -455,7 +455,7 @@ The catalog database stores ExtendDB metadata: table definitions, indexes, tags,
 - REQ-PG-005: Use parameterized queries for all read operations to prevent SQL injection
 - REQ-PG-006: Schema migrations managed via embedded migration files
 - REQ-PG-007: Support PostgreSQL 14+
-- REQ-PG-008: Support optional read replica connection for eventually consistent reads. When `read_replica_url` is configured, `ConsistentRead=false` reads (GetItem, Query, Scan, BatchGetItem) route to the replica pool. All writes and `ConsistentRead=true` reads always use the primary pool.
+- REQ-PG-008 (proposed, not implemented): Support an optional read replica connection for eventually consistent reads. When a `read_replica_url` is configured, `ConsistentRead=false` reads (GetItem, Query, Scan, BatchGetItem) would route to the replica pool, and all writes and `ConsistentRead=true` reads would use the primary pool. The backend has no such setting today: `PostgresStorageConfig` (`crates/storage-postgres/src/config.rs`) refuses unknown fields, so a configuration carrying `read_replica_url` stops the server at startup. Every item read and write runs on the data pool (`data_pool`). Design document 04, sections 5.2 and 5.3, describe the proposal with one replica URL; design document 11, Stage 2, plans the same routing with a `replicas` list.
 
 ## 9. Expression Engine Requirements
 

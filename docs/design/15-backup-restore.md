@@ -255,7 +255,7 @@ Phase 1's PRs, one line each; the PRs still to be written have a section each be
 ### PR 1: PITR surface
 
 Goal, interfaces and acceptance, as its line states; section 6 is its contract:
-- PR 1 (#335, merged): PITR surface per section 6, smaller than the draft of #335 because #384 had already removed the trait's `restore_table_to_point_in_time`; the engine answers the three operations without storage (`crates/engine/src/backup/pitr.rs`), and migration 5, `drop_continuous_backups`, drops the `continuous_backups` table on PostgreSQL, SQLite and Cassandra and the collection on MongoDB. `TableNotFoundException` for a missing table on DescribeContinuousBackups and a disable (section 6). Tests: three operations on all four backends.
+- PR 1 (#335, merged): PITR surface per section 6, smaller than the draft of #335 because #384 had already removed the trait's `restore_table_to_point_in_time`; the engine answers the three operations without storage (`crates/engine/src/backup_requests/pitr.rs`), and migration 5, `drop_continuous_backups`, drops the `continuous_backups` table on PostgreSQL, SQLite and Cassandra and the collection on MongoDB. `TableNotFoundException` for a missing table on DescribeContinuousBackups and a disable (section 6). Tests: three operations on all four backends.
 Documentation: the differences doc's PITR row, rewritten as section 6 says.
 
 ### PR 6: catalog index, `BackupCatalog`, `JobClaim`, the legacy reader

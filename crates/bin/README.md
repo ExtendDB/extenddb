@@ -63,7 +63,7 @@ The PostgreSQL, MongoDB and Cassandra builds each need a running database:
 
 Run `extenddb init` once to create the catalog, the admin user, a TLS certificate and `extenddb.toml`. Then run
 `extenddb serve`, which listens with TLS on port 18443.
-[Getting started](https://github.com/ExtendDB/extenddb/blob/main/docs/getting-started.md) describes each step and
+[Install from source](https://github.com/ExtendDB/extenddb/blob/main/docs/install-from-source.md) describes each step and
 each backend's options.
 
 ## Other ways to run ExtendDB
