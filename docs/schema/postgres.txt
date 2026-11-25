@@ -404,6 +404,7 @@ index extenddb_migrations_pkey: CREATE UNIQUE INDEX extenddb_migrations_pkey ON 
 index gsi_pending_pkey: CREATE UNIQUE INDEX gsi_pending_pkey ON public.gsi_pending USING btree (id)
 index idempotency_tokens_pkey: CREATE UNIQUE INDEX idempotency_tokens_pkey ON public.idempotency_tokens USING btree (account_id, token)
 index idx_gsi_pending_claim: CREATE INDEX idx_gsi_pending_claim ON public.gsi_pending USING btree (worker_partition, ready_at, id)
+index idx_gsi_pending_table_claim: CREATE INDEX idx_gsi_pending_table_claim ON public.gsi_pending USING btree (worker_partition, table_id, id)
 index idx_idempotency_tokens_created: CREATE INDEX idx_idempotency_tokens_created ON public.idempotency_tokens USING btree (created_at)
 index idx_stream_records_created: CREATE INDEX idx_stream_records_created ON public.stream_records USING btree (created_at)
 index idx_stream_shards_table: CREATE INDEX idx_stream_shards_table ON public.stream_shards USING btree (table_id)

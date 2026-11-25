@@ -76,7 +76,7 @@ Exit status 6 means the migration lock, or a running server, was still held when
 
 `verify` also checks the connection to the data database. When that check fails, `verify` exits 1 on a Behind catalog instead of 3, because `migrate --yes` cannot apply the pending migrations while the data database cannot be reached. It still exits 4 or 5 for the statuses that need a person.
 
-A migration is additive when the previous release serves the catalog correctly with it applied, and breaking otherwise. Migrations 1 to 7 and 9 to 12 are breaking. Migration 8 creates a table in the PostgreSQL data database that the previous release never reads; on PostgreSQL it is declared breaking only because the job that proves an additive declaration against the old binary does not yet exist (CONTRIBUTING, step 4 of adding a migration), and on SQLite, MongoDB and Cassandra it does not apply (`migrate --list` prints it as not applicable, and `migrate` counts it as additive). Do not run a server of 0.1.14 or an earlier release against a migrated catalog. A binary of those releases that writes to a migrated catalog (its `migrate --yes`, or a SQLite dev server) leaves it WrittenByOlderRelease. `migrate --yes --reconverge` repairs it by running the convergent migrations again. Migration 2, which rewrites stored policies, is not convergent: the repair skips it and prints a line that says so (see the v0.1.14 notes below).
+A migration is additive when the previous release serves the catalog correctly with it applied, and breaking otherwise. Migrations 1 to 7 and 9 to 12 are breaking. Migration 8 creates a table in the PostgreSQL data database that the previous release never reads, and migration 13 adds an index to that database; on PostgreSQL each is declared breaking only because the job that proves an additive declaration against the old binary does not yet exist (CONTRIBUTING, step 4 of adding a migration), and on SQLite, MongoDB and Cassandra neither applies (`migrate --list` prints each as not applicable, and `migrate` counts each as additive). Do not run a server of 0.1.14 or an earlier release against a migrated catalog. A binary of those releases that writes to a migrated catalog (its `migrate --yes`, or a SQLite dev server) leaves it WrittenByOlderRelease. `migrate --yes --reconverge` repairs it by running the convergent migrations again. Migration 2, which rewrites stored policies, is not convergent: the repair skips it and prints a line that says so (see the v0.1.14 notes below).
 
 ### Migration 6: the backup catalog index
 
@@ -398,6 +398,34 @@ deployment, even when no catalog migration is required.
 - The segment memory is bounded: at most 111,488 bytes of buckets for each operation of each account that sent it in the last day, about 4.46 MB for an account that sends all 40 operations every second. 1.0.0 kept about 250 bytes for each request that reached dispatch in the last 24 hours, so the sizing rule in the deployment guide's [Process Memory](11-deployment-guide.md#process-memory) section stops applying after the upgrade.
 
 No catalog migration or configuration change is required.
+
+### v1.1.0: PostgreSQL: the GSI propagation queue serves tables in turn
+
+**What changed.** A queue worker claimed the lowest `id` across its whole
+partition, and partitions are shared by every table, so a table's index rows
+waited behind every row another table had enqueued earlier: a bulk write to one
+table with an asynchronous GSI delayed a second table's propagation by the time
+the backlog took to drain. Each batch now lists the tables with a ready row in the
+partition and claims each table's oldest row in turn, so a table's latency depends
+on its own backlog. Within a table the order is unchanged. A table is listed once
+its oldest queued row is ready; a per-index `propagation_delay_ms` set above the
+default (the column is not written by any command today) widens the window in
+which a table's later row waits for its earlier one, by the difference between
+the two delays.
+
+**Operator step.** Migration 13, `gsi_pending_table_claim`, adds the index
+`idx_gsi_pending_table_claim` on `gsi_pending (worker_partition, table_id, id)`
+in the data database. Apply it with the usual sequence: stop the servers,
+`extenddb migrate --config extenddb.toml --yes`, start the servers.
+`migrate` builds the index with the servers stopped; at about 1.7 s per million
+queued rows on a development host the build is a pause of that length inside the
+maintenance window, and `CREATE INDEX IF NOT EXISTS` makes a repeated run harmless.
+
+Migration 13 is breaking on PostgreSQL. A 1.0.0 server refuses the migrated
+catalog (`AheadIncompatible`), so a rollback to 1.0.0 restores both databases
+from the backups taken before the upgrade. SQLite, MongoDB and Cassandra record
+the migration as not applicable, and 1.0.0 serves their migrated catalogs with a
+warning.
 
 ### v1.0.0: Cassandra reads and writes at `LOCAL_QUORUM`
 
