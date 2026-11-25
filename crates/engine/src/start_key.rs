@@ -17,8 +17,8 @@ use extenddb_core::validation::{IndexKeyRef, validate_index_key_types};
 use crate::index_helpers::combined_lek_key_schema;
 
 /// Validate `ExclusiveStartKey` against the (table or index) key schema for
-/// `Scan`. Base-table scans use the long `DynamoDB` error message; index scans
-/// use the short one.
+/// `Scan`. A start key that does not fit gets `The provided starting key is
+/// invalid`, as in a Query (measured 2026-11-19 and 2026-11-20).
 ///
 /// An index Scan names a key of another type, table keys included, ahead of a key
 /// left out or an extra attribute (measured 2026-11-14 to 2026-11-19).
@@ -40,17 +40,11 @@ pub fn validate_scan_exclusive_start_key(
         };
         validate_index_key_types(start_key, &[keys], &key_info.attribute_definitions)?;
     }
-    let message = scan_invalid_start_key_message(index_info);
-    check_exclusive_start_key(
-        start_key,
-        &required,
-        &key_info.attribute_definitions,
-        message,
-    )
+    check_exclusive_start_key(start_key, &required, &key_info.attribute_definitions)
 }
 
-/// Validate `ExclusiveStartKey` for `Query`. Same rules as Scan; uses the
-/// short `DynamoDB` error message in all cases.
+/// Validate `ExclusiveStartKey` for `Query`. Same rules and message as a
+/// table Scan.
 ///
 /// # Errors
 ///
@@ -62,15 +56,10 @@ pub fn validate_query_exclusive_start_key(
     index_info: Option<&IndexInfo>,
 ) -> Result<(), extenddb_core::error::DynamoDbError> {
     let required = combined_lek_key_schema(&key_info.key_schema, index_info);
-    check_exclusive_start_key(
-        start_key,
-        &required,
-        &key_info.attribute_definitions,
-        QUERY_INVALID_START_KEY_MSG,
-    )
+    check_exclusive_start_key(start_key, &required, &key_info.attribute_definitions)
 }
 
-const QUERY_INVALID_START_KEY_MSG: &str = "The provided starting key is invalid";
+const INVALID_START_KEY_MSG: &str = "The provided starting key is invalid";
 const QUERY_START_KEY_OUTSIDE_BOUNDARIES_MSG: &str =
     "The provided starting key is outside query boundaries based on provided conditions";
 const QUERY_EXCLUSIVE_START_KEY_INVALID_MSG: &str = "The provided exclusive start key is invalid";
@@ -403,27 +392,13 @@ fn condition_attribute_name<'a>(
     }
 }
 
-const SCAN_INVALID_START_KEY_MSG_BASE: &str = "The provided starting key is invalid: \
-     The provided key element does not match the schema";
-const SCAN_INVALID_START_KEY_MSG_INDEX: &str = "The provided starting key is invalid";
-
-fn scan_invalid_start_key_message(index_info: Option<&IndexInfo>) -> &'static str {
-    if index_info.is_some() {
-        SCAN_INVALID_START_KEY_MSG_INDEX
-    } else {
-        SCAN_INVALID_START_KEY_MSG_BASE
-    }
-}
-
 /// Three rules: required-keys-present, no-extras, scalar-type-match.
 fn check_exclusive_start_key(
     start_key: &Item,
     required: &[KeySchemaElement],
     attribute_definitions: &[AttributeDefinition],
-    error_message: &str,
 ) -> Result<(), extenddb_core::error::DynamoDbError> {
-    let invalid =
-        || extenddb_core::error::DynamoDbError::ValidationException(error_message.to_owned());
+    let invalid = || validation(INVALID_START_KEY_MSG);
 
     for ks in required {
         if !start_key.contains_key(&ks.attribute_name) {
