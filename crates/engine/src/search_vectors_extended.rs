@@ -34,7 +34,7 @@ mod imp {
 
     use extenddb_core::error::DynamoDbError;
     use extenddb_core::expression::search_filter::{
-        DEFAULT_MAX_CONDITIONS, SearchFilter, parse_search_filter,
+        DEFAULT_MAX_CONDITIONS, SearchFilter, name_refs, parse_search_filter,
     };
     use extenddb_core::expression::search_params::with_unused_names;
     use extenddb_core::types::{AttributeDefinition, AttributeValue, Item, SearchSchemaElement};
@@ -67,7 +67,8 @@ mod imp {
         with_unused_names(
             parse_search_filter(expr, names, values, DEFAULT_MAX_CONDITIONS),
             names,
-            &[expr, projection.unwrap_or_default()],
+            &name_refs(expr),
+            projection.unwrap_or_default(),
         )
         .map(|filter| Extended(Arc::new(filter)))
     }

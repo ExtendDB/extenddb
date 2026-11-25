@@ -115,54 +115,60 @@ pub fn check_search_maps(
     )
 }
 
-/// Every `#name` written in `exprs`.
-fn written_names<'a>(exprs: &[&'a str]) -> BTreeSet<&'a str> {
-    let mut found = BTreeSet::new();
-    for expr in exprs {
-        let bytes = expr.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'#' {
-                let end = bytes[i + 1..]
-                    .iter()
-                    .position(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
-                    .map_or(bytes.len(), |n| i + 1 + n);
-                found.insert(&expr[i..end]);
-                i = end.max(i + 1);
-            } else {
-                i += 1;
-            }
-        }
-    }
-    found
-}
-
-/// Every name in `names` must be written in one of `exprs` (the search
-/// condition and the projection). The unused keys are listed in sorted order.
+/// Refuse the keys of `map` that `used` does not hold, listed in sorted
+/// order. `field` names the map in the message. Both grammars of the search
+/// condition and the projection check use it.
 ///
 /// # Errors
 ///
-/// Returns the unused-names `ValidationException`.
-pub fn check_unused_names(
-    names: Option<&HashMap<String, String>>,
-    exprs: &[&str],
+/// Returns the unused-keys `ValidationException`.
+pub fn check_unused_keys<V>(
+    field: &str,
+    map: Option<&HashMap<String, V>>,
+    used: &BTreeSet<&str>,
 ) -> Result<(), DynamoDbError> {
-    let Some(names) = names else {
-        return Ok(());
-    };
-    let written = written_names(exprs);
-    let unused: BTreeSet<&str> = names
-        .keys()
+    let unused: BTreeSet<&str> = map
+        .into_iter()
+        .flat_map(HashMap::keys)
         .map(String::as_str)
-        .filter(|k| !written.contains(k))
+        .filter(|k| !used.contains(k))
         .collect();
     if unused.is_empty() {
         return Ok(());
     }
     Err(invalid(format!(
-        "Value provided in {NAMES} unused in expressions: keys: {{{}}}",
+        "Value provided in {field} unused in expressions: keys: {{{}}}",
         unused.into_iter().collect::<Vec<_>>().join(", ")
     )))
+}
+
+/// Every name in `names` must be used by the search condition, whose
+/// `#name` tokens are `condition_names`, or by `projection`, a projection
+/// that has already parsed.
+///
+/// # Errors
+///
+/// Returns the unused-names `ValidationException`, or the projection's
+/// tokenizer error, which the earlier parse of the projection has answered.
+pub fn check_unused_names(
+    names: Option<&HashMap<String, String>>,
+    condition_names: &BTreeSet<&str>,
+    projection: &str,
+) -> Result<(), DynamoDbError> {
+    if names.is_none() {
+        return Ok(());
+    }
+    let projection_names: Vec<String> =
+        crate::expression::tokenize_with_limit(projection, usize::MAX)?
+            .into_iter()
+            .filter_map(|t| match t {
+                crate::expression::Token::NameRef(name) => Some(format!("#{name}")),
+                _ => None,
+            })
+            .collect();
+    let mut used = condition_names.clone();
+    used.extend(projection_names.iter().map(String::as_str));
+    check_unused_keys(NAMES, names, &used)
 }
 
 /// Apply the unused-names check to the result of parsing a search condition.
@@ -176,12 +182,13 @@ pub fn check_unused_names(
 pub fn with_unused_names<T>(
     parsed: Result<T, DynamoDbError>,
     names: Option<&HashMap<String, String>>,
-    exprs: &[&str],
+    condition_names: &BTreeSet<&str>,
+    projection: &str,
 ) -> Result<T, DynamoDbError> {
     match parsed {
-        Ok(parsed) => check_unused_names(names, exprs).map(|()| parsed),
+        Ok(parsed) => check_unused_names(names, condition_names, projection).map(|()| parsed),
         Err(DynamoDbError::ValidationException(msg)) if msg.starts_with(UNUSED_VALUES) => {
-            check_unused_names(names, exprs)?;
+            check_unused_names(names, condition_names, projection)?;
             Err(DynamoDbError::ValidationException(msg))
         }
         Err(other) => Err(other),

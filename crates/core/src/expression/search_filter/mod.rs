@@ -43,6 +43,7 @@ pub use gate::EnabledAccounts;
 pub use rules::{Condition, Operator};
 
 use crate::error::DynamoDbError;
+use crate::expression::search_params::check_unused_keys;
 use crate::expression::{Expr, ExpressionMaps};
 use crate::types::{AttributeDefinition, AttributeValue, Item, SearchSchemaElement};
 
@@ -117,26 +118,22 @@ fn unused_values(
     src: &str,
     values: Option<&HashMap<String, AttributeValue>>,
 ) -> Result<(), DynamoDbError> {
-    let Some(values) = values else {
-        return Ok(());
-    };
-    let used: BTreeSet<&str> = toks
-        .iter()
-        .filter(|t| t.kind == lexer::Kind::ValueRef)
+    let used = refs(toks, src, lexer::Kind::ValueRef);
+    check_unused_keys("ExpressionAttributeValues", values, &used)
+}
+
+/// The text of every token of `kind`.
+fn refs<'a>(toks: &[lexer::Tok], src: &'a str, kind: lexer::Kind) -> BTreeSet<&'a str> {
+    toks.iter()
+        .filter(|t| t.kind == kind)
         .map(|t| &src[t.start..t.end])
-        .collect();
-    let unused: BTreeSet<&str> = values
-        .keys()
-        .map(String::as_str)
-        .filter(|k| !used.contains(k))
-        .collect();
-    if unused.is_empty() {
-        return Ok(());
-    }
-    Err(DynamoDbError::ValidationException(format!(
-        "Value provided in ExpressionAttributeValues unused in expressions: keys: {{{}}}",
-        unused.into_iter().collect::<Vec<_>>().join(", ")
-    )))
+        .collect()
+}
+
+/// The `#name` tokens of `expr`, for the unused-names check.
+#[must_use]
+pub fn name_refs(expr: &str) -> BTreeSet<&str> {
+    refs(&lexer::lex(expr), expr, lexer::Kind::NameRef)
 }
 
 /// The maps the evaluator reads: names keyed without `#`, values without `:`.

@@ -109,6 +109,13 @@ pub fn validate_search_condition_expression(
     Ok(conditions)
 }
 
+/// The `ExpressionAttributeNames` keys the equality-only grammar can resolve
+/// in `expr`, for the unused-names check.
+#[must_use]
+pub fn search_condition_name_refs(expr: &str) -> std::collections::BTreeSet<&str> {
+    phases::name_refs(expr)
+}
+
 /// Validate resolved filter conditions against a vector index search schema.
 ///
 /// Enforces that every referenced attribute belongs to the search schema, that

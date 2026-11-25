@@ -6,7 +6,9 @@
 
 use std::collections::HashMap;
 
-use super::{check_search_maps, check_unused_names, with_unused_names};
+use std::collections::BTreeSet;
+
+use super::{check_search_maps, check_unused_keys, check_unused_names, with_unused_names};
 use crate::error::DynamoDbError;
 use crate::types::AttributeValue;
 
@@ -194,15 +196,42 @@ fn a_map_needs_the_expression_that_reads_it() {
 #[test]
 fn a_name_is_used_by_the_condition_or_the_projection() {
     let n = names(&[("#p", "Price"), ("#c", "Country")]);
-    assert!(check_unused_names(Some(&n), &["#c = :us", "#p"]).is_ok());
-    assert!(check_unused_names(None, &["a = :s"]).is_ok());
+    let cond = |keys: &[&'static str]| keys.iter().copied().collect::<BTreeSet<_>>();
+    assert!(check_unused_names(Some(&n), &cond(&["#c"]), "#p").is_ok());
+    assert!(check_unused_names(Some(&n), &cond(&[]), "#c, a.#p[0]").is_ok());
+    assert!(check_unused_names(None, &cond(&[]), "").is_ok());
     assert_eq!(
-        refused(check_unused_names(Some(&n), &["Country = :us", "Price"])),
+        refused(check_unused_names(Some(&n), &cond(&[]), "Price")),
         "Value provided in ExpressionAttributeNames unused in expressions: keys: {#c, #p}"
     );
     assert_eq!(
-        refused(check_unused_names(Some(&n), &["#c = :us", ""])),
+        refused(check_unused_names(Some(&n), &cond(&["#c"]), "")),
         "Value provided in ExpressionAttributeNames unused in expressions: keys: {#p}"
+    );
+}
+
+#[test]
+fn unused_keys_are_listed_in_sorted_order() {
+    let v: HashMap<String, u8> = [(":b", 1), (":a", 2), (":c", 3)]
+        .into_iter()
+        .map(|(k, x)| (k.to_owned(), x))
+        .collect();
+    let used: BTreeSet<&str> = [":c"].into_iter().collect();
+    assert_eq!(
+        refused(check_unused_keys(
+            "ExpressionAttributeValues",
+            Some(&v),
+            &used
+        )),
+        "Value provided in ExpressionAttributeValues unused in expressions: keys: {:a, :b}"
+    );
+    assert!(
+        check_unused_keys(
+            "ExpressionAttributeValues",
+            None::<&HashMap<String, u8>>,
+            &used
+        )
+        .is_ok()
     );
 }
 
@@ -218,12 +247,13 @@ fn unused_names_answer_after_a_parse_error_and_before_unused_values() {
         Err(DynamoDbError::ValidationException(m.to_owned()))
     };
     let names_msg = "Value provided in ExpressionAttributeNames unused in expressions: keys: {#u}";
+    let none = BTreeSet::new();
     assert_eq!(
-        refused(with_unused_names(syntax(), Some(&n), &["Country = = :us"])),
+        refused(with_unused_names(syntax(), Some(&n), &none, "")),
         "Invalid SearchConditionExpression: Syntax error"
     );
     assert_eq!(
-        refused(with_unused_names(Ok(()), Some(&n), &["Country = :us"])),
+        refused(with_unused_names(Ok(()), Some(&n), &none, "")),
         names_msg
     );
     for values_msg in [
@@ -234,7 +264,8 @@ fn unused_names_answer_after_a_parse_error_and_before_unused_values() {
             refused(with_unused_names(
                 unused_values(values_msg),
                 Some(&n),
-                &["Country = :us"]
+                &none,
+                ""
             )),
             names_msg
         );
@@ -242,9 +273,23 @@ fn unused_names_answer_after_a_parse_error_and_before_unused_values() {
             refused(with_unused_names(
                 unused_values(values_msg),
                 None,
-                &["Country = :us"]
+                &none,
+                ""
             )),
             values_msg
         );
     }
+}
+
+/// The equality-only grammar resolves `#alias` through the key `#alias` and
+/// then the key `alias`, so `##c` uses the key `#c`, and its names check
+/// counts the key the resolution reads.
+#[test]
+fn equality_grammar_names_are_the_keys_it_resolves() {
+    let refs = crate::expression::search_condition_name_refs("##c = :v AND #p = :w");
+    for key in ["#c", "#p"] {
+        assert!(refs.contains(key), "{key} is used: {refs:?}");
+    }
+    let n = names(&[("#c", "cat")]);
+    assert!(check_unused_names(Some(&n), &refs, "").is_ok());
 }

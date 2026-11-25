@@ -46,7 +46,7 @@ pub use resolver::{
 };
 pub use search_condition::{
     MAX_INLINE_FILTER_CONDITIONS, MAX_PARTITION_KEY_CONDITIONS, MAX_SEARCH_CONDITIONS,
-    SearchCondition, validate_conditions_against_search_schema,
+    SearchCondition, search_condition_name_refs, validate_conditions_against_search_schema,
     validate_search_condition_expression,
 };
 pub use tokenizer::{Token, tokenize, tokenize_for, tokenize_with_limit};

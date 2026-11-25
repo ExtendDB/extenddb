@@ -11,14 +11,15 @@
 //! unused-names check here; a request with one gets it after its condition
 //! parses, through [`equality_conditions`] or the extended parser.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::search_params::{
     check_search_maps, check_unused_names, with_unused_names,
 };
 use extenddb_core::expression::{
-    ExpressionMaps, Projection, SearchCondition, validate_search_condition_expression,
+    ExpressionMaps, Projection, SearchCondition, search_condition_name_refs,
+    validate_search_condition_expression,
 };
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::AttributeValue;
@@ -47,7 +48,7 @@ pub(crate) fn check(
         Projection::compile(&paths, &ExpressionMaps::new(names, HashMap::new()), true)?;
     }
     if condition.is_none() {
-        check_unused_names(names, &[projection.unwrap_or_default()])?;
+        check_unused_names(names, &BTreeSet::new(), projection.unwrap_or_default())?;
     }
     Ok(())
 }
@@ -66,7 +67,8 @@ pub(crate) fn equality_conditions(
     with_unused_names(
         validate_search_condition_expression(expr, names, values),
         names,
-        &[expr, projection.unwrap_or_default()],
+        &search_condition_name_refs(expr),
+        projection.unwrap_or_default(),
     )
 }
 
