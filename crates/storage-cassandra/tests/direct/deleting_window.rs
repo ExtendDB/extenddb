@@ -7,10 +7,12 @@
 //! Amazon DynamoDB answers a second `DeleteTable` and an `UpdateTable` in that
 //! window with `ResourceInUseException` and the sentence `Attempt to change a
 //! resource which is still in use: Table is being deleted: <name>` (measured
-//! 2026-10-24). On this backend `DeleteTable` drops the data and the catalog
-//! row in one call and never sets `DELETING` itself; the removal of a restore
-//! target does. The window is produced here by setting the row's status
-//! directly.
+//! 2026-10-24). On this backend `DeleteTable` claims the row as `DELETING`
+//! with a lightweight transaction and then drops the data and the catalog row
+//! inside the same call, so the window lasts as long as the drops. The tests
+//! here need it held open for longer than that, and set the row's status
+//! directly; `concurrent_delete_table.rs` runs against the window the request
+//! itself opens.
 //!
 //! The catalog keyspace is shared by every test in this binary, and the
 //! control-plane sweep (`process_control_plane_transitions`) removes any
@@ -28,6 +30,7 @@ use extenddb_storage::TableEngine;
 use extenddb_storage::error::StorageError;
 use extenddb_storage_cassandra::CassandraEngine;
 
+use crate::delete_table_support::row_status;
 use crate::helpers::{TestAccount, TestTable, setup_engine, test_config};
 
 const TABLE: &str = "DeletingWindowTable";
@@ -59,25 +62,6 @@ async fn remove_row(engine: &CassandraEngine, account_id: &str) {
         .query_with_values(&query, cdrs_tokio::query_values!(account_id, TABLE))
         .await
         .expect("remove the table row");
-}
-
-async fn status_of(engine: &CassandraEngine, account_id: &str) -> Option<String> {
-    use cdrs_tokio::types::IntoRustByName;
-    let query = format!(
-        "SELECT table_status FROM {}.tables WHERE account_id = ? AND table_name = ?",
-        engine.catalog_keyspace()
-    );
-    let rows = engine
-        .session()
-        .query_with_values(&query, cdrs_tokio::query_values!(account_id, TABLE))
-        .await
-        .expect("read the row")
-        .response_body()
-        .expect("response body")
-        .into_rows()
-        .unwrap_or_default();
-    rows.first()
-        .map(|row| row.get_r_by_name("table_status").expect("table_status"))
 }
 
 fn update_input() -> UpdateTableInput {
@@ -130,7 +114,9 @@ async fn a_second_delete_table_during_the_window_is_table_being_deleted() {
         "expected TableBeingDeleted({TABLE:?}), got {err:?}"
     );
     assert_eq!(
-        status_of(&engine, &account.account_id).await.as_deref(),
+        row_status(&engine, &account.account_id, TABLE)
+            .await
+            .as_deref(),
         Some("DELETING")
     );
     remove_row(&engine, &account.account_id).await;

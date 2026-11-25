@@ -243,3 +243,68 @@ class TestDeletingWindowDataPlane:
         with pytest.raises(ClientError) as exc:
             dynamodb_client.scan(TableName=name, IndexName="gsi1")
         assert_validation(exc.value, NOT_FOUND, "ResourceNotFoundException")
+
+
+class TestConcurrentDeleteTable:
+    """Two DeleteTable calls sent at once, which needs no held window.
+
+    The service answers one of them 200 and the other
+    ``ResourceInUseException`` with the sentence above (measured 2026-10-25,
+    five rounds of five). Cassandra and MongoDB answer the same. PostgreSQL
+    and SQLite with ``control_plane_delay_seconds`` under 1 (the CI setting)
+    remove the catalog row inside the request, so a second call that arrives
+    after the first has finished finds no row and answers
+    ``ResourceNotFoundException``; that answer is accepted there only. The
+    PostgreSQL and SQLite CI legs run ``devtools/run-tests`` without
+    ``--backend``, so an empty ``EXTENDDB_TEST_BACKEND`` counts as one of them.
+    Two 200s mean both calls ran the deletion.
+    """
+
+    ROUNDS = 3
+    ROW_REMOVED_IN_REQUEST = ("", "postgres", "sqlite")
+
+    def test_only_one_of_two_concurrent_delete_tables_deletes(
+        self, dynamodb_client, endpoint_url, is_extenddb
+    ):
+        from concurrent.futures import ThreadPoolExecutor
+
+        from helpers import make_dynamodb_client
+
+        for round_index in range(self.ROUNDS):
+            name = unique_name("del-pair")
+            dynamodb_client.create_table(
+                TableName=name,
+                AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+                KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+                BillingMode="PAY_PER_REQUEST",
+            )
+            wait_for_active(dynamodb_client, name)
+
+            def _delete(_worker: int, table: str = name):
+                client = make_dynamodb_client(endpoint_url)
+                try:
+                    return ("ok", client.delete_table(TableName=table))
+                except ClientError as exc:
+                    return ("err", exc)
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                outcomes = list(pool.map(_delete, range(2)))
+
+            accepted = [o for kind, o in outcomes if kind == "ok"]
+            refused = [o for kind, o in outcomes if kind == "err"]
+            assert len(accepted) == 1, (
+                f"round {round_index}: {len(accepted)} of the two DeleteTable calls were "
+                f"accepted; one call deletes the table and the other is refused"
+            )
+            assert accepted[0]["TableDescription"]["TableStatus"] == "DELETING"
+            expected = {"ResourceInUseException": _being_deleted(name)}
+            if is_extenddb and BACKEND in self.ROW_REMOVED_IN_REQUEST:
+                # ExtendDB's DeleteTable answer for a table it has removed, on
+                # PostgreSQL (a local server, 2026-11-24) and SQLite, which
+                # share the engine's mapping. The service adds the table name.
+                expected["ResourceNotFoundException"] = NOT_FOUND
+            code = refused[0].response["Error"]["Code"]
+            assert code in expected, (round_index, BACKEND, refused[0].response["Error"])
+            assert_validation(refused[0], expected[code], code)
+
+            wait_for_deleted(dynamodb_client, name, timeout=120.0)

@@ -3914,7 +3914,11 @@ async fn test_a_failed_record_whose_target_is_deleting_is_listed_once_stale_and_
 }
 
 /// Whether `table` exists in `account_id`'s keyspace.
-async fn data_table_exists(engine: &CassandraEngine, account_id: &str, table: &str) -> bool {
+pub(crate) async fn data_table_exists(
+    engine: &CassandraEngine,
+    account_id: &str,
+    table: &str,
+) -> bool {
     !extenddb_storage_cassandra::cassandra_util::system_read::<StorageError>(
         &engine.session_arc(),
         "SELECT table_name FROM system_schema.tables WHERE keyspace_name = ? AND table_name = ?",
