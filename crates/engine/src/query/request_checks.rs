@@ -35,9 +35,6 @@ pub(super) fn check_request(
     mut body: Value,
     limits: &LimitsConfig,
 ) -> Result<CheckedRequest, DynamoDbError> {
-    // The checks on the raw body, before typed deserialization: Limit, the
-    // ReturnConsumedCapacity enum, the parameter mix, the names map and the
-    // numbers, in the service's order.
     crate::query_key_values::validate_query_request_body(&body)?;
     // The service checks Select after Limit, the request's parameters, the
     // FilterExpression and the KeyConditionExpression checks below (measured
@@ -87,10 +84,13 @@ pub(super) fn check_request(
 }
 
 /// Refuse a `Query` body whose `KeyConditionExpression` has two conditions on
-/// one attribute, with the first fault [`check_request`] finds in it. `names`
-/// is the body's `ExpressionAttributeNames` without the `#`. Authorization
-/// calls this before the IAM decision, as the service refuses such a request
-/// for every principal (measured 2026-11-19, us-east-1).
+/// one attribute, or whose `Select` is invalid, with the first fault
+/// [`check_request`] finds in it. `names` is the body's
+/// `ExpressionAttributeNames` without the `#`. Authorization calls this before
+/// the IAM decision. The service refuses a duplicate for every principal
+/// (measured 2026-11-19, us-east-1). For an invalid `Select`, every principal
+/// gets the `Select` text or a fault that `check_request` reports ahead of it.
+/// That answer is not measured for a principal the policy denies.
 ///
 /// # Errors
 ///
@@ -100,16 +100,18 @@ pub fn refuse_duplicate_key_condition(
     names: &HashMap<String, String>,
     limits: &LimitsConfig,
 ) -> Result<(), DynamoDbError> {
-    let Some(kce) = body.get("KeyConditionExpression").and_then(Value::as_str) else {
-        return Ok(());
-    };
-    let duplicate = tokenize_for(
-        kce,
-        limits.max_expression_tokens,
-        ExpressionKind::KeyCondition,
-    )
-    .is_ok_and(|tokens| has_duplicate_key_condition(&tokens, names));
-    if duplicate {
+    let duplicate = body
+        .get("KeyConditionExpression")
+        .and_then(Value::as_str)
+        .is_some_and(|kce| {
+            tokenize_for(
+                kce,
+                limits.max_expression_tokens,
+                ExpressionKind::KeyCondition,
+            )
+            .is_ok_and(|tokens| has_duplicate_key_condition(&tokens, names))
+        });
+    if duplicate || crate::query_key_values::validate_query_select(body).is_err() {
         check_request(body.clone(), limits)?;
     }
     Ok(())
@@ -179,6 +181,33 @@ mod tests {
     fn a_key_condition_without_a_duplicate_goes_on_to_authorization() {
         for kce in ["pk = :own AND sk = :b", "pk > :own"] {
             assert!(refuse(kce, json!({})).is_ok(), "{kce}");
+        }
+    }
+
+    /// An invalid `Select` is refused before authorization, after the filter
+    /// fault the service reports ahead of it (H3).
+    #[test]
+    fn an_invalid_select_is_refused_before_authorization() {
+        let select = "1 validation error detected: Value 'BOGUS' at 'select' failed to satisfy \
+                      constraint: Member must satisfy enum value set: [SPECIFIC_ATTRIBUTES, \
+                      COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]";
+        let rows = [
+            ("pk = :own", json!({"Select": "BOGUS"}), select),
+            ("pk > :own", json!({"Select": "BOGUS"}), select),
+            (
+                "pk = :own",
+                json!({"Select": "BOGUS", "FilterExpression": "#q = :own"}),
+                "Invalid FilterExpression: An expression attribute name used in the document \
+                 path is not defined; attribute name: #q",
+            ),
+        ];
+        for (kce, extra, want) in rows {
+            let label = format!("{kce} {extra}");
+            let got = refuse(kce, extra);
+            assert!(
+                matches!(&got, Err(DynamoDbError::ValidationException(msg)) if msg == want),
+                "{label}: {got:?}"
+            );
         }
     }
 }
