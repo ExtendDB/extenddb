@@ -5,10 +5,10 @@
 //! the scope-date rules, and the temporary buffers of the cache.
 
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
+use web_time::{Duration, Instant};
 use zeroize::Zeroize;
 
 use crate::StoredCredential;
