@@ -54,6 +54,10 @@ def _writes(n: int, empty: range | set[int], big: int | None = None) -> list[tup
     return [("tbl", _puts(c)) for c in _counts(n, empty, big, 26)]
 
 
+# The start of a table ARN in an account that is not the caller's.
+OTHER_ACCOUNT = "arn:aws:dynamodb:us-east-1:000000000000:table/"
+
+
 NESTED_PUT = {
     "PutRequest": {
         "Item": {
@@ -160,6 +164,14 @@ class TestBatchWriteItem:
             pytest.param(_writes(26, range(1, 10)), range(1, 10), id="26_tables_9_none"),
             pytest.param(_writes(26, range(1, 11)), range(1, 11), id="26_tables_10_none"),
             pytest.param(_writes(26, {5}, 9), [5, 9], id="26_tables_1_none_1_of_26"),
+            pytest.param(
+                [
+                    (OTHER_ACCOUNT + p if i == 13 else p, r)
+                    for i, (p, r) in enumerate(_writes(26, {5}))
+                ],
+                [5],
+                id="26_tables_1_none_1_arn_of_another_account",
+            ),
         ],
     )
     def test_batch_write_too_many_items(
