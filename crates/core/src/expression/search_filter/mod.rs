@@ -41,7 +41,7 @@ mod walk;
 use std::collections::{BTreeSet, HashMap};
 
 pub use gate::EnabledAccounts;
-pub use rules::{Condition, Operator};
+use rules::Condition;
 
 use crate::error::DynamoDbError;
 use crate::expression::search_params::check_unused_keys;
@@ -152,8 +152,8 @@ fn evaluation_maps(
 
 impl SearchFilter {
     /// The conditions in written order.
-    #[must_use]
-    pub fn conditions(&self) -> &[Condition] {
+    #[cfg(test)]
+    pub(super) fn conditions(&self) -> &[Condition] {
         &self.conditions
     }
 
