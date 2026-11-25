@@ -1307,8 +1307,8 @@ async fn test_a_restore_is_refused_while_a_target_of_its_backup_is_creating() {
 }
 
 /// Four restores of one backup started together admit exactly one; the
-/// other three are `BackupInUse` naming the admitted target and leave no
-/// target behind. A restore that passes the early in-use check creates its
+/// other three are `BackupInUse` naming the backup and leave no target
+/// behind. A restore that passes the early in-use check creates its
 /// target's tables before it registers, and that takes a schema agreement
 /// round that can outlast a copy. The admitted restore's copy is held until
 /// all four have been answered, so a slow registration meets the first
@@ -1364,8 +1364,8 @@ async fn test_simultaneous_restores_of_one_backup_admit_exactly_one() {
             continue;
         }
         assert!(
-            matches!(result, Err(StorageError::BackupInUse(m)) if m.contains(&admitted)),
-            "restore {i} names {admitted}: {result:?}"
+            matches!(result, Err(StorageError::BackupInUse(m)) if m.contains(&backup_arn)),
+            "restore {i} is BackupInUse naming the backup: {result:?}"
         );
         let gone = engine
             .describe_table(
