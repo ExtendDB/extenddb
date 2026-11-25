@@ -11,12 +11,15 @@ use crate::sample_toml_support as support;
 #[test]
 fn storage_sqlite_section_matches_the_struct() {
     let root = support::sample();
-    // The sample documents the file default; the `memory` feature changes the
-    // compiled-in default to `:memory:`.
-    let mut expected = SqliteConfig::default();
+    // The sample documents the file build's default path. The `memory`
+    // feature changes the compiled-in default to `:memory:`, as the sample
+    // says, so that build checks the path's type only.
     if cfg!(feature = "memory") {
-        assert_eq!(expected.path, ":memory:");
-        expected.path = "extenddb.sqlite".to_owned();
+        let missing: SqliteConfig =
+            toml::from_str("").expect("empty [storage.sqlite] deserializes");
+        assert_eq!(missing.path, ":memory:");
+        support::pin::<SqliteConfig>(&root, "storage.sqlite", &["path"]);
+    } else {
+        support::pin::<SqliteConfig>(&root, "storage.sqlite", &[]);
     }
-    support::pin(&root, "storage.sqlite", &[], &expected);
 }

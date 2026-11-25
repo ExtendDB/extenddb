@@ -11,15 +11,13 @@ use crate::sample_toml_support as support;
 #[test]
 fn storage_cassandra_section_matches_the_struct() {
     let root = support::sample();
-    // The struct has no `Default`: `contact_points` is required and the
-    // sample shows an example, so its value is not compared. `username` and
-    // `password` are `Option<String>` shown as examples.
-    let expected = CassandraStorageConfig::new(vec!["example.invalid:9042".to_owned()]);
-    support::pin(
+    // `contact_points` is required and the sample shows an example, so its
+    // value is not compared. `username` and `password` are `Option<String>`
+    // shown as examples.
+    support::pin::<CassandraStorageConfig>(
         &root,
         "storage.cassandra",
         &["contact_points", "username", "password"],
-        &expected,
     );
     // The struct does not deny unknown fields, so a stray sub-table would
     // pass deserialization; the section must have none.

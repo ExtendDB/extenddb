@@ -12,17 +12,19 @@
 //! document whose tables hold every key with its default.
 //!
 //! [`pin`] checks a section three ways: the table deserializes into the
-//! struct; the set of keys equals the struct's field names, taken from a
-//! JSON serialization so that `Option` fields set to `None` still count
-//! (TOML drops them); and every key's value equals the struct default,
-//! except the named example keys, whose value is only type checked. A field
-//! added to a struct without a sample line fails here, `Option` or not.
+//! struct; the set of keys equals the struct's field names, read from its
+//! derived `Deserialize` so that `Option` fields and struct-valued fields
+//! count too; and every key's value equals the value serde gives the field
+//! when the key is missing, except the named example keys, whose value is
+//! only type checked. A field added to a struct without a sample line fails
+//! here, `Option`, struct or not.
 
 // Each including crate uses a subset of these helpers.
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;
 
+use serde::de::{DeserializeOwned, Error as _, Visitor};
 use toml::{Table, Value};
 
 /// Workspace-root path of the sample, relative to any `crates/<name>` crate.
@@ -96,8 +98,8 @@ pub fn section(root: &Table, path: &str, remove: &[&str]) -> Table {
     out
 }
 
-/// A struct's defaults as a TOML table without sub-tables. `None` fields are
-/// absent, as the TOML serializer leaves them out.
+/// A struct's field values as a TOML table without sub-tables. `None` fields
+/// are absent, as the TOML serializer leaves them out.
 pub fn defaults<T: serde::Serialize>(value: &T) -> Table {
     let mut table = Value::try_from(value)
         .expect("struct serializes to TOML")
@@ -108,21 +110,58 @@ pub fn defaults<T: serde::Serialize>(value: &T) -> Table {
     table
 }
 
-/// The struct's field names, from a JSON serialization: `None` is `null`
-/// there, so optional fields are listed; nested structs (objects) are not.
-pub fn field_names<T: serde::Serialize>(value: &T) -> BTreeSet<String> {
-    serde_json::to_value(value)
-        .expect("struct serializes to JSON")
-        .as_object()
-        .expect("struct serializes to an object")
+/// A `Deserializer` that records the field list a derived `Deserialize`
+/// passes to `deserialize_struct`, then stops. It needs no value of the
+/// struct, so it works for `AppConfig`, whose `storage` field cannot be
+/// built in this crate.
+struct FieldRecorder<'a>(&'a mut Option<&'static [&'static str]>);
+
+impl<'de> serde::Deserializer<'de> for FieldRecorder<'_> {
+    type Error = serde::de::value::Error;
+
+    fn deserialize_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        fields: &'static [&'static str],
+        _visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        *self.0 = Some(fields);
+        Err(Self::Error::custom("field list recorded"))
+    }
+
+    fn deserialize_any<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Self::Error> {
+        Err(Self::Error::custom(
+            "not a struct with a derived Deserialize",
+        ))
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+        bytes byte_buf option unit unit_struct newtype_struct seq tuple
+        tuple_struct map enum identifier ignored_any
+    }
+}
+
+/// The field names of `T` as its derived `Deserialize` declares them: the
+/// serde name of a renamed field, `Option` and struct-valued fields included,
+/// `#[serde(skip)]` fields left out. The derive's list also holds every
+/// `#[serde(alias)]` name, so `pin` cannot pass for a struct with an alias.
+/// Without a sample line for the alias, `pin` reports the alias as missing.
+/// With one, the derived `Deserialize` refuses the duplicate field. A struct
+/// with a `#[serde(flatten)]` field passes no list, and this panics.
+pub fn struct_fields<T: DeserializeOwned>() -> BTreeSet<String> {
+    let mut fields = None;
+    let _ = T::deserialize(FieldRecorder(&mut fields));
+    fields
+        .expect("T has a derived Deserialize")
         .iter()
-        .filter(|(_, v)| !v.is_object())
-        .map(|(k, _)| k.clone())
+        .map(|field| (*field).to_owned())
         .collect()
 }
 
 /// Assert the sample section holds exactly the struct's fields, and that the
-/// value of every field not named in `examples` equals the struct default.
+/// value of every field not named in `examples` equals the value a missing
+/// key gives.
 pub fn assert_pinned(
     what: &str,
     sample: &Table,
@@ -147,10 +186,10 @@ pub fn assert_pinned(
             match defaults.get(key) {
                 Some(value) if value == actual => {}
                 Some(value) => problems.push(format!(
-                    "{key}: sample has {actual}, struct default is {value}"
+                    "{key}: sample has {actual}, a missing key gives {value}"
                 )),
                 None => problems.push(format!(
-                    "{key}: struct default is None; list it as an example key"
+                    "{key}: a missing key gives None; list it as an example key"
                 )),
             }
         }
@@ -168,29 +207,58 @@ pub fn assert_pinned(
     );
 }
 
-/// Pin the sample section at `path` to `expected`: the table deserializes
-/// into `T` (a key the struct lacks fails here when `T` denies unknown
-/// fields), its keys are exactly the struct's field names, and every value
-/// equals the struct default except for the `examples`, whose sample line is
-/// an example rather than a default and whose value is only type checked by
-/// the deserialization. A field the sample writes as a sub-table (an
-/// `Option` of a struct, `None` in the default) is left to the pin of that
-/// sub-table.
-pub fn pin<T>(root: &Table, path: &str, examples: &[&str], expected: &T)
+/// Pin the sample section at `path` to `T`: the table deserializes into `T`
+/// (a key the struct lacks fails here when `T` denies unknown fields), its
+/// keys are exactly the field names of `T`'s derived `Deserialize`, and
+/// every value equals the value serde fills in for a missing key, except for
+/// the `examples`, whose sample line is an example rather than a default and
+/// whose value is only type checked by the deserialization. The expected
+/// values come from deserializing a table that holds only the `examples`
+/// (the required keys are among them), so a `#[serde(default = ...)]`
+/// function that disagrees with the sample fails here. A field the sample
+/// writes as a sub-table (an `Option` of a struct, `None` when missing) is
+/// left to the pin of that sub-table. Returns the field set it compared.
+pub fn pin<T>(root: &Table, path: &str, examples: &[&str]) -> BTreeSet<String>
 where
-    T: serde::de::DeserializeOwned + serde::Serialize,
+    T: DeserializeOwned + serde::Serialize,
 {
     let full = table_at(root, path).clone();
-    let mut fields = field_names(expected);
+    let mut fields = struct_fields::<T>();
     fields.retain(|field| !full.get(field).is_some_and(Value::is_table));
-    let _: T = Value::Table(full)
+    let _: T = Value::Table(full.clone())
         .try_into()
         .unwrap_or_else(|e| panic!("[{path}] of extenddb.sample.toml does not deserialize: {e}"));
+    let seed: Table = full
+        .iter()
+        .filter(|(k, _)| examples.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let expected: T = Value::Table(seed).try_into().unwrap_or_else(|e| {
+        panic!("[{path}] of extenddb.sample.toml: the example keys alone do not deserialize: {e}")
+    });
     assert_pinned(
         path,
         &section(root, path, &[]),
         &fields,
-        &defaults(expected),
+        &defaults(&expected),
+        examples,
+    );
+    fields
+}
+
+/// [`pin`], then the same comparison with `T::default()`: the value of every
+/// field when the file leaves the whole section out, which the parent
+/// field's `#[serde(default)]` fills in.
+pub fn pin_with_default<T>(root: &Table, path: &str, examples: &[&str])
+where
+    T: Default + DeserializeOwned + serde::Serialize,
+{
+    let fields = pin::<T>(root, path, examples);
+    assert_pinned(
+        &format!("{path} (section left out)"),
+        &section(root, path, &[]),
+        &fields,
+        &defaults(&T::default()),
         examples,
     );
 }
