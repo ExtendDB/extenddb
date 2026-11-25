@@ -60,8 +60,11 @@ def _segment_count(env: tuple[str, str, str], account_id: str) -> int:
         verify=False,
     )
     assert resp.status_code == 200, f"/metrics: {resp.status_code} {resp.text[:200]}"
+    # The response leaves out `segments` when it has no entry.
     return sum(
-        s["count"] for s in resp.json()["segments"] if s["operation"] == "SearchVectors"
+        s["count"]
+        for s in resp.json().get("segments", [])
+        if s["operation"] == "SearchVectors"
     )
 
 
