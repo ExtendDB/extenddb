@@ -388,6 +388,17 @@ Catalog upgrades change the schema; behavior changes alter how the running serve
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
 
+### v1.1.0: latency `segments` are summed into time buckets
+
+**What changed** (#398). The latency `segments` that `/metrics` and the console's `/console/metrics-data` return come from time buckets per account and operation. 1.0.0 kept one record per request for 24 hours. Each operation's count and means are still exact over the requests that the window covers. Four things change:
+
+- A window of `W` seconds returns at least the last `W` seconds and at most one bucket width more: up to 1 second more for `LastMinute` and `Last5Minutes`, and up to 60 seconds more for `LastHour` and `LastDay`. 1.0.0 cut each window exactly `W` seconds before the query.
+- `AllTime` returns the same as `LastDay`. 1.0.0 returned every record it held, 24 hours to 24 hours and 5 minutes of requests.
+- The operations are sorted by name. 1.0.0 returned them in no fixed order.
+- The segment memory is bounded: at most 111,488 bytes of buckets for each operation of each account that sent it in the last day, about 4.46 MB for an account that sends all 40 operations every second. 1.0.0 kept about 250 bytes for each request that reached dispatch in the last 24 hours, so the sizing rule in the deployment guide's [Process Memory](11-deployment-guide.md#process-memory) section stops applying after the upgrade.
+
+No catalog migration or configuration change is required.
+
 ### v1.1.0: `[storage.cassandra]` refuses unknown keys; every key has an environment form
 
 **What changed.** `[storage.cassandra]` refuses a key the struct does not have, as every other section already did. A hand-edited key such as `replication_factr` or `pasword`, or a variable such as `EXTENDDB__STORAGE__CASSANDRA__KEYSPACE`, started v1.0.0 with the default in force; `serve`, `verify`, `migrate` and `init` now stop with `unknown field` and the key named. Files `init` wrote carry only known keys and are unaffected. `import.paths`, `export.paths` and `storage.cassandra.contact_points` accept one comma-delimited string as well as an array, and `storage.sqlite.pool_size`, `storage.cassandra.replication_factor` and `storage.cassandra.max_connections` accept their string form, so each has an environment override. A value of the wrong type in a `[storage.<backend>]` table is reported with its key in front, on one line: `Failed to parse sqlite config: pool_size: invalid u32 value "-1": invalid digit found in string`.
