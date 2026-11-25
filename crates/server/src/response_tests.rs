@@ -5,39 +5,25 @@
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::types::{AttributeValue, CancellationReason, Item};
-use serde::de::{Deserializer as _, IgnoredAny, MapAccess, Visitor};
 
 use super::error_response;
 
-/// The top-level member names of the body `error_response` sends for
-/// `error`, in the order of the bytes.
-async fn body_members(error: &DynamoDbError) -> Vec<String> {
-    struct Names;
-    impl<'de> Visitor<'de> for Names {
-        type Value = Vec<String>;
-        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("an object")
-        }
-        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-            let mut names = Vec::new();
-            while let Some((name, IgnoredAny)) = map.next_entry::<String, IgnoredAny>()? {
-                names.push(name);
-            }
-            Ok(names)
-        }
-    }
+/// The body `error_response` sends for `error`.
+async fn body(error: &DynamoDbError) -> String {
     let response = error_response(error, "request-1");
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body");
-    serde_json::Deserializer::from_slice(&bytes)
-        .deserialize_map(Names)
-        .expect("json object")
+    String::from_utf8(bytes.to_vec()).expect("UTF-8 body")
 }
 
-/// Each body writes `__type` first and the other members in the order the
-/// service writes them, with the message under the key the service uses for
-/// that error (us-east-1, raw bodies, 2026-10-29 to 2026-11-20).
+/// Each expected body is the one the service sent for that error (us-east-1,
+/// raw bodies, 2026-11-20, each request twice): `__type` first, the other
+/// members in the service's order, and the message under the key the service
+/// uses for that error. An `Item` here holds one attribute, because the service
+/// changed the order of the attributes inside an `Item` between two sends of
+/// one request. The `SerializationException` with an empty text has no measured
+/// body: ExtendDB omits an empty message (REQ-ERR-003).
 #[tokio::test]
 async fn the_members_follow_the_service_per_error() {
     let cancelled = DynamoDbError::TransactionCanceledException {
@@ -52,15 +38,18 @@ async fn the_members_follow_the_service_per_error() {
     };
     let old_item = Item::from([("pk".to_owned(), AttributeValue::S("e1222".to_owned()))]);
     let failed = "The conditional request failed";
-    let rows: [(DynamoDbError, &[&str]); 7] = [
-        (cancelled, &["__type", "CancellationReasons", "Message"]),
+    let rows: [(DynamoDbError, &str); 7] = [
+        (
+            cancelled,
+            r#"{"__type":"com.amazonaws.dynamodb.v20120810#TransactionCanceledException","CancellationReasons":[{"Code":"ConditionalCheckFailed","Message":"The conditional request failed"}],"Message":"Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed]"}"#,
+        ),
         (
             DynamoDbError::ConditionalCheckFailedException(failed.into(), Some(old_item)),
-            &["__type", "Item", "message"],
+            r#"{"__type":"com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException","Item":{"pk":{"S":"e1222"}},"message":"The conditional request failed"}"#,
         ),
         (
             DynamoDbError::ConditionalCheckFailedException(failed.into(), None),
-            &["__type", "message"],
+            r#"{"__type":"com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException","message":"The conditional request failed"}"#,
         ),
         (
             DynamoDbError::IdempotentParameterMismatchException(
@@ -68,31 +57,32 @@ async fn the_members_follow_the_service_per_error() {
                  within the idempotency window"
                     .to_owned(),
             ),
-            &["__type", "Message"],
+            r#"{"__type":"com.amazonaws.dynamodb.v20120810#IdempotentParameterMismatchException","Message":"Specified idempotent token was used with different request parameters within the idempotency window"}"#,
         ),
         (
             DynamoDbError::SerializationException(
                 "STRING_VALUE cannot be converted to Integer".to_owned(),
             ),
-            &["__type", "Message"],
+            r#"{"__type":"com.amazon.coral.service#SerializationException","Message":"STRING_VALUE cannot be converted to Integer"}"#,
         ),
         (
             DynamoDbError::SerializationException(String::new()),
-            &["__type"],
+            r#"{"__type":"com.amazon.coral.service#SerializationException"}"#,
         ),
         (
-            DynamoDbError::ValidationException("One or more parameter values were invalid".into()),
-            &["__type", "message"],
+            DynamoDbError::ValidationException(
+                "1 validation error detected: Value null at 'key' failed to satisfy \
+                 constraint: Member must not be null"
+                    .to_owned(),
+            ),
+            r#"{"__type":"com.amazon.coral.validate#ValidationException","message":"1 validation error detected: Value null at 'key' failed to satisfy constraint: Member must not be null"}"#,
         ),
     ];
     let mut got = Vec::new();
-    let mut want: Vec<(&str, Vec<String>)> = Vec::new();
-    for (error, members) in &rows {
-        got.push((error.error_type(), body_members(error).await));
-        want.push((
-            error.error_type(),
-            members.iter().map(ToString::to_string).collect(),
-        ));
+    let mut want = Vec::new();
+    for (error, expected) in &rows {
+        got.push(body(error).await);
+        want.push(*expected);
     }
     assert_eq!(got, want);
 }
