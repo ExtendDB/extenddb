@@ -560,6 +560,7 @@ async fn start_server_refuses_a_reserved_slug_and_a_reserved_prefix_before_servi
         ),
     ] {
         let (state, _) = build_state_with(
+            None,
             |account_id| {
                 Arc::new(SlowAuth {
                     account_id,
