@@ -105,12 +105,17 @@ UNAUTHENTICATED_ROWS = {
     "number": (b"5", False),
 }
 
-# The type of the authentication error for each signing. ExtendDB's type for a
-# missing signature is MissingAuthenticationToken (#1075), so the type after
-# the "#" is compared by its start.
+# The authentication error for each signing: the start of its type after the
+# "#", and its message. For a missing signature, ExtendDB's type is
+# MissingAuthenticationToken and its message differs from the service's
+# (#1075). So the type is compared by its start, and that message is not
+# compared.
 AUTHENTICATION_ERRORS = {
-    "unsigned": "MissingAuthenticationToken",
-    "unknown-key": "UnrecognizedClientException",
+    "unsigned": ("MissingAuthenticationToken", None),
+    "unknown-key": (
+        "UnrecognizedClientException",
+        "The security token included in the request is invalid.",
+    ),
 }
 
 
@@ -129,5 +134,7 @@ def test_which_bodies_are_refused_before_authentication(
     if refused:
         assert _is_messageless_serialization_error(err), resp.text
     else:
-        error_type = err["__type"].rpartition("#")[2]
-        assert error_type.startswith(AUTHENTICATION_ERRORS[signing]), resp.text
+        error_type, message = AUTHENTICATION_ERRORS[signing]
+        assert err["__type"].rpartition("#")[2].startswith(error_type), resp.text
+        if message is not None:
+            assert err["message"] == message, resp.text
