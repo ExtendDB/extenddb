@@ -27,6 +27,7 @@ mod test_catalog;
 use std::sync::Arc;
 
 use axum::Router;
+use axum::http::Method;
 use axum::routing::{get, post};
 
 use session::SessionStore;
@@ -141,7 +142,13 @@ pub async fn require_console_session(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let mut req = if req.method().is_safe() {
+    // The four methods are named here because `Method::is_safe` follows the
+    // `http` crate's list, and http 1.5.0 adds QUERY to it.
+    let read_only = matches!(
+        *req.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE
+    );
+    let mut req = if read_only {
         req
     } else {
         match pages::require_form_csrf(req, &session).await {

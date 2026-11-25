@@ -69,6 +69,9 @@ const ROWS: &[Row] = &[
     Row { name: "POST with the token in JSON", holder: Holder::Admin, stored: StoredHash::LoginHash, method: "POST", csrf: Csrf::InJson, status: StatusCode::FORBIDDEN, location: None, body: "CSRF token mismatch" },
     Row { name: "DELETE without a token", holder: Holder::Admin, stored: StoredHash::LoginHash, method: "DELETE", csrf: Csrf::Absent, status: StatusCode::FORBIDDEN, location: None, body: "CSRF token mismatch" },
     Row { name: "PROPFIND without a token", holder: Holder::Admin, stored: StoredHash::LoginHash, method: "PROPFIND", csrf: Csrf::Absent, status: StatusCode::FORBIDDEN, location: None, body: "CSRF token mismatch" },
+    // With http 1.5.0, `Method::is_safe` is true for QUERY, and a gate that
+    // uses it fails this row.
+    Row { name: "QUERY without a token", holder: Holder::Admin, stored: StoredHash::LoginHash, method: "QUERY", csrf: Csrf::Absent, status: StatusCode::FORBIDDEN, location: None, body: "CSRF token mismatch" },
     Row { name: "POST with no cookie", holder: Holder::Nobody, stored: StoredHash::LoginHash, method: "POST", csrf: Csrf::Absent, status: StatusCode::SEE_OTHER, location: LOGIN, body: "" },
     Row { name: "POST for a deleted principal", holder: Holder::Admin, stored: StoredHash::Missing, method: "POST", csrf: Csrf::SessionToken, status: StatusCode::SEE_OTHER, location: LOGIN, body: "" },
 ];
