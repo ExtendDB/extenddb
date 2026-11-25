@@ -88,22 +88,36 @@ fn allow_get_item() -> Document {
 /// Migration 2 sends two requests per user through the leased management
 /// store, for its `detect` and again for its run. Each one that completes is
 /// progress, so a scan that lasts longer than the idle limit keeps the lock
-/// and the migration is applied.
+/// and the migration is applied. The run goes through a proxy that holds
+/// each chunk for 20 ms, which slows every migration's requests, so the
+/// assertion is set past the run without the scan: only with the scan does
+/// the run outlast it, while each request completes well within one idle
+/// limit.
 #[tokio::test(flavor = "multi_thread")]
 async fn migration_2_keeps_the_lock_through_a_scan_longer_than_the_idle_limit() {
     let Some(uri) = server() else { return };
     let d = Deployment::new(&uri, "scan").await;
     fixture::load(&d, &fixture::read("0.1.14")).await;
     let account = first_account(&d).await;
-    add_users(&d, &account, "scan", 1000, &allow_get_item()).await;
+    // At this delay the run without users took 8.1 to 8.4 s (up to 9.2 s
+    // beside other tests on a loaded host), and each user adds about
+    // 190 ms: 50 users took 17.1 to 17.8 s, against the seven idle limits
+    // (14 s) asserted below.
+    add_users(&d, &account, "scan", 50, &allow_get_item()).await;
+    let proxy = PausingProxy::in_front_of(&uri).await;
+    proxy.delay(Duration::from_millis(20));
+    let through_proxy =
+        MongoTarget::with_databases(proxy.uri(), d.target.catalog.clone(), d.target.data.clone());
     let timing = Timing {
         lease: Duration::from_secs(20),
         renew_every: Duration::from_millis(100),
         margin: Duration::from_secs(5),
-        idle_limit: Duration::from_millis(300),
+        // Room for a loaded runner between two completed requests: 300 ms
+        // without one lost the lock (#1232).
+        idle_limit: Duration::from_secs(2),
         ..Timing::PRODUCTION
     };
-    let (held, target) = lock(&d.target, false, Duration::from_secs(10), timing)
+    let (held, target) = lock(&through_proxy, false, Duration::from_secs(10), timing)
         .await
         .expect("lock");
     let started = Instant::now();
@@ -112,7 +126,7 @@ async fn migration_2_keeps_the_lock_through_a_scan_longer_than_the_idle_limit() 
     held.release().await;
     applied.expect("every migration applies");
     // A shorter run would apply without the progress the scan records.
-    assert!(took > timing.idle_limit * 4, "the run took {took:?}");
+    assert!(took > timing.idle_limit * 7, "the run took {took:?}");
     assert_eq!(
         d.status().await,
         CatalogStatus::Current {
@@ -126,27 +140,39 @@ async fn migration_2_keeps_the_lock_through_a_scan_longer_than_the_idle_limit() 
 /// `migrate --yes` reads the status under the lock before it runs, and on a
 /// catalog behind migration 2 the status runs migration 2's `detect`. Read
 /// as the holder, its calls keep the lock through a scan longer than the
-/// idle limit, and the run that follows applies.
+/// idle limit, and the run that follows applies. The scan goes through a
+/// proxy that holds each chunk for 20 ms, so it outlasts two idle limits on
+/// any runner while each request completes well within one.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_status_read_under_the_lock_keeps_it_through_a_long_scan() {
     let Some(uri) = server() else { return };
     let d = Deployment::new(&uri, "lockedstatus").await;
     fixture::load(&d, &fixture::read("0.1.14")).await;
     let account = first_account(&d).await;
-    add_users(&d, &account, "status", 1000, &allow_get_item()).await;
+    // The read makes two requests per user (its policies and its boundary),
+    // each held 40 ms (20 ms for the request and 20 ms for the answer), so
+    // 75 users take at least 6 s, 2 s past the two idle limits asserted below.
+    add_users(&d, &account, "status", 75, &allow_get_item()).await;
+    let proxy = PausingProxy::in_front_of(&uri).await;
+    proxy.delay(Duration::from_millis(20));
+    let through_proxy =
+        MongoTarget::with_databases(proxy.uri(), d.target.catalog.clone(), d.target.data.clone());
     let timing = Timing {
         lease: Duration::from_secs(20),
         renew_every: Duration::from_millis(100),
         margin: Duration::from_secs(5),
-        idle_limit: Duration::from_millis(300),
+        // Room for a loaded runner between two completed requests: 300 ms
+        // without one lost the lock on CI (#989).
+        idle_limit: Duration::from_secs(2),
         ..Timing::PRODUCTION
     };
-    let (held, target) = lock(&d.target, false, Duration::from_secs(10), timing)
+    let (held, target) = lock(&through_proxy, false, Duration::from_secs(10), timing)
         .await
         .expect("lock");
     let started = Instant::now();
     let status = status_holding(&target, &held).await;
     let took = started.elapsed();
+    proxy.delay(Duration::ZERO);
     let applied = migrate_holding(&target, "test", &held).await;
     held.release().await;
     status.expect("the status");

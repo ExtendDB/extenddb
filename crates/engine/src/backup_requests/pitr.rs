@@ -73,7 +73,7 @@ const NAME_PATTERN_CONSTRAINT: &str =
     "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+";
 
 /// The member's string value, or the service's missing-table-name refusal.
-pub(super) fn table_name_member<'a>(
+pub(crate) fn table_name_member<'a>(
     body: &'a Value,
     member: &str,
 ) -> Result<&'a str, DynamoDbError> {
@@ -117,6 +117,10 @@ fn check_table_name(name: &str, (min, max): (usize, usize)) -> Result<(), Dynamo
 /// units. A name within the bounds is then checked against the model's
 /// constraints at `path`, which count characters (measured on DynamoDB in
 /// us-east-1 on 20 Nov 2026 for both members).
+///
+/// # Errors
+///
+/// `ValidationException` for a name of a bad length or outside the pattern.
 pub fn check_restore_table_name(
     name: &str,
     path: &str,

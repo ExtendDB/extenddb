@@ -23,8 +23,10 @@
 //!   characters the message lists both clauses, the length first, joined by
 //!   `; ` under `2 validation errors detected:` (measured at `tableName`;
 //!   derived for the other locations). Locations: `tableName` for `TableName`,
-//!   `targetTableName`, `sourceTableName`, `tableCreationParameters.tableName`,
-//!   `exclusiveStartTableName`, `indexName` for `Query`, `Scan` and `SearchVectors`, and
+//!   `targetTableName` and `sourceTableName` of RestoreTableToPointInTime (a
+//!   RestoreTableFromBackup `TargetTableName` is described below),
+//!   `tableCreationParameters.tableName`, `exclusiveStartTableName`,
+//!   `indexName` for `Query`, `Scan` and `SearchVectors`, and
 //!   `transactItems.<n>.member.<op>.tableName` (1-based, `put`, `get`,
 //!   `delete`, `update`, `conditionCheck`). A name inside the pattern but of a
 //!   bad length is left to the engine handlers, whose answer the service's
@@ -696,8 +698,9 @@ mod tests {
         }
     }
 
-    /// Measured on DynamoDB on 20 and 21 Nov 2026 (see the module docs). Only
-    /// the type of a `SerializationException` is checked (#1012).
+    /// Measured on DynamoDB on 20 and 21 Nov 2026 (see the module docs). The
+    /// `SerializationException` text names the member and is ExtendDB's
+    /// (DynamoDB's texts are #1012).
     #[test]
     fn a_member_of_another_json_type_is_refused_before_its_value_is_checked() {
         let own =
@@ -705,17 +708,14 @@ mod tests {
         let refused_arn = format!("{ARN}/backup/01700000000000-abcdef12");
         let (arn, target, name) = ("BackupArn", "TargetTableName", "t367name");
         let disable = json!({ "PointInTimeRecoveryEnabled": false });
-        let (restore, pitr, ser) = (
-            "RestoreTableFromBackup",
-            "DescribeContinuousBackups",
-            "SerializationException",
-        );
+        let (restore, pitr) = ("RestoreTableFromBackup", "DescribeContinuousBackups");
+        // (operation, body, the member refused, or `None` when the gate passes)
         let mut rows = vec![
-            (restore, json!({ arn: 5, target: "a*" }), ser),
-            (restore, json!({ arn: null, target: name }), "passed"),
-            (restore, json!({ arn: own, target: null }), "passed"),
-            (pitr, json!({ "TableName": null }), "passed"),
-            (pitr, json!({ "TableName": name }), "passed"),
+            (restore, json!({ arn: 5, target: "a*" }), Some(arn)),
+            (restore, json!({ arn: null, target: name }), None),
+            (restore, json!({ arn: own, target: null }), None),
+            (pitr, json!({ "TableName": null }), None),
+            (pitr, json!({ "TableName": name }), None),
         ];
         let values = [
             json!(5),
@@ -726,27 +726,33 @@ mod tests {
             json!(5.5),
         ];
         for value in values {
-            rows.push((restore, json!({ arn: value, target: name }), ser));
-            rows.push((restore, json!({ arn: refused_arn, target: value }), ser));
-            rows.push((pitr, json!({ "TableName": value }), ser));
+            rows.push((restore, json!({ arn: value, target: name }), Some(arn)));
+            rows.push((
+                restore,
+                json!({ arn: refused_arn, target: value }),
+                Some(target),
+            ));
+            rows.push((pitr, json!({ "TableName": value }), Some("TableName")));
             let body = json!({ "TableName": value, "PointInTimeRecoverySpecification": disable });
-            rows.push(("UpdateContinuousBackups", body, ser));
-            rows.push(("DescribeBackup", json!({ arn: value }), ser));
-            rows.push(("DeleteBackup", json!({ arn: value }), ser));
+            rows.push(("UpdateContinuousBackups", body, Some("TableName")));
+            rows.push(("DescribeBackup", json!({ arn: value }), Some(arn)));
+            rows.push(("DeleteBackup", json!({ arn: value }), Some(arn)));
         }
-        for (op, input, expected) in rows {
+        for (op, input, refused) in rows {
             let answer = match check_table_name_chars(op, &input, "123456789012") {
-                Ok(()) => "passed",
-                Err(DynamoDbError::SerializationException(_)) => ser,
+                Ok(()) => None,
+                Err(DynamoDbError::SerializationException(m)) => Some(m),
                 Err(other) => panic!("{op} {input}: unexpected error {other:?}"),
             };
+            let expected =
+                refused.map(|m| format!("Start of structure or map found where not expected: {m}"));
             assert_eq!(answer, expected, "{op} {input}");
         }
     }
 
-    /// Measured on DynamoDB on 20 and 21 Nov 2026: with a target name the gate
-    /// refuses, an override member of another JSON kind is answered first, and
-    /// a `BackupArn` of another account is passed on to the cross-account
+    /// Measured on DynamoDB on 20, 21 and 25 Nov 2026: with a target name the
+    /// gate refuses, an override member of another JSON kind is answered first,
+    /// and a `BackupArn` of another account is passed on to the cross-account
     /// refusal. Then the account and the shape of the `BackupArn` are answered
     /// (a null one stands for an absent one); its id is answered after the
     /// name. Any other override fault keeps the name's answer. Each body has
@@ -793,6 +799,7 @@ mod tests {
             (json!({ "LocalSecondaryIndexOverride": {} }), "a*", ser),
             (json!({ sse: 5 }), "a*", ser),
             (json!({ pt: "x" }), "a*", ser),
+            (json!({ "OnDemandThroughputOverride": 5 }), "a*", ser),
             (json!({ bm: 5 }), "a*", ser),
             (json!({ bm: "PAY", sse: 5 }), "a*", ser),
             (json!({ bm: "PAY" }), "a*", len),
