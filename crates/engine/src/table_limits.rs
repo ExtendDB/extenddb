@@ -124,3 +124,7 @@ async fn reserved_capacity(
     }
     Ok(reserved)
 }
+
+#[cfg(test)]
+#[path = "table_limits_tests.rs"]
+mod tests;
