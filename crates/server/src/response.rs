@@ -5,12 +5,12 @@
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use extenddb_core::error::DynamoDbError;
+use extenddb_core::error::{DynamoDbError, SERIALIZATION_FAILURE_BODY, error_document};
 use serde_json::Value;
 
-/// Hardcoded fallback body for when response serialization itself fails.
-const SERIALIZATION_FAILURE_BODY: &[u8] =
-    br#"{"__type":"com.amazonaws.dynamodb.v20120810#InternalServerError","message":"Internal error"}"#;
+#[cfg(test)]
+#[path = "response_tests.rs"]
+mod message_key_tests;
 
 /// REQ-WIRE-010: `x-amzn-RequestId` on every response.
 /// REQ-WIRE-011: `x-amz-crc32` checksum.
@@ -33,27 +33,14 @@ pub(crate) fn success_response(body: &Value, request_id: &str) -> Response {
         .into_response()
 }
 
-/// REQ-ERR-001: `__type` with prefix. REQ-ERR-002: message field.
-/// REQ-ERR-003: Omit `message` when empty (real `DynamoDB` behavior, verified 2026-05-04).
+/// REQ-ERR-001: `__type` with prefix. REQ-ERR-002: message field, under the
+/// key `error_document` picks. REQ-ERR-003: Omit the message field when empty
+/// (real `DynamoDB` behavior, verified 2026-05-04).
 pub(crate) fn error_response(error: &DynamoDbError, request_id: &str) -> Response {
-    // Fix #14: Use full_error_type() which includes the prefix
-    let mut body = serde_json::json!({
-        "__type": error.full_error_type(),
-    });
-    // Only include message field when non-empty (real DynamoDB omits it for
-    // UnknownOperationException and other errors with no message).
-    let msg = error.message();
-    if !msg.is_empty() {
-        body["message"] = serde_json::Value::String(msg.to_owned());
-    }
-    // TransactionCanceledException includes per-item CancellationReasons
-    if let Some(reasons) = error.cancellation_reasons() {
-        body["CancellationReasons"] = serde_json::to_value(reasons).unwrap_or_default();
-    }
-    // ConditionalCheckFailedException includes the old item when requested
-    if let Some(item) = error.condition_check_item() {
-        body["Item"] = serde_json::to_value(item).unwrap_or_default();
-    }
+    // The body shape (`__type`, optional message, `CancellationReasons`, `Item`)
+    // is built by the shared `error_document` helper so the wire body and the
+    // in-process body come from the same code; this transport adds the HTTP status and headers.
+    let body = error_document(error);
     let body_bytes =
         serde_json::to_vec(&body).unwrap_or_else(|_| SERIALIZATION_FAILURE_BODY.to_vec());
     let crc = crc32fast::hash(&body_bytes);
