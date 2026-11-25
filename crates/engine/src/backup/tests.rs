@@ -1836,6 +1836,21 @@ pub(crate) fn restore_from_an_unreadable_store() -> (Arc<Fake>, BackupRuntime, V
     (fake, runtime, restore_body(json!({})))
 }
 
+/// A `DeleteBackup` of a backup whose row is AVAILABLE on the configured
+/// store, run against a catalog whose id cannot be read, so the deletion
+/// fence fails before the DELETING write: the client's error.
+pub(crate) async fn delete_backup_with_an_unreadable_catalog() -> DynamoDbError {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let arn = arn(ACCOUNT);
+    seed_rows(&fake, &[row(&arn, BackupStatus::Available)]);
+    *fake.catalog_id_error.lock().unwrap() = true;
+    delete_backup(&*fake, &runtime, ACCOUNT, REGION, &own(&arn))
+        .await
+        .unwrap_err()
+}
+
 /// A runtime whose configured store (`store()`'s kind and root) failed its
 /// startup check with `problem`: the id is unknown.
 fn runtime_unhealthy(mem: &Arc<MemStore>, problem: StoreProblem) -> BackupRuntime {

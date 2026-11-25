@@ -8,7 +8,9 @@
 //! line carries neither. The macro expands at its call site, so each line
 //! keeps the site's own target and level. The detached restore re-enters the
 //! scope in its spawned task, so the store read its request makes there
-//! names the request too.
+//! names the request too. DeleteBackup's line for a catalog id that cannot
+//! be read and BatchWriteItem's line for the requests a batch did not apply
+//! go through the macro as well.
 
 use std::sync::{Arc, Mutex};
 
@@ -264,6 +266,20 @@ async fn the_fault_line_carries_no_request_fields_outside_a_scope_at_every_site(
     }
 }
 
+/// Runs `fut` inside a scope for `request_id` and `operation` under a fresh
+/// subscriber and returns the error and warn lines written meanwhile.
+async fn scoped_fault_lines<F: std::future::Future>(
+    request_id: &str,
+    operation: &str,
+    fut: F,
+) -> Vec<Seen> {
+    with_scope(
+        RequestScope::new(request_id.to_owned(), operation.to_owned()),
+        error_events_during_async(fut),
+    )
+    .await
+}
+
 /// Runs `RestoreTableFromBackup` through its detached entry point inside a
 /// scope for `request_id`, checks that the client gets a redacted 500, and
 /// returns the error and warn lines written meanwhile.
@@ -274,22 +290,19 @@ async fn detached_restore_fault_lines(
     request_id: &str,
 ) -> Vec<Seen> {
     let limits = Arc::new(extenddb_core::limits::LimitsConfig::default());
-    with_scope(
-        RequestScope::new(request_id.to_owned(), "RestoreTableFromBackup".to_owned()),
-        error_events_during_async(async {
-            let result = crate::backup::restore_table_from_backup_detached(
-                backups,
-                Arc::new(runtime),
-                Arc::from("123456789012"),
-                Arc::from("us-east-1"),
-                limits,
-                body,
-                |_, _| async {},
-            )
-            .await;
-            assert!(matches!(result, Err(DynamoDbError::InternalServerError(_))));
-        }),
-    )
+    scoped_fault_lines(request_id, "RestoreTableFromBackup", async {
+        let result = crate::backup::restore_table_from_backup_detached(
+            backups,
+            Arc::new(runtime),
+            Arc::from("123456789012"),
+            Arc::from("us-east-1"),
+            limits,
+            body,
+            |_, _| async {},
+        )
+        .await;
+        assert!(matches!(result, Err(DynamoDbError::InternalServerError(_))));
+    })
     .await
 }
 
@@ -346,5 +359,60 @@ async fn the_restore_tasks_failed_store_read_names_the_request() {
             level: "ERROR".to_owned(),
         }],
         "one fault line for the failed store read, naming the request"
+    );
+}
+
+/// DeleteBackup runs its deletion fence on the request task. When the
+/// catalog's id cannot be read, the client gets a redacted 500 and the line
+/// names the request.
+#[tokio::test]
+async fn the_delete_backup_line_for_an_unreadable_catalog_names_the_request() {
+    let logged = scoped_fault_lines("req-delete", "DeleteBackup", async {
+        let err = crate::backup::tests::delete_backup_with_an_unreadable_catalog().await;
+        assert!(
+            matches!(err, DynamoDbError::InternalServerError(_)),
+            "{err:?}"
+        );
+    })
+    .await;
+    assert_eq!(
+        logged,
+        vec![Seen {
+            request_id: Some("req-delete".to_owned()),
+            operation: Some("DeleteBackup".to_owned()),
+            message: "DeleteBackup arn:aws:dynamodb:us-east-1:123456789012:table/Music/backup/\
+                      01791976431438-73d8d5bc: the catalog id could not be read"
+                .to_owned(),
+            target: "extenddb_engine::backup".to_owned(),
+            level: "ERROR".to_owned(),
+        }],
+        "one fault line for the catalog id that could not be read, naming the request"
+    );
+}
+
+/// A BatchWriteItem whose first write meets a connection error applies
+/// nothing and answers 503. Its one line, at warn level, names the request.
+#[tokio::test]
+async fn the_batch_write_item_line_for_a_batch_that_applied_nothing_names_the_request() {
+    let logged = scoped_fault_lines("req-batch", "BatchWriteItem", async {
+        let (err, _) =
+            crate::batch_write_item::scripted::batch_that_applies_nothing_after_a_connection_error(
+            )
+            .await;
+        assert_eq!(err.status_code(), 503, "{err:?}");
+    })
+    .await;
+    assert_eq!(
+        logged,
+        vec![Seen {
+            request_id: Some("req-batch".to_owned()),
+            operation: Some("BatchWriteItem".to_owned()),
+            message: "BatchWriteItem: 2 request(s) of the batch not applied; no request applied \
+                      and the batch answers 503"
+                .to_owned(),
+            target: "extenddb_engine::batch_write_item".to_owned(),
+            level: "WARN".to_owned(),
+        }],
+        "one warn line for the batch that applied nothing, naming the request"
     );
 }

@@ -17,11 +17,14 @@
 //! a request and wants the task's log lines correlated reads [`current`]
 //! before the spawn and re-enters the scope inside it with
 //! [`with_scope_opt`]. The engine makes most of its storage calls inline on
-//! the request task, so a backend serving the request sees the scope. The
-//! calls made from a task the request starts do not see it, except in the
-//! detached restore of `RestoreTableFromBackup`, which re-enters the scope:
-//! the backup and restore jobs and the TTL index backfill that
-//! `UpdateTimeToLive` spawns on a backend reporting ENABLING run without it.
+//! the request task, so a backend serving the request sees the scope. A task
+//! the request starts does not see it unless the engine carries it in: the
+//! detached restore of `RestoreTableFromBackup` re-enters the scope. The job
+//! tasks of a store-backed `CreateBackup` and of `RestoreTableFromBackup`'s
+//! registration answer the request from a task without the scope, so a
+//! storage fault there carries no request id. The backup and restore jobs
+//! after the answer and the TTL index backfill that `UpdateTimeToLive`
+//! spawns on a backend reporting ENABLING run without it as well.
 //!
 //! The two SDK fields are header values the client chose. Treat them as
 //! untrusted text: write them to a log line if useful, never into a query, a
@@ -43,9 +46,10 @@ pub struct RequestScope {
     /// value per call and resend it on each retry of that call.
     pub sdk_invocation_id: Option<String>,
     /// `amz-sdk-request` when the client sent it. The AWS SDKs send their
-    /// attempt counter here: `attempt=1; max=3` on the first attempt, and on
-    /// a retry a `ttl` field first, `ttl=20261124T190559Z; attempt=2; max=3`,
-    /// the time after which the client no longer waits for the answer.
+    /// attempt counter here, as in `attempt=1; max=3`. Once botocore has
+    /// received a response, it puts a `ttl` field first, as in
+    /// `ttl=20261124T190559Z; attempt=2; max=3`: the time after which the
+    /// client no longer waits for the answer.
     pub sdk_request: Option<String>,
 }
 

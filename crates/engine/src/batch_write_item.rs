@@ -353,10 +353,11 @@ async fn write_batch(
         } else {
             "they are returned in UnprocessedItems"
         };
-        tracing::warn!(
+        log_storage_fault!(
+            warn,
+            last_error = last_error,
             applied,
             not_applied,
-            last_error = %last_error,
             "BatchWriteItem: {not_applied} request(s) of the batch not applied; {outcome}"
         );
         if applied == 0 {
@@ -626,7 +627,7 @@ fn collect_icm_if_needed(
 }
 
 #[cfg(test)]
-mod scripted;
+pub(crate) mod scripted;
 #[cfg(test)]
 mod write_batch_deferral_tests;
 #[cfg(test)]

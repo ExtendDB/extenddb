@@ -23,7 +23,9 @@
 ///
 /// `log_storage_fault!(warn, field = error, "message")` writes the same
 /// event at warn level, with the error recorded under `field`: the form for
-/// a fault the client sees as a 503 it retries, such as a transient error.
+/// the lines that have always been warn level, the transient error, the
+/// expired snapshot and the BatchWriteItem line for the requests a batch did
+/// not apply. More fields may follow the error, before the message.
 macro_rules! log_storage_fault {
     (@event $level:expr, $field:ident, $error:expr, $($message:tt)+) => {{
         let (request_id, operation) = extenddb_storage::request_scope::log_fields();

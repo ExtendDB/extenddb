@@ -1386,7 +1386,10 @@ async fn delete_catalog_backup<S: BackupCatalog + ?Sized>(
             return Err(refusal);
         }
         if let StoreProblem::Catalog(e) = &problem {
-            tracing::error!("DeleteBackup {arn_text}: the catalog id could not be read: {e}");
+            log_storage_fault!(
+                e,
+                "DeleteBackup {arn_text}: the catalog id could not be read"
+            );
             return Err(DynamoDbError::InternalServerError(
                 "Internal server error".to_owned(),
             ));
