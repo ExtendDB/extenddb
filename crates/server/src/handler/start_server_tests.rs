@@ -419,11 +419,19 @@ async fn a_console_tab_is_behind_the_session_check_and_listed_in_the_nav_bar() {
     let (addr, task) = serve_with_tabs(Vec::new(), tabs, None, 0).await;
 
     // Without a session: the page, a non-route under it and the slash form
-    // all redirect to the login page, so the slug is not confirmed.
-    for path in ["/console/chaos", "/console/chaos/other", "/console/chaos/"] {
+    // all redirect to the login page, as a built-in page does; an unmounted
+    // slug is 404, as an unknown console path is.
+    for (path, status) in [
+        ("/console/chaos", 303),
+        ("/console/chaos/other", 303),
+        ("/console/chaos/", 303),
+        ("/console/accounts", 303),
+        ("/console/nothere", 404),
+    ] {
         let r = raw(addr, &get_req(path)).await;
-        assert_eq!(r.status, 303, "{path}: {}", r.body);
-        assert_eq!(r.header("location"), Some("/console/login"), "{path}");
+        assert_eq!(r.status, status, "{path}: {}", r.body);
+        let location = (status == 303).then_some("/console/login");
+        assert_eq!(r.header("location"), location, "{path}");
     }
 
     let cookie = login(addr).await;

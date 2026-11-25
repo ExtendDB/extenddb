@@ -292,8 +292,10 @@ pub async fn start_server(
                 .fallback(|| async { StatusCode::NOT_FOUND })
                 .layer(gate.clone());
             // The trailing-slash form redirects to the page, as /console/ does
-            // below, behind the same check so a slug is not confirmed to a
-            // client without a session.
+            // below, behind the same check. Without a session every path under
+            // the slug answers 303 to the login page, as a built-in page such
+            // as /console/accounts does, and an unmounted slug answers 404, as
+            // an unknown console path does.
             let page = format!("/console/{}", tab.slug);
             let slash = Router::new()
                 .route("/", get(move || async move { Redirect::permanent(&page) }))
