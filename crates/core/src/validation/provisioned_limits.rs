@@ -249,7 +249,9 @@ pub fn check_create_table_capacity(
 /// `reserved` is what the account holds now, including `current`, what this
 /// table and its indexes hold now, which `after` replaces. A unit the request
 /// does not raise is not refused, so a table can still be lowered after an
-/// operator lowers a maximum below what it holds.
+/// operator lowers a maximum below what it holds. An on-demand table holds no
+/// units, whatever figures it kept from before its switch, so every figure of
+/// a switch back to `PROVISIONED` is a raise.
 ///
 /// # Errors
 ///
@@ -264,7 +266,11 @@ pub fn check_update_table_capacity(
 ) -> Result<(), DynamoDbError> {
     if let Some(request) = table_request {
         let requested = CapacityUnits::of(request);
-        let held = CapacityUnits::of_description(&existing.provisioned_throughput);
+        let held = if is_on_demand(existing) {
+            CapacityUnits::default()
+        } else {
+            CapacityUnits::of_description(&existing.provisioned_throughput)
+        };
         for unit in Unit::BOTH {
             let max = unit.table_max(limits);
             if unit.of(requested) > max && unit.of(requested) > unit.of(held) {

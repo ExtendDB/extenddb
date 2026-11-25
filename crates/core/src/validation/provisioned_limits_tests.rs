@@ -286,6 +286,34 @@ fn a_table_above_a_lowered_maximum_can_still_be_lowered() {
         REGION,
     )
     .expect("a decrease is not refused");
+    // An on-demand table keeps the figures it held before the switch, and
+    // holds none of them: a switch back to PROVISIONED at 300 raises it above
+    // the per-table maximum. The account maximum admits the 300.
+    let account_admits = LimitsConfig {
+        per_account_max_rcu: 2_000,
+        per_account_max_wcu: 2_000,
+        ..limits
+    };
+    let on_demand = TableDescription {
+        billing_mode_summary: Some(BillingModeSummary {
+            billing_mode: BillingMode::PayPerRequest,
+            last_update_to_pay_per_request_date_time: None,
+        }),
+        ..table(500, 500, Vec::new())
+    };
+    assert_eq!(
+        refusal(check_update_table_capacity(
+            Some(&request),
+            &on_demand,
+            units(1_000, 1_000),
+            units(300, 300),
+            &account_admits,
+            REGION,
+        )),
+        "The requested ReadCapacityUnits, 300, is above the per table maximum for the account \
+         in us-east-1. Per table maximum: 100. Refer to the Amazon DynamoDB Developer Guide for \
+         current limits and how to request higher limits."
+    );
 }
 
 #[test]
