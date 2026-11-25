@@ -7,10 +7,7 @@
 //! which `storage_err_to_dynamo` answers as `ServiceUnavailable` (503), the
 //! status of a fault that clears when the deployment comes back. Everything
 //! else stays [`StorageError::Internal`] and answers as `InternalServerError`
-//! (500), the status of a server fault. Two SQL classifiers answer the same
-//! fault the same way: `map_sqlx_err` on the SQLite index paths and `read_err`
-//! on the PostgreSQL DescribeBackup definition read. The SQL backends' own
-//! key-info reads map every driver error to `Internal`.
+//! (500), the status of a server fault.
 //!
 //! The driver has predicates for this (`is_network_error`, `is_read_retryable`)
 //! but they are `pub(crate)` to the driver, so the classification is written
@@ -71,12 +68,8 @@ pub(crate) fn catalog_read_err(e: &DriverError) -> StorageError {
     }
 }
 
-/// A connection string nothing listens on. Port 1 on loopback refuses the
-/// connection, and `serverSelectionTimeoutMS` is short so a read that waits
-/// for a server costs milliseconds. `MongoEngine::new` performs no I/O, so an
-/// engine built on it fails at its first read the way an unreachable
-/// deployment makes it fail, with `ErrorKind::ServerSelection` from the
-/// driver.
+/// A connection string nothing listens on: port 1 on loopback refuses the
+/// connection, and a read fails within the 50 ms server-selection timeout.
 #[cfg(test)]
 pub(crate) const CLOSED_PORT_URI: &str =
     "mongodb://127.0.0.1:1/?directConnection=true&serverSelectionTimeoutMS=50";
