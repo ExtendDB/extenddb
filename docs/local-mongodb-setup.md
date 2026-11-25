@@ -109,8 +109,11 @@ one binary per backend.
 
 ## Initializing ExtendDB with MongoDB
 
+`init` reads the MongoDB connection string from an existing `extenddb.toml`, so write the `[storage.mongodb]` section first and pass `--overwrite`:
+
 ```bash
-./target/release/extenddb init --backend mongodb --config extenddb.toml
+printf '[storage]\nbackend = "mongodb"\n\n[storage.mongodb]\nconnection_string = "mongodb://localhost:27017/?replicaSet=rs0"\n' > extenddb.toml
+./target/release/extenddb init --backend mongodb --config extenddb.toml --overwrite
 ```
 
 This creates:

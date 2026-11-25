@@ -12,7 +12,7 @@ ExtendDB stores tables, items, indexes and its own catalog in a database you run
 | PostgreSQL (default) | `postgres` | `extenddb/extenddb-postgres` | PostgreSQL 14 or newer; the pgvector extension on the data database for vector indexes | [Docker Compose](local-dev-docker-compose.md), [full walkthrough](getting-started.md), [deployment](manuals/11-deployment-guide.md) |
 | MongoDB | `mongodb` | `extenddb/extenddb-mongodb` | MongoDB 7.0 or newer as a replica set, including for a single node | [full walkthrough](getting-started.md), [MongoDB container](https://github.com/ExtendDB/extenddb/blob/main/docker/README-mongodb.md) |
 | SQLite | `sqlite` | `extenddb/extenddb-dev` (built in developer mode, see below) | None; a file, or `:memory:` | [development image](dev-image.md), [SQLite section of the walkthrough](getting-started.md#sqlite-backend-developer-mode) |
-| Cassandra | `cassandra` | None | An Apache Cassandra cluster | [Cassandra setup](cassandra-setup.md), [upgrade manual](manuals/07-upgrade-manual.md), [backend RFC (draft)](rfcs/draft-cassandra-backend.md) |
+| Cassandra | `cassandra` | `extenddb/extenddb-cassandra` | An Apache Cassandra cluster | [Cassandra setup](cassandra-setup.md), [Cassandra container](https://github.com/ExtendDB/extenddb/blob/main/docker/README-cassandra.md), [upgrade manual](manuals/07-upgrade-manual.md), [backend RFC (draft)](rfcs/draft-cassandra-backend.md) |
 
 ## Selecting a backend
 
@@ -25,24 +25,26 @@ cargo build --release --no-default-features --features sqlite    # SQLite
 cargo build --release --no-default-features --features cassandra # Cassandra
 ```
 
-`extenddb init` writes a configuration for the backend the binary was built with; `--backend` selects the matching `[storage.<name>]` section:
+`extenddb init` writes a configuration for the backend the binary was built with; `--backend` selects the matching `[storage.<name>]` section. The MongoDB binary reads its connection string from an existing `extenddb.toml`, so write that section first and pass `--overwrite`:
 
 ```bash
 extenddb init                      # PostgreSQL
-extenddb init --backend mongodb
 extenddb init --backend sqlite --sqlite-path /data/extenddb.sqlite
+
+printf '[storage]\nbackend = "mongodb"\n\n[storage.mongodb]\nconnection_string = "mongodb://localhost:27017/?replicaSet=rs0"\n' > extenddb.toml
+extenddb init --backend mongodb --overwrite
 ```
 
 The published images are built one per backend, so with a container the choice is the image name.
 
 ## What differs between backends
 
-The DynamoDB API surface is the same on every backend. Where a backend's behaviour differs from the service, or from another backend, the row on the [Differences from DynamoDB](differences-from-dynamodb.md) page names the backend. Backend-specific items include:
+Most of the DynamoDB API behaves the same on every backend. Where a backend differs from the service, or from another backend, the row on the [Differences from DynamoDB](differences-from-dynamodb.md) page names the backend. Backend-specific items include:
 
 - PostgreSQL: vector indexes and `SearchVectors` need the pgvector extension on the data database; without it every vector operation is refused and nothing else is affected.
-- MongoDB: partition and sort key numbers carry 34 significant digits (BSON Decimal128) against the service's 38; larger precision is refused with a `ValidationException`.
+- MongoDB: no vector indexes or `SearchVectors`. `Query` on a global secondary index with more than one RANGE attribute takes a key condition on the first one only. Partition and sort key numbers carry 34 significant digits (BSON Decimal128) against the service's 38; larger precision is refused with a `ValidationException`.
 - SQLite: one server per database file, enforced with a lock file next to the database. The `extenddb/extenddb-dev` image compiles this backend in developer mode: plain HTTP, open authorization, a seeded credential, for local development and CI only ([development image](dev-image.md)).
-- Cassandra: backups copy the live table and are not point-in-time; see the backup rows on the differences page.
+- Cassandra: no vector indexes or `SearchVectors`; the same `Query` limit as MongoDB on a GSI with more than one RANGE attribute; `CreateBackup` keeps each backup in the catalog, with or without a backup store, and backups copy the live table and are not point-in-time (see the backup rows on the differences page).
 
 Running more than one server against one PostgreSQL or MongoDB catalog is not supported in this release; the [deployment guide](manuals/11-deployment-guide.md#multi-instance-considerations) explains why.
 

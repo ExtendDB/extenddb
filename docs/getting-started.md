@@ -82,8 +82,9 @@ Run `extenddb init` to create the catalog and data databases:
 # PostgreSQL (default)
 ./target/release/extenddb init
 
-# MongoDB
-./target/release/extenddb init --backend mongodb
+# MongoDB: init reads the connection string from an existing extenddb.toml
+printf '[storage]\nbackend = "mongodb"\n\n[storage.mongodb]\nconnection_string = "mongodb://localhost:27017/?replicaSet=rs0"\n' > extenddb.toml
+./target/release/extenddb init --backend mongodb --overwrite
 
 # Cassandra
 ./target/release/extenddb init --backend cassandra
