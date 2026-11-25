@@ -254,13 +254,13 @@ fn tokenize_reports_the_whole_invalid_character() {
 #[test]
 fn tokenize_for_multibyte_utf8_does_not_panic() {
     // Emoji (4-byte UTF-8) should produce a validation error, not a panic.
-    let err = tokenize_for("a = 😀", 4096, super::super::ExpressionKind::Condition).unwrap_err();
+    let err = tokenize_for("a = 😀", 4096, super::super::ExpressionKind::KeyCondition).unwrap_err();
     assert!(
         matches!(err, DynamoDbError::ValidationException(ref msg) if msg.contains("Syntax error"))
     );
 
     // Accented character (2-byte UTF-8)
-    let err = tokenize_for("café", 4096, super::super::ExpressionKind::Filter).unwrap_err();
+    let err = tokenize_for("café", 4096, super::super::ExpressionKind::Projection).unwrap_err();
     assert!(
         matches!(err, DynamoDbError::ValidationException(ref msg) if msg.contains("Syntax error"))
     );
@@ -331,6 +331,13 @@ const UNKNOWN_CHARACTER_ROWS: &[(&str, &str, &str)] = &[
     // (measured 2026-11-18).
     ("#v = é _abc", "é", "= é _"),
     ("#v = é __x", "é", "= é _"),
+    // No token after the character: the window runs to the end of the
+    // expression, trailing whitespace kept (measured 2026-11-24).
+    ("#v = é   ", "é", "= é   "),
+    ("  é  ", "é", "  é  "),
+    // A leading byte-order mark is a character outside the grammar too
+    // (measured 2026-11-24).
+    ("\u{feff}#v = :v", "\u{feff}", "\u{feff}#v"),
 ];
 
 #[test]

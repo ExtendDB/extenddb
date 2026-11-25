@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Expression tokenizer — converts expression strings into token streams.
+//! Expression tokenizer: converts expression strings into token streams.
 //!
 //! Handles the complete `DynamoDB` expression grammar including identifiers,
 //! `#name` references, `:value` placeholders, operators, and keywords.
@@ -373,25 +373,27 @@ fn is_ident_char(c: u8) -> bool {
 /// The token text and the `near` window the service reports for a character
 /// the expression grammar does not accept, at byte offset `at` of `input`.
 ///
-/// Measured 2026-10-25 on FilterExpression, ConditionExpression,
-/// KeyConditionExpression, UpdateExpression and ProjectionExpression: the
-/// token is the character as sent (a whole code point, `é` or an emoji), and
-/// the window is the source text from the start of the previous token to the
-/// end of the next one, whitespace kept, each dropped when absent. Every
-/// character outside the grammar is a token of its own, so `#v = ééé` answers
+/// Measured 2026-10-25 on `FilterExpression`, `ConditionExpression`,
+/// `KeyConditionExpression`, `UpdateExpression` and `ProjectionExpression`:
+/// the token is the character as sent (a whole code point, `é` or an emoji),
+/// and the window is the source text from the start of the previous token to
+/// the end of the next one, whitespace kept. Every character outside the
+/// grammar is a token of its own, so `#v = ééé` answers
 /// `token: "é", near: "= éé"`, and a name stops at the first such character,
 /// so `abéc = :v` answers `near: "abéc"`.
 ///
 /// When no token comes before the character the window starts at the start
 /// of the expression, leading whitespace kept (`  é = :v` answers
-/// `near: "  é ="`), and U+0000 is removed from the token and the window
-/// (`#v = \0x` answers `token: "", near: "= x"`).
+/// `near: "  é ="`). When no token follows the character the window runs to
+/// the end of the expression, trailing whitespace kept (`#v = é   ` answers
+/// `near: "= é   "`, measured 2026-11-24). U+0000 is removed from the token
+/// and the window (`#v = \0x` answers `token: "", near: "= x"`).
 ///
 /// `prev_start` is the byte offset where the previous token starts.
 fn unknown_character(input: &str, at: usize, prev_start: Option<usize>) -> (String, String) {
     let ch = input[at..].chars().next().unwrap_or('?');
     let after = at + ch.len_utf8();
-    let end = next_token_end(input, after).unwrap_or(after);
+    let end = next_token_end(input, after).unwrap_or(input.len());
     let start = prev_start.unwrap_or(0);
     let token = if ch == '\0' {
         String::new()

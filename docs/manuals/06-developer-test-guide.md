@@ -9,7 +9,7 @@ extenddb/
 ├── Cargo.toml                 Workspace root
 ├── extenddb.sample.toml           Configuration template
 ├── crates/
-│   ├── core/                  Pure sync Rust: types, expressions, validation, errors
+│   ├── core/                  Sync Rust: types, expressions, validation, errors
 │   ├── engine/                Async operation handlers
 │   ├── storage/               Storage trait definitions
 │   ├── storage-postgres/      PostgreSQL backend
@@ -52,7 +52,7 @@ Both debug and release builds must pass before any phase exit.
 
 ### Crate Boundaries
 
-- `core` is pure sync Rust — no async runtime, no database drivers, no HTTP framework
+- `core` is sync Rust — no async runtime, no database drivers, no HTTP framework
 - `storage` defines traits and backend-agnostic utilities (ARN, key parsing)
 - `engine` contains async operation handlers that call storage traits
 - `storage-postgres` implements storage traits for PostgreSQL
