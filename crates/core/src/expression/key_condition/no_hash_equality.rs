@@ -25,16 +25,8 @@
 //!   classifies the pair as it does any other, equality first, and
 //!   [`KeyCondition::lacks_hash_equality`] spots it once the schema is known.
 //!
-//! The wordings, measured on the service on 2026-10-21 (table with HASH `pk`
-//! and RANGE `sk`, index with HASH `g` and RANGE `s`, multi-attribute index
-//! with HASH `h` and RANGE `a`, `b`, `c`, `d`) and on 2026-10-23 (every other
-//! row):
-//!
-//! | clauses | key schema | message |
-//! |---|---|---|
-//! | a non-equality clause names the HASH attribute (`pk > :x`, `begins_with(pk, :x)`, `pk BETWEEN :x AND :y`, `sk = :x AND pk > :y`, `pk > :x AND zz > :y`) | one HASH attribute | `Query key condition not supported` |
-//! | no clause names the HASH attribute (`sk > :x`, `z > :x`, `sk > :x AND zz > :y`) | one HASH attribute | `Query condition missed key schema element: pk` |
-//! | any clauses (`h > :h`, `a > :x`, `z > :x`, `h1 > :x`, `r > :x`) | several key attributes | `HASH key attributes h must have equality conditions specified in the query` (every HASH attribute, comma separated) |
+//! `tests/python/test_query_lone_non_equality.py` lists the service's
+//! wording for each key schema and shape, with the dates it was measured.
 //!
 //! [`parse_key_condition_with_maps`](super::parse_key_condition_with_maps)
 //! refuses an undefined `#name` or `:value` and two conditions on one
