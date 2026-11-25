@@ -136,27 +136,34 @@ pub(crate) async fn handle_request(
     // expression maps, the projection and the search condition. They run once
     // the table name passes `check_table_name_chars`; a table name outside
     // its pattern answers first, from `authorize_request`, and no length
-    // check applies to the table name here (#1462).
+    // check applies to the table name here (#1462). The checked request goes
+    // to the engine at dispatch, so the checks run once.
+    let mut checked_search = None;
     if operation == "SearchVectors"
         && crate::table_name_gate::check_table_name_chars(&operation, &input, &account_id).is_ok()
-        && let Err(e) = extenddb_engine::check_search_vectors_request(
+    {
+        match extenddb_engine::check_search_vectors_request(
             &input,
             &state.storage,
             &account_id,
             &state.limits,
         )
         .await
-    {
-        let metric_table = metric_table_name(&operation, &input, &state.limits);
-        record_error_metrics(
-            &state.metrics,
-            &e,
-            &account_id,
-            metric_table.as_deref(),
-            &operation,
-        );
-        state.metrics.record_request_count(&account_id, &operation);
-        return error_response(&e, &request_id);
+        {
+            Ok(checked) => checked_search = Some(checked),
+            Err(e) => {
+                let metric_table = metric_table_name(&operation, &input, &state.limits);
+                record_error_metrics(
+                    &state.metrics,
+                    &e,
+                    &account_id,
+                    metric_table.as_deref(),
+                    &operation,
+                );
+                state.metrics.record_request_count(&account_id, &operation);
+                return error_response(&e, &request_id);
+            }
+        }
     }
 
     // --- Authz segment ---
@@ -295,8 +302,10 @@ pub(crate) async fn handle_request(
 
     // --- Dispatch segment ---
     let dispatch_start = std::time::Instant::now();
-    let dispatch_result =
-        extenddb_engine::dispatch(&operation, input, &ctx, &state.server_addr).await;
+    let dispatch_result = match checked_search {
+        Some(checked) => extenddb_engine::handle_checked_search_vectors(checked, &ctx).await,
+        None => extenddb_engine::dispatch(&operation, input, &ctx, &state.server_addr).await,
+    };
     #[allow(clippy::cast_precision_loss)]
     let dispatch_us = dispatch_start.elapsed().as_micros() as f64;
     // P120c: Record storage query metrics for the request's dispatch phase.

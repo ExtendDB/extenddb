@@ -46,11 +46,18 @@ struct SearchVectorsOutput {
     consumed_capacity: Option<extenddb_core::types::VectorCapacity>,
 }
 
+/// A `SearchVectors` request whose checks that need no table passed, as
+/// [`check_search_vectors_request`] returns it. The server hands it to
+/// [`handle_checked_search_vectors`], so the checks, the search condition's
+/// parse and the read of the `search_inequality_filters` setting run once
+/// per request.
+pub struct CheckedSearchVectors(request::Checked);
+
 /// The checks of a `SearchVectors` request that need no table: the body,
 /// the backend's vector search, `IndexName`, `SearchVector`, `TopK`, the
 /// expression maps, the projection and the search condition. The service
 /// makes them before it authorizes the request, so the server calls this
-/// ahead of the IAM decision. The handler makes them again.
+/// ahead of the IAM decision.
 ///
 /// # Errors
 ///
@@ -60,10 +67,10 @@ pub async fn check_search_vectors_request(
     storage: &std::sync::Arc<dyn extenddb_storage::StorageEngine>,
     account_id: &str,
     limits: &extenddb_core::limits::LimitsConfig,
-) -> Result<(), DynamoDbError> {
+) -> Result<CheckedSearchVectors, DynamoDbError> {
     request::check(body, storage, account_id, limits)
         .await
-        .map(|_| ())
+        .map(CheckedSearchVectors)
 }
 
 /// Handle a `SearchVectors` request.
@@ -76,12 +83,35 @@ pub async fn handle_search_vectors(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
+    let checked = request::check(&body, &ctx.storage, &ctx.account_id, &ctx.limits).await?;
+    search(checked, ctx).await
+}
+
+/// Handle a `SearchVectors` request that [`check_search_vectors_request`]
+/// checked for the account and storage engine of `ctx`.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError` for missing tables/indexes, the checks that need
+/// the index, or storage errors.
+pub async fn handle_checked_search_vectors(
+    checked: CheckedSearchVectors,
+    ctx: &OperationContext,
+) -> Result<DispatchResult, DynamoDbError> {
+    search(checked.0, ctx).await
+}
+
+async fn search(
+    checked: request::Checked,
+    ctx: &OperationContext,
+) -> Result<DispatchResult, DynamoDbError> {
     let request::Checked {
         input,
         query_vector,
         parsed,
-        vector_search,
-    } = request::check(&body, &ctx.storage, &ctx.account_id, &ctx.limits).await?;
+    } = checked;
+    let vector_search =
+        crate::vector_gate::ensure_search_supported(ctx.storage.as_vector_search())?;
 
     let key_info = ctx
         .table_key_info(&input.table_name)

@@ -12,7 +12,7 @@ use serde_json::Value;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{AttributeValue, ReturnConsumedCapacity};
-use extenddb_storage::{StorageEngine, VectorSearchEngine};
+use extenddb_storage::StorageEngine;
 
 use super::condition;
 
@@ -46,11 +46,10 @@ pub(super) struct SearchVectorsInput {
 }
 
 /// A `SearchVectors` request whose checks that need no table passed.
-pub(super) struct Checked<'s> {
+pub(super) struct Checked {
     pub(super) input: SearchVectorsInput,
     pub(super) query_vector: Vec<f32>,
     pub(super) parsed: condition::Parsed,
-    pub(super) vector_search: &'s dyn VectorSearchEngine,
 }
 
 /// Check a `SearchVectors` request as far as the checks need no table.
@@ -58,15 +57,15 @@ pub(super) struct Checked<'s> {
 /// # Errors
 ///
 /// Returns the error of the first failed check.
-pub(super) async fn check<'s>(
+pub(super) async fn check(
     body: &Value,
-    storage: &'s Arc<dyn StorageEngine>,
+    storage: &Arc<dyn StorageEngine>,
     account_id: &str,
     limits: &LimitsConfig,
-) -> Result<Checked<'s>, DynamoDbError> {
+) -> Result<Checked, DynamoDbError> {
     let input = SearchVectorsInput::deserialize(body).map_err(crate::deserialize_error)?;
 
-    let vector_search = crate::vector_gate::ensure_search_supported(storage.as_vector_search())?;
+    crate::vector_gate::ensure_search_supported(storage.as_vector_search())?;
 
     // Request-shape validation runs before the table lookup, so a malformed
     // request against a missing table reports the validation error rather than
@@ -123,7 +122,6 @@ pub(super) async fn check<'s>(
         input,
         query_vector,
         parsed,
-        vector_search,
     })
 }
 
