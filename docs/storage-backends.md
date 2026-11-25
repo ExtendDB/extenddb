@@ -51,3 +51,14 @@ Running more than one server against one PostgreSQL or MongoDB catalog is not su
 ## Developer notes
 
 Setting up a local PostgreSQL or MongoDB for building and testing ExtendDB itself is covered by the [local PostgreSQL](local-postgres-setup.md) and [local MongoDB](local-mongodb-setup.md) setup notes.
+
+---
+
+## License
+
+Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
+
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

@@ -129,3 +129,14 @@ docker volume rm extenddb
 - [Using ExtendDB](manuals/03-usage-guide.md): the operations, expressions, transactions and streams, with examples.
 - [Differences from DynamoDB](differences-from-dynamodb.md): every behaviour that is measured to differ from the service.
 - [Deployment](manuals/11-deployment-guide.md): running ExtendDB on your own servers.
+
+---
+
+## License
+
+Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
+
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

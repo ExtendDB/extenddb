@@ -207,6 +207,9 @@ const sidebars: SidebarsConfig = {
             {type: 'doc', id: 'design/testing', label: 'Test strategy'},
             {type: 'doc', id: 'design/dependency-licenses', label: 'Dependency licenses'},
             {type: 'doc', id: 'design/backup-restore', label: 'Backup and restore'},
+            {type: 'doc', id: 'design/backup-restore-bench-pr8', label: 'Backup and restore benchmarks (PR 8)'},
+            {type: 'doc', id: 'design/backup-restore-bench-pr9', label: 'Backup and restore benchmarks (PR 9)'},
+            {type: 'doc', id: 'design/backup-restore-bench-pr11', label: 'Backup and restore benchmarks (PR 11)'},
           ],
         },
         {
