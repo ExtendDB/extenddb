@@ -16,20 +16,21 @@ use crate::create_table::handle_create_table;
 use crate::partiql::test_context::context;
 use crate::update_table::handle_update_table;
 
-const GUIDE: &str =
-    "Refer to the Amazon DynamoDB Developer Guide for current limits and how to request higher \
-     limits.";
+const GUIDE: &str = "Refer to the Amazon DynamoDB Developer Guide for current limits and how \
+                     to request higher limits.";
 
+/// A request to one of the two handlers.
 enum Op {
-    Create,
-    Update,
+    Create(Value),
+    Update(Value),
 }
 
 fn throughput(read: i64, write: i64) -> Value {
     json!({ "ReadCapacityUnits": read, "WriteCapacityUnits": write })
 }
 
-fn create(name: &str, read: i64, write: i64) -> Value {
+/// A `CreateTable` request for a provisioned table keyed on `pk`.
+fn provisioned(name: &str, read: i64, write: i64) -> Value {
     json!({
         "TableName": name,
         "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
@@ -38,17 +39,21 @@ fn create(name: &str, read: i64, write: i64) -> Value {
     })
 }
 
-fn on_demand(name: &str) -> Value {
-    json!({
+fn create(name: &str, read: i64, write: i64) -> Op {
+    Op::Create(provisioned(name, read, write))
+}
+
+fn on_demand(name: &str) -> Op {
+    Op::Create(json!({
         "TableName": name,
         "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
         "AttributeDefinitions": [{ "AttributeName": "pk", "AttributeType": "S" }],
         "BillingMode": "PAY_PER_REQUEST",
-    })
+    }))
 }
 
-fn update(name: &str, read: i64, write: i64) -> Value {
-    json!({ "TableName": name, "ProvisionedThroughput": throughput(read, write) })
+fn update(name: &str, read: i64, write: i64) -> Op {
+    Op::Update(json!({ "TableName": name, "ProvisionedThroughput": throughput(read, write) }))
 }
 
 fn per_table(unit: &str, requested: i64) -> String {
@@ -71,6 +76,85 @@ fn account(reserved: i64, table: Option<i64>, requested: i64) -> String {
     )
 }
 
+/// A row: its name, the request, and the error type and message it gets, or
+/// `None` when it is accepted.
+type Row = (&'static str, Op, Option<(&'static str, String)>);
+
+fn rows() -> Vec<Row> {
+    let limit = |message| Some(("LimitExceededException", message));
+    let mut undefined_key = provisioned("lim-a", 101, 1);
+    undefined_key["AttributeDefinitions"][0]["AttributeName"] = json!("x");
+    let gsi_create = Op::Update(json!({
+        "TableName": "lim-b",
+        "AttributeDefinitions": [{ "AttributeName": "g", "AttributeType": "S" }],
+        "GlobalSecondaryIndexUpdates": [{ "Create": {
+            "IndexName": "gix",
+            "KeySchema": [{ "AttributeName": "g", "KeyType": "HASH" }],
+            "Projection": { "ProjectionType": "ALL" },
+            "ProvisionedThroughput": throughput(11, 1),
+        }}],
+    }));
+    vec![
+        (
+            "an undefined key at 101 RCU",
+            Op::Create(undefined_key),
+            Some((
+                "ValidationException",
+                "One or more parameter values were invalid: Some index key attributes are not \
+                 defined in AttributeDefinitions. Keys: [pk], AttributeDefinitions: [x]"
+                    .to_owned(),
+            )),
+        ),
+        (
+            "101 RCU",
+            create("lim-a", 101, 1),
+            limit(per_table("ReadCapacityUnits", 101)),
+        ),
+        (
+            "101 WCU",
+            create("lim-a", 1, 101),
+            limit(per_table("WriteCapacityUnits", 101)),
+        ),
+        ("100 RCU", create("lim-a", 100, 1), None),
+        (
+            "51 RCU with 100 reserved",
+            create("lim-b", 51, 1),
+            limit(account(100, None, 51)),
+        ),
+        ("50 RCU", create("lim-b", 50, 1), None),
+        (
+            "UpdateTable to 101 RCU",
+            update("lim-b", 101, 1),
+            limit(per_table("ReadCapacityUnits", 101)),
+        ),
+        (
+            "UpdateTable to 60 RCU",
+            update("lim-b", 60, 1),
+            limit(account(150, Some(50), 60)),
+        ),
+        ("UpdateTable down to 40 RCU", update("lim-b", 40, 1), None),
+        (
+            "UpdateTable with a GSI create of 11 RCU",
+            gsi_create,
+            limit(account(140, Some(40), 51)),
+        ),
+        ("a third table, on-demand", on_demand("lim-c"), None),
+        (
+            "a fourth table",
+            on_demand("lim-d"),
+            limit("There is a soft account quota of 3 tables.".to_owned()),
+        ),
+        (
+            "a taken name at the quota",
+            create("lim-a", 1, 1),
+            Some((
+                "ResourceInUseException",
+                "Table already exists: lim-a".to_owned(),
+            )),
+        ),
+    ]
+}
+
 #[tokio::test]
 async fn create_table_and_update_table_apply_the_account_limits() {
     let mut ctx = context(None).await;
@@ -87,97 +171,18 @@ async fn create_table_and_update_table_apply_the_account_limits() {
         per_account_max_wcu: 150,
         ..LimitsConfig::default()
     });
-    let mut undefined_key = create("lim-a", 101, 1);
-    undefined_key["AttributeDefinitions"][0]["AttributeName"] = json!("x");
-    let gsi_create = json!({
-        "TableName": "lim-b",
-        "AttributeDefinitions": [{ "AttributeName": "g", "AttributeType": "S" }],
-        "GlobalSecondaryIndexUpdates": [{ "Create": {
-            "IndexName": "gix",
-            "KeySchema": [{ "AttributeName": "g", "KeyType": "HASH" }],
-            "Projection": { "ProjectionType": "ALL" },
-            "ProvisionedThroughput": throughput(11, 1),
-        }}],
-    });
-    let limit = "LimitExceededException";
-    // Each row: its name, the operation, the request, and the error type and
-    // message it gets, or None when it is accepted.
-    let rows = [
-        (
-            "an undefined key at 101 RCU",
-            Op::Create,
-            undefined_key,
-            Some((
-                "ValidationException",
-                "One or more parameter values were invalid: Some index key attributes are not \
-                 defined in AttributeDefinitions. Keys: [pk], AttributeDefinitions: [x]"
-                    .to_owned(),
-            )),
-        ),
-        (
-            "101 RCU",
-            Op::Create,
-            create("lim-a", 101, 1),
-            Some((limit, per_table("ReadCapacityUnits", 101))),
-        ),
-        (
-            "101 WCU",
-            Op::Create,
-            create("lim-a", 1, 101),
-            Some((limit, per_table("WriteCapacityUnits", 101))),
-        ),
-        ("100 RCU", Op::Create, create("lim-a", 100, 1), None),
-        (
-            "51 RCU with 100 reserved",
-            Op::Create,
-            create("lim-b", 51, 1),
-            Some((limit, account(100, None, 51))),
-        ),
-        ("50 RCU", Op::Create, create("lim-b", 50, 1), None),
-        (
-            "UpdateTable to 101 RCU",
-            Op::Update,
-            update("lim-b", 101, 1),
-            Some((limit, per_table("ReadCapacityUnits", 101))),
-        ),
-        (
-            "UpdateTable to 60 RCU",
-            Op::Update,
-            update("lim-b", 60, 1),
-            Some((limit, account(150, Some(50), 60))),
-        ),
-        ("UpdateTable down to 40 RCU", Op::Update, update("lim-b", 40, 1), None),
-        (
-            "UpdateTable with a GSI create of 11 RCU",
-            Op::Update,
-            gsi_create,
-            Some((limit, account(140, Some(40), 51))),
-        ),
-        ("a third table, on-demand", Op::Create, on_demand("lim-c"), None),
-        (
-            "a fourth table",
-            Op::Create,
-            on_demand("lim-d"),
-            Some((limit, "There is a soft account quota of 3 tables.".to_owned())),
-        ),
-        (
-            "a taken name at the quota",
-            Op::Create,
-            create("lim-a", 1, 1),
-            Some((
-                "ResourceInUseException",
-                "Table already exists: lim-a".to_owned(),
-            )),
-        ),
-    ];
-    for (row, op, request, want) in rows {
+    for (row, op, want) in rows() {
         let answer = match op {
-            Op::Create => handle_create_table(request, &ctx).await,
-            Op::Update => handle_update_table(request, &ctx).await,
+            Op::Create(request) => handle_create_table(request, &ctx).await,
+            Op::Update(request) => handle_update_table(request, &ctx).await,
         };
-        let got = answer
-            .err()
-            .map(|e| (e.status_code(), e.error_type().to_owned(), e.message().to_owned()));
+        let got = answer.err().map(|e| {
+            (
+                e.status_code(),
+                e.error_type().to_owned(),
+                e.message().to_owned(),
+            )
+        });
         let want = want.map(|(error_type, message)| (400, error_type.to_owned(), message));
         assert_eq!(got, want, "{row}");
     }
