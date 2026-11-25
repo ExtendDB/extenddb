@@ -10,6 +10,13 @@
 //! sent, and so does every operation for a `BS` with a member that only the
 //! second reading decodes. The answers come ahead of the table lookup, so
 //! the rows send each request through [`dispatch`] with no table.
+//!
+//! The `R` rows were measured on 2026-11-25 in the same way, on a table that
+//! does not exist. A `GetItem`, `BatchGetItem` or `TransactGetItems` key, and
+//! a `Query` `ExclusiveStartKey` or `KeyConditions` value, give the sorted
+//! text as it is. A `DeleteItem` key and a `PutItem` `Expected` value give it
+//! after the prefix, and a `BatchWriteItem` `DeleteRequest` key lists the
+//! members as sent.
 
 use serde_json::{Value, json};
 
@@ -65,8 +72,9 @@ async fn each_operation_gives_its_duplicates_text() {
     let second_bs = "Input collection [//Q=, YQ==, //Q=]of type BS contains duplicates.";
     let put = |item: Value| json!({"TableName": TABLE, "Item": item});
     let transact_put = |value: &Value| transact("Put", &put(item(value)));
+    let key = json!({"pk": ss});
     #[rustfmt::skip]
-    let rows: [(&str, &str, Value, Answer); 19] = [
+    let rows: [(&str, &str, Value, Answer); 29] = [
         ("O1", "UpdateItem", update(&ss), single_write(sorted_ss)),
         ("O2", "UpdateItem", update(&bs), single_write(sorted_bs)),
         ("O3", "UpdateItem", update(&ns), single_write(no_list)),
@@ -101,6 +109,27 @@ async fn each_operation_gives_its_duplicates_text() {
         ("O17", "TransactWriteItems", transact_put(&bs), invalid(sorted_bs)),
         ("O18", "BatchWriteItem", batch(&second), invalid(second_bs)),
         ("P1", "PutItem", put(item(&second)), invalid(second_bs)),
+        ("R1", "PutItem", put(item(&json!({"SS": ["b", "a", "b", "d", "c"]}))),
+         single_write(r#"Input collection ["a", "b", "b", "d", "c"] contains duplicates."#)),
+        ("R2", "PutItem", put(item(&json!({"SS": ["\"", "\\", "\""]}))),
+         single_write(r#"Input collection ["\"", "\\", "\""] contains duplicates."#)),
+        ("R3", "GetItem", json!({"TableName": TABLE, "Key": key}), invalid(sorted_ss)),
+        ("R4", "BatchGetItem", json!({"RequestItems": {TABLE: {"Keys": [key]}}}), invalid(sorted_ss)),
+        ("R5", "TransactGetItems", transact("Get", &json!({"TableName": TABLE, "Key": key})),
+         invalid(sorted_ss)),
+        ("R6", "DeleteItem", json!({"TableName": TABLE, "Key": key}), single_write(sorted_ss)),
+        ("R7", "Query", json!({"TableName": TABLE, "KeyConditionExpression": "pk = :k",
+                               "ExpressionAttributeValues": {":k": {"S": "x"}},
+                               "ExclusiveStartKey": key}),
+         invalid(sorted_ss)),
+        ("R8", "Query", json!({"TableName": TABLE, "KeyConditions": {"pk": {
+                                   "ComparisonOperator": "EQ", "AttributeValueList": [ss]}}}),
+         invalid(sorted_ss)),
+        ("R9", "PutItem", json!({"TableName": TABLE, "Item": {"pk": {"S": "k"}},
+                                 "Expected": {"s": {"Value": ss}}}),
+         single_write(sorted_ss)),
+        ("R10", "BatchWriteItem", json!({"RequestItems": {TABLE: [{"DeleteRequest": {"Key": key}}]}}),
+         invalid("Input collection [b, a, b] contains duplicates.")),
     ];
     let (ctx, _dir) = context().await;
     let mut wrong = Vec::new();
