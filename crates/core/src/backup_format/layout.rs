@@ -244,8 +244,9 @@ pub fn check_store_prefix_table_name(table_name: &str) -> Result<(), FormatError
 /// U+2029) from a `BackupArn`. The service ignores it and refuses every other
 /// whitespace around the ARN (measured on 2026-11-21, the whitespace rows of
 /// `tests/test_backup_restore_fidelity.py`). Other whitespace stays for
-/// [`check_backup_arn`] to refuse. Every layer that reads a backup ARN from a
-/// request strips with this function, so they act on the same string.
+/// [`check_backup_arn`] to refuse. Authorization and the engine strip with
+/// this function before they read the backup, so they act on the same
+/// string.
 #[must_use]
 pub fn trim_backup_arn(arn: &str) -> &str {
     arn.strip_suffix("\r\n")
