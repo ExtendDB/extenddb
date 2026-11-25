@@ -156,10 +156,11 @@
 
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 /// Which store implementation `[backup.store]` selects.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
 #[serde(rename_all = "lowercase")]
 pub enum BackupStoreKind {
     /// Local directory store. The default: local development works with no
@@ -192,7 +193,8 @@ impl BackupStoreKind {
 /// survive `serde(flatten)`, so the server nests this struct under its own
 /// key (`store`) in its `[backup]` model rather than flattening it; that
 /// keeps one definition of these fields and unknown-field rejection on both.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
 #[serde(deny_unknown_fields)]
 pub struct BackupStoreConfig {
     /// Selected store kind; `filesystem` when absent.
@@ -207,7 +209,8 @@ pub struct BackupStoreConfig {
 }
 
 /// `[backup.store.filesystem]` settings.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
 #[serde(deny_unknown_fields)]
 pub struct FilesystemStoreConfig {
     /// Root directory for backup objects. Must exist at startup.
@@ -218,7 +221,8 @@ pub struct FilesystemStoreConfig {
 /// from the standard AWS SDK chain. `Debug` prints the endpoint without its
 /// user information, which `open` refuses but a log of the configuration
 /// written before `open` would otherwise carry.
-#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
 #[serde(deny_unknown_fields)]
 pub struct S3StoreConfig {
     /// Destination bucket.

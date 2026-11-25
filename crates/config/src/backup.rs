@@ -110,7 +110,7 @@ pub use extenddb_backup_store::{
     BackupStoreConfig, BackupStoreKind, FilesystemStoreConfig, S3StoreConfig,
 };
 use extenddb_storage::backup_catalog::JOB_HEARTBEAT_INTERVAL;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 /// The smallest `data_file_target_bytes`: the cap on one line of a data
 /// file, so a file closes at most one line past the knob.
@@ -130,7 +130,8 @@ pub const DEFAULT_ROOT_DIR_NAME: &str = "backups";
 /// The directory name of the defaulted restore spool beside a database file.
 pub const DEFAULT_SPOOL_DIR_NAME: &str = "backup-spool";
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Serialize))]
 #[serde(deny_unknown_fields)]
 pub struct BackupConfig {
     /// Uncompressed bytes per data file; a file closes once it reaches this,
