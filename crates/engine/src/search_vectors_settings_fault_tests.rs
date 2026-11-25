@@ -18,8 +18,9 @@ fn poison<T: Send>(lock: &Mutex<T>) {
     assert!(lock.is_poisoned());
 }
 
-/// A thread that panicked while holding the server list or a server's kept
-/// read leaves the setting readable.
+/// A thread that panicked while holding the server list, a server's kept
+/// read, its change count or its last value read leaves the setting
+/// readable, and a failed read still answers the last value read.
 #[tokio::test]
 async fn a_poisoned_lock_leaves_the_setting_readable() {
     let storage = storage().await;
@@ -35,6 +36,7 @@ async fn a_poisoned_lock_leaves_the_setting_readable() {
     poison(&SERVERS);
     poison(&settings.kept);
     poison(&settings.changes);
+    poison(&settings.last);
     assert_eq!(
         enabled_accounts(&storage).await.unwrap(),
         EnabledAccounts::All
@@ -51,6 +53,13 @@ async fn a_poisoned_lock_leaves_the_setting_readable() {
         EnabledAccounts::Off
     );
     assert_eq!(store.reads(), 2);
+    store.set(Answer::Fail);
+    search_filter_settings_changed();
+    assert_eq!(
+        enabled_accounts(&storage).await.unwrap(),
+        EnabledAccounts::Off,
+        "a failed read answers the last value read"
+    );
 }
 
 /// The warnings this thread's subscriber receives.
