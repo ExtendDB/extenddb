@@ -25,8 +25,10 @@
 //!    before the body is parsed, so a body that does not parse gets it too,
 //!    where the server answers `SerializationException`.
 //! 2. It runs `extenddb_engine::parse_request` and `ParsedRequest::admit`, the
-//!    pre-dispatch checks the server applies too (the server also
-//!    authenticates between them; this build authenticates no request).
+//!    engine's pre-dispatch checks. The server makes the operation name check
+//!    of `parse_request` (`extenddb_engine::check_operation`) and `admit` too,
+//!    parses the body with its own parser between them, and authenticates the
+//!    caller before `admit`; this build authenticates no request.
 //! 3. It passes the request to [`extenddb_engine::dispatch`], with no backup
 //!    store and no import or export paths configured.
 //!
@@ -41,9 +43,11 @@
 //! (`handle_request` in `crates/server/src/handler.rs`) and its authorization
 //! (`authorize_request` in `crates/server/src/request_helpers.rs`) check it.
 //! Of the server's checks, [`Engine::dispatch`] runs only the two the engine
-//! owns, `extenddb_engine::parse_request` and `ParsedRequest::admit`, and runs
-//! neither for an operation [`unsupported_reason`] names, which it refuses
-//! first. A request one of the others would refuse gets the answer
+//! owns, the operation name check and `ParsedRequest::admit`, which it runs
+//! through `extenddb_engine::parse_request`, and runs neither for an
+//! operation [`unsupported_reason`] names, which it refuses first. It parses
+//! the body with `parse_request`, where the server parses it with its own
+//! parser. A request one of the others would refuse gets the answer
 //! this build gives it anyway: the engine handler's for the operation, or one
 //! of the refusals above. The README section "Checks the server makes that
 //! this build does not" describes the others, with the server's answer and
@@ -177,12 +181,13 @@ impl Engine {
             return Err(unsupported(operation, reason));
         }
 
-        // The engine's own pre-dispatch checks, which the server calls too, in
-        // the engine's order: the operation name, then the body parse, then the
-        // engine's refusals of requests no deployment serves (point-in-time
-        // recovery). The server authenticates between the first two steps and
-        // the last, and makes its other checks (see the module doc) around
-        // them; this build authenticates no request and makes none of those.
+        // The engine's own pre-dispatch checks, in the engine's order: the
+        // operation name, then the body parse, then the engine's refusals of
+        // requests no deployment serves (point-in-time recovery). The server
+        // makes the first and the last too, with its own parse of the body
+        // between them. It authenticates before the last, and makes its other
+        // checks (see the module doc) around them; this build authenticates no
+        // request and makes none of those.
         let body = extenddb_engine::parse_request(operation, body_json.as_bytes())?.admit()?;
 
         let ctx = self.operation_context();

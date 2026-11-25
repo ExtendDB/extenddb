@@ -507,13 +507,16 @@ step does not see.
 Before the HTTP server passes a request to the engine, its request handler
 (`handle_request` in `crates/server/src/handler.rs`) and its authorization
 (`authorize_request` in `crates/server/src/request_helpers.rs`) check it. Both
-builds run the checks the engine owns, `parse_request` and
-`ParsedRequest::admit` in `crates/engine/src/pre_dispatch.rs`, except on the
-operations this build refuses by name before them, whatever the body (see
-"What it refuses"). This build makes none of the
-server's other checks: it passes the request to the engine's handler for the
-operation, so where a check below refuses a request, this build answers what
-the handler answers, and the two answers can differ.
+builds run the checks the engine owns in `crates/engine/src/pre_dispatch.rs`,
+the operation name check `check_operation` and `ParsedRequest::admit`, except
+on the operations this build refuses by name before them, whatever the body
+(see "What it refuses"). Between the two, this build parses the body with the
+engine's `parse_request`, and the server with its own parser
+(`crates/server/src/request_parse.rs`), so the two builds can answer a body
+differently; the table below does not list those answers. This build makes
+none of the server's other checks: it passes the request to the engine's
+handler for the operation, so where a check below refuses a request, this
+build answers what the handler answers, and the two answers can differ.
 
 The server makes the checks in the table for every caller, in developer mode
 too, except the IAM decision of **signature**, which it makes only outside
@@ -541,7 +544,7 @@ PostgreSQL backend registers again with its catalog, or the
 `AccessDeniedException` "User: is not authorized to perform this operation" it
 gives a request that passes its signature check and `admit` when its state has
 no catalog store, which `extenddb serve` never builds. The server's name checks
-of a `RestoreTableToPointInTime` never run: `parse_request` refuses one whose
+of a `RestoreTableToPointInTime` never run: the body parse refuses one whose
 body does not parse, the server's authentication one it does not accept, and
 `admit` every other one, first (this build authenticates nothing, so here
 `admit` refuses every one whose body parses). Nor do its **table names**,
