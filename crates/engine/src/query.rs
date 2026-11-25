@@ -694,13 +694,8 @@ fn refuse_without_hash_equality(
     if !extenddb_core::types::is_multipart_key_schema(key_schema)
         && let Some(hash) = key_schema.iter().find(|ks| ks.key_type == KeyType::Hash)
     {
-        let hash_definition: Vec<extenddb_core::types::AttributeDefinition> = attribute_definitions
-            .iter()
-            .filter(|def| def.attribute_name == hash.attribute_name)
-            .cloned()
-            .collect();
         for (path, value) in key_condition.operands_naming(&hash.attribute_name, &maps.names) {
-            check_key_value_type(path, value, &hash_definition, maps)?;
+            check_key_value_type(path, value, attribute_definitions, maps)?;
         }
     }
     key_condition.refuse_without_hash_equality(key_schema, &maps.names)
