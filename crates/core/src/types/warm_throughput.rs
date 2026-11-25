@@ -349,8 +349,8 @@ impl WarmThroughputRecord {
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
 pub fn epoch_seconds_now() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map_or(0.0, |d| d.as_secs_f64())
 }
 

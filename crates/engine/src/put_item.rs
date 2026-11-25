@@ -35,11 +35,6 @@ pub async fn handle_put_item(
             table_name,
             &ctx.limits,
         )?;
-    } else if body
-        .get("TableName")
-        .is_some_and(serde_json::Value::is_string)
-    {
-        // An empty string is refused by validate_item_table_name above.
     } else if body.get("TableName").is_none()
         || body
             .get("TableName")

@@ -98,8 +98,7 @@ fn collector() -> Arc<MetricsCollector> {
     collector.record_segments(
         TABLES[0].0,
         "GetItem",
-        Some(TABLES[0].1),
-        LatencySegments {
+        &LatencySegments {
             dispatch_us: 500.0,
             total_us: 500.0,
             ..LatencySegments::default()

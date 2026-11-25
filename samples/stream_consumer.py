@@ -9,6 +9,10 @@ Creates a table with streams enabled, then runs two threads:
 
 Usage:
     EXTENDDB_TEST_ENDPOINT=http://localhost:18443 python samples/stream_consumer.py
+
+    EXTENDDB_STREAM_SINCE, an epoch time in seconds, is optional. When set,
+    the poller starts each shard at the first record created at or after
+    that time (AT_TIMESTAMP) instead of the oldest one (TRIM_HORIZON).
 """
 
 from __future__ import annotations
@@ -125,11 +129,23 @@ def poller_thread() -> None:
         for shard in resp["StreamDescription"]["Shards"]:
             sid = shard["ShardId"]
             if sid not in shard_iterators:
-                it = streams_client.get_shard_iterator(
-                    StreamArn=stream_arn,
-                    ShardId=sid,
-                    ShardIteratorType="TRIM_HORIZON",
-                )
+                # EXTENDDB_STREAM_SINCE (epoch seconds) starts each shard at
+                # the first record created at or after that time instead of
+                # the oldest retained record.
+                since = os.environ.get("EXTENDDB_STREAM_SINCE")
+                if since:
+                    it = streams_client.get_shard_iterator(
+                        StreamArn=stream_arn,
+                        ShardId=sid,
+                        ShardIteratorType="AT_TIMESTAMP",
+                        Timestamp=float(since),
+                    )
+                else:
+                    it = streams_client.get_shard_iterator(
+                        StreamArn=stream_arn,
+                        ShardId=sid,
+                        ShardIteratorType="TRIM_HORIZON",
+                    )
                 shard_iterators[sid] = it["ShardIterator"]
                 log("POLLER", f"Tracking shard {sid}")
 
