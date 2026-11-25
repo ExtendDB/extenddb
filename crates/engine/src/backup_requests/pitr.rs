@@ -117,6 +117,10 @@ fn check_table_name(name: &str, (min, max): (usize, usize)) -> Result<(), Dynamo
 /// units. A name within the bounds is then checked against the model's
 /// constraints at `path`, which count characters (measured on DynamoDB in
 /// us-east-1 on 20 Nov 2026 for both members).
+///
+/// # Errors
+///
+/// `ValidationException` for a name of a bad length or outside the pattern.
 pub fn check_restore_table_name(
     name: &str,
     path: &str,
