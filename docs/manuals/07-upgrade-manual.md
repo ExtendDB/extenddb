@@ -228,9 +228,9 @@ SQLite deployments follow the same sequence, backing up the database files as [S
 
 ## Upgrading a container deployment
 
-The published images carry the same binary as a source build, so the catalog rules above apply unchanged: `migrate` must run once per deployment before the new server starts, and an older binary refuses a newer catalog. What differs is where `migrate` runs and how the version is chosen: the version is the image tag, and the repository's Compose files run `migrate` for you in the `extenddb-bootstrap` service.
+The published images carry the same binary as a source build, so the catalog rules above apply unchanged: `migrate` must run once per deployment before the new server starts, and an older binary refuses a newer catalog. What differs is where `migrate` runs and how the version is chosen: the version is the image tag, and the repository's Compose files run `migrate` for you in the `extenddb-bootstrap` service. That service runs the preview first (`extenddb migrate --config ...`, which takes no lock) and runs `migrate --yes` only when the preview exits 3, so an `up` on a current catalog exits 0 without taking the migration lock. A preview that exits with another status ends the service with that status, and the server does not start.
 
-Published tags are listed on Docker Hub for [`extenddb/extenddb-postgres`](https://hub.docker.com/r/extenddb/extenddb-postgres/tags), [`extenddb/extenddb-dev`](https://hub.docker.com/r/extenddb/extenddb-dev/tags) and [`extenddb/extenddb-mongodb`](https://hub.docker.com/r/extenddb/extenddb-mongodb/tags). `docker run --rm <image> version` prints the catalog version an image expects. The newest published tag, `1.0.0`, reports `catalog migration 12` and the name of its backend. `0.1.15` and `1.0.0` carry the migration ledger this page describes, with migrations 1 to 12. `0.1.14`, the last tag before the ledger, reports `catalog 0.0.3 (postgres)`, `catalog 0.0.3 (sqlite)` and `catalog 0.0.2 (mongodb)`. The PostgreSQL tags `0.1.5` to `0.1.10` report `catalog 0.0.2 (postgres)`, and every `extenddb-dev` tag up to `0.1.14` reports `catalog 0.0.3 (sqlite)`. The commands and output below were run on the PostgreSQL stack upgraded from `0.1.10` (catalog 0.0.2) to `0.1.14` (catalog 0.0.3), so they show a volume initialised by an older catalog version being migrated. <!-- version-literal-ok: names the measured tags -->
+Published tags are listed on Docker Hub for [`extenddb/extenddb-postgres`](https://hub.docker.com/r/extenddb/extenddb-postgres/tags), [`extenddb/extenddb-dev`](https://hub.docker.com/r/extenddb/extenddb-dev/tags) and [`extenddb/extenddb-mongodb`](https://hub.docker.com/r/extenddb/extenddb-mongodb/tags). `docker run --rm <image> version` prints the catalog version an image expects. The newest published tag, `1.0.0`, reports `catalog migration 12` and the name of its backend. `0.1.15` and `1.0.0` carry the migration ledger this page describes, with migrations 1 to 12. `0.1.14`, the last tag before the ledger, reports `catalog 0.0.3 (postgres)`, `catalog 0.0.3 (sqlite)` and `catalog 0.0.2 (mongodb)`. The PostgreSQL tags `0.1.5` to `0.1.10` report `catalog 0.0.2 (postgres)`, and every `extenddb-dev` tag up to `0.1.14` reports `catalog 0.0.3 (sqlite)`. The commands and output below were run on the PostgreSQL stack upgraded from `0.1.14` (catalog 0.0.3) to `1.0.0` (catalog migration 12), so they show a volume initialised before the migration ledger being migrated. <!-- version-literal-ok: names the measured tags -->
 
 ### Docker Compose (PostgreSQL)
 
@@ -245,35 +245,116 @@ docker compose exec -T postgres pg_dump -U postgres extenddb_catalog > catalog_b
 docker compose exec -T postgres pg_dump -U postgres extenddb > data_backup_$(date +%Y%m%d).sql
 ```
 
-A fresh catalog at 0.0.2 dumped to 747 non-empty lines; the dump's `settings` rows include `catalog_version\t0.0.2`, which is how to check what a dump holds.
+A catalog at 0.0.3 holding one table dumped to 780 non-empty lines; the dump's `settings` rows include `catalog_version\t0.0.3`, which is how to check what a dump holds.
 
-2. **Change the tag, pull, and start.** Compose compares the image of every service against the running containers, stops the server, recreates `extenddb-volume-init`, `extenddb-bootstrap` and `extenddb` from the new image, runs the two bootstrap services to completion and starts the server. The server is stopped before `extenddb-bootstrap` starts, so `migrate` runs with no server on the catalog.
+2. **Change the tag, pull, and start.** Compose compares the image of every service against the running containers, recreates `extenddb-volume-init`, `extenddb-bootstrap` and `extenddb` from the new image (which stops the server), runs the two bootstrap services to completion and starts the server. The server is stopped before `extenddb-bootstrap` starts, so `migrate` runs with no server on the catalog.
 
 ```bash
-export EXTENDDB_IMAGE=extenddb/extenddb-postgres:0.1.14
+export EXTENDDB_IMAGE=extenddb/extenddb-postgres:1.0.0
 docker compose pull extenddb
 docker compose up -d
 ```
 
 ```
  Container extenddb-postgres-dev-postgres-1  Running
- Container extenddb-postgres-dev-extenddb-bootstrap-1  Stopping
- Container extenddb-postgres-dev-extenddb-bootstrap-1  Stopped
  Container extenddb-postgres-dev-extenddb-volume-init-1  Recreate
  Container extenddb-postgres-dev-extenddb-volume-init-1  Recreated
- Container extenddb-postgres-dev-extenddb-1  Stopping
- Container extenddb-postgres-dev-extenddb-1  Stopped
  Container extenddb-postgres-dev-extenddb-bootstrap-1  Recreate
  Container extenddb-postgres-dev-extenddb-bootstrap-1  Recreated
  Container extenddb-postgres-dev-extenddb-1  Recreate
  Container extenddb-postgres-dev-extenddb-1  Recreated
  Container extenddb-postgres-dev-extenddb-volume-init-1  Started
+ Container extenddb-postgres-dev-postgres-1  Healthy
+ Container extenddb-postgres-dev-extenddb-volume-init-1  Exited
  Container extenddb-postgres-dev-extenddb-bootstrap-1  Started
  Container extenddb-postgres-dev-extenddb-bootstrap-1  Exited
  Container extenddb-postgres-dev-extenddb-1  Started
 ```
 
-3. **Read the bootstrap log.** `extenddb-bootstrap` finds the config file written by the first start in `/var/lib/extenddb/extenddb.toml` and runs `extenddb migrate --config /var/lib/extenddb/extenddb.toml --yes --pg-user $PG_ADMIN_USER`, with `EXTENDDB_PG_PASSWORD` taken from `PG_ADMIN_PASSWORD`. On a first start, when the file does not exist, the same service runs `extenddb init` instead.
+Compose also prints `Starting` and `Waiting` lines, left out above.
+
+3. **Read the bootstrap log.** `extenddb-bootstrap` finds the config file written by the first start in `/var/lib/extenddb/extenddb.toml`, runs the preview `extenddb migrate --config /var/lib/extenddb/extenddb.toml`, and when that exits 3 runs `extenddb migrate --config /var/lib/extenddb/extenddb.toml --yes --pg-user $PG_ADMIN_USER`, with `EXTENDDB_PG_PASSWORD` taken from `PG_ADMIN_PASSWORD`. On a first start, when the file does not exist, the same service runs `extenddb init` instead.
+
+```bash
+docker compose logs extenddb-bootstrap
+```
+
+```
+bootstrap: existing config detected; running migrations
+=== extenddb migrate ===
+Config:           /var/lib/extenddb/extenddb.toml
+Catalog:          postgresql://extenddb_app:***@postgres:5432/extenddb_catalog (postgres)
+
+Stop every server that uses this catalog before applying: a server of a release before 0.1.15 is not detected while it runs.
+The catalog has no migration ledger (a release before 0.1.15 created it); this binary carries migrations 1 to 12.
+Pending:
+  1 baseline (catalog, breaking): create the catalog schema, or bring a released catalog to it
+  1 baseline (data, breaking): create the catalog schema, or bring a released catalog to it
+  ...
+  12 unique_access_key_ids (catalog, additive): make every access key ID unique, which the MongoDB catalog did not enforce
+Migration 2 rewrites no stored policy.
+
+Nothing was changed; back up both PostgreSQL databases, the catalog database extenddb_catalog and the data database extenddb, then run again with --yes to apply (exit status 3: migrations pending).
+=== extenddb migrate ===
+Config:           /var/lib/extenddb/extenddb.toml
+Catalog:          postgresql://extenddb_app:***@postgres:5432/extenddb_catalog (postgres)
+
+--- Taking the migration lock (waiting up to 60 s for a server or another migration)...
+  Applied 1 baseline in extenddb_catalog
+  Applied 1 baseline in extenddb
+  Applied 2 resource_tag_condition_keys in extenddb_catalog
+  ...
+  Applied 11 attribute_name_escape in extenddb
+  Recorded 12 unique_access_key_ids in extenddb_catalog as not applicable
+
+=== extenddb migrate complete ===
+Catalog: no ledger -> migration 12
+```
+
+The log is shortened to its first and last migration lines. On a volume whose catalog already matches the new image, the preview prints `Up to date: the catalog is at migration 12, the latest this binary carries. No migrations needed.` and the service exits 0 without running `migrate --yes`. The `pgvector` notice described under [Catalog 0.0.3](#catalog-003) appears in this log on the Compose stack, because the `postgres` image carries no `vector` extension.
+
+4. **Check the server.** `docker compose ps -a` shows `extenddb-bootstrap` as `Exited (0)` and `extenddb` as `(healthy)` after 10 to 20 seconds, both on the new image. The first lines of the server's log after the banner name the version and catalog it started with:
+
+```bash
+docker compose logs extenddb
+```
+
+```
+extenddb 1.0.0 (catalog migration 12) starting on 0.0.0.0:18443
+  storage: postgres (postgresql://extenddb_app:***@postgres:5432/extenddb_catalog)
+  backup store: none ([backup.store] is absent); CreateBackup writes in-catalog backups
+```
+
+A table created and an item written under `0.1.14` were listed and read back unchanged through the `1.0.0` server with the same access key; `select value from settings where key = 'catalog_version'` on the catalog database returned `12`, the catalog database's `extenddb_migrations` ledger listed migrations 1 to 12 and the data database's ledger 1, 4, 7, 8 and 11. The `schema_history` table of the older release keeps its three rows and is not read.
+
+#### Running migrate as a one-off step
+
+To see or apply the migration separately from starting the server, stop the server and run the bootstrap service on its own. It runs the preview and then, when the preview exits 3, the same `migrate --yes`, and exits with the exit status of `migrate`; `--rm` removes the one-off container.
+
+```bash
+docker compose stop extenddb
+EXTENDDB_IMAGE=extenddb/extenddb-postgres:1.0.0 docker compose run --rm extenddb-bootstrap
+echo $?
+```
+
+On a catalog at 0.0.3 this printed the plan, applied migrations 1 to 12, printed `Catalog: no ledger -> migration 12` and exited 0. To preview without applying, override the entrypoint and leave `--yes` off; a pending migration prints the plan and exits 3:
+
+```bash
+EXTENDDB_IMAGE=extenddb/extenddb-postgres:1.0.0 docker compose run --rm --entrypoint extenddb \
+  extenddb-bootstrap migrate --config /var/lib/extenddb/extenddb.toml --pg-user postgres
+```
+
+```
+Nothing was changed; back up both PostgreSQL databases, the catalog database extenddb_catalog and the data database extenddb, then run again with --yes to apply (exit status 3: migrations pending).
+```
+
+The Compose files of this release upgrade to `0.1.15` or later only. The `migrate` of a tag up to `0.1.14` exits 1 on a pending catalog, so with such a tag as the target the bootstrap service exits 1 and the server is not started. On a catalog that tag is already at, its preview exits 0 (`Everything is up to date (catalog version 0.0.3). No migrations needed.`) and the stack starts.
+
+`docker compose run --rm extenddb-bootstrap` does not stop a running server first: run while the `1.0.0` server was up on a current catalog, it printed `Up to date: the catalog is at migration 12, the latest this binary carries. No migrations needed.` and exited 0. Stop the server before a run that applies a migration, as step 1 of the general procedure does and as `docker compose up -d` does. After the one-off run, `docker compose up -d` recreates the server from the new image; its own `extenddb-bootstrap` run then reports nothing pending.
+
+#### What a downgrade shows
+
+Pointing `EXTENDDB_IMAGE` at the older tag and running `docker compose up -d` fails at the Compose level. The older image's `extenddb-bootstrap` runs its preview against the newer catalog, reads `Current version: 12`, and exits 1; the catalog is not changed. Compose stops there: `docker compose up -d` prints `service "extenddb-bootstrap" didn't complete successfully: exit 1` and exits 1, `docker compose ps -a` shows `extenddb-bootstrap` as `Exited (1)` and `extenddb` as `Created` on the older image, the server never starts, and the port answers nothing. The refusal is in the bootstrap's log, shown without its table key and resource-tag check lines:
 
 ```bash
 docker compose logs extenddb-bootstrap
@@ -286,101 +367,59 @@ Config:           /var/lib/extenddb/extenddb.toml
 
 --- Loading defaults from /var/lib/extenddb/extenddb.toml
 --- Checking current catalog version...
-  Current version: 0.0.2
+  Current version: 12
 --- Checking data migrations...
-  Pending: 004_vector_index_state.sql
---- Running catalog migrations...
-    Applying 002_vector_indexes.sql...
-    Migrations applied.
---- Running data migrations...
-    Applying 004_vector_index_state.sql...
-    Data migrations applied.
-
-=== extenddb migrate complete ===
-Catalog version: 0.0.2 -> 0.0.3
+  Data migrations up to date.
+Error: --yes is required to apply migrations. Pending: catalog 12 -> 0.0.3; record the resource-tag migration marker.
 ```
 
-The log is shortened to the lines that change between runs. On a volume whose catalog already matches the new image, the same service prints `Everything is up to date (catalog version 0.0.3). No migrations needed.` and exits 0. The `pgvector` notice described under [Catalog 0.0.3](#catalog-003) appears in this log on the Compose stack, because the `postgres` image carries no `vector` extension.
-
-4. **Check the server.** `docker compose ps -a` shows `extenddb-bootstrap` as `Exited (0)` and `extenddb` as `(healthy)` after 10 to 20 seconds, both on the new image. The first line of the server's log after the banner names the version and catalog it started with:
-
-```bash
-docker compose logs extenddb
-```
-
-```
-extenddb 0.1.14 (catalog 0.0.3) starting on 0.0.0.0:18443
-```
-
-A table created and an item written under `0.1.10` were listed and read back unchanged through the `0.1.14` server with the same access key; `select value from settings where key = 'catalog_version'` on the catalog database returned `0.0.3` and `schema_history` listed `001_schema.sql` and `002_vector_indexes.sql`.
-
-#### Running migrate as a one-off step
-
-To see or apply the migration separately from starting the server, stop the server and run the bootstrap service on its own. It runs the same `migrate --yes` and exits with the exit status of `migrate`; `--rm` removes the one-off container.
-
-```bash
-docker compose stop extenddb
-EXTENDDB_IMAGE=extenddb/extenddb-postgres:0.1.14 docker compose run --rm extenddb-bootstrap
-echo $?
-```
-
-On a catalog at 0.0.2 this applied `002_vector_indexes.sql` and `004_vector_index_state.sql`, printed `Catalog version: 0.0.2 -> 0.0.3` and exited 0. To preview instead of apply, override the entrypoint and leave `--yes` off; with the published `0.1.14` image a pending migration prints the plan and exits 1 (a source build exits 3, see [The Catalog Status](#the-catalog-status)):
-
-```bash
-EXTENDDB_IMAGE=extenddb/extenddb-postgres:0.1.14 docker compose run --rm --entrypoint extenddb \
-  extenddb-bootstrap migrate --config /var/lib/extenddb/extenddb.toml --pg-user postgres
-```
-
-```
-Error: --yes is required to apply migrations. Pending: catalog 0.0.2 -> 0.0.3; data migrations [004_vector_index_state.sql]; record the resource-tag migration marker.
-```
-
-`docker compose run --rm extenddb-bootstrap` does not stop a running server first: run while the `0.1.14` server was up, it reported nothing pending and exited 0. Stop the server before a run that applies a migration, as step 1 of the general procedure does and as `docker compose up -d` does. After the one-off run, `docker compose up -d` recreates the server from the new image; its own `extenddb-bootstrap` run then reports nothing pending.
-
-#### What a downgrade shows
-
-Pointing `EXTENDDB_IMAGE` at the older tag and running `docker compose up -d` does not fail at the Compose level. The older image's `extenddb-bootstrap` runs its `migrate --yes` against the newer catalog, reports `Current version: 0.0.3` and `Catalog version: 0.0.3 -> 0.0.3`, and exits 0; the catalog is not changed. The older server then refuses to start, and because the `extenddb` service has `restart: unless-stopped`, Docker restarts it until it is stopped. `docker compose ps -a` shows `extenddb` as `Up Less than a second (health: starting)` on every look, `docker inspect` on the container shows the restart count climbing, and the port answers nothing. The refusal is in the server's log, not the bootstrap's:
-
-```bash
-docker compose logs extenddb
-```
-
-```
-extenddb 0.1.10 (catalog 0.0.2) starting on 0.0.0.0:18443
-extenddb fatal: Catalog version mismatch: expected 0.0.2, found 0.0.3. Run 'extenddb migrate'
-```
-
-Setting `EXTENDDB_IMAGE` back to the newer tag and running `docker compose up -d` brought the server back with its data. To run the older version on the data written before the upgrade, follow [Rollback Procedure](#rollback-procedure) against the `postgres` container (`docker compose exec -T postgres psql -U postgres -d postgres -c ...` and `docker compose exec -T postgres psql -U postgres -d extenddb_catalog < catalog_backup_YYYYMMDD.sql`), then start the older image.
+Setting `EXTENDDB_IMAGE` back to the newer tag and running `docker compose up -d` brought the server back with its data: the table and item written under `0.1.14` were listed and read back. To run the older version on the data written before the upgrade, follow [Rollback Procedure](#rollback-procedure) against the `postgres` container (`docker compose exec -T postgres psql -U postgres -d postgres -c ...` and `docker compose exec -T postgres psql -U postgres -d extenddb_catalog < catalog_backup_YYYYMMDD.sql`), then start the older image.
 
 ### Docker Compose (MongoDB)
 
-`docker-compose.mongodb.yml` has the same `extenddb-bootstrap` service; its image variable is `EXTENDDB_MONGODB_IMAGE` and its `migrate` takes no admin flags. The upgrade is the same three commands with `-f docker-compose.mongodb.yml` and the MongoDB variable. Upgrading from `extenddb/extenddb-mongodb:0.1.13` to `0.1.14` printed `Catalog version: 0.0.2 -> 0.0.2` in the bootstrap log and the server started with `extenddb 0.1.14 (catalog 0.0.2) starting on 0.0.0.0:18443`; the MongoDB catalog version has not changed between published tags, so the migrate step had nothing to apply. The MongoDB container's notes are in [docker/README-mongodb.md](https://github.com/ExtendDB/extenddb/blob/main/docker/README-mongodb.md).
+`docker-compose.mongodb.yml` has the same `extenddb-bootstrap` service; its image variable is `EXTENDDB_MONGODB_IMAGE` and its `migrate` takes no admin flags. The upgrade is the same three commands with `-f docker-compose.mongodb.yml` and the MongoDB variable. Upgrading from `extenddb/extenddb-mongodb:0.1.14` to `1.0.0` applied migrations 1 to 12 in the bootstrap log (`Catalog: no ledger -> migration 12`; on MongoDB migrations 3, 4, 7, 8, 9 and 11 are recorded as not applicable) and the server started with `extenddb 1.0.0 (catalog migration 12) starting on 0.0.0.0:18443`. The table and item written under `0.1.14` were still there, but the access key created under `0.1.14` answered `UnrecognizedClientException` through the `1.0.0` server, and `manage list-accounts` listed no account. The account document that `init` writes on MongoDB has no `account_id` field, which this release's credential lookup and account listing read (#<MONGODB-ACCOUNT-ID>). Until that is fixed, set the field on the account documents after the upgrade, then check `manage list-accounts`:
+
+```bash
+docker compose -f docker-compose.mongodb.yml exec -T mongodb mongosh --quiet extenddb_catalog \
+  --eval 'db.accounts.find({account_id: {$exists: false}}).forEach(a => db.accounts.updateOne({_id: a._id}, {$set: {account_id: a._id}}))'
+```
+
+With the field set, `manage list-accounts` listed the account and the same `0.1.14` access key listed and read the table through the `1.0.0` server. A key that the server refused less than 5 seconds earlier stays refused until that time passes (`[auth.cache] negative_ttl_seconds`). The MongoDB container's notes are in [docker/README-mongodb.md](https://github.com/ExtendDB/extenddb/blob/main/docker/README-mongodb.md).
 
 ### The development image
 
 `extenddb/extenddb-dev` (see [Development image](../dev-image.md)) has no bootstrap service and no config file: `serve` creates the SQLite database in `/var/lib/extenddb` on first start and opens it on later starts. Upgrading is replacing the container with one from the new tag on the same volume. With `docker run`:
 
 ```bash
-docker pull extenddb/extenddb-dev:0.1.14
+docker pull extenddb/extenddb-dev:1.0.0
 docker rm -f <container>
-docker run -d -p 127.0.0.1:18080:18080 -v extenddb:/var/lib/extenddb extenddb/extenddb-dev:0.1.14
+docker run -d -p 127.0.0.1:18080:18080 -v extenddb:/var/lib/extenddb extenddb/extenddb-dev:1.0.0
 ```
 
 With the repository's `docker-compose.dev.yml`, where the image is `EXTENDDB_DEV_IMAGE`:
 
 ```bash
-EXTENDDB_DEV_IMAGE=extenddb/extenddb-dev:0.1.14 docker compose -f docker-compose.dev.yml pull extenddb-dev
-EXTENDDB_DEV_IMAGE=extenddb/extenddb-dev:0.1.14 docker compose -f docker-compose.dev.yml up -d extenddb-dev
+EXTENDDB_DEV_IMAGE=extenddb/extenddb-dev:1.0.0 docker compose -f docker-compose.dev.yml pull extenddb-dev
+EXTENDDB_DEV_IMAGE=extenddb/extenddb-dev:1.0.0 docker compose -f docker-compose.dev.yml up -d extenddb-dev
 ```
 
-Both were run from `0.1.13` to `0.1.14`, with a table created on the first version. The second start logs the new version and the existing file, and skips the `Bootstrapped file backend` and admin credential lines the first start printed; the table was listed afterwards:
+Both were run from `0.1.14` to `1.0.0`, with a table and an item written on the first version. The second start copies the database file aside (to `extenddb.sqlite.pre-migration-<from>-to-<to>-<time>` beside it), applies the pending catalog migrations, and logs the new version, the existing file and the backup store it defaults beside the file; the table was listed and the item read back afterwards, with the seeded key pair (the `DEVELOPER MODE` line is left out):
 
 ```
-extenddb 0.1.14 (catalog 0.0.3) starting on 0.0.0.0:18080
+extenddb 1.0.0 (catalog migration 12) starting on 0.0.0.0:18080
   storage: sqlite (/var/lib/extenddb/extenddb.sqlite)
+  backup store: filesystem /var/lib/extenddb/backups (the default beside the database file)
+--- Copying the database (319488 bytes) to /var/lib/extenddb/extenddb.sqlite.pre-migration-legacy-to-12-20261125T121450Z...
+--- Copied the database in 0.0 s
 ```
 
-The dev image does not run `migrate` at start, and `migrate` cannot be run against its volume: `docker compose -f docker-compose.dev.yml run --rm extenddb-dev migrate` exits 1 with `Error: Config file 'extenddb.toml' not found`, because the image serves from built-in defaults and writes no config file. Every published `extenddb-dev` tag expects catalog 0.0.3, so a start against a volume at another catalog version has not been observed. When a future tag changes the SQLite catalog, the server answers a volume behind it as the [status table](#the-catalog-status) gives for a Behind catalog; the dev image holds development data, and the recovery is a fresh volume (`docker compose -f docker-compose.dev.yml down -v`, or `docker volume rm` on the volume named in `docker run`).
+To see what a new tag will apply before you start it, run its preview against the volume; it reads `EXTENDDB__STORAGE__SQLITE__PATH` from the image and needs no config file:
+
+```bash
+docker run --rm -v extenddb:/var/lib/extenddb extenddb/extenddb-dev:1.0.0 migrate
+```
+
+It exits 3 and lists the pending migrations, or exits 0 when the volume is current (`Up to date: the catalog is at migration 12, the latest this binary carries. No migrations needed.`). To roll back, stop the container, remove `extenddb.sqlite-wal` and `extenddb.sqlite-shm`, put the copied file back in place of `extenddb.sqlite`, and start the older tag: run this way, the `0.1.14` image started on the volume and listed the table written before the upgrade.
 
 ## Rollback Procedure
 
