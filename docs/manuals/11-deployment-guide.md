@@ -204,6 +204,12 @@ extenddb init \
   --pg-pass
 ```
 
+### Transaction isolation
+
+ExtendDB's PostgreSQL statements are written for `READ COMMITTED`. The server sets `default_transaction_isolation` to `read committed` before the first statement of each connection of the pools that serve requests and run background work, and of the session that holds a backup or restore job's claim. That setting replaces a default from `postgresql.conf`, `ALTER DATABASE`, `ALTER ROLE` or the connection string's `options`. The `settings`, `encryption-key` and `backup` commands set it on the pools they read and write settings, accounts and items through. `verify` sets it on the connection it checks the catalog with. The migration runner's sessions, `init`, `destroy` and `catalog-check` keep the server's default. A transaction that needs one snapshot, such as TransactGetItems or the read of a backup, names its own level.
+
+Behind a connection pooler in transaction mode (PgBouncer with `pool_mode = transaction`), the setting reaches only the server connection that runs it. It stays on that server connection for the pool's later clients. Behind such a pooler, keep `default_transaction_isolation` at `read committed`, PostgreSQL's default, for the role and the database ExtendDB connects as and to.
+
 ## Production Checklist
 
 ### Authentication

@@ -441,6 +441,11 @@ pub(crate) async fn try_claim_with(
             tracing::warn!("could not open the claim connection for {key}: {e}");
             lock_connection_error(&e)
         })?;
+    // Opened outside the pool, so the pool's setting does not reach it; the
+    // job's conditional writes and heartbeats run on it.
+    crate::pin_read_committed(&mut conn)
+        .await
+        .map_err(|e| lock_connection_error(&e))?;
     // A server-side idle_session_timeout would end this session between
     // heartbeats if it were shorter than the heartbeat period; disable it for
     // this session when the server permits. Some managed PostgreSQL services

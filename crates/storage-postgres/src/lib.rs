@@ -159,7 +159,8 @@ pub fn backend() -> extenddb_storage::Backend {
         settings_store: |connection_string| {
             let connection_string = connection_string.to_string();
             Box::pin(async move {
-                let pool = sqlx::PgPool::connect(&connection_string)
+                let pool = pool_options()
+                    .connect(&connection_string)
                     .await
                     .map_err(|e| {
                         extenddb_storage::settings_store::SettingsStoreError::ConnectionFailed(
@@ -175,7 +176,8 @@ pub fn backend() -> extenddb_storage::Backend {
         management_store: |connection_string| {
             let connection_string = connection_string.to_string();
             Box::pin(async move {
-                let pool = sqlx::PgPool::connect(&connection_string)
+                let pool = pool_options()
+                    .connect(&connection_string)
                     .await
                     .map_err(|e| {
                         extenddb_storage::management_store_factory::ManagementStoreError::ConnectionFailed(
@@ -216,6 +218,33 @@ use std::sync::Arc;
 use extenddb_storage::error::StorageError;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+
+/// Options for a pool of this backend: each connection runs
+/// [`pin_read_committed`] before the pool hands it out.
+pub(crate) fn pool_options() -> PgPoolOptions {
+    PgPoolOptions::new().after_connect(|conn, _meta| Box::pin(pin_read_committed(conn)))
+}
+
+/// Set the session's `default_transaction_isolation` to `read committed`,
+/// over the level the server, the database, the role or the connection
+/// string sets.
+///
+/// The backend's statements are written for READ COMMITTED, where each
+/// statement reads the rows committed before it starts: a put that lost a
+/// create race reads the winner's row, and a statement that waited for a row
+/// lock goes on with the row its holder committed. Under REPEATABLE READ or
+/// SERIALIZABLE a transaction reads the snapshot of its first statement, and
+/// those statements fail with a serialization error (SQLSTATE 40001). A
+/// transaction that needs one snapshot names its level in `BEGIN`, which
+/// overrides this default.
+///
+/// Behind a pooler in transaction mode, see "Transaction isolation" in
+/// `docs/manuals/11-deployment-guide.md`.
+pub(crate) async fn pin_read_committed(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {
+    sqlx::Executor::execute(conn, "SET default_transaction_isolation = 'read committed'")
+        .await
+        .map(drop)
+}
 
 /// Minimum number of connections allowed per pool.
 ///
@@ -412,7 +441,7 @@ impl PostgresEngine {
 
         // P79/P6: Set min_connections to avoid cold-start latency on first requests.
         let min_conns = pool_size.min(2);
-        let pool = PgPoolOptions::new()
+        let pool = pool_options()
             .max_connections(pool_size)
             .min_connections(min_conns)
             .test_before_acquire(false)
@@ -436,7 +465,7 @@ impl PostgresEngine {
         };
         let mut shared_data_pool = false;
         let data_pool = match row.as_deref() {
-            Some(data_conn) if !data_conn.is_empty() => PgPoolOptions::new()
+            Some(data_conn) if !data_conn.is_empty() => pool_options()
                 .max_connections(pool_size)
                 .min_connections(min_conns)
                 .test_before_acquire(false)
@@ -999,7 +1028,7 @@ fn server_components_factory(
         } else {
             max_catalog_connections
         };
-        let catalog_pool = PgPoolOptions::new()
+        let catalog_pool = pool_options()
             .max_connections(catalog_pool_size)
             .min_connections(catalog_pool_size.min(2))
             .test_before_acquire(false)
