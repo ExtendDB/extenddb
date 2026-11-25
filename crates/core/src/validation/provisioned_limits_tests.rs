@@ -417,14 +417,15 @@ enum Answer {
     /// `Given value <n> for <unit> is out of bounds`.
     Bounds(&'static str, &'static str),
     /// The minimum of 1, which the service words as a member constraint and
-    /// ExtendDB its own way. Both texts carry [`MINIMUM`].
+    /// `ExtendDB` as [`MINIMUM`].
     Minimum,
     Limit(&'static str),
     /// Passes these checks, with the table's write figure read as this.
     Passes(i64),
 }
 
-const MINIMUM: &str = "greater than or equal to 1";
+const MINIMUM: &str = "One or more parameter values were invalid: ReadCapacityUnits and \
+    WriteCapacityUnits must both be greater than or equal to 1 for table";
 const MAX: &str = "9223372036854775807";
 const PAST_MAX: &str = "9223372036854775808";
 const READ: &str = "ReadCapacityUnits";
@@ -465,7 +466,9 @@ const CAPACITY_FIGURES: &[(bool, &str, &str, Option<&str>, Answer)] = {
 
 /// The checks `CreateTable` runs on `body` in the engine's order, or the
 /// check of the table's figures `UpdateTable` runs, and the table's write
-/// figure as read.
+/// figure as read. This function repeats the order of `enforce_create_table`
+/// and cannot see a change to it: `tests/test_capacity_figure_bounds.py`
+/// sends the same rows through the server and pins that order.
 fn capacity_checks(update: bool, body: serde_json::Value) -> Result<i64, DynamoDbError> {
     let unreadable = |e: serde_json::Error| DynamoDbError::SerializationException(e.to_string());
     if update {
@@ -514,8 +517,7 @@ fn a_capacity_figure_is_read_and_bounded_as_measured() {
         match (answer, &result) {
             (Answer::Bounds(n, unit), Err(DynamoDbError::ValidationException(m)))
                 if *m == format!("Given value {n} for {unit} is out of bounds") => {}
-            (Answer::Minimum, Err(DynamoDbError::ValidationException(m)))
-                if m.contains(MINIMUM) && !m.contains("out of bounds") => {}
+            (Answer::Minimum, Err(DynamoDbError::ValidationException(m))) if m == MINIMUM => {}
             (Answer::Limit(text), Err(DynamoDbError::LimitExceededException(m))) if m == text => {}
             (Answer::Passes(n), Ok(write)) if write == n => {}
             _ => panic!("{body}: got {result:?}"),

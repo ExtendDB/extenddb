@@ -31,7 +31,23 @@ def bounds(value: int, unit: str = "WriteCapacityUnits") -> str:
     return re.escape(f"Given value {value} for {unit} is out of bounds")
 
 
-MINIMUM = r"(?!.*out of bounds).*greater than or equal to 1.*"
+EXTENDDB_MINIMUM = (
+    "One or more parameter values were invalid: ReadCapacityUnits and "
+    "WriteCapacityUnits must both be greater than or equal to 1 for table"
+)
+
+
+def minimum(value: int) -> str:
+    """ExtendDB's text for the minimum of 1, or DynamoDB's for a write figure
+    that it read as `value`."""
+    service = (
+        f"1 validation error detected: Value '{value}' at "
+        "'provisionedThroughput.writeCapacityUnits' failed to satisfy "
+        "constraint: Member must have value greater than or equal to 1"
+    )
+    return f"{re.escape(EXTENDDB_MINIMUM)}|{re.escape(service)}"
+
+
 PER_INDEX = re.escape(
     f"The requested WriteCapacityUnits for index by-label, {MAX}, is above "
     "the per index maximum for the account in {region}. Per table maximum: "
@@ -48,8 +64,8 @@ ACCOUNT = (
         "exceeded for the account in {region}. Current WriteCapacityUnits "
         "reserved by the account: "
     )
-    + r"\d+\. Limit: \d+\. "
-    + re.escape("Requested: 1000000000006. " + GUIDE)
+    + r"\d+"
+    + re.escape(". Limit: {account_write_max}. Requested: 1000000000006. " + GUIDE)
 )
 
 # (operation, table read, table write, index write, error, text pattern).
@@ -63,8 +79,8 @@ ROWS = [
     ("CreateTable", 5, 5, MAX + 1, LIMIT, PER_INDEX),
     ("CreateTable", MAX + 1, 5, None, INVALID, bounds(MAX, "ReadCapacityUnits")),
     ("CreateTable", 10**12 + 1, 5, None, INVALID, bounds(10**12 + 1, "ReadCapacityUnits")),
-    ("CreateTable", MAX + 1, 0, None, INVALID, MINIMUM),
-    ("CreateTable", 5, -MAX - 2, None, INVALID, MINIMUM),
+    ("CreateTable", MAX + 1, 0, None, INVALID, minimum(0)),
+    ("CreateTable", 5, -MAX - 2, None, INVALID, minimum(-MAX - 1)),
     ("CreateTable", 5, 5, 10**12 + 1, LIMIT, ACCOUNT),
     ("UpdateTable", 5, 10**12, None, LIMIT, PER_TABLE),
     ("UpdateTable", 5, 10**12 + 1, None, INVALID, bounds(10**12 + 1)),
@@ -78,7 +94,7 @@ ROWS = [
 
 @pytest.fixture(scope="module")
 def target(dynamodb_client):
-    """Post a raw body to the target, and the account's write maximum."""
+    """Post a raw body to the target, and the account's write maxima."""
     endpoint = os.environ.get("EXTENDDB_TEST_ENDPOINT", "").strip()
     region = dynamodb_client.meta.region_name
     endpoint = endpoint or f"https://dynamodb.{region}.amazonaws.com/"
@@ -91,7 +107,10 @@ def target(dynamodb_client):
         )
 
     limits = dynamodb_client.describe_limits()
-    return post, region, limits["TableMaxWriteCapacityUnits"]
+    return (
+        post, region, limits["TableMaxWriteCapacityUnits"],
+        limits["AccountMaxWriteCapacityUnits"],
+    )
 
 
 @pytest.fixture(scope="module")
@@ -114,7 +133,7 @@ def test_capacity_figure(
     dynamodb_client, target, provisioned_table, operation, read, write,
     index_write, error, text,
 ):
-    post, region, write_max = target
+    post, region, write_max, account_write_max = target
     throughput = {"ReadCapacityUnits": read, "WriteCapacityUnits": write}
     name = f"extenddb-test-{uuid.uuid4().hex[:12]}"
     if operation == "UpdateTable":
@@ -158,8 +177,10 @@ def test_capacity_figure(
     answer = resp.json()
     assert answer["__type"].endswith("#" + error), answer
     message = answer.get("message", answer.get("Message", ""))
-    pattern = text.replace(r"\{region\}", re.escape(region)).replace(
-        r"\{write_max\}", str(write_max)
+    pattern = (
+        text.replace(r"\{region\}", re.escape(region))
+        .replace(r"\{write_max\}", str(write_max))
+        .replace(r"\{account_write_max\}", str(account_write_max))
     )
     assert re.fullmatch(pattern, message), message
     if operation == "UpdateTable":
