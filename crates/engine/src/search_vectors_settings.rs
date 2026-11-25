@@ -19,11 +19,17 @@
 //! other transient storage faults do. A fault never changes which grammar an
 //! account gets.
 //!
-//! A server sends at most one read of the setting at a time. A read that
-//! outlasts [`READ_TIMEOUT`] keeps running in its own task, and the next
-//! request waits on that read rather than sending another, so a catalog
-//! that does not answer holds at most one of its connections for the
-//! setting while requests that do not read it keep the rest.
+//! A server sends at most one read of the setting at a time, a read sent
+//! before a change through the management API included. A read that
+//! outlasts [`READ_TIMEOUT`] keeps running in its own task until it ends,
+//! and no other read is sent meanwhile, so a catalog that does not answer
+//! holds at most one of its connections for the setting while requests that
+//! do not read it keep the rest. Once a read has answered, a request never
+//! waits on a read another request sent: while a read is in flight, it uses
+//! the value of the last read that answered. Before any read has answered,
+//! a request waits on the read in flight for at most [`READ_TIMEOUT`]. A
+//! change through the management API applies at the first read sent after
+//! it, which is the next one once no read is in flight.
 
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
@@ -117,17 +123,16 @@ struct InFlight {
 struct Settings {
     store: Arc<dyn SettingsStore>,
     kept: Mutex<Option<Kept>>,
-    /// The value of the last read that answered, with the value of
-    /// [`Settings::changes`] when it was sent. A change through the management
-    /// API leaves it, so a read that fails after a change uses it.
-    last: Mutex<Option<(u64, EnabledAccounts)>>,
+    /// The value of the last read that answered. A change through the
+    /// management API leaves it, so a read that fails after a change uses it.
+    last: Mutex<Option<EnabledAccounts>>,
     /// How many times the management API changed the setting, so a read
     /// sent before a change is not used after it.
     changes: Mutex<u64>,
     /// Held by the one request that reads the store when the kept read is
-    /// stale, so concurrent requests wait for that read instead of sending
-    /// their own. It holds a read that outlasted [`READ_TIMEOUT`] until the
-    /// read ends, so the next request waits on it instead of sending another.
+    /// stale, so concurrent requests do not send reads of their own. It
+    /// holds a read that outlasted [`READ_TIMEOUT`] until the read ends, so
+    /// no other read is sent while it runs.
     reading: tokio::sync::Mutex<Option<InFlight>>,
 }
 
@@ -150,18 +155,10 @@ impl Settings {
 
     /// The value of the last read that answered.
     fn last(&self) -> Option<EnabledAccounts> {
-        let last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
-        last.as_ref().map(|(_, accounts)| accounts.clone())
-    }
-
-    /// The value of the last read that answered, when no change through the
-    /// management API came after it was sent.
-    fn unchanged_last(&self) -> Option<EnabledAccounts> {
-        let last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
-        let changes = self.changes();
-        last.as_ref()
-            .filter(|(sent, _)| *sent == changes)
-            .map(|(_, accounts)| accounts.clone())
+        self.last
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     fn changes(&self) -> u64 {
@@ -189,12 +186,12 @@ impl Settings {
         if let Some(answer) = self.fresh() {
             return answer;
         }
-        // A request does not wait on a read that another request waits on, or
-        // that outlasted READ_TIMEOUT, when an earlier read answered after the
-        // last change: it uses that read's value.
+        // Once a read has answered, a request does not wait on a read that
+        // another request waits on, or that outlasted READ_TIMEOUT: it uses
+        // the value of the last read that answered.
         let mut reading = match self.reading.try_lock() {
             Ok(reading) => reading,
-            Err(_) => match self.unchanged_last() {
+            Err(_) => match self.last() {
                 Some(accounts) => return Ok(accounts),
                 None => self.reading.lock().await,
             },
@@ -202,18 +199,18 @@ impl Settings {
         if let Some(answer) = self.fresh() {
             return answer;
         }
-        // A read sent before a change through the management API may answer
-        // the old value: it is left to end on its own and a new one is sent.
-        if reading
-            .as_ref()
-            .is_some_and(|r| r.changes != self.changes())
-        {
-            *reading = None;
-        }
-        if reading.as_ref().is_some_and(|r| !r.task.is_finished())
-            && let Some(accounts) = self.unchanged_last()
-        {
-            return Ok(accounts);
+        if let Some(in_flight) = reading.as_ref() {
+            if !in_flight.task.is_finished() {
+                // The read has not ended, whenever it was sent: no other is
+                // sent while it runs.
+                if let Some(accounts) = self.last() {
+                    return Ok(accounts);
+                }
+            } else if in_flight.changes != self.changes() {
+                // A read that ended but was sent before a change through the
+                // management API may hold the old value: a new one is sent.
+                *reading = None;
+            }
         }
         let in_flight = reading.get_or_insert_with(|| self.send_read());
         let sent = in_flight.changes;
@@ -229,8 +226,7 @@ impl Settings {
                 if let Some(ignored) = ignored {
                     tracing::warn!("{ignored}");
                 }
-                *self.last.lock().unwrap_or_else(PoisonError::into_inner) =
-                    Some((sent, accounts.clone()));
+                *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Some(accounts.clone());
                 (raw, Some(accounts))
             }
             Ok(Ok(Err(e))) => {

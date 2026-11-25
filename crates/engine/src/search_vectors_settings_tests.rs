@@ -316,20 +316,93 @@ async fn a_read_that_ends_late_answers_the_next_request() {
     assert_eq!(store.reads(), 1);
 }
 
-/// A read sent before a change through the management API is not waited on
-/// after it: the next request sends a read of the changed value.
+/// Wait until no read of the store is in flight.
+async fn until_the_read_ends(settings: &Settings) {
+    loop {
+        if let Ok(reading) = settings.reading.try_lock()
+            && reading.as_ref().is_none_or(|r| r.task.is_finished())
+        {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+/// A read sent before a change through the management API stays the one
+/// read in flight until it ends. Before any value has been read, the next
+/// request waits on it; once it has ended, the next request sends a read of
+/// the changed value.
 #[tokio::test(start_paused = true)]
-async fn a_change_applies_while_an_earlier_read_has_not_ended() {
-    let store = Store::new(Answer::Hang);
+async fn a_read_sent_before_a_change_is_the_only_read_until_it_ends() {
+    let gate = Arc::new(Notify::new());
+    let store = Store::new(Answer::Gated(Arc::clone(&gate), "off".to_owned()));
     let settings = Settings::new(store.clone());
     assert!(is_unavailable(&settings.enabled_accounts().await));
     store.set(Answer::Value(Some("all".to_owned())));
     settings.changed();
+    // the test's own deadline, so a request that waits without a bound
+    // fails here
+    let answer = tokio::time::timeout(READ_TIMEOUT * 2, settings.enabled_accounts())
+        .await
+        .expect("the wait is bounded");
+    assert!(is_unavailable(&answer), "{answer:?}");
+    assert_eq!(
+        store.reads(),
+        1,
+        "a read was sent while another was in flight"
+    );
+    gate.notify_one();
+    until_the_read_ends(&settings).await;
     assert_eq!(
         settings.enabled_accounts().await.unwrap(),
         EnabledAccounts::All
     );
     assert_eq!(store.reads(), 2);
+}
+
+/// Once a value has been read, a read that outlasted READ_TIMEOUT and was
+/// sent before a change through the management API stays the one read in
+/// flight: requests use the last value read at once until it ends, and the
+/// next request then reads the changed value.
+#[tokio::test(start_paused = true)]
+async fn a_change_sends_no_second_read_while_one_is_in_flight() {
+    let store = Store::value("off");
+    let settings = Settings::new(store.clone());
+    assert_eq!(
+        settings.enabled_accounts().await.unwrap(),
+        EnabledAccounts::Off
+    );
+    let gate = Arc::new(Notify::new());
+    store.set(Answer::Gated(Arc::clone(&gate), "off".to_owned()));
+    tokio::time::advance(REFRESH).await;
+    // the test's own deadline, so a read without a bound fails here
+    let answer = tokio::time::timeout(READ_TIMEOUT * 2, settings.enabled_accounts())
+        .await
+        .expect("the read is bounded");
+    assert_eq!(answer.unwrap(), EnabledAccounts::Off);
+    store.set(Answer::Value(Some("all".to_owned())));
+    settings.changed();
+    for _ in 0..3 {
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            settings.enabled_accounts().await.unwrap(),
+            EnabledAccounts::Off
+        );
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+        tokio::time::advance(REFRESH).await;
+    }
+    assert_eq!(
+        store.reads(),
+        2,
+        "a read was sent while another was in flight"
+    );
+    gate.notify_one();
+    until_the_read_ends(&settings).await;
+    assert_eq!(
+        settings.enabled_accounts().await.unwrap(),
+        EnabledAccounts::All
+    );
+    assert_eq!(store.reads(), 3);
 }
 
 /// A read that fails, after an earlier read answered, uses the value of the
@@ -402,6 +475,39 @@ async fn a_request_does_not_wait_on_a_read_in_flight_once_a_value_was_read() {
     let gate = Arc::new(Notify::new());
     store.set(Answer::Gated(Arc::clone(&gate), "all".to_owned()));
     tokio::time::advance(REFRESH).await;
+    let waiting = {
+        let settings = Arc::clone(&settings);
+        tokio::spawn(async move { settings.enabled_accounts().await })
+    };
+    while store.reads() < 2 {
+        tokio::task::yield_now().await;
+    }
+    let started = tokio::time::Instant::now();
+    // the test's own deadline, so a request that waits on the read fails here
+    let answer = tokio::time::timeout(READ_TIMEOUT / 2, settings.enabled_accounts())
+        .await
+        .expect("the request does not wait on the read");
+    assert_eq!(answer.unwrap(), EnabledAccounts::Off);
+    assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+    gate.notify_one();
+    assert_eq!(waiting.await.unwrap().unwrap(), EnabledAccounts::All);
+    assert_eq!(store.reads(), 2);
+}
+
+/// Once a value has been read, a request does not wait on a read another
+/// request is waiting on, also when that read was sent after a change
+/// through the management API.
+#[tokio::test(start_paused = true)]
+async fn a_request_does_not_wait_on_a_read_in_flight_after_a_change() {
+    let store = Store::value("off");
+    let settings = Arc::new(Settings::new(store.clone()));
+    assert_eq!(
+        settings.enabled_accounts().await.unwrap(),
+        EnabledAccounts::Off
+    );
+    let gate = Arc::new(Notify::new());
+    store.set(Answer::Gated(Arc::clone(&gate), "all".to_owned()));
+    settings.changed();
     let waiting = {
         let settings = Arc::clone(&settings);
         tokio::spawn(async move { settings.enabled_accounts().await })
