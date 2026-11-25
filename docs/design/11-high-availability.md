@@ -270,10 +270,9 @@ Status (2026-10-25): the plumbing in 8.1 and 8.2 landed with a different shape.
 `DataEngine::get_item`, `query` and `scan` take `extenddb_storage::ReadOptions
 { consistent_read }` as their last parameter, a `#[non_exhaustive]` struct
 with `new` and `Default`, in place of the bare `bool` and the
-`ConsistencyLevel` enum below (ADR-0024). The engine passes the client's value,
-each table's own value on `BatchGetItem`, `false` on a global secondary index
-read (refused before storage when the client asks for `true`), and `true` on
-the export scan. The text below is the proposal as written; 8.2.1 through 8.3
+`ConsistencyLevel` enum below (ADR-0024). The `ReadOptions` documentation in
+`crates/storage/src/lib.rs` lists the value the engine passes on each read.
+The text below is the proposal as written; 8.2.1 through 8.3
 and Stage 2 onward build on the landed shape.
 
 ### 8.1 ConsistencyLevel Parameter

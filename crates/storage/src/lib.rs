@@ -210,21 +210,36 @@ pub struct VectorSearch<'a> {
 /// The contract is stated by what the read returns. `consistent_read: true`:
 /// the read reflects every write acknowledged before it started. `false`: the
 /// read may miss recently acknowledged writes. A backend that serves every
-/// read from the copy that took the write meets both by ignoring the value;
-/// every in-tree backend does that today. A backend with followers can serve
-/// `false` from a follower (a `secondaryPreferred` read on MongoDB, a
-/// streaming replica on PostgreSQL); a quorum backend needs read and write
-/// levels that intersect for `true`.
+/// read from the copy that took the write meets both by ignoring the value,
+/// as the SQLite and PostgreSQL backends do today, and the MongoDB backend
+/// on a replica-set connection (its `get_item` comment describes a direct
+/// connection); a quorum backend needs read and write levels that intersect
+/// for `true`, which the Cassandra backend has for both values (reads and
+/// writes at `LOCAL_QUORUM`, with its clocks in sync). A backend with
+/// followers can serve `false` from a follower (a `secondaryPreferred` read
+/// on MongoDB, a streaming replica on PostgreSQL).
+///
+/// The engine passes the client's `ConsistentRead` on `GetItem`, `Query`,
+/// `Scan`, each table's own on `BatchGetItem`, and on the base-table read
+/// under a PartiQL `SELECT` from a local secondary index that does not
+/// project a selected attribute; a read through a global secondary index gets
+/// `false`, because the engine refuses `ConsistentRead: true` on one before
+/// storage is called. It passes `true` on reads that must reflect
+/// every acknowledged write: the export scan, the read that evaluates a
+/// PartiQL `UPDATE` whose value nests past the item limit, and the read that
+/// sizes the charge of a PartiQL batch write that failed at its item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct ReadOptions {
-    /// `ConsistentRead` as the client sent it; `false` when absent, so
-    /// [`ReadOptions::default`] is an eventually consistent read.
+    /// `true` for a read that must reflect every write acknowledged before it
+    /// started: the client's `ConsistentRead`, or `true` on the engine reads
+    /// listed above. `false` when absent, so [`ReadOptions::default`] is an
+    /// eventually consistent read.
     pub consistent_read: bool,
 }
 
 impl ReadOptions {
-    /// Options for one read with the request's `ConsistentRead` value.
+    /// Options for one read with the given `consistent_read`.
     pub const fn new(consistent_read: bool) -> Self {
         Self { consistent_read }
     }
@@ -358,8 +373,10 @@ pub trait DataEngine: Send + Sync {
     ///
     /// Returns `None` if the item does not exist (not an error).
     ///
-    /// `opts.consistent_read` carries the request's `ConsistentRead`; see
-    /// [`ReadOptions`] for how a backend with replicas uses it.
+    /// `opts.consistent_read` carries the request's `ConsistentRead`, or
+    /// `true` on an engine read that must reflect every acknowledged write;
+    /// see [`ReadOptions`] for the list and for how a backend with replicas
+    /// uses it.
     fn get_item(
         &self,
         key_info: &TableKeyInfo,
@@ -450,9 +467,9 @@ pub trait DataEngine: Send + Sync {
     /// (before filtering). `exclusive_start_key` enables pagination.
     /// `segment` and `total_segments` enable parallel scan.
     /// `index_name` routes the scan to a secondary index table.
-    /// `opts.consistent_read` carries the request's `ConsistentRead`; it is
-    /// always `false` for a global secondary index and the client's value for
-    /// a local secondary index.
+    /// `opts.consistent_read` carries the request's `ConsistentRead`, or
+    /// `true` on the export scan; it is always `false` for a global secondary
+    /// index and the client's value for a local secondary index.
     ///
     /// Returns `(items, last_evaluated_key)`.
     #[allow(clippy::too_many_arguments)]

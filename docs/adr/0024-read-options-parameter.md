@@ -62,9 +62,14 @@ and serves the read serializable.
 
 The engine passes the client's value on `GetItem`, `Query` and `Scan`
 (`false` when the member is absent), each table's own
-`KeysAndAttributes.ConsistentRead` on `BatchGetItem`, and `true` on the
-export scan, because an export reflects every write acknowledged before the
-export time. A read through a global secondary index reaches storage with
+`KeysAndAttributes.ConsistentRead` on `BatchGetItem`, and the client's value
+on the base-table read under a PartiQL `SELECT` from a local secondary index
+that does not project a selected attribute. It passes `true` on the reads
+that must reflect every acknowledged write: the export scan, because an
+export reflects every write acknowledged before the export time, the read
+that evaluates a PartiQL `UPDATE` whose value nests past the item limit, and
+the read that sizes the charge of a PartiQL batch write that failed at its
+item. A read through a global secondary index reaches storage with
 `false`: the engine refuses `ConsistentRead: true` on a GSI before any
 storage call, as the service does. A local secondary index read carries the
 client's value.
@@ -99,14 +104,15 @@ routing change would have to do.
 - The high availability design's section 8 and Stage 1 now describe the
   shape that landed; Stage 2 (replica routing in the PostgreSQL backend)
   builds on it.
-- The Cassandra backend serves `ConsistentRead: true` at the driver's
-  default consistency `ONE`, and its OCC and put-if-absent lightweight
-  transactions, plain delete and transaction commit run at `ONE` (the
-  conditional delete and the batched secondary writes run at
-  `LOCAL_QUORUM`), so the flag is not honoured there when the replication
-  factor is above 1. That
-  predates this decision and is tracked separately; the parameter is what a
-  fix routes on.
+- The Cassandra backend runs its item reads and its base-row writes at
+  `LOCAL_QUORUM` (the lightweight transactions run their Paxos round at
+  `LOCAL_SERIAL` and commit at `LOCAL_QUORUM`), so, with the node and host
+  clocks in sync (`docs/design/11-high-availability.md`, Model 4), a read in
+  the local datacenter sees every acknowledged write and both values are met
+  by ignoring the flag. Before #945 the reads and most base-row writes ran
+  at `ONE`, which did not honour `true` above replication factor 1 (#560,
+  closed by #945); the parameter is what a routing change (`false` at
+  `LOCAL_ONE`) would read.
 
 ## License
 

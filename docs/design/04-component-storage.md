@@ -130,23 +130,22 @@ inside the storage transaction to prevent TOCTOU races. Stream records are
 written atomically with data writes when `stream` is `Some`.
 
 `get_item`, `query` and `scan` take a `ReadOptions` value as their last
-parameter (ADR-0024). It carries `consistent_read`, the request's
-`ConsistentRead` as the client sent it (`false` when absent, and always `false`
-for a global secondary index, which the engine refuses to read strongly
-consistent before storage is called; a local secondary index read carries the
-client's value). `BatchGetItem` passes each table's own
-`KeysAndAttributes.ConsistentRead` on its per-key `get_item` calls; the export
-scan passes `true`, because an export reflects every write acknowledged before
-the export time; `TransactGetItems` has no flag because the service serves
-transactional reads serializable. The struct is `#[non_exhaustive]` and follows
+parameter (ADR-0024). It carries `consistent_read`, always `false` for a read
+through a global secondary index, which the engine refuses to read strongly
+consistent before storage is called. The `ReadOptions` documentation in
+`crates/storage/src/lib.rs` lists the value the engine passes on each read.
+`TransactGetItems` has no flag because
+the service serves transactional reads serializable. The struct is `#[non_exhaustive]` and follows
 the `VectorSearch` parameter-struct precedent so later per-read options do not
 widen the three signatures again. The contract is what the read returns:
 with `true` the read reflects every write acknowledged before it started; with
 `false` it may miss recently acknowledged writes. A backend that serves every
 read from the copy that took the write meets both by ignoring the value, which
-the SQLite, PostgreSQL and MongoDB backends do today; the Cassandra backend
-reads at `ONE` against a keyspace whose replication factor defaults to 3, so
-it does not meet `true` (ADR-0024, Consequences; issue #560). A backend with followers can serve `false`
+the SQLite and PostgreSQL backends do today, and the MongoDB backend on a
+replica-set connection (a direct connection keeps reading a member that
+stepped down); the Cassandra backend
+reads and writes at `LOCAL_QUORUM` (#945), levels that intersect, so it meets
+both the same way (ADR-0024, Consequences). A backend with followers can serve `false`
 from a follower (a streaming replica on PostgreSQL, where section 5.3 describes
 that routing as a proposal; a `secondaryPreferred` read selected per operation
 on MongoDB); a quorum backend needs read and write levels that intersect for

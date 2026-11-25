@@ -45,14 +45,15 @@ impl DataEngine for CassandraEngine {
         })
     }
 
-    /// `_opts.consistent_read` is accepted and not acted on. Reads run at the
-    /// driver default consistency `ONE`, and the base-row writes (the OCC and
-    /// put-if-absent lightweight transactions, the plain delete, the
-    /// transaction commit) are acknowledged at `ONE` as well, so a `true` is
-    /// not honoured when the keyspace replication factor is above 1. Serving
-    /// `true` consistently needs those writes acknowledged at `LOCAL_QUORUM`
-    /// and `true` read at `LOCAL_QUORUM` (reads plus writes above the
-    /// replication factor); `false` can stay at `LOCAL_ONE`.
+    /// `_opts.consistent_read` is accepted and not acted on. Every item read
+    /// runs at `LOCAL_QUORUM`, and the base-row writes (the plain writes, and
+    /// the commit of the OCC and put-if-absent lightweight transactions, whose
+    /// Paxos round runs at `LOCAL_SERIAL`) are acknowledged at `LOCAL_QUORUM`
+    /// (`cassandra_util::Stmt`), so, with the node and host clocks in sync
+    /// (`docs/cassandra-setup.md`), a read in the local datacenter sees every
+    /// acknowledged write and both values are met by ignoring the flag.
+    /// `false` is not stepped down to `LOCAL_ONE`; a routing change would read
+    /// `false` at `LOCAL_ONE` and keep `true` at `LOCAL_QUORUM`.
     fn get_item(
         &self,
         key_info: &TableKeyInfo,

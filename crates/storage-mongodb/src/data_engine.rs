@@ -182,10 +182,14 @@ impl DataEngine for MongoEngine {
         })
     }
 
-    /// `_opts.consistent_read` is accepted and not acted on. Every read goes
-    /// to the primary: `guarded_client_options` (behind `connect_guarded` and
-    /// `MongoEngine::new`) refuses a connection string with a non-primary read
-    /// preference. A routing change would select
+    /// `_opts.consistent_read` is accepted and not acted on. On a replica-set
+    /// connection every read goes to the primary: `guarded_client_options`
+    /// (behind `connect_guarded` and `MongoEngine::new`) refuses a connection
+    /// string with a non-primary read preference. A `directConnection=true`
+    /// string pins one member instead, and the driver sends its reads with
+    /// `$readPreference: primaryPreferred`, as the server selection
+    /// specification asks for a direct connection, so a member that stepped
+    /// down keeps answering reads. A routing change would select
     /// `secondaryPreferred` per operation on a `false` read against a replica
     /// set; `true` stays on the primary.
     fn get_item(
