@@ -26,6 +26,8 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::types::{BatchGetItemInput, BatchWriteItemInput};
 use serde_json::Value;
 
+use crate::query_key_values::reads_as_boolean;
+
 /// Maximum number of keys across all tables in one `BatchGetItem` request,
 /// and the maximum number of tables in its `RequestItems`.
 pub(crate) const MAX_BATCH_GET_KEYS: usize = 100;
@@ -209,10 +211,15 @@ pub fn check_request_item_counts(operation: &str, body: &Value) -> Result<(), Dy
 /// The handler's `SerializationException` for a batch body, when its parse
 /// finds a value of another JSON type than the member's. The service answers
 /// that ahead of the counts. It answers the count clause for a missing or null
-/// member and for the string `"true"` or `"false"` where a boolean goes
-/// (measured 2026-11-20 and 2026-11-21). The `AttributeValue` reader names its
-/// faults in its own words, which do not tell a null or an accepted string
-/// from a value of another type, so those keep the count clause too.
+/// member, and for a string where a boolean goes that it reads as a boolean
+/// (see [`reads_as_boolean`]): measured 2026-11-20 and 2026-11-21, and
+/// 2026-11-25 for `"TRUE"`, `"True"`, `"1"`, `"yes"`, `"FALSE"` and `"0"`. It
+/// answers `"x"` there with a `SerializationException` (2026-11-21). The
+/// `AttributeValue` reader names its faults in its own words, which do not
+/// tell a null or an accepted string from a value of another type, so those
+/// keep the count clause too. `serde_json` has no error variant for these
+/// faults, so the check reads serde's fixed `invalid type: <unexpected>,
+/// expected <expected>` text.
 fn type_fault(operation: &str, body: &Value) -> Option<DynamoDbError> {
     let e = if operation == "BatchGetItem" {
         <BatchGetItemInput as serde::Deserialize>::deserialize(body).err()
@@ -220,8 +227,10 @@ fn type_fault(operation: &str, body: &Value) -> Option<DynamoDbError> {
         <BatchWriteItemInput as serde::Deserialize>::deserialize(body).err()
     }?;
     let text = e.to_string();
-    let boolean = text == "invalid type: string \"true\", expected a boolean"
-        || text == "invalid type: string \"false\", expected a boolean";
+    let boolean = text
+        .strip_prefix("invalid type: string \"")
+        .and_then(|rest| rest.strip_suffix("\", expected a boolean"))
+        .is_some_and(reads_as_boolean);
     if !text.starts_with("invalid type: ") || text.starts_with("invalid type: null") || boolean {
         return None;
     }
@@ -447,10 +456,11 @@ mod tests {
 
     #[test]
     fn malformed_entries_in_order() {
-        // Measured 2026-11-20 and 2026-11-21. Rows 0 to 4, 6 and 7 have the
-        // service's error type, and row 4 its text too. Rows 8 to 10 and 13 to
-        // 16 pin this server's answer, which has the service's type only. Rows
-        // 5, 11 and 12 are within the counts, where the check passes.
+        // Measured 2026-11-20 and 2026-11-21, and 2026-11-25 for rows 17 and
+        // 18. Rows 0 to 4, 6, 7 and 20 have the service's error type, and row 4
+        // has the text DynamoDB gave on 20 November. Rows 8 to 10 and 13 to 19
+        // pin this server's answer, which has the service's type only. Rows 5,
+        // 11 and 12 are within the counts, where the check passes.
         let many = names(101);
         // `n` tables of one item each, with the value of `odd` at its indexes.
         let body = |op: &str, n: usize, odd: &[(usize, Value)]| {
@@ -473,6 +483,8 @@ mod tests {
         let one = |c: String| format!("1 validation error detected: {c}");
         // A write list of one put whose attribute `x` is `v`.
         let put_x = |v: Value| json!([{"PutRequest": {"Item": {"pk": {"S": "a"}, "x": v}}}]);
+        // A get of one key with the `ConsistentRead` string `v`.
+        let read = |v: &str| json!({"Keys": [{"pk": {"S": "a"}}], "ConsistentRead": v});
         let ser = || "SerializationException".to_owned();
         let ok = || "Ok".to_owned();
         let (bw, bg) = ("BatchWriteItem", "BatchGetItem");
@@ -506,15 +518,11 @@ mod tests {
                 vec![(5, put_x(json!({"BOOL": "true"})))],
                 one(count(25)),
             ),
-            (
-                bg,
-                101,
-                vec![(
-                    5,
-                    json!({"Keys": [{"pk": {"S": "a"}}], "ConsistentRead": "true"}),
-                )],
-                one(count(100)),
-            ),
+            (bg, 101, vec![(5, read("true"))], one(count(100))),
+            (bg, 101, vec![(5, read("TRUE"))], one(count(100))),
+            (bg, 101, vec![(5, read("1"))], one(count(100))),
+            (bg, 101, vec![(5, read("false"))], one(count(100))),
+            (bg, 101, vec![(5, read("x"))], ser()),
         ];
         let failed: Vec<String> = cases
             .into_iter()

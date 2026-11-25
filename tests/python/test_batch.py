@@ -408,12 +408,21 @@ class TestBatchGetItem:
         assert resp.get("UnprocessedKeys", {}) == {}
 
 
+def _read(consistent: str) -> dict:
+    """A BatchGetItem table value of one key, with the ConsistentRead string `consistent`."""
+    return {"Keys": [{"pk": {"S": "k0"}}], "ConsistentRead": consistent}
+
+
 # A batch over its table count, with the value of one table, or two, given in
 # `odd` and one request or key in every other table. DynamoDB answered a
 # SerializationException for a number in place of a table's value, a write
 # request or `Keys`, and for a map in place of a write list. It answered the
 # table count clause for a write request that is an empty map (measured
-# 2026-11-20).
+# 2026-11-20). For a ConsistentRead string that it reads as a boolean it
+# answered the table count clause: "false" on 2026-11-21, "TRUE" and "1" on
+# 2026-11-25. It answered "x" with a SerializationException (2026-11-21). In
+# the table count clauses of 2026-11-21 and 2026-11-25 it quoted the request
+# map, so the test accepts that from DynamoDB.
 @pytest.mark.parametrize(
     ("operation", "tables", "odd", "code"),
     [
@@ -432,10 +441,24 @@ class TestBatchGetItem:
         pytest.param(
             "BatchWriteItem", 26, {5: [{}]}, "ValidationException", id="write_empty_request"
         ),
+        pytest.param(
+            "BatchGetItem", 101, {5: _read("TRUE")}, "ValidationException", id="get_read_TRUE"
+        ),
+        pytest.param("BatchGetItem", 101, {5: _read("1")}, "ValidationException", id="get_read_1"),
+        pytest.param(
+            "BatchGetItem", 101, {5: _read("false")}, "ValidationException", id="get_read_false"
+        ),
+        pytest.param(
+            "BatchGetItem", 101, {5: _read("x")}, "SerializationException", id="get_read_x"
+        ),
     ],
 )
-def test_batch_type_fault_over_the_table_count(raw_client, operation, tables, odd, code):
-    """A table value of another JSON type is refused before the table count."""
+def test_batch_type_fault_over_the_table_count(
+    raw_client, is_extenddb, operation, tables, odd, code
+):
+    """A table value of another JSON type is refused before the table count. A
+    ConsistentRead string that DynamoDB reads as a boolean gets the table count
+    clause."""
     normal = _puts(1) if operation == "BatchWriteItem" else {"Keys": [{"pk": {"S": "k0"}}]}
     # The tables do not exist, as measured.
     request_items = {unique_name(): odd.get(i, normal) for i in range(tables)}
@@ -444,6 +467,11 @@ def test_batch_type_fault_over_the_table_count(raw_client, operation, tables, od
     error = exc.value.response["Error"]
     assert error["Code"] == code
     if code == "ValidationException":
+        bound = "less than or equal to " + ("25" if operation == "BatchWriteItem" else "100")
+        if not is_extenddb and error["Message"].endswith(
+            QUOTED + "Member must have length " + bound
+        ):
+            return
         assert error["Message"] == "1 validation error detected: " + CLAUSE.format(
-            "RequestItems", "less than or equal to 25"
+            "RequestItems", bound
         )
