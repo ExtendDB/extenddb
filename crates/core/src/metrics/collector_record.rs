@@ -300,8 +300,8 @@ impl MetricsCollector {
     #[allow(clippy::cast_precision_loss)]
     pub fn record_worker_success(&self, source: super::types::QuerySource, latency_us: f64) {
         let worker_str = source.to_string();
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let now_secs = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         self.record(

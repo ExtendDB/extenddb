@@ -569,11 +569,20 @@ mod tests {
                 _ => delete(name),
             });
             let path = format!("globalSecondaryIndexUpdates.{position}.member.{action}.indexName");
-            let expected: Vec<(&str, &str, &str)> =
-                clauses.iter().map(|c| (name, path.as_str(), *c)).collect();
+            let at =
+                |c: &str| format!("Value '{name}' at '{path}' failed to satisfy constraint: {c}");
+            let expected = match clauses {
+                [one] => format!("1 validation error detected: {}", at(one)),
+                [first, second] => format!(
+                    "2 validation errors detected: {}; {}",
+                    at(first),
+                    at(second)
+                ),
+                _ => unreachable!("{clauses:?}"),
+            };
             assert_eq!(
                 message(validate_gsi_updates(&input(Value::Array(updates)))),
-                extenddb_core::error::validation_errors(&expected),
+                expected,
                 "{path}, {} characters",
                 name.chars().count()
             );

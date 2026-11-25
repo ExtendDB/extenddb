@@ -16,8 +16,8 @@ pub mod sigv4;
 pub use cache_registry::{AuthCacheRegistry, AuthzCacheInvalidator, TableKeyInfoCacheInvalidator};
 pub use credential_cache::{CachedCredential, CachedCredentialStore, ResolvedCredential};
 
-use axum::http::HeaderMap;
 use extenddb_core::error::DynamoDbError;
+use http::HeaderMap;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Auth provider trait: pluggable authentication.
@@ -246,6 +246,8 @@ impl AuthProvider for BuiltinAuthProvider {
     }
 }
 
+#[cfg(test)]
+mod scope_tests;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
