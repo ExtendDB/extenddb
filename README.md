@@ -441,7 +441,7 @@ that names the build:
   `wasm32`. A body that does not parse gets `SerializationException`, as on
   a server; a body that parses gets the refusal, even one the handler would
   refuse, such as a `DescribeBackup` with no `BackupArn` (natively and on a
-  server, "1 validation error detected: Value null at 'backupArn' …"). Built
+  server, "Invalid Backup ARN"). Built
   natively, the adapter runs the engine's backup handlers instead, and with no
   backup store `CreateBackup` backs a table up in the catalog, as a server
   without one does.
