@@ -337,7 +337,9 @@ class TestQueryCheckOrder:
     items. R10 and R11 (2026-11-23T16:58Z) have no equality on the partition
     key: the service reads the key condition's shape after the table. W5
     (2026-11-24T22:04Z) has no equality on the HASH attribute of the KEYS_ONLY
-    index: the service refuses it ahead of the Select index check."""
+    index: the service refuses it ahead of the Select index check. A3
+    (2026-11-25T04:41Z) has no clause on that attribute, and the missed key
+    schema element also comes ahead of the Select index check."""
 
     Q = "#q = :a"
     CO = {"ConditionalOperator": "AND"}
@@ -387,6 +389,11 @@ class TestQueryCheckOrder:
             "W5",
             _q("g > :a", "a", IndexName=GSI, Select="ALL_ATTRIBUTES"),
             "Query key condition not supported",
+        ),
+        (
+            "A3",
+            _q("sk > :a", "a", IndexName=GSI, Select="ALL_ATTRIBUTES"),
+            "Query condition missed key schema element: g",
         ),
     ]
 
