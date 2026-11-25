@@ -75,20 +75,14 @@ pub(crate) fn check_transact_count(count: usize, member: &str) -> Result<(), Dyn
     Ok(())
 }
 
-/// The write-request list of one `BatchWriteItem` table as the service echoes
-/// it in a validation message, with each request printed as its type name.
-fn write_requests_repr(count: usize) -> String {
-    vec!["WriteRequest"; count].join(", ")
-}
-
 /// Check the table and item counts of a `BatchGetItem` or `BatchWriteItem`.
 ///
 /// `tables` lists each entry of `RequestItems` with its key count
 /// (`BatchGetItem`) or write-request count (`BatchWriteItem`), or `None` when
 /// the entry is not the expected shape; the handler's deserialization rejects
 /// such an entry, so it counts towards the number of tables only. The checks
-/// run in this order: an empty `RequestItems`, too many tables, too many items
-/// in one table, too many items in total, a table with no items.
+/// run in this order: an empty `RequestItems`, too many tables, tables with
+/// too many items or none, too many items in total.
 ///
 /// # Errors
 ///
@@ -113,31 +107,22 @@ pub(crate) fn check_batch_counts(
     }
 
     if tables.len() > limit {
-        return Err(DynamoDbError::ValidationException(if get {
-            "1 validation error detected: Value at 'RequestItems' failed to satisfy constraint: Member must have length less than or equal to 100".to_owned()
-        } else {
-            let map = tables
-                .iter()
-                .map(|(t, n)| format!("{t}=[{}]", write_requests_repr(n.unwrap_or(0))))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(
-                "1 validation error detected: Value '{{{map}}}' at 'requestItems' failed to satisfy constraint: Member must have length less than or equal to 25"
-            )
-        }));
+        return Err(DynamoDbError::ValidationException(format!(
+            "1 validation error detected: Value at 'RequestItems' failed to satisfy constraint: Member must have length less than or equal to {limit}"
+        )));
     }
 
-    // The service names the `BatchWriteItem` tables over the limit, at most
-    // `MAX_PARTS` of them, and counts only the tables it names. It listed
-    // two such tables in either order (measured 2026-11-20).
-    let over: Vec<&str> = tables
+    // The service names each table with too many items or none, at most
+    // `MAX_PARTS` of them, before it counts the total, and counts only the
+    // tables it names. It listed them in a different order from one send to
+    // the next (measured 2026-11-20).
+    let failed: Vec<(&str, usize)> = tables
         .iter()
-        .filter(|(_, count)| count.is_some_and(|n| n > limit))
-        .map(|&(table_name, _)| table_name)
-        .take(if get { 1 } else { MAX_PARTS })
+        .filter_map(|&(t, count)| count.filter(|&n| n == 0 || n > limit).map(|n| (t, n)))
+        .take(MAX_PARTS)
         .collect();
-    if !over.is_empty() {
-        return Err(per_table_count_error(get, &over, false));
+    if !failed.is_empty() {
+        return Err(per_table_count_error(get, limit, &failed));
     }
 
     let total: usize = tables.iter().filter_map(|(_, n)| *n).sum();
@@ -146,36 +131,24 @@ pub(crate) fn check_batch_counts(
             "Too many items requested for the {operation} call"
         )));
     }
-
-    for &(table_name, count) in tables {
-        if count == Some(0) {
-            return Err(per_table_count_error(get, &[table_name], true));
-        }
-    }
     Ok(())
 }
 
-/// The texts are the service's: a `BatchGetItem` table and an empty
-/// `BatchWriteItem` table measured 2026-10-21, a `BatchWriteItem` table over
-/// the limit 2026-11-20.
-fn per_table_count_error(get: bool, table_names: &[&str], empty: bool) -> DynamoDbError {
-    let errors = table_names
+/// The refusal naming each table of `failed`, whose key or write-request
+/// count is 0 or over `limit`, at its member path (measured 2026-11-20).
+fn per_table_count_error(get: bool, limit: usize, failed: &[(&str, usize)]) -> DynamoDbError {
+    let member = if get { "member.Keys" } else { "member" };
+    let errors = failed
         .iter()
-        .map(|table_name| match (get, empty) {
-            (true, true) => format!(
-                "Value at 'RequestItems.{table_name}.member.Keys' failed to satisfy constraint: Member must have length greater than or equal to 1"
-            ),
-            (true, false) => format!(
-                "Value at 'RequestItems.{table_name}.member.Keys' failed to satisfy constraint: Member must have length less than or equal to 100"
-            ),
-            (false, true) => format!(
-                "Value '{{{table_name}=[]}}' at 'requestItems' failed to satisfy constraint: \
-                 Map value must satisfy constraint: [Member must have length less than or equal to 25, \
-                 Member must have length greater than or equal to 1]"
-            ),
-            (false, false) => format!(
-                "Value at 'RequestItems.{table_name}.member' failed to satisfy constraint: Member must have length less than or equal to 25"
-            ),
+        .map(|&(table_name, count)| {
+            let bound = if count == 0 {
+                "greater than or equal to 1".to_owned()
+            } else {
+                format!("less than or equal to {limit}")
+            };
+            format!(
+                "Value at 'RequestItems.{table_name}.{member}' failed to satisfy constraint: Member must have length {bound}"
+            )
         })
         .collect();
     validation_refusal(errors)
@@ -315,23 +288,9 @@ mod tests {
         assert_eq!(
             message(check_request_item_counts(
                 "BatchGetItem",
-                &bgi(&[("a", 101)])
-            )),
-            "1 validation error detected: Value at 'RequestItems.a.member.Keys' failed to satisfy constraint: Member must have length less than or equal to 100"
-        );
-        assert_eq!(
-            message(check_request_item_counts(
-                "BatchGetItem",
                 &bgi(&[("a", 60), ("b", 41)])
             )),
             "Too many items requested for the BatchGetItem call"
-        );
-        assert_eq!(
-            message(check_request_item_counts(
-                "BatchGetItem",
-                &bgi(&[("a", 1), ("b", 0)])
-            )),
-            "1 validation error detected: Value at 'RequestItems.b.member.Keys' failed to satisfy constraint: Member must have length greater than or equal to 1"
         );
     }
 
@@ -342,13 +301,6 @@ mod tests {
             message(check_request_item_counts("BatchWriteItem", &bwi(&[]))),
             "The requestItems parameter is required for BatchWriteItem"
         );
-        let many = names(26);
-        let tables: Vec<(&str, usize)> = many.iter().map(|t| (t.as_str(), 1)).collect();
-        let m = message(check_request_item_counts("BatchWriteItem", &bwi(&tables)));
-        assert!(m.starts_with("1 validation error detected: Value '{t000=[WriteRequest], "));
-        assert!(m.ends_with(
-            "}' at 'requestItems' failed to satisfy constraint: Member must have length less than or equal to 25"
-        ));
         assert_eq!(
             message(check_request_item_counts(
                 "BatchWriteItem",
@@ -356,46 +308,75 @@ mod tests {
             )),
             "Too many items requested for the BatchWriteItem call"
         );
-        assert_eq!(
-            message(check_request_item_counts(
-                "BatchWriteItem",
-                &bwi(&[("a", 1), ("b", 0)])
-            )),
-            "1 validation error detected: Value '{b=[]}' at 'requestItems' failed to satisfy constraint: Map value must satisfy constraint: [Member must have length less than or equal to 25, Member must have length greater than or equal to 1]"
-        );
     }
 
     #[test]
-    fn batch_write_tables_over_the_limit_are_named_at_their_member_paths() {
-        // The service's answers to these requests (measured 2026-11-20).
-        let at = |t: &str| {
+    fn batch_count_refusals_name_each_path() {
+        // The service's answers to these requests, measured 2026-11-20, and
+        // 2026-10-21 for the last two.
+        const LE25: &str = "less than or equal to 25";
+        const LE100: &str = "less than or equal to 100";
+        const GE1: &str = "greater than or equal to 1";
+        let at = |path: &str, bound: &str| {
             format!(
-                "Value at 'RequestItems.{t}.member' failed to satisfy constraint: \
-                 Member must have length less than or equal to 25"
+                "Value at '{path}' failed to satisfy constraint: Member must have length {bound}"
             )
         };
-        let one = |t: &str| format!("1 validation error detected: {}", at(t));
-        let many = names(11);
-        let eleven: Vec<(&str, usize)> = many.iter().map(|t| (t.as_str(), 26)).collect();
-        let ten: Vec<String> = many[..10].iter().map(|t| at(t)).collect();
+        let w = |t: &str, bound: &str| at(&format!("RequestItems.{t}.member"), bound);
+        let g = |t: &str, bound: &str| at(&format!("RequestItems.{t}.member.Keys"), bound);
+        let one = |c: String| format!("1 validation error detected: {c}");
+        let two = |a: String, b: String| format!("2 validation errors detected: {a}; {b}");
+        let many = names(26);
+        let first = |n: usize, count: usize| -> Vec<(&str, usize)> {
+            many[..n].iter().map(|t| (t.as_str(), count)).collect()
+        };
+        let ten = |clause: &dyn Fn(&str) -> String| {
+            let clauses: Vec<String> = many[..10].iter().map(|t| clause(t)).collect();
+            format!("10 validation errors detected: {}", clauses.join("; "))
+        };
+        let (bw, bg) = ("BatchWriteItem", "BatchGetItem");
         let cases = [
-            (bwi(&[("t.2", 26)]), one("t.2")),
+            (bw, bwi(&[("t.2", 26)]), one(w("t.2", LE25))),
             (
+                bw,
                 bwi(&[("a", 26), ("b", 26)]),
-                format!("2 validation errors detected: {}; {}", at("a"), at("b")),
+                two(w("a", LE25), w("b", LE25)),
             ),
-            (bwi(&[("a", 1), ("b", 26)]), one("b")),
+            (bw, bwi(&[("a", 1), ("b", 26)]), one(w("b", LE25))),
+            (bw, bwi(&first(11, 26)), ten(&|t| w(t, LE25))),
+            (bw, bwi(&first(26, 1)), one(at("RequestItems", LE25))),
+            (bw, bwi(&[("a", 1), ("b", 0)]), one(w("b", GE1))),
             (
-                bwi(&eleven),
-                format!("10 validation errors detected: {}", ten.join("; ")),
+                bw,
+                bwi(&[("a", 26), ("b", 0)]),
+                two(w("a", LE25), w("b", GE1)),
             ),
+            (bw, bwi(&[("a", 20), ("b", 10), ("c", 0)]), one(w("c", GE1))),
+            (bw, bwi(&first(11, 0)), ten(&|t| w(t, GE1))),
+            (
+                bg,
+                bgi(&[("a", 101), ("b", 101)]),
+                two(g("a", LE100), g("b", LE100)),
+            ),
+            (bg, bgi(&first(11, 101)), ten(&|t| g(t, LE100))),
+            (
+                bg,
+                bgi(&[("a", 101), ("b", 0)]),
+                two(g("a", LE100), g("b", GE1)),
+            ),
+            (bg, bgi(&[("a", 60), ("b", 41), ("c", 0)]), one(g("c", GE1))),
+            (bg, bgi(&[("a", 101)]), one(g("a", LE100))),
+            (bg, bgi(&[("a", 1), ("b", 0)]), one(g("b", GE1))),
         ];
-        for (body, expected) in cases {
-            assert_eq!(
-                message(check_request_item_counts("BatchWriteItem", &body)),
-                expected
-            );
-        }
+        let failed: Vec<String> = cases
+            .into_iter()
+            .enumerate()
+            .filter_map(|(row, (op, body, expected))| {
+                let got = message(check_request_item_counts(op, &body));
+                (got != expected).then(|| format!("row {row}: {got}"))
+            })
+            .collect();
+        assert!(failed.is_empty(), "{}", failed.join("\n"));
     }
 
     #[test]
