@@ -10,7 +10,9 @@
 //! with a 300 ms propagation delay, and requires B's rows to apply while more than
 //! three quarters of A's backlog is still queued. The second test checks that a
 //! running worker leaves a held table's rows queued (the claim's hold check) and
-//! applies them once the hold is gone.
+//! applies them once the hold is gone. The third test counts the reads of
+//! `gsi_pending_pkey` while table B's rows apply behind table A's held backlog:
+//! a claim planned without B's id walks that key through every row of A.
 //!
 //! Not covered: a listed table whose claim finds nothing leaves the rotation for
 //! the rest of the batch. Ending the batch instead would apply the same rows in
@@ -45,6 +47,10 @@ const A_STILL_QUEUED: i64 = BACKLOG * 3 / 4;
 /// backstop) is the expectation; behind a 20,000 row backlog the rows took over
 /// 10 s on the test host, and over 60 s on a slow one.
 const B_CEILING: Duration = Duration::from_secs(60);
+/// PostgreSQL reports a server process's statistics at most 10 s after the
+/// process goes idle, so counters read after this wait include every statement
+/// that finished before it.
+const STATS_DELAY: Duration = Duration::from_secs(12);
 
 /// Create two tables and return `(a, b)` with `a` the one whose `table_id` sorts
 /// first. The rotation lists tables in `table_id` order, so the backlog table is
@@ -192,5 +198,94 @@ async fn a_held_tables_rows_stay_queued_until_the_hold_is_removed() {
         "{test}: table B's {ROWS} rows applied {released_after:?} after the hold was removed"
     );
     assert_eq!(index_rows(&s.db, &b.table_id).await, ROWS as i64);
+    s.cleanup().await;
+}
+
+/// The entries read from `gsi_pending_pkey` and the rows deleted from
+/// `gsi_pending`, as the cumulative statistics count them.
+async fn pkey_reads_and_deletes(s: &Scratch) -> (i64, i64) {
+    sqlx::query_as(
+        "SELECT i.idx_tup_read, t.n_tup_del FROM pg_stat_user_indexes i \
+         JOIN pg_stat_user_tables t ON t.relid = i.relid \
+         WHERE i.indexrelname = 'gsi_pending_pkey'",
+    )
+    .fetch_one(&s.db)
+    .await
+    .expect("read the queue's statistics")
+}
+
+/// Table A's backlog fills partition 0 and is analyzed, and its first 300 rows
+/// apply, so every pooled connection has run the claim more than five times: a
+/// prepared claim is then on its generic plan. A is held, which keeps its rows
+/// ahead of table B's in `id` order and stops A's own claims at the hold check.
+/// B's 8 rows then apply. A claim planned without B's id walks
+/// `gsi_pending_pkey` from the lowest `id` and reads every row of A; a claim
+/// planned with it reads `idx_gsi_pending_table_claim`, and only B's deletes
+/// read the key, one entry each.
+#[tokio::test]
+async fn a_small_tables_claim_reads_no_row_another_table_queued_ahead() {
+    let test = "a_small_tables_claim_reads_no_row_another_table_queued_ahead";
+    if base_conn().is_none() {
+        eprintln!("SKIP {test}: EXTENDDB_TEST_PG_CONNECTION_STRING is not set");
+        return;
+    }
+    let s = scratch().await;
+    let (a, b) = two_tables_backlog_first(&s).await;
+    set_delay_ms(&s.db, 60_000).await;
+    let ta = template_row(&s, &a).await;
+    let tb = template_row(&s, &b).await;
+    enqueue_rows(&s, &a, &ta, "a", BACKLOG, Some(0), Duration::ZERO).await;
+    sqlx::query("ANALYZE gsi_pending")
+        .execute(&s.db)
+        .await
+        .expect("analyze the queue");
+    let started = Instant::now();
+    while pending(&s.db, &a.table_id).await > BACKLOG - 300 {
+        assert!(
+            started.elapsed() < B_CEILING,
+            "table A applied fewer than 300 rows in {B_CEILING:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    sqlx::query("INSERT INTO vector_index_holds (table_id, index_id) VALUES ($1, 'building')")
+        .bind(&a.table_id)
+        .execute(&s.db)
+        .await
+        .expect("hold table A");
+    // A claim that read the queue before the hold committed can still apply.
+    let mut a_left = pending(&s.db, &a.table_id).await;
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let now = pending(&s.db, &a.table_id).await;
+        if now == a_left {
+            break;
+        }
+        a_left = now;
+    }
+    tokio::time::sleep(STATS_DELAY).await;
+    let (reads_before, deletes_before) = pkey_reads_and_deletes(&s).await;
+
+    enqueue_rows(&s, &b, &tb, "b", B_ROWS as i64, Some(0), Duration::ZERO).await;
+    let applied_after = wait_applied(&s, &b, B_CEILING, "table B").await;
+    assert_eq!(index_rows(&s.db, &b.table_id).await, B_ROWS as i64);
+    tokio::time::sleep(STATS_DELAY).await;
+    let (reads_after, deletes_after) = pkey_reads_and_deletes(&s).await;
+    assert_eq!(
+        deletes_after - deletes_before,
+        B_ROWS as i64,
+        "the statistics count table B's deletes"
+    );
+    let reads = reads_after - reads_before;
+    eprintln!(
+        "{test}: table B's {B_ROWS} rows applied {applied_after:?} after they were queued, \
+         behind {a_left} held rows of table A; gsi_pending_pkey entries read meanwhile: {reads}"
+    );
+    assert!(
+        reads < a_left / 4,
+        "table B's claims read {reads} entries of gsi_pending_pkey with {a_left} rows of table A \
+         queued ahead of B's rows: a claim walked the key and filtered on the table (the bound is \
+         under {})",
+        a_left / 4
+    );
     s.cleanup().await;
 }

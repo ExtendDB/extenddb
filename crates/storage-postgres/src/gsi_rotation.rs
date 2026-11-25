@@ -88,6 +88,14 @@ pub(crate) async fn process_batch(
         // commits before the index it guards is published. Bound to the table rather
         // than correlated, so the planner evaluates it once and walks
         // `idx_gsi_pending_table_claim` in `id` order to the first ready row.
+        //
+        // The claim is sent unprepared, so PostgreSQL plans it with this table's id
+        // every time. Kept prepared, it gets a generic plan from its sixth
+        // execution on a connection. Once statistics show one table dominating a
+        // partition, that plan walks `gsi_pending_pkey` from the lowest `id` and
+        // filters on `table_id`, so a small table's claim reads every row queued
+        // ahead of its first one (168 ms at 1,000,000 rows on PostgreSQL 16,
+        // against 0.03 ms for the plan made with the table id).
         let row: Option<ClaimedRow> = sqlx::query_as(
             "SELECT id, table_id, old_item, new_item, index_context FROM gsi_pending \
              WHERE worker_partition = $1 AND table_id = $2 AND ready_at <= NOW() \
@@ -97,6 +105,7 @@ pub(crate) async fn process_batch(
              LIMIT 1 \
              FOR UPDATE SKIP LOCKED",
         )
+        .persistent(false)
         .bind(worker_id as i32)
         .bind(&table_id)
         .bind(&skip)

@@ -8,19 +8,22 @@
 -- ready_at <= NOW() ORDER BY id LIMIT 1. The existing claim index leads on
 -- (worker_partition, ready_at), which cannot return one table's rows in id order
 -- without reading and sorting every ready row in the partition. This index
--- returns them directly, so a claim reads one index entry whatever another
--- table's backlog is. Within a partition ready_at never decreases with id (the
--- enqueue floors it), so a table's first row in id order is also its earliest
--- ready one and the scan stops at the first entry.
+-- returns them directly, so a claim planned with its table id reads one index
+-- entry whatever another table's backlog is. Within a partition ready_at never
+-- decreases with id (the enqueue floors it), so a table's first row in id order
+-- is also its earliest ready one and the scan stops at the first entry.
 --
 -- The same index serves the per-batch listing of the tables with a ready row
 -- in the partition: one probe per table to its lowest-id entry, whose row's
 -- ready_at decides whether the table is listed.
 --
--- With statistics present the planner serves the dominant table's claim from
--- gsi_pending_pkey (its rows are at the head of the id order); this index is
--- the plan for a small table in a partition another table dominates, and for a
--- table before its first ANALYZE. Both plans are under 0.05 ms.
+-- With statistics present, a plan made with the claim's parameters serves the
+-- dominant table's claim from gsi_pending_pkey (its rows are at the head of the
+-- id order) and uses this index for a small table in a partition another table
+-- dominates, and for a table before its first ANALYZE. Both plans are under
+-- 0.05 ms. A generic plan, made without the table id, scans gsi_pending_pkey
+-- for the small table as well and reads every row queued ahead of its first
+-- one, so the worker sends the claim unprepared.
 --
 -- `extenddb migrate --yes` applies it during the stop / migrate / start
 -- upgrade sequence, and a server refuses a deployment where it is pending.
