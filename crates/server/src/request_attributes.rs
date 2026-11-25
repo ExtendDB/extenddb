@@ -403,7 +403,7 @@ impl<'a> Names<'a> {
             self.limits.max_expression_tokens,
             ExpressionKind::Update,
         )
-        .and_then(|tokens| parse_update_from(&tokens, text));
+        .and_then(|tokens| parse_update_from(&tokens, text, self.limits.max_expression_depth));
         for action in parsed.iter().flatten() {
             match action {
                 UpdateAction::Set { path, .. }
@@ -491,5 +491,7 @@ impl<'a> Names<'a> {
     }
 }
 
+#[cfg(test)]
+mod depth_tests;
 #[cfg(test)]
 mod tests;

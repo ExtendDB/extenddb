@@ -40,7 +40,7 @@ fuzz_target!(|data: &[u8]| {
     let max_tokens = limits.max_expression_tokens;
     if is_update {
         if let Ok(tokens) = tokenize_for(expr, max_tokens, ExpressionKind::Update) {
-            if let Ok(actions) = parse_update_from(&tokens, expr) {
+            if let Ok(actions) = parse_update_from(&tokens, expr, limits.max_expression_depth) {
                 // Empty vector-index and attribute-definition slices: a table
                 // without vector indexes, which is the common case and a valid
                 // call (see the Cassandra update path).

@@ -7,7 +7,8 @@
 //! so `init_stream_shards` (`stream_lifecycle.rs`) runs in the caller's
 //! catalog transaction. Monotonic sequence numbers come from the
 //! `seq_counters` table (there is no PostgreSQL sequence). Retention cleanup
-//! compares an RFC 3339 cutoff computed in Rust.
+//! compares a text cutoff computed in Rust in the millisecond shape of the
+//! `created_at` column.
 
 use extenddb_core::types::{DescribeStreamInput, StreamDescription, StreamRecord};
 use extenddb_storage::error::StorageError;
@@ -16,8 +17,24 @@ use extenddb_storage::util::{parse_stream_arn, shard_in_stream, stream_arn};
 use extenddb_storage::{StreamEngine, StreamListResult, StreamRecordsResult};
 use futures::future::BoxFuture;
 
-use crate::sqlite_util::format_timestamp;
+use crate::sqlite_util::format_epoch_millis;
 use crate::store::SqliteEngine;
+
+/// Retention cutoff for `stream_records.created_at`: `now` minus
+/// `retention_hours`, rendered in the column's own millisecond shape
+/// (`2026-10-23T14:19:07.000Z`). The sweep compares text, so the cutoff has to
+/// carry the same three fraction digits as the rows. An RFC 3339 cutoff drops
+/// the fraction on a whole second (`...07Z`), and `Z` sorts after `.`, which
+/// put every row of that second (`...07.000Z` to `...07.999Z`) before the
+/// cutoff and deleted them up to 999 ms early.
+fn retention_cutoff(now: time::OffsetDateTime, retention_hours: i64) -> String {
+    let cutoff = now - time::Duration::hours(retention_hours);
+    let cutoff_ms = cutoff
+        .unix_timestamp()
+        .saturating_mul(1_000)
+        .saturating_add(i64::from(cutoff.millisecond()));
+    format_epoch_millis(cutoff_ms)
+}
 
 /// Most stream records one retention cleanup statement deletes. Each statement
 /// holds the engine write lock for its own duration only, so this bounds how
@@ -50,9 +67,30 @@ pub(crate) const DELETE_EXPIRED_STREAM_RECORDS_BATCH: &str = "DELETE FROM stream
      ORDER BY created_at LIMIT ?2)";
 
 impl SqliteEngine {
-    /// Delete the stream records created before `cutoff`, at most `batch_rows`
-    /// per statement, until a statement deletes fewer than `batch_rows`.
-    /// Returns the records deleted and the statements run.
+    /// The retention sweep with the clock passed in: renders the cutoff from
+    /// `now`, deletes the rows before it in batches and returns the count. The
+    /// trait method calls this with the wall clock; tests call it with a fixed
+    /// `now` so the production path is what runs. The trait method reads the
+    /// clock before the first batch takes the lock, so a record written while
+    /// the sweep waits for the lock is newer than the cutoff and stays.
+    pub(crate) async fn cleanup_expired_stream_records_at(
+        &self,
+        now: time::OffsetDateTime,
+        retention_hours: i64,
+    ) -> Result<u64, StorageError> {
+        // One cutoff for the whole run, so the batches delete exactly the
+        // records that had expired when the run started.
+        let cutoff = retention_cutoff(now, retention_hours);
+        let (deleted, _) = self
+            .delete_stream_records_before(&cutoff, STREAM_CLEANUP_BATCH_ROWS)
+            .await?;
+        Ok(deleted)
+    }
+
+    /// Delete the stream records whose `created_at` sorts before `cutoff`, at
+    /// most `batch_rows` per statement, until a statement deletes fewer than
+    /// `batch_rows`. Both sides are text in the column's shape. Returns the
+    /// records deleted and the statements run.
     ///
     /// Each statement takes the engine write lock (D1) for itself and releases
     /// it before the next one. The lock is a FIFO tokio mutex, so a write that
@@ -308,15 +346,8 @@ impl StreamEngine for SqliteEngine {
         retention_hours: i64,
     ) -> BoxFuture<'_, Result<u64, StorageError>> {
         Box::pin(async move {
-            // One cutoff for the whole run, so the batches delete exactly the
-            // records that had expired when the run started.
-            let cutoff = format_timestamp(
-                time::OffsetDateTime::now_utc() - time::Duration::hours(retention_hours),
-            );
-            let (deleted, _) = self
-                .delete_stream_records_before(&cutoff, STREAM_CLEANUP_BATCH_ROWS)
-                .await?;
-            Ok(deleted)
+            self.cleanup_expired_stream_records_at(time::OffsetDateTime::now_utc(), retention_hours)
+                .await
         })
     }
 
@@ -428,6 +459,18 @@ impl StreamEngine for SqliteEngine {
             Ok(row.map(|(s,)| s))
         })
     }
+
+    fn first_sequence_number_at_or_after(
+        &self,
+        shard_id: &str,
+        at_ms: i64,
+    ) -> BoxFuture<'_, Result<Option<String>, StorageError>> {
+        let shard_id = shard_id.to_owned();
+        Box::pin(async move {
+            self.first_sequence_number_at_or_after_impl(&shard_id, at_ms)
+                .await
+        })
+    }
 }
 
 impl SqliteEngine {
@@ -449,3 +492,6 @@ impl SqliteEngine {
         Ok(found != 0)
     }
 }
+
+#[cfg(test)]
+mod retention_cutoff_tests;

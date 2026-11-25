@@ -161,25 +161,6 @@ pub fn arb_expression_maps(u: &mut Unstructured) -> ExpressionMaps {
     ExpressionMaps::new(names, values)
 }
 
-/// Build a header map of up to three arbitrary name and value pairs. Bytes that
-/// are not a valid header name or value are skipped, as the HTTP layer would
-/// reject them before these parsers ever run.
-pub fn build_header_map(u: &mut Unstructured) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    let count = (byte(u) & 0x3) as usize;
-    for _ in 0..count {
-        let name = bytes_vec(u);
-        let value = bytes_vec(u);
-        if let (Ok(n), Ok(v)) = (
-            HeaderName::from_bytes(&name),
-            HeaderValue::from_bytes(&value),
-        ) {
-            headers.insert(n, v);
-        }
-    }
-    headers
-}
-
 /// Set one fixed-name header from raw bytes, skipping bytes that are not a valid
 /// header value.
 pub fn insert_header(headers: &mut HeaderMap, name: &'static str, value: &[u8]) {
