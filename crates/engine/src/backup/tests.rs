@@ -1822,6 +1822,20 @@ fn runtime_on(mem: &Arc<MemStore>, identity: StoreIdentity) -> BackupRuntime {
     ))
 }
 
+/// A `RestoreTableFromBackup` whose backup row is AVAILABLE on the configured
+/// store, and whose store refuses every read under the backup's prefix: the
+/// request's read of the manifest's sidecar fails. The catalog, the runtime
+/// and the request body.
+pub(crate) fn restore_from_an_unreadable_store() -> (Arc<Fake>, BackupRuntime, Value) {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let arn = arn(ACCOUNT);
+    seed_rows(&fake, &[row(&arn, BackupStatus::Available)]);
+    *mem.fail_gets_under.lock().unwrap() = Some(prefix_of(&arn));
+    (fake, runtime, restore_body(json!({})))
+}
+
 /// A runtime whose configured store (`store()`'s kind and root) failed its
 /// startup check with `problem`: the id is unknown.
 fn runtime_unhealthy(mem: &Arc<MemStore>, problem: StoreProblem) -> BackupRuntime {

@@ -154,7 +154,7 @@ pub fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> Dynamo
         // Raised by the backup catalog's claim alone, whose caller handles
         // it; here it is a programming error, reported without the row.
         StorageError::AlreadyExists(msg) => {
-            tracing::error!(internal_error = %msg, "unexpected already-exists storage error");
+            log_storage_fault!(msg, "unexpected already-exists storage error");
             DynamoDbError::InternalServerError("Internal server error".to_owned())
         }
         // The resource exists and the request is well formed; its current state
@@ -166,21 +166,21 @@ pub fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> Dynamo
         StorageError::LimitExceeded(msg) => DynamoDbError::LimitExceededException(msg), // Retryable by definition, so it maps like Connection: a 503 the SDKs
         // retry, rather than a 500 they surface.
         StorageError::Transient(msg) => {
-            tracing::warn!(transient_error = %msg, "transient storage error");
+            log_storage_fault!(warn, transient_error = msg, "transient storage error");
             DynamoDbError::ServiceUnavailable("Service is temporarily unavailable".to_owned())
         }
         // Only backup and export jobs hold snapshots; a request that reaches
         // this arm lost one mid-operation. The job owner restarts it; the
         // client sees the same retryable 503 as a transient fault.
         StorageError::SnapshotExpired(msg) => {
-            tracing::warn!(snapshot_error = %msg, "storage snapshot expired");
+            log_storage_fault!(warn, snapshot_error = msg, "storage snapshot expired");
             DynamoDbError::ServiceUnavailable("Service is temporarily unavailable".to_owned())
         }
         StorageError::DeletionProtected(arn) => DynamoDbError::ValidationException(format!(
             "Resource '{arn}' cannot be deleted as it is currently protected against deletion. Disable deletion protection first then try again."
         )),
         StorageError::Connection(msg) => {
-            tracing::error!(internal_error = %msg, "storage connection error");
+            log_storage_fault!(msg, "storage connection error");
             DynamoDbError::ServiceUnavailable("Service is temporarily unavailable".to_owned())
         }
         // Not a fault, so deliberately not logged at error level: the backend

@@ -433,7 +433,7 @@ The server sets `extenddb_storage::request_scope::RequestScope` around each clie
 
 The scope is a Tokio task-local. Both accessors return `None` in a task started with `tokio::spawn` or `spawn_blocking`, in background workers and in tests. A backend does not keep the scope beyond the call that read it. A backend that spawns a task on behalf of a request and wants that task's lines correlated reads `current()` before the spawn and runs the task's future through `request_scope::with_scope_opt`. The two SDK fields are header values the client chose, each at most 256 bytes of visible ASCII; treat them as untrusted text and do not use them in a query, a key or a file name.
 
-Construct a scope only through `RequestScope::new` and `with_sdk_headers`; the struct is `#[non_exhaustive]` and may gain fields in a minor release. The engine's own `storage internal error` and `backup storage error` lines already carry `request_id` and `operation`, so a backend that returns an error without logging still gets one correlated line.
+Construct a scope only through `RequestScope::new` and `with_sdk_headers`; the struct is `#[non_exhaustive]` and may gain fields in a minor release. The engine's own fault lines carry `request_id` and `operation`: `storage internal error` and `backup storage error`, the `storage connection error` and `transient storage error` lines of the shared error mapper, and the line for a backup store read that fails during a restore. A backend that returns `Internal`, `Connection` or `Transient` without logging still gets one correlated line.
 
 ## PostgreSQL-isms in the Default Backend
 
