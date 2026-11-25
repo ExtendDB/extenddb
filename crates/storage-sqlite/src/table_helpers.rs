@@ -12,8 +12,7 @@ use extenddb_core::types::{
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{
-    index_arn, parse_warm_throughput_record, reported_status, stream_arn,
-    table_throughput_description,
+    TableThroughputRecord, index_arn, parse_warm_throughput_record, reported_status, stream_arn,
 };
 use extenddb_storage::vector_catalog::{VectorIndexCatalogRow, vector_index_descriptions};
 
@@ -273,12 +272,18 @@ impl SqliteEngine {
             .map(|s| parse_json(s, "stream_specification"))
             .transpose()?;
 
-        let provisioned_throughput = table_throughput_description(
-            row.provisioned_throughput
-                .as_deref()
-                .map(|s| parse_json(s, "provisioned_throughput"))
-                .transpose()?,
-        );
+        // One clock read for the throughput and the status, so both compare
+        // the end of an UPDATING window with the same instant.
+        let now = time::OffsetDateTime::now_utc();
+        let provisioned_throughput = row
+            .provisioned_throughput
+            .as_deref()
+            .map(|s| parse_json::<TableThroughputRecord>(s, "provisioned_throughput"))
+            .transpose()?
+            .map(|record| {
+                record.description((now - time::OffsetDateTime::UNIX_EPOCH).as_seconds_f64())
+            })
+            .unwrap_or_default();
 
         let stored_status = match row.table_status.as_str() {
             "ACTIVE" => TableStatus::Active,
@@ -297,11 +302,7 @@ impl SqliteEngine {
             .map(parse_timestamp)
             .transpose()
             .map_err(|e| StorageError::Internal(format!("Parse status_transition_at: {e}")))?;
-        let table_status = reported_status(
-            stored_status,
-            transition_at,
-            time::OffsetDateTime::now_utc(),
-        );
+        let table_status = reported_status(stored_status, transition_at, now);
 
         let creation_epoch = parse_timestamp(&row.creation_date_time)
             .map(|dt| dt.unix_timestamp() as f64)
