@@ -4,7 +4,7 @@
 //! Unit tests for `BuiltinAuthProvider::authenticate`.
 
 use super::*;
-use axum::http::{HeaderMap, HeaderValue};
+use http::{HeaderMap, HeaderValue};
 
 /// In-memory credential store for unit tests.
 pub(super) struct MockCredentialStore {
