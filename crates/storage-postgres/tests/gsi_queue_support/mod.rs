@@ -1,139 +1,50 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
-//! Scratch database and table helpers shared by the GSI queue storage-level
-//! tests (`gsi_queue_fairness.rs`, `gsi_queue_many_tables.rs`).
+//! Table and queue helpers shared by the GSI queue storage-level tests
+//! (`gsi_queue_fairness.rs`, `gsi_queue_many_tables.rs`), on the scratch
+//! database of `tests/common/stream_disable_fixture.rs`.
 //!
 //! Each test builds its own throwaway database, applies the shipped migrations
 //! to it, and drops it when it passes. A failing test leaves its database behind,
-//! named `eddb_gsiq_*`, so the state that failed can be inspected.
+//! named `eddb_sdis_*`, so the state that failed can be inspected.
 //!
 //! Requires `EXTENDDB_TEST_PG_CONNECTION_STRING`, a base URL with no database
 //! component (for example `postgresql://postgres@127.0.0.1:5432`), pointing at a
 //! server whose role may create and drop databases. Without it each test reports
-//! a skip and passes, the same convention the wire suites use.
+//! a skip and passes. With `EXTENDDB_TEST_PG_REQUIRED` set to any value but `0`,
+//! the fixture's `base_conn` fails each test instead.
 
 #![allow(dead_code)]
+
+// The fixture re-exports the types the stream disable tests need; these tests
+// use its scratch database, its skip check and its table input only.
+#[path = "../common/stream_disable_fixture.rs"]
+#[allow(unused_imports)]
+mod fixture;
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 use extenddb_core::expression::ExpressionMaps;
 use extenddb_core::types::{
-    AttributeDefinition, AttributeValue, BillingMode, CreateTableInput, GsiInput, Item,
-    KeySchemaElement, KeyType, Projection, ProjectionType, ScalarAttributeType, TableKeyInfo,
+    AttributeDefinition, AttributeValue, GsiInput, KeySchemaElement, KeyType, Projection,
+    ProjectionType, ScalarAttributeType, TableKeyInfo,
 };
 use extenddb_storage::{DataEngine, TableEngine};
-use extenddb_storage_postgres::{PostgresConfig, PostgresEngine};
+use fixture::{ACCOUNT, table_input};
+pub use fixture::{Scratch, base_conn};
 use sqlx::PgPool;
-use sqlx::postgres::PgPoolOptions;
 
-pub const ACCOUNT: &str = "123456789012";
-pub const REGION: &str = "us-east-1";
-
-pub struct Scratch {
-    pub engine: PostgresEngine,
-    pub db: PgPool,
-    pub admin: PgPool,
-    pub db_name: String,
-}
-
-impl Scratch {
-    pub async fn cleanup(self) {
-        let Scratch {
-            engine,
-            db,
-            admin,
-            db_name,
-        } = self;
-        drop(engine);
-        db.close().await;
-        sqlx::query(&format!(
-            "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
-        ))
-        .execute(&admin)
-        .await
-        .expect("drop the scratch database");
-        admin.close().await;
-    }
-}
-
-pub fn base_conn() -> Option<String> {
-    let conn = std::env::var("EXTENDDB_TEST_PG_CONNECTION_STRING").ok()?;
-    (!conn.trim().is_empty()).then(|| conn.trim_end_matches('/').to_owned())
-}
-
-/// Every `.sql` file under `migrations/` and `data_migrations/`, each directory
-/// in filename order.
-fn shipped_migrations() -> Vec<String> {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut out = Vec::new();
-    for dir in ["migrations", "data_migrations"] {
-        let mut files: Vec<_> = std::fs::read_dir(root.join(dir))
-            .expect("read the migrations directory")
-            .map(|e| e.expect("directory entry").path())
-            .filter(|p| p.extension().is_some_and(|e| e == "sql"))
-            .collect();
-        files.sort();
-        for f in files {
-            out.push(std::fs::read_to_string(&f).expect("read a migration file"));
-        }
-    }
-    out
-}
-
-/// A scratch database with every shipped migration applied, the control-plane
-/// delay pinned to zero, one account, and an engine with its queue workers
-/// started.
+/// The fixture's scratch database, with the engine's queue workers started.
 pub async fn scratch() -> Scratch {
-    let base = base_conn().expect("caller checks base_conn() first");
-    let db_name = format!("eddb_gsiq_{}", uuid::Uuid::new_v4().simple())[..24].to_owned();
-    let admin = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&format!("{base}/postgres"))
-        .await
-        .expect("connect to the postgres maintenance database");
-    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
-        .execute(&admin)
-        .await
-        .expect("create the scratch database");
-    let url = format!("{base}/{db_name}");
-    let db = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&url)
-        .await
-        .expect("connect to the scratch database");
-    for sql in shipped_migrations() {
-        sqlx::raw_sql(&sql)
-            .execute(&db)
-            .await
-            .expect("apply a shipped migration");
-    }
-    sqlx::query(
-        "INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0') \
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-    )
-    .execute(&db)
-    .await
-    .expect("pin the control-plane delay to zero");
-    sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES ($1, $2)")
-        .bind(ACCOUNT)
-        .bind(format!("acct-{db_name}"))
-        .execute(&db)
-        .await
-        .expect("seed the account row");
-    let engine = PostgresEngine::new(
-        &PostgresConfig {
-            connection_string: url,
-            pool_size: 10,
-            max_item_size_bytes: 400_000,
-        },
-        REGION,
-    )
-    .await
-    .expect("open a PostgresEngine on the scratch database")
-    .start_gsi_workers();
-    Scratch {
+    let Scratch {
         engine,
+        db,
+        admin,
+        db_name,
+    } = fixture::scratch().await;
+    Scratch {
+        engine: engine.start_gsi_workers(),
         db,
         admin,
         db_name,
@@ -151,43 +62,29 @@ pub async fn set_delay_ms(db: &PgPool, ms: u64) {
     .expect("set the propagation delay");
 }
 
-fn s_attr(name: &str) -> AttributeDefinition {
-    AttributeDefinition {
-        attribute_name: name.to_owned(),
-        attribute_type: ScalarAttributeType::S,
-    }
-}
-
-fn hash_key(name: &str) -> KeySchemaElement {
-    KeySchemaElement {
-        attribute_name: name.to_owned(),
-        key_type: KeyType::Hash,
-    }
-}
-
-/// Create `name`, keyed on `pk`, with one GSI `gidx` keyed on `g`.
+/// Create `name`, the fixture's table keyed on `pk`, with one GSI `gidx` keyed
+/// on `g`.
 pub async fn table_with_gsi(s: &Scratch, name: &str) -> TableKeyInfo {
+    let mut input = table_input(name, false);
+    input.attribute_definitions.push(AttributeDefinition {
+        attribute_name: "g".to_owned(),
+        attribute_type: ScalarAttributeType::S,
+    });
+    input.global_secondary_indexes = Some(vec![GsiInput {
+        index_name: "gidx".to_owned(),
+        key_schema: vec![KeySchemaElement {
+            attribute_name: "g".to_owned(),
+            key_type: KeyType::Hash,
+        }],
+        projection: Projection {
+            projection_type: ProjectionType::All,
+            non_key_attributes: None,
+        },
+        provisioned_throughput: None,
+        warm_throughput: None,
+    }]);
     s.engine
-        .create_table(
-            ACCOUNT,
-            CreateTableInput {
-                table_name: name.to_owned(),
-                key_schema: vec![hash_key("pk")],
-                attribute_definitions: vec![s_attr("pk"), s_attr("g")],
-                billing_mode: Some(BillingMode::PayPerRequest),
-                global_secondary_indexes: Some(vec![GsiInput {
-                    index_name: "gidx".to_owned(),
-                    key_schema: vec![hash_key("g")],
-                    projection: Projection {
-                        projection_type: ProjectionType::All,
-                        non_key_attributes: None,
-                    },
-                    provisioned_throughput: None,
-                    warm_throughput: None,
-                }]),
-                ..Default::default()
-            },
-        )
+        .create_table(ACCOUNT, input)
         .await
         .expect("create the table");
     s.engine
@@ -196,17 +93,14 @@ pub async fn table_with_gsi(s: &Scratch, name: &str) -> TableKeyInfo {
         .expect("read the key info")
 }
 
-pub fn item(pk: &str, g: &str) -> Item {
-    BTreeMap::from([
+pub async fn put(s: &Scratch, key_info: &TableKeyInfo, pk: &str, g: &str) {
+    let item = BTreeMap::from([
         ("pk".to_owned(), AttributeValue::S(pk.to_owned())),
         ("g".to_owned(), AttributeValue::S(g.to_owned())),
-    ])
-}
-
-pub async fn put(s: &Scratch, key_info: &TableKeyInfo, pk: &str, g: &str) {
+    ]);
     let maps = ExpressionMaps::default();
     s.engine
-        .put_item(key_info, item(pk, g), false, None, &maps, None)
+        .put_item(key_info, item, false, None, &maps, None)
         .await
         .expect("put the item");
 }
