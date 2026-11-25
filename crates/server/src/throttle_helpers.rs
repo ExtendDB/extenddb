@@ -506,7 +506,8 @@ mod partial_batch_throttle_tests {
     #[test]
     fn a_partial_batch_records_one_throttle_event_per_throttled_entry() {
         type Events<'a> = &'a [(&'a str, (f64, u64))];
-        let rows: [(&str, &[(&str, u32)], Events, Events); 4] = [
+        type Row<'a> = (&'a str, &'a [(&'a str, u32)], Events<'a>, Events<'a>);
+        let rows: [Row; 4] = [
             (
                 "BatchGetItem",
                 &[("T", 3), ("U", 1)],
