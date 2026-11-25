@@ -2238,7 +2238,9 @@ def test_backup_and_table_names_are_validated(dynamodb_client):
     255 and [a-zA-Z0-9_.-]+, with the service's texts (measured on DynamoDB;
     the order of the two clauses when both fail was not captured, so it is
     asserted exactly on ExtendDB and as membership on the service). The
-    restore names a backup that does not exist: the service checks the
+    rows with names in both override lists compare one name's two clauses
+    as a set on both.
+    The restore names a backup that does not exist: the service checks the
     IndexName before it reads the backup. Its TargetTableName gets the
     restore's own length text, counted in UTF-16 code units, before the
     member constraints (measured on 20 Nov 2026). Sent
