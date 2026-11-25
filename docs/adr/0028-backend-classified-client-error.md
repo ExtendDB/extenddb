@@ -57,10 +57,14 @@ item, as the engine's own `ConditionFailed` does on the generic path, and only
 the conditional check mapping returns the item, to a request that set
 `ReturnValuesOnConditionCheckFailure` to `ALL_OLD`.
 
-Two answers outside these functions depend on the error's class. In a
+Three answers outside these functions depend on the error's class. In a
 `BatchExecuteStatement` response, the entry of a statement that failed with a
 throttle, an item collection size limit or an internal error carries the code
 that the API Reference lists for that class (`BatchStatementError`).
+`BatchGetItem` and `BatchWriteItem` hold back a throttle error for one entry
+and return the entry as unprocessed for the client to send again; the storage
+design (`docs/design/04-component-storage.md`, Error Types) states the rule
+this puts on a backend's writes.
 The server reads a table's key schema before the IAM decision, which needs it
 for `dynamodb:LeadingKeys`, so that read treats a `ResourceNotFoundException`
 as a missing table: a caller the IAM decision refuses gets the refusal, not the

@@ -362,6 +362,18 @@ must be service-shaped text with no driver output, host names, connection
 strings or credentials, and a failure the backend cannot classify stays
 `Internal`.
 
+`BatchGetItem` and `BatchWriteItem` do not return a throttle error
+(`ProvisionedThroughputExceededException`, `ThrottlingException` or
+`RequestLimitExceeded` inside `Service`) for one entry to the client at once.
+The engine puts that entry in `UnprocessedKeys` or `UnprocessedItems`, goes on
+with the other entries, and answers the first throttle error only when every
+entry of the batch was throttled. The client sends the unprocessed entries
+again. So a backend reports a throttle for a write only when the write did not
+commit, and reports a write whose commit outcome it does not know as
+`Internal`, which fails the batch with 500. If a backend reported a throttle
+for a write that had committed, the client's replay would apply the write a
+second time and write a second stream record.
+
 ## 5. PostgreSQL Backend Implementation
 
 ### 5.1 Schema Design
