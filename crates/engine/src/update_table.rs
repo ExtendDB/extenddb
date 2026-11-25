@@ -168,8 +168,11 @@ pub async fn handle_update_table(
     // Create or Delete (the index sentence), and an index WarmThroughput or
     // DeletionProtection (their only-operation sentences) are refused by
     // `stream_change_companion`, after the index checks above and the stream
-    // state check below. Not measured: the order of TableClass against those,
-    // and OnDemandThroughput beside a stream change, which stays accepted.
+    // state check below. Not measured: the order of TableClass against those;
+    // the order of the stream state refusals against the index, WarmThroughput
+    // and DeletionProtection sentences (measured against the IOPS sentence and
+    // a bare index Update only); and OnDemandThroughput beside a stream change,
+    // which stays accepted.
     if input.stream_specification.is_some() && input.table_class.is_some() {
         return Err(DynamoDbError::ValidationException(
             extenddb_core::validation::TABLE_CLASS_MUST_BE_ONLY_OPERATION.to_owned(),
