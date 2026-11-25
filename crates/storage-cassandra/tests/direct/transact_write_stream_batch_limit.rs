@@ -135,6 +135,7 @@ async fn two_gsi_table(engine: &CassandraEngine) -> (TableKeyInfo, DropKeyspaces
             non_key_attributes: None,
         },
         provisioned_throughput: None,
+        warm_throughput: None,
     };
     let attribute_definitions = vec![
         string_attribute("id"),

@@ -10,14 +10,24 @@
 //! the checksum test prints.
 //!
 //! Entry points: [`catalog_status`] reads, [`migrate`] takes the database's
-//! lock and applies, [`migrate_holding`] applies for a caller that already
-//! holds the lock (the server's factory), and [`SqliteMigrations::on_pool`]
-//! runs on an in-memory database's single connection.
+//! lock and applies, [`migrate_holding`](file_database::migrate_holding)
+//! applies for a caller that already holds the lock (the server's factory),
+//! and [`SqliteMigrations::on_pool`] runs on an in-memory database's single
+//! connection.
 
 mod backend;
+// `CatalogMigrations`, which the `extenddb` commands call.
+#[cfg(not(target_arch = "wasm32"))]
 mod commands;
+// The copy taken before a migration, through `libsqlite3-sys`'s online backup.
+#[cfg(not(target_arch = "wasm32"))]
 mod copy;
+// Creates and opens database files, for `SqliteMigrations::open_with` only.
+#[cfg(not(target_arch = "wasm32"))]
 mod open;
+// Locks, reads and migrates a database file; wasm32 opens none.
+#[cfg(not(target_arch = "wasm32"))]
+mod file_database;
 // The migration bodies are frozen once released: neither rustfmt nor a later
 // clippy lint may require an edit that changes their checksums.
 #[rustfmt::skip]
@@ -32,29 +42,147 @@ mod m0004_index_table_base_key;
 #[rustfmt::skip]
 #[allow(clippy::all, deprecated)]
 mod m0006_backup_catalog_index;
+#[rustfmt::skip]
+#[allow(clippy::all, deprecated)]
+mod m0009_warm_throughput;
 mod postcheck;
-
-use std::time::Duration;
 
 use extenddb_storage::file_body;
 use extenddb_storage::migrations::m0002_resource_tag_condition_keys::{
     self, ResourceTagConditionKeys,
 };
 use extenddb_storage::migrations::{
-    CatalogStatus, Kind, Migration, MigrationBackend, MigrationError, MigrationId, Released,
-    RunReport, Runner, StoreBody, StoreKind,
+    Kind, Migration, MigrationError, MigrationId, Released, RunReport, Runner, StoreBody, StoreKind,
 };
 
 pub use backend::{SqliteMigrations, SqliteStores};
-pub use commands::SqliteCatalogMigrations;
+// From `commands` and `file_database`, which wasm32 does not compile.
+#[cfg(not(target_arch = "wasm32"))]
+pub use {
+    commands::SqliteCatalogMigrations,
+    file_database::{catalog_status, lock_for_migration, migrate},
+};
+// Callers of these are native only: the commands and the server's factory.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use file_database::{in_memory_refusal, log_report, prepare_for_serve};
 
 /// The definitions migration 1 creates in an empty database, which the
 /// post-check compares the database with the first time migration 1 is
 /// applied to it.
 const BASELINE_EXPECTED: &str = include_str!("../../migrations/0001_baseline.expected.json");
 
-/// Checksums of the released bodies (none until v1.0).
-pub(crate) const RELEASED: &[Released] = &[];
+/// Checksums of the released bodies, every migration at or below
+/// `RELEASED_THROUGH`.
+pub(crate) const RELEASED: &[Released] = &[
+    Released {
+        id: MigrationId::Baseline,
+        store: StoreKind::Catalog,
+        checksum: "b72a83faad465556bceeb9c37554abbbc3aca316abd2823c3b117cd39e62349c",
+        fingerprint: Some("0001_baseline/sqlite/1"),
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::ResourceTagConditionKeys,
+        store: StoreKind::Catalog,
+        checksum: "80c502c54ef9240ab5f64b24b060261a295e41d29954d9b492b83c64c444170e",
+        fingerprint: Some("0002_resource_tag_condition_keys/1"),
+        kind: Kind::Breaking,
+        convergent: false,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::SortKeyDefinitions,
+        store: StoreKind::Catalog,
+        checksum: "a6f6841cb02734cc578f82b50ceb05fd7600d1647e6a0fed9e46fcd0c28c0e97",
+        fingerprint: Some("0003_sort_key_definitions/sqlite/1"),
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::IndexTableBaseKey,
+        store: StoreKind::Catalog,
+        checksum: "33863368aef25b7d9e678ddb4c9676de5a3c0408c818e4b3a91a88253d1b46c2",
+        fingerprint: Some("0004_index_table_base_key/sqlite/1"),
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::DropContinuousBackups,
+        store: StoreKind::Catalog,
+        checksum: "b7531559f55e4903371072c3e059ce3b82147f9b7fa7ba405dbb403b399e095c",
+        fingerprint: None,
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::BackupCatalogIndex,
+        store: StoreKind::Catalog,
+        checksum: "8528b29cd83afb95ac2e2bb637d90efe51dfaa704b5280e479edde4b7b2fa1cf",
+        fingerprint: Some("0006_backup_catalog_index/sqlite/1"),
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::StreamPending,
+        store: StoreKind::Catalog,
+        checksum: "99dc4a51692c3cc58d619420e2055130e33f93870dab2e02c087d4d44f1e5402",
+        fingerprint: None,
+        kind: Kind::Additive,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::RestoreProgress,
+        store: StoreKind::Catalog,
+        checksum: "6d2e68d8284d72072de839c13f121be4005e8950fda90c5d9f7742c6958175c9",
+        fingerprint: None,
+        kind: Kind::Additive,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::WarmThroughput,
+        store: StoreKind::Catalog,
+        checksum: "fd2dd35c3afbf3c8efcafe8dc6bddbfccbfb8c820c123bd5e74f87f60321953b",
+        fingerprint: Some("0009_warm_throughput/sqlite/1"),
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::AccountMetrics,
+        store: StoreKind::Catalog,
+        checksum: "6c75cabed24c7d7488b33148800fe492d3dc2f561dd286ae70f203098b5375df",
+        fingerprint: None,
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::AttributeNameEscape,
+        store: StoreKind::Catalog,
+        checksum: "d1d6e06c5e8e048d163b16f9b2d816a2d4f636bfc642be4d5e1d608cbac9994a",
+        fingerprint: None,
+        kind: Kind::Additive,
+        convergent: true,
+        rebless: None,
+    },
+    Released {
+        id: MigrationId::UniqueAccessKeyIds,
+        store: StoreKind::Catalog,
+        checksum: "5003dffcdb2e46d560d794360fdb7a6a9d5eb000968082450b8bee9a0bc23d02",
+        fingerprint: None,
+        kind: Kind::Additive,
+        convergent: true,
+        rebless: None,
+    },
+];
 
 /// This backend's entry for every id. Public so `migrate --list` can print
 /// each migration's kind without opening the database.
@@ -118,11 +246,42 @@ pub fn migration(id: MigrationId) -> Migration<SqliteStores> {
                 m0006_backup_catalog_index::SOURCE,
             )],
         },
+        MigrationId::StreamPending => Migration::NotApplicable(
+            "SQLite runs one writer at a time, so its stream records commit in the order of \
+             their sequence numbers",
+        ),
+        MigrationId::RestoreProgress => Migration::NotApplicable(
+            "the restore progress of a store-backed restore is on table_restores (file_index, \
+             items_applied) on SQLite; the table is PostgreSQL's data database's",
+        ),
+        MigrationId::WarmThroughput => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![StoreBody::code(
+                StoreKind::Catalog,
+                &m0009_warm_throughput::WarmThroughput,
+                m0009_warm_throughput::SOURCE,
+            )],
+        },
+        MigrationId::AccountMetrics => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Catalog,
+                "migrations",
+                "0010_account_metrics.sql"
+            )],
+        },
+        MigrationId::AttributeNameEscape => Migration::NotApplicable(
+            "SQLite stores the documents that carry attribute names as JSON text in TEXT columns, \
+             where U+0000 is the six-character escape \\u0000, so every name reads back as it was \
+             written",
+        ),
+        MigrationId::UniqueAccessKeyIds => Migration::NotApplicable(
+            "access_key_id is the primary key of access_keys, so an ID can be stored once",
+        ),
     }
 }
-
-/// The longest wait a lock timeout can ask for that `Instant` can add.
-const MAX_LOCK_WAIT: Duration = Duration::from_secs(86_400);
 
 /// The database file's lock, held for a migration. Dropping it releases it.
 #[derive(Debug)]
@@ -130,190 +289,22 @@ pub struct MigrationLock {
     _lock: crate::serve_lock::ServeLock,
 }
 
-/// Take the lock `extenddb serve` holds on the database file, retrying every
-/// 250 ms while another process holds it, for up to `timeout`. `Ok(None)` for
-/// an in-memory database, which no other process can open.
+/// Create or bring up to date the catalog of an in-memory database, on the
+/// engine's own pool: a new connection to an in-memory location opens another,
+/// empty database, so the runner must use the one connection the engine holds.
+/// The server's in-memory startup and the embedded in-memory engine both
+/// migrate through this function.
 ///
 /// # Errors
 ///
-/// [`MigrationError::Locked`] when the lock is still held at the timeout
-/// (exit 6), or a store error when the lock file cannot be opened.
-pub async fn lock_for_migration(
-    location: &str,
-    timeout: Duration,
-) -> Result<Option<MigrationLock>, MigrationError> {
-    let Some(file) = crate::serve_lock::database_file(location).map_err(MigrationError::Store)?
-    else {
-        return Ok(None);
-    };
-    // The lock file goes beside the database, in a directory that exists:
-    // `init` creates both before it takes the lock.
-    let now = tokio::time::Instant::now();
-    let deadline = now.checked_add(timeout).unwrap_or(now + MAX_LOCK_WAIT);
-    loop {
-        match crate::serve_lock::ServeLock::try_acquire(&file) {
-            Ok(lock) => return Ok(Some(MigrationLock { _lock: lock })),
-            Err(crate::serve_lock::LockFailure::Failed(m)) => return Err(MigrationError::Store(m)),
-            Err(crate::serve_lock::LockFailure::Held(m)) => {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(MigrationError::Locked(format!(
-                        "{m}; waited {} s",
-                        timeout.as_secs()
-                    )));
-                }
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-        }
-    }
-}
-
-/// The catalog status of the database at `location`. Read-only: a file that
-/// does not exist is `Uninitialized` and is not created, and nothing is
-/// written. Takes no lock, so it runs beside a server.
-///
-/// # Errors
-///
-/// The database cannot be opened or its ledger read.
-pub async fn catalog_status(location: &str) -> Result<CatalogStatus, MigrationError> {
-    let Some(file) = crate::serve_lock::database_file(location).map_err(MigrationError::Store)?
-    else {
-        return Err(in_memory_refusal());
-    };
-    if !file.exists() {
-        return Ok(CatalogStatus::Uninitialized);
-    }
-    let migrations = SqliteMigrations::open_for_status(location).await?;
-    // A read records nothing, so no release is named.
-    let status = Runner::new(&migrations, "").status().await;
-    migrations.close().await;
-    status
-}
-
-/// Apply every pending migration to the database at `location`: take the
-/// lock (waiting up to `lock_timeout`), open the runner's connection, run,
-/// and close the connection and release the lock on every exit path.
-///
-/// # Errors
-///
-/// As [`Runner::migrate`] and [`lock_for_migration`].
-pub async fn migrate(
+/// The pool allows more than one connection, or the run fails.
+pub(crate) async fn migrate_in_memory(
+    pool: &sqlx::SqlitePool,
     location: &str,
     release: &str,
-    lock_timeout: Duration,
 ) -> Result<RunReport, MigrationError> {
-    if crate::serve_lock::database_file(location)
-        .map_err(MigrationError::Store)?
-        .is_none()
-    {
-        return Err(in_memory_refusal());
-    }
-    let _lock = lock_for_migration(location, lock_timeout).await?;
-    run_on_file(location, release).await
-}
-
-/// [`migrate`] for a caller that already holds the database's lock, which a
-/// second `flock` from this process could never take: the server's factory,
-/// which takes the lock before it opens the engine. `held` must be the lock
-/// of `location`'s file.
-///
-/// # Errors
-///
-/// [`MigrationError::Refused`] when `held` is another file's lock or the
-/// location is in memory, or as [`Runner::migrate`].
-pub(crate) async fn migrate_holding(
-    location: &str,
-    release: &str,
-    held: &crate::serve_lock::ServeLock,
-) -> Result<RunReport, MigrationError> {
-    let file = crate::serve_lock::database_file(location)
-        .map_err(MigrationError::Store)?
-        .ok_or_else(in_memory_refusal)?;
-    let expected = crate::serve_lock::ServeLock::lock_path(&file);
-    if held.path() != expected {
-        return Err(MigrationError::Refused(format!(
-            "the lock held is {}, and the database at {location} is locked by {}",
-            held.path().display(),
-            expected.display()
-        )));
-    }
-    run_on_file(location, release).await
-}
-
-/// Decide whether a server may open the file database at `location`, whose
-/// lock the server holds: `Current` and `AheadCompatible` serve (the second
-/// with a warning naming the migrations above this binary's), and in a dev
-/// build `Behind` and an `Uninitialized` file with no tables (missing or
-/// empty) are migrated first. An `Uninitialized` file that holds tables is
-/// another program's database, and is refused as the commands refuse it,
-/// naming `extenddb init`, before anything writes to it. Every other status
-/// refuses with [`MigrationError::Status`], in a dev build too.
-///
-/// # Errors
-///
-/// The refusal, or as [`migrate_holding`].
-pub(crate) async fn prepare_for_serve(
-    location: &str,
-    release: &str,
-    held: &crate::serve_lock::ServeLock,
-    dev: bool,
-) -> Result<(), MigrationError> {
-    match catalog_status(location).await? {
-        CatalogStatus::Current { .. } => Ok(()),
-        status @ CatalogStatus::AheadCompatible { .. } => {
-            tracing::warn!(
-                "{status}; serving it, because a binary may serve migrations it does not know \
-                 when every one of them is additive"
-            );
-            Ok(())
-        }
-        CatalogStatus::Uninitialized if dev && !holds_tables(location).await? => {
-            log_report(&migrate_holding(location, release, held).await?);
-            Ok(())
-        }
-        CatalogStatus::Behind { .. } if dev => {
-            log_report(&migrate_holding(location, release, held).await?);
-            Ok(())
-        }
-        status => Err(MigrationError::Status(status)),
-    }
-}
-
-/// Whether the file database at `location` exists and holds a table, read
-/// on a read-only connection.
-async fn holds_tables(location: &str) -> Result<bool, MigrationError> {
-    let exists = crate::serve_lock::database_file(location)
-        .map_err(MigrationError::Store)?
-        .is_some_and(|file| file.exists());
-    if !exists {
-        return Ok(false);
-    }
-    let migrations = SqliteMigrations::open_for_status(location).await?;
-    let empty = migrations.catalog_is_empty().await;
-    migrations.close().await;
-    Ok(!empty?)
-}
-
-/// Log what a run the server started did: the copy's path, then each step
-/// with its notes.
-pub(crate) fn log_report(report: &RunReport) {
-    for note in &report.notes {
-        tracing::info!("{note}");
-    }
-    for step in &report.applied {
-        tracing::info!("applied catalog migration {} {}", step.id, step.name);
-        for note in &step.notes {
-            tracing::info!("  {note}");
-        }
-    }
-}
-
-/// Open the runner's connection to a file database, run, and close it.
-async fn run_on_file(location: &str, release: &str) -> Result<RunReport, MigrationError> {
-    let migrations = SqliteMigrations::open(location).await?;
-    let result = Runner::new(&migrations, release).migrate().await;
-    let result = migrations.discard_unused_copy(result);
-    migrations.close().await;
-    result
+    let migrations = SqliteMigrations::on_pool(pool.clone(), location)?;
+    Runner::new(&migrations, release).migrate().await
 }
 
 /// Bring a test database to the latest migration: on the engine's own
@@ -323,10 +314,7 @@ async fn run_on_file(location: &str, release: &str) -> Result<RunReport, Migrati
 #[cfg(test)]
 pub(crate) async fn apply_for_tests(pool: &sqlx::SqlitePool) {
     if pool.options().get_max_connections() == 1 {
-        let migrations =
-            SqliteMigrations::on_pool(pool.clone(), ":memory:").expect("one connection");
-        Runner::new(&migrations, "test")
-            .migrate()
+        migrate_in_memory(pool, ":memory:", "test")
             .await
             .expect("migrate the test database");
     } else {
@@ -335,20 +323,10 @@ pub(crate) async fn apply_for_tests(pool: &sqlx::SqlitePool) {
             .get_filename()
             .to_string_lossy()
             .into_owned();
-        migrate(&file, "test", Duration::ZERO)
+        migrate(&file, "test", std::time::Duration::ZERO)
             .await
             .expect("migrate the test database");
     }
-}
-
-/// A new connection to an in-memory location opens a new, empty database,
-/// so the file-based entry points refuse one.
-fn in_memory_refusal() -> MigrationError {
-    MigrationError::Refused(
-        "an in-memory SQLite database exists only inside a running server, which creates its \
-         catalog when it starts; init, migrate and verify have no database to work on"
-            .to_owned(),
-    )
 }
 
 #[cfg(test)]

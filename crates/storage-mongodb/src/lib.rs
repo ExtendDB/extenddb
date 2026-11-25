@@ -18,16 +18,22 @@ mod credential_store;
 mod data;
 mod data_engine;
 mod management_store;
+mod management_store_secrets;
 mod metadata_engine;
 pub mod migrations;
 mod operations;
 mod password_hash_store;
 pub mod pushdown;
+mod restore_engine;
 mod snapshot_engine;
+mod stream_at_timestamp;
 mod stream_engine;
+mod stream_lifecycle;
 mod table_engine;
 mod ttl_worker;
+mod warm_throughput;
 mod worker_store;
+mod write_conflict;
 
 pub use bootstrapper::MongoBootstrapper;
 pub use catalog_store::MongoCatalogStore;
@@ -43,7 +49,7 @@ use extenddb_storage::error::StorageError;
 // ============================================================================
 
 use extenddb_storage::hooks::{ServerRuntimeHooks, ServingRegistrar, WorkerContext};
-use extenddb_storage::server_components::{BackendError, ServerComponents};
+use extenddb_storage::server_components::{BackendError, ServerComponents, load_secret_keys};
 
 /// Backend-specific runtime hooks for `MongoDB`.
 struct MongoRuntimeHooks {
@@ -103,7 +109,7 @@ fn server_components_factory(
     // MongoDB bootstrap needs operator input (databases, admin credentials), so
     // `bootstrap_if_uninitialized` is not honored here: an uninitialized catalog
     // fails with the explicit-`init` guidance, matching the PostgreSQL backend.
-    options: extenddb_storage::server_components::ServerComponentsOptions,
+    mut options: extenddb_storage::server_components::ServerComponentsOptions,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<ServerComponents, BackendError>> + Send>,
 > {
@@ -133,9 +139,12 @@ fn server_components_factory(
         // Register as the catalog's server, then read the migration lock and
         // the catalog's status, before the engine writes anything: a server
         // that refuses has deleted its registration and written nothing else.
-        let registration = migrations::register_and_check(
+        // Every caller registers, a command too, so a migration does not run
+        // under one; a command's registration carries its own name.
+        let registration = migrations::register_and_check_as(
             &migrations::MongoTarget::new(&connection_string),
             options.release,
+            options.command.unwrap_or(migrations::SERVE_COMMAND),
             migrations::Timing::PRODUCTION,
         )
         .await
@@ -148,6 +157,7 @@ fn server_components_factory(
             max_catalog_connections,
             tx_read_concern,
             Arc::clone(&registration),
+            &mut options,
         )
         .await;
         if built.is_err() {
@@ -155,6 +165,33 @@ fn server_components_factory(
         }
         built
     })
+}
+
+/// Start the startup key repair, for a server only; returns its task.
+///
+/// An UpdateItem on a build before the fix for issue #436 could create
+/// an item whose document has no key. The repair rewrites any such
+/// document, so that reads return the key and PutItem on it succeeds (see
+/// `data_engine::key_repair`). It runs in the background: the pass costs
+/// time in proportion to the number of affected documents, and the
+/// listener must not wait for it. A key the pass has not reached yet
+/// answers as it did before the repair existed, and each batch is its own
+/// transaction, so running it while another process serves the same data
+/// is safe.
+///
+/// The repair is a server's: a command that opens the catalog beside a
+/// server (`options.beside_server`: `extenddb backup list` and the purge's
+/// dry run), or one that writes beside the live servers with
+/// `options.startup_recovery` off (`purge --confirm`), starts none, as on
+/// PostgreSQL, where such a command runs none of the startup recovery; it
+/// would otherwise start a write pass over the data and exit while the pass
+/// may be mid-batch.
+fn start_key_repair(
+    engine: &Arc<MongoEngine>,
+    options: &extenddb_storage::server_components::ServerComponentsOptions,
+) -> Option<tokio::task::JoinHandle<()>> {
+    (!options.beside_server && options.startup_recovery)
+        .then(|| data_engine::key_repair::spawn_key_repair(engine.clone()))
 }
 
 /// The engine and stores `serve` runs on, built once the server holds its
@@ -166,6 +203,7 @@ async fn build_components(
     max_catalog_connections: Option<u32>,
     tx_read_concern: mongodb::options::ReadConcern,
     registration: Arc<migrations::ServerRegistration>,
+    options: &mut extenddb_storage::server_components::ServerComponentsOptions,
 ) -> Result<ServerComponents, BackendError> {
     // Create MongoEngine
     let engine = MongoEngine::new(connection_string, region, max_connections, tx_read_concern)
@@ -177,16 +215,7 @@ async fn build_components(
 
     let engine = Arc::new(engine);
 
-    // An UpdateItem on a build before the fix for issue #436 could create
-    // an item whose document has no key. Rewrite any such document, so
-    // that reads return the key and PutItem on it succeeds (see
-    // `data_engine::key_repair`). This runs in the background: the pass
-    // costs time in proportion to the number of affected documents, and
-    // the listener must not wait for it. A key the pass has not reached
-    // yet answers as it did before the repair existed, and each batch is
-    // its own transaction, so running this while another process serves
-    // the same data is safe.
-    data_engine::key_repair::spawn_key_repair(engine.clone());
+    start_key_repair(&engine, options);
 
     // Create one shared catalog/management client. MongoDB Client clones
     // share the underlying pool, so max_catalog_connections limits the
@@ -199,31 +228,22 @@ async fn build_components(
             details: format!("Failed to create catalog client: {e}"),
         })?;
 
-    // Load encryption key from settings collection. A missing key must be
-    // a hard failure: an empty key would base64-decode to zero bytes, and
-    // the secret cipher refuses any key that is not 32 bytes, so every
-    // credential lookup would fail. Refuse to start instead, matching the
-    // postgres backend.
-    let catalog_db = catalog_client.database("extenddb_catalog");
-    let settings_coll = catalog_db.collection::<mongodb::bson::Document>("settings");
-    let enc_key = settings_coll
-        .find_one(mongodb::bson::doc! { "_id": "encryption_key" })
-        .await
-        .map_err(|e| BackendError::InitializationFailed(format!("Load encryption key: {e}")))?
-        .and_then(|d| d.get_str("value").ok().map(std::borrow::ToOwned::to_owned))
-        .ok_or(BackendError::MissingEncryptionKey)?;
-
+    // Load the key the stores share (RFC-0000 section 7): the catalog key,
+    // or the DEK of the key ring unwrapped with the KEK `serve` read. The
+    // refusals of section 7's table come from the loader, so a catalog with
+    // no key, or one the cipher refuses, stops the server here instead of
+    // failing every credential lookup with a 500.
     let auth_client = catalog_client.clone();
-    let catalog_store = Arc::new(MongoCatalogStore::with_encryption_key(
-        catalog_client,
-        enc_key.clone(),
-    )) as Arc<dyn extenddb_storage::CatalogStore>;
+    let catalog_store = MongoCatalogStore::new(catalog_client);
+    let keys = load_secret_keys(&catalog_store, std::mem::take(&mut options.key_source)).await?;
+    let catalog_store = Arc::new(catalog_store.with_secret_keys(keys.clone()))
+        as Arc<dyn extenddb_storage::CatalogStore>;
 
     // Create credential store. The bin layer wraps this in
     // CachedCredentialStore using the operator-configured TTL
     // before constructing the auth provider.
     let cred_store: Arc<dyn extenddb_auth::CredentialStore> =
-        Arc::new(MongoCredentialStore::new(auth_client, enc_key));
+        Arc::new(MongoCredentialStore::new(auth_client, keys));
 
     // Create runtime hooks
     let runtime_hooks = Box::new(MongoRuntimeHooks {

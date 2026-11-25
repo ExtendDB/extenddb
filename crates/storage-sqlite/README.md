@@ -5,7 +5,11 @@ in-tree workspace crate selected by Cargo feature.
 
 ## Design
 
-Single-file (or in-memory) storage using SQLite via `sqlx`. Targets:
+Single-file (or in-memory) storage using SQLite via `sqlx`. On `wasm32`, which
+`sqlx`'s SQLite driver does not build for, the crate opens only an in-memory database and
+reaches it through `src/wasm_sqlx.rs`, a module that implements the part of the
+`sqlx` API the crate uses over the SQLite that `sqlite-wasm-rs` bundles; its
+module documentation lists the differences from `sqlx`. Targets:
 
 - Local development without PostgreSQL
 - CI / integration tests (especially the ephemeral in-memory mode)
@@ -62,8 +66,8 @@ built with that feature needs no path configured.
 
 ## Developer mode
 
-A build-time profile that makes ExtendDB a drop-in replacement for DynamoDB
-Local: plain HTTP on loopback, open authorization, and a seeded credential — with
+A build-time profile that builds ExtendDB dev, a drop-in replacement for
+DynamoDB Local: plain HTTP on loopback, open authorization, and a seeded credential — with
 real SigV4 verification still in force. It is enabled by the `dev-mode` feature
 and, by a compile-time guard, **can never be built with the Postgres backend**.
 
@@ -94,7 +98,16 @@ SigV4 is verified — a request signed with a different secret is rejected with
 ## Conformance
 
 Per [RFC-0002](https://github.com/ExtendDB/extenddb/blob/main/docs/rfcs), this
-backend implements the full storage trait surface.
+backend implements the full storage trait surface. The `wasm32` build does
+not compile five of those implementations, which outside tests only the
+`extenddb` command-line tool and the server it starts use: `Bootstrapper`
+(`SqliteBootstrapper`), `ServerRuntimeHooks`, `OperationsEngine`,
+`CatalogMigrations` and `LockedStores`. Two methods answer
+`StorageError::Unsupported` there:
+`SnapshotEngine::open_table_snapshot`, for every table, since its native
+implementation uses `sqlx` API that the `wasm32` build does not provide, and
+`TableEngine::update_table`, for a request that creates a vector index, since
+the build cannot run the index backfill.
 
 Mandatory traits (required for acceptance):
 

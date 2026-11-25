@@ -7,8 +7,23 @@
 //! inputs, dispatches operations by name, and translates storage errors into
 //! `DynamoDB`-format error responses.
 
+// The store-backed backup subsystem depends on an S3/filesystem store,
+// networking and background threads that have no wasm32 target, so it is
+// compiled only off wasm; on wasm32 `dispatch` refuses its four operations
+// with a ValidationException. `backup_requests` holds the backup and point-in-time
+// recovery requests that read no store, and compiles on both targets.
+#[cfg(not(target_arch = "wasm32"))]
 mod backup;
-pub use backup::{BackupRuntime, reconciler};
+#[cfg(not(target_arch = "wasm32"))]
+pub use backup::{
+    BackupRuntime, ConfiguredStore, HeldClaim, JobSettings, KillPoint, LOCAL_CHECK_TIMEOUT,
+    OTHER_STORE, RESTORE_REGISTRATION_TIMEOUT, S3_CHECK_TIMEOUT, STORE_IDENTITY_KEY, Spool,
+    StoreFence, StoreHealth, StoreHealthReport, StoreIdentityFile, StoreProblem, TARGET_NOT_EMPTY,
+    check_configured_store, check_configured_store_read_only, maintenance, migrate_legacy,
+    read_identity_bounded, reconciler, store_identity, store_maintenance, sync,
+};
+mod backup_requests;
+pub use backup_requests::refuse_point_in_time_recovery;
 mod batch_get_item;
 mod batch_write_item;
 pub mod capacity_helpers;
@@ -21,11 +36,26 @@ mod describe_table;
 mod expected;
 mod expression_helpers;
 mod get_item;
+mod gsi_updates;
 mod import_export;
+// The filesystem helpers of import/export; the WebAssembly build has no
+// filesystem, and `import_export` keeps its file I/O off that target.
+#[cfg(not(target_arch = "wasm32"))]
 mod import_export_io;
 mod index_helpers;
+mod int32_member;
+mod item_authorizer;
 mod legacy_filter;
 mod list_tables;
+#[cfg(feature = "partiql")]
+mod partiql;
+mod pre_dispatch;
+pub use pre_dispatch::{ParsedRequest, parse_request};
+// `private_fs` creates the private directories the filesystem-backed
+// import/export use; it has no wasm32 consumer and uses unix/windows file
+// APIs, so it is compiled only off wasm.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod private_fs;
 mod put_item;
 mod query;
 mod read_helpers;
@@ -35,6 +65,7 @@ mod search_vectors;
 mod start_key;
 pub mod stream_capture;
 mod streams;
+mod streams_iterator_params;
 mod tagging;
 mod transact_get_items;
 mod transact_write_helpers;
@@ -43,6 +74,9 @@ mod ttl;
 mod update_item;
 mod update_table;
 mod vector_gate;
+mod warm_throughput;
+#[cfg(feature = "partiql")]
+use partiql::PartiqlExecutor;
 
 pub use batch_get_item::handle_batch_get_item;
 pub use batch_write_item::handle_batch_write_item;
@@ -55,6 +89,7 @@ pub use describe_limits::handle_describe_limits;
 pub use describe_table::handle_describe_table;
 pub use get_item::handle_get_item;
 pub use import_export::{handle_export_table, handle_import_table};
+pub use item_authorizer::{ItemAccess, ItemAuthorization, ItemAuthorizer};
 pub use list_tables::handle_list_tables;
 pub use put_item::handle_put_item;
 pub use query::handle_query;
@@ -84,7 +119,8 @@ use extenddb_core::types::TableKeyInfo;
 ///
 /// Real `DynamoDB` validates the operation name before checking authentication.
 /// An unknown operation with no auth headers returns `UnknownOperationException`,
-/// not `MissingAuthenticationToken`. The server layer calls this before auth.
+/// not `MissingAuthenticationToken`. `parse_request` applies this check, and
+/// the server calls it before auth.
 #[must_use]
 pub fn is_known_operation(operation: &str) -> bool {
     matches!(
@@ -126,7 +162,23 @@ pub fn is_known_operation(operation: &str) -> bool {
             | "DescribeContinuousBackups"
             | "UpdateContinuousBackups"
             | "RestoreTableToPointInTime"
+    ) || is_known_partiql_operation(operation)
+}
+
+/// PartiQL operations, known only when the `partiql` feature is on. With the
+/// feature off this is always false, so the server answers them with
+/// `UnknownOperationException`.
+#[cfg(feature = "partiql")]
+fn is_known_partiql_operation(operation: &str) -> bool {
+    matches!(
+        operation,
+        "ExecuteStatement" | "BatchExecuteStatement" | "ExecuteTransaction"
     )
+}
+
+#[cfg(not(feature = "partiql"))]
+fn is_known_partiql_operation(_operation: &str) -> bool {
+    false
 }
 use serde::Serialize;
 
@@ -151,6 +203,26 @@ pub(crate) fn serialize_output(
 pub(crate) fn sanitize_storage_error(e: extenddb_storage::error::StorageError) -> DynamoDbError {
     tracing::error!(internal_error = %e, "storage internal error");
     DynamoDbError::InternalServerError("Internal server error".to_owned())
+}
+
+/// The null-member sentence for a `StreamSpecification` object without
+/// `StreamEnabled`, on `CreateTable` and `UpdateTable` alike (measured
+/// 2026-10-24). Checked before the body is deserialised, where the missing
+/// field would otherwise surface as a serialization error; its order against
+/// the other request checks is not measured. A `StreamSpecification` that is
+/// not an object is left to deserialisation, which refuses it as a
+/// `SerializationException`.
+pub(crate) fn require_stream_enabled_member(body: &serde_json::Value) -> Result<(), DynamoDbError> {
+    if let Some(spec) = body.get("StreamSpecification").filter(|v| v.is_object())
+        && spec
+            .get("StreamEnabled")
+            .is_none_or(serde_json::Value::is_null)
+    {
+        return Err(DynamoDbError::ValidationException(
+            "1 validation error detected: Value null at 'streamSpecification.streamEnabled' failed to satisfy constraint: Member must not be null".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Map a serde deserialization error to the appropriate `DynamoDB` error type.
@@ -245,13 +317,9 @@ pub(crate) fn validate_enum_fields(
     if errors.is_empty() {
         return Ok(());
     }
-    let count = errors.len();
-    let msg = format!(
-        "{count} validation error{} detected: {}",
-        if count == 1 { "" } else { "s" },
-        errors.join("; ")
-    );
-    Err(DynamoDbError::ValidationException(msg))
+    Err(DynamoDbError::ValidationException(
+        extenddb_core::error::validation_errors_detected(&errors),
+    ))
 }
 
 /// Validate the `ReturnValues` field for `PutItem` / `DeleteItem`, which accept
@@ -343,8 +411,11 @@ pub type AuthorizedKeyInfo = std::collections::HashMap<String, Option<TableKeyIn
 /// the discussion file and principal reviewer approval.
 pub struct OperationContext {
     pub storage: Arc<dyn extenddb_storage::StorageEngine>,
-    /// The process's job slots and configured backup store, which the backup
-    /// operations read.
+    /// The process's job slots and configured backup store, which the
+    /// store-backed backup operations read. That subsystem is compiled only
+    /// off wasm, so this field is absent in the wasm build, where
+    /// [`dispatch`] refuses those operations.
+    #[cfg(not(target_arch = "wasm32"))]
     pub backup: Arc<BackupRuntime>,
     pub limits: Arc<LimitsConfig>,
     pub region: Arc<str>,
@@ -370,6 +441,10 @@ pub struct OperationContext {
     /// read. When unset (e.g. unit tests), the engine falls back to direct
     /// storage lookups.
     pub table_key_info_lookup: Option<Arc<dyn extenddb_storage::TableKeyInfoLookup>>,
+    /// Authorizes the item reads and writes a request names inside its body
+    /// (the statements of the PartiQL operations), which the server does not
+    /// authorize before dispatch. `None` refuses every such read and write.
+    pub item_authorizer: Option<Arc<dyn ItemAuthorizer>>,
 }
 
 impl OperationContext {
@@ -505,30 +580,63 @@ pub async fn dispatch(
         "ExportTableToPointInTime" => handle_export_table(body, ctx)
             .await
             .map(DispatchResult::body_only),
+        #[cfg(not(target_arch = "wasm32"))]
         "CreateBackup" => backup::handle_create_backup(body, ctx)
             .await
             .map(DispatchResult::body_only),
+        #[cfg(not(target_arch = "wasm32"))]
         "DescribeBackup" => backup::handle_describe_backup(body, ctx)
             .await
             .map(DispatchResult::body_only),
-        "ListBackups" => backup::handle_list_backups(body, ctx)
+        "ListBackups" => backup_requests::handle_list_backups(body, ctx)
             .await
             .map(DispatchResult::body_only),
+        #[cfg(not(target_arch = "wasm32"))]
         "DeleteBackup" => backup::handle_delete_backup(body, ctx)
             .await
             .map(DispatchResult::body_only),
+        #[cfg(not(target_arch = "wasm32"))]
         "RestoreTableFromBackup" => backup::handle_restore_table_from_backup(body, ctx)
             .await
             .map(DispatchResult::body_only),
-        "DescribeContinuousBackups" => backup::handle_describe_continuous_backups(body, ctx)
+        "DescribeContinuousBackups" => {
+            backup_requests::handle_describe_continuous_backups(body, ctx)
+                .await
+                .map(DispatchResult::body_only)
+        }
+        "UpdateContinuousBackups" => backup_requests::handle_update_continuous_backups(body, ctx)
             .await
             .map(DispatchResult::body_only),
-        "UpdateContinuousBackups" => backup::handle_update_continuous_backups(body, ctx)
-            .await
-            .map(DispatchResult::body_only),
-        "RestoreTableToPointInTime" => backup::handle_restore_table_to_point_in_time(body, ctx)
-            .await
-            .map(DispatchResult::body_only),
+        "RestoreTableToPointInTime" => {
+            backup_requests::handle_restore_table_to_point_in_time(body, ctx)
+                .await
+                .map(DispatchResult::body_only)
+        }
+        #[cfg(feature = "partiql")]
+        "ExecuteStatement" => ctx.execute_statement(body).await,
+        #[cfg(feature = "partiql")]
+        "BatchExecuteStatement" => ctx.batch_execute_statement(body).await,
+        #[cfg(feature = "partiql")]
+        "ExecuteTransaction" => ctx.execute_transaction(body).await,
+        // An arm above that is compiled only off wasm32 leaves its operation
+        // known on wasm32 (`is_known_operation` is the same on every target)
+        // but unserved there. Today these are the four store-backed backup
+        // operations: the `backup` module does not build for wasm32, because
+        // it uses the backup store's S3 client, whose network stack needs mio,
+        // and tokio's file I/O. Such an operation is refused with a
+        // ValidationException that names the build, not answered as unknown,
+        // and an arm gated the same way later is refused here too. This arm
+        // is compiled for wasm32 only because its message names wasm32: off
+        // wasm32, a known operation without an arm (an arm with a cfg of its
+        // own can leave one) answers UnknownOperationException from the last
+        // arm.
+        #[cfg(target_arch = "wasm32")]
+        _ if is_known_operation(operation) => Err(DynamoDbError::ValidationException(
+            extenddb_core::error::webassembly_unsupported_message(
+                operation,
+                "the code that serves it is not compiled for wasm32",
+            ),
+        )),
         _ => Err(DynamoDbError::UnknownOperationException(String::new())),
     }
 }

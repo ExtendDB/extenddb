@@ -8,9 +8,9 @@
 //! availability chart (D16), and CSV/JSON data export (D19). Charts use
 //! inline `<canvas>` and no external dependencies.
 //!
-//! The dashboard and its data feed are for admins only. The `metrics` table
-//! has no account column, so the feed holds the table names, index names,
-//! operations, request counts and latencies of every account.
+//! The dashboard and its data feed are for admins only. The feed holds the
+//! table names, index names, operations, request counts and latencies of
+//! every account, each row under its `AccountId`.
 //!
 //! HTML and JS content live in `metrics_content` to stay under the 500-line
 //! file limit.
@@ -139,10 +139,12 @@ async fn metrics_json(
                 .window
                 .unwrap_or(extenddb_core::metrics::TimeWindow::Last5Minutes);
             let seg_metrics = Arc::clone(collector);
-            response.segments =
-                tokio::task::spawn_blocking(move || seg_metrics.query_segments(window))
-                    .await
-                    .unwrap_or_default();
+            let account = params.account_id.clone();
+            response.segments = tokio::task::spawn_blocking(move || {
+                seg_metrics.query_segments(window, account.as_deref())
+            })
+            .await
+            .unwrap_or_default();
             axum::Json(serde_json::to_value(response).unwrap_or_default()).into_response()
         }
         Err(msg) => {

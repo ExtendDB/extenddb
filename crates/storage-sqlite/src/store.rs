@@ -31,23 +31,31 @@
 //!
 //! The management stores (users, access keys, policies, groups, roles,
 //! accounts, admin, settings, metrics) write through the separate catalog
-//! pool in `lib.rs`, which for a file-backed database opens the same file;
-//! the server wiring shares this same lock instance into
+//! pool in `server_backend.rs`, which for a file-backed database opens the
+//! same file; the server wiring there shares this same lock instance into
 //! `SqliteCatalogStore`, so those writers queue with the engine's. The
 //! credential store only reads. The one deliberate exclusion from the lock,
 //! so the invariant stays auditable, is init-time bootstrap (in this file and
 //! in `bootstrapper.rs`), which runs before the server serves traffic.
 
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use extenddb_storage::error::StorageError;
+use extenddb_storage::management_store::SettingsStore as _;
 use sqlx::SqlitePool;
-use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tokio::sync::Mutex;
 
 use crate::INDEX_PROPAGATION_DELAY_QUERY;
 use crate::sqlite_util::sqlite_url;
+
+/// Rows the driver's worker buffers ahead of the reading task (see
+/// `SqliteEngine::new_for_server`). The rows ahead of the reader are one
+/// more than this: the channel holds this many and the worker, blocked on
+/// its `send`, holds the next row it has already stepped and copied.
+const ROW_BUFFER_ROWS: usize = 4;
 
 /// The SQLite storage engine. Implements `StorageEngine` (all data/metadata/
 /// stream/worker/backup traits) over a single SQLite database.
@@ -91,13 +99,48 @@ pub struct SqliteEngine {
     pub(crate) job_slots: Arc<crate::backup_catalog::JobSlots>,
 }
 
+/// The connection options of every pool connection. The driver runs each
+/// statement on a worker thread that buffers rows ahead of the task reading
+/// them (sqlx's `row_buffer_size`, 50 by default) over a bounded channel;
+/// the worker steps and copies the next row before its `send` blocks, so
+/// the rows ahead of the reader are the buffer plus one. A table snapshot
+/// reads rows of up to the 32 MiB line cap and stops a page at the byte
+/// budget, so a 50-row buffer is up to 1.6 GB the page never asked for;
+/// [`ROW_BUFFER_ROWS`] bounds the run-ahead at five rows (160 MiB at the
+/// line cap), which costs ordinary queries a channel hand-off every four
+/// rows. The test at the end of this module counts the rows stepped ahead.
+pub(crate) fn connect_options(url: &str) -> Result<SqliteConnectOptions, StorageError> {
+    Ok(SqliteConnectOptions::from_str(url)
+        .map_err(|e| StorageError::Connection(e.to_string()))?
+        .row_buffer_size(ROW_BUFFER_ROWS))
+}
+
 impl SqliteEngine {
     /// Open (creating if necessary) the SQLite database and build the engine.
     ///
     /// `path_or_url` accepts a filesystem path, `:memory:`, or a `sqlite:` URL.
+    /// The pool is sized for no backup jobs; a server opens the engine with
+    /// [`Self::new_for_server`].
     pub async fn new(
         path_or_url: &str,
         pool_size: u32,
+        region: &str,
+        max_item_size_bytes: usize,
+    ) -> Result<Self, StorageError> {
+        Self::new_for_server(path_or_url, pool_size, 0, region, max_item_size_bytes).await
+    }
+
+    /// [`Self::new`] for a server that runs up to `max_concurrent_jobs`
+    /// backup and restore jobs at once: a file-backed pool is raised, with a
+    /// warning naming both numbers, until its server slots admit every job
+    /// the engine's permit admits (`backup::pool_size_for_jobs`; the rule is
+    /// stated on `SqliteConfig::pool_size`), so no job the permit admitted
+    /// is refused by the slot. The in-memory pool has one connection by
+    /// nature and is not raised.
+    pub async fn new_for_server(
+        path_or_url: &str,
+        pool_size: u32,
+        max_concurrent_jobs: usize,
         region: &str,
         max_item_size_bytes: usize,
     ) -> Result<Self, StorageError> {
@@ -107,6 +150,18 @@ impl SqliteEngine {
         let in_memory = crate::serve_lock::database_file(path_or_url)
             .map_err(StorageError::Connection)?
             .is_none();
+        let for_jobs = if in_memory {
+            pool_size
+        } else {
+            crate::backup::pool_size_for_jobs(pool_size, max_concurrent_jobs)
+        };
+        if for_jobs != pool_size {
+            tracing::warn!(
+                "{}",
+                crate::backup::pool_raise_message(pool_size, for_jobs, max_concurrent_jobs)
+            );
+        }
+        let pool_size = for_jobs;
         // An in-memory database lives only inside its own connection: a second
         // connection opens a *separate* empty database. So for an in-memory
         // location we pin the pool to a single connection that is never
@@ -129,13 +184,14 @@ impl SqliteEngine {
         if in_memory {
             opts = opts.idle_timeout(None).max_lifetime(None);
         }
+        let connect = connect_options(&url)?;
         let pool = opts
             .after_connect(|conn, _| {
                 Box::pin(
                     async move { crate::sqlite_util::set_connection_pragmas(conn, true).await },
                 )
             })
-            .connect(&url)
+            .connect_with(connect)
             .await
             .map_err(|e| StorageError::Connection(e.to_string()))?;
 
@@ -185,8 +241,24 @@ impl SqliteEngine {
     }
 
     /// Handle to the control-plane notifier, for the background poller.
+    // Read by the control-plane worker, which the browser build does not run.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn control_plane_notify(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.control_plane_notify)
+    }
+
+    /// Insert the account `account_id` under the name `default`, unless it
+    /// exists. The server's bootstrap ([`Self::bootstrap_dev_rows`]) and the
+    /// embedded in-memory engine ([`Self::new_in_memory`]) both register their
+    /// account through this one statement.
+    async fn insert_default_account(&self, account_id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO accounts (account_id, account_name) VALUES (?, 'default')",
+        )
+        .bind(account_id)
+        .execute(&self.pool)
+        .await
+        .map(drop)
     }
 
     /// Write the rows a server needs that `init` writes on a production
@@ -199,6 +271,8 @@ impl SqliteEngine {
     /// Returns `Some(password)` when a new admin user was created with a
     /// generated password (so the caller can surface it once), or `None` when
     /// the admin already existed or the password came from the environment.
+    // Called only by the server's startup (`server_backend.rs`).
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn bootstrap_dev_rows(
         &self,
         admin_user: Option<&str>,
@@ -208,9 +282,13 @@ impl SqliteEngine {
 
         let internal = |e: String| StorageError::Internal(e);
 
-        // Encryption key.
+        // Encryption key: only into a catalog that has neither a catalog key
+        // nor a key ring. A switched catalog has the ring and no catalog
+        // key, and a catalog key written into it at each start would stop
+        // the next start.
         let key_exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM settings WHERE key = 'encryption_key')",
+            "SELECT EXISTS(SELECT 1 FROM settings \
+             WHERE key IN ('encryption_key', 'encryption_key_ring'))",
         )
         .fetch_one(&self.pool)
         .await
@@ -227,26 +305,21 @@ impl SqliteEngine {
         // Default account + canonical marker. Record the default account id in
         // settings (idempotent, backfill-safe) so callers resolve it explicitly
         // rather than inferring it from account-list ordering.
-        let account_id: String = match sqlx::query_scalar(
-            "SELECT account_id FROM accounts ORDER BY account_id LIMIT 1",
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| internal(format!("check accounts: {e}")))?
-        {
-            Some(id) => id,
-            None => {
-                let id = helpers::generate_account_id();
-                sqlx::query(
-                    "INSERT OR IGNORE INTO accounts (account_id, account_name) VALUES (?, 'default')",
-                )
-                .bind(&id)
-                .execute(&self.pool)
+        let account_id: String =
+            match sqlx::query_scalar("SELECT account_id FROM accounts ORDER BY account_id LIMIT 1")
+                .fetch_optional(&self.pool)
                 .await
-                .map_err(|e| internal(format!("create default account: {e}")))?;
-                id
-            }
-        };
+                .map_err(|e| internal(format!("check accounts: {e}")))?
+            {
+                Some(id) => id,
+                None => {
+                    let id = helpers::generate_account_id();
+                    self.insert_default_account(&id)
+                        .await
+                        .map_err(|e| internal(format!("create default account: {e}")))?;
+                    id
+                }
+            };
         sqlx::query("INSERT OR IGNORE INTO settings (key, value) VALUES ('default_account_id', ?)")
             .bind(&account_id)
             .execute(&self.pool)
@@ -410,6 +483,96 @@ impl SqliteEngine {
         .ok()
         .flatten()
         .map_or_else(|| "(not configured)".to_owned(), |(v,)| v)
+    }
+}
+
+// The real `SnapshotEngine` impl (`snapshot_engine`) uses `sqlx` API the
+// wasm32 shim does not provide, so it is compiled off the browser build. The
+// `StorageEngine` blanket impl still requires the subtrait, so the wasm build
+// answers it with an `Unsupported` error.
+#[cfg(target_arch = "wasm32")]
+impl extenddb_storage::snapshot::SnapshotEngine for SqliteEngine {
+    fn open_table_snapshot(
+        &self,
+        account_id: &str,
+        table_name: &str,
+    ) -> futures::future::BoxFuture<
+        '_,
+        Result<extenddb_storage::snapshot::TableSnapshot, StorageError>,
+    > {
+        let _ = (account_id, table_name);
+        Box::pin(async {
+            Err(StorageError::Unsupported(
+                extenddb_core::error::webassembly_unsupported_message(
+                    "A table snapshot",
+                    "its SQLite driver lacks the API the snapshot reader uses",
+                ),
+            ))
+        })
+    }
+}
+
+impl SqliteEngine {
+    /// Build a ready-to-use in-memory engine for an embedded (browser) caller:
+    /// open a `:memory:` database, run the catalog migrations on its single
+    /// connection, register `account_id`, and switch the control plane to
+    /// synchronous (`control_plane_delay_seconds = 0`,
+    /// `index_propagation_delay_ms = 0`) so a created table is `ACTIVE` at once
+    /// and index maintenance happens on the write path — there are no
+    /// background workers in this configuration to drive an asynchronous one.
+    ///
+    /// The migrations run through the function the server's in-memory startup
+    /// calls, and the account row through the statement its bootstrap uses. No
+    /// encryption key or admin user is written: an embedded build does no
+    /// authentication, and the data-plane operations need only the account row
+    /// to exist.
+    ///
+    /// # Errors
+    ///
+    /// The database cannot be opened, the migrations fail, or a setup statement
+    /// fails.
+    #[doc(hidden)]
+    pub async fn new_in_memory(
+        region: &str,
+        account_id: &str,
+        max_item_size_bytes: usize,
+    ) -> Result<Self, StorageError> {
+        let engine = Self::new(":memory:", 1, region, max_item_size_bytes).await?;
+
+        // An in-memory database lives only on the engine's single connection,
+        // so its catalog is created there, by the call the server's in-memory
+        // startup makes.
+        crate::migrations::migrate_in_memory(&engine.pool, ":memory:", "")
+            .await
+            .map_err(|e| StorageError::Internal(format!("run in-memory migrations: {e}")))?;
+
+        // The account the data-plane operations write under. CreateTable
+        // records the owning account, so the row must exist first. The rest of
+        // `bootstrap_dev_rows` is not run: it generates the account id and an
+        // encryption key and hashes an admin password, none of which an
+        // embedded build without authentication uses.
+        Self::validate_account_id(account_id)?;
+        engine
+            .insert_default_account(account_id)
+            .await
+            .map_err(|e| StorageError::Internal(format!("register account: {e}")))?;
+
+        // No background workers run here, so make the control plane synchronous:
+        // a created table is `ACTIVE` at once and index maintenance happens on
+        // the write path, not via a poller that never runs. Zero means
+        // synchronous for both settings.
+        let settings = crate::SqliteCatalogStore::new(engine.pool.clone());
+        for (key, value) in [
+            ("control_plane_delay_seconds", "0"),
+            ("index_propagation_delay_ms", "0"),
+        ] {
+            settings
+                .set_setting(key, value)
+                .await
+                .map_err(|e| StorageError::Internal(format!("set {key}: {e:?}")))?;
+        }
+
+        Ok(engine)
     }
 }
 
@@ -593,14 +756,13 @@ mod d1_write_lock_tests {
     }
 
     /// Build a catalog store over the engine's pool and, critically, the
-    /// engine's OWN write lock, mirroring the server wiring in `lib.rs`. The
-    /// cached key lets access-key creation encrypt without a settings lookup.
+    /// engine's OWN write lock, mirroring the server wiring in
+    /// `server_backend.rs`. The key holder lets access-key creation encrypt.
     fn catalog_store(engine: &SqliteEngine) -> crate::SqliteCatalogStore {
-        use base64::Engine as _;
-        let key = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
-        crate::SqliteCatalogStore::with_encryption_key(
+        let keys = extenddb_storage::secret_keys::SecretKeys::dek_for_tests([0; 32], 1, "test");
+        crate::SqliteCatalogStore::with_secret_keys(
             engine.pool.clone(),
-            key,
+            Some(std::sync::Arc::new(keys)),
             std::sync::Arc::clone(&engine.write_lock),
         )
     }
@@ -798,5 +960,67 @@ mod d1_write_lock_tests {
             "set_setting",
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod row_buffer_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures::TryStreamExt;
+
+    /// The rows the driver's worker steps ahead of a reader that pulls one
+    /// row and stops, on a connection with the engine's options: a collation
+    /// the query's `WHERE` applies to every stepped row counts the steps, a
+    /// table of large rows (1 MiB each, 40 of them) is read through a plain
+    /// scan, the reader takes one row and drops the stream, and the steps
+    /// beyond that row are the buffer plus the one the worker holds, five.
+    /// With sqlx's default buffer of 50 the count is 51, 1.6 GB of lines at
+    /// the cap a page never asked for.
+    #[tokio::test]
+    async fn the_driver_steps_five_rows_ahead_of_the_pages_reader() {
+        let steps = Arc::new(AtomicUsize::new(0));
+        let counting = Arc::clone(&steps);
+        let options = super::connect_options("sqlite::memory:")
+            .expect("options")
+            .collation("counting", move |a: &str, b: &str| {
+                counting.fetch_add(1, Ordering::SeqCst);
+                a.cmp(b)
+            });
+        let mut conn = sqlx::ConnectOptions::connect(&options)
+            .await
+            .expect("connect");
+        sqlx::query("CREATE TABLE big (pk TEXT COLLATE counting, item_data TEXT)")
+            .execute(&mut conn)
+            .await
+            .expect("create");
+        let payload = "x".repeat(1024 * 1024);
+        for i in 0..40 {
+            sqlx::query("INSERT INTO big (pk, item_data) VALUES (?, ?)")
+                .bind(format!("k{i:03}"))
+                .bind(&payload)
+                .execute(&mut conn)
+                .await
+                .expect("insert");
+        }
+        steps.store(0, Ordering::SeqCst);
+        // The scan evaluates the comparison on each row it steps, so the
+        // collation is called once per step; no index, no sort, so no
+        // comparison runs ahead of the stepping.
+        let mut rows = sqlx::query("SELECT item_data FROM big WHERE pk <> 'none'").fetch(&mut conn);
+        let first = rows.try_next().await.expect("fetch").expect("a row");
+        drop(first);
+        // The worker runs on until its channel is full and its next send
+        // blocks; give it the time to get there.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let stepped = steps.load(Ordering::SeqCst);
+        drop(rows);
+        assert_eq!(
+            stepped - 1,
+            super::ROW_BUFFER_ROWS + 1,
+            "{stepped} rows stepped for one pulled: the buffer plus the row the worker holds"
+        );
+        assert_eq!(stepped - 1, 5);
     }
 }

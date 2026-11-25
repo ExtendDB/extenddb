@@ -13,11 +13,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use extenddb_storage::migrations::{
-    CatalogMigrations, CatalogStatus, HeldLock, LedgerRow, Listed, MigrationError, MigrationId,
-    RunKind, RunReport, Runner, Target,
+    CatalogMigrations, CatalogStatus, HeldLock, LedgerRow, Listed, LockedStores, MigrationError,
+    MigrationId, RunKind, RunReport, Runner, Target,
 };
 
-use super::backend::CassandraMigrations;
+use super::backend::{CassandraMigrations, CassandraStores};
 use super::connect::{Deployment, has_columns};
 use super::locks::{LeaseHandle, LeaseTimes, MigrationLock};
 use super::registrations::wait_for_no_servers;
@@ -190,6 +190,22 @@ impl CatalogMigrations for CassandraCatalogMigrations {
         let held = held(lock)?;
         let migrations = CassandraMigrations::locked(&held.lock, &held.keyspace_prefix);
         Runner::new(&migrations, "").forget(id).await
+    }
+
+    /// The catalog keyspace's stores on the lock's session, under its lease.
+    /// A Cassandra catalog holds no data connection string row, so
+    /// `data_connection` is not read.
+    async fn locked_stores(
+        &self,
+        lock: &HeldLock,
+        _data_connection: Option<&str>,
+    ) -> Result<Box<dyn LockedStores>, MigrationError> {
+        let held = held(lock)?;
+        Ok(Box::new(CassandraStores::new(
+            held.lock.session().clone(),
+            &held.keyspace_prefix,
+            Some(held.lock.handle()),
+        )))
     }
 
     async fn release(&self, lock: HeldLock) {

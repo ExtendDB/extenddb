@@ -7,13 +7,15 @@ use extenddb_core::types::{
     BillingMode, BillingModeSummary, CreateTableInput, GsiDescription, LsiDescription,
     ProvisionedThroughputDescription, SseDescription, SseType, TableDescription, TableStatus,
 };
+use extenddb_storage::backup_catalog::RestoreRegistrationRow;
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{index_arn, stream_arn, table_arn};
+use extenddb_storage::util::{index_arn, stream_arn, table_arn, warm_throughput_record_for_create};
 
 use crate::PostgresEngine;
+use crate::catalog_json::to_catalog_json;
 
-/// What a restore target records about where it came from, written in the
-/// same catalog transaction that creates it.
+/// What a legacy restore target records about where it came from, written
+/// in the same catalog transaction that creates it.
 pub(crate) struct RestoreRegistration<'a> {
     pub(crate) backup_arn: &'a str,
     /// Reported as `RestoreSummary.SourceTableArn`.
@@ -24,6 +26,18 @@ pub(crate) struct RestoreRegistration<'a> {
     /// The job claim's fencing token, written on the job record (RUNNING,
     /// `kind = legacy`) with the target.
     pub(crate) owner_generation: u64,
+}
+
+/// Which backup a restore target is registered from, and so which row its
+/// registration locks: a legacy restore locks the `backups` row of the
+/// in-catalog backup, a store-backed one the `backup_index` row (the lock
+/// DeleteBackup's `start_backup_delete` takes). The two paths keep their own
+/// locks: a legacy and a store-backed restore are of two different backups
+/// and never meet, and a DeleteBackup of a `backup_index` row meets only
+/// store-backed registrations.
+pub(crate) enum RestoreSource<'a> {
+    Legacy(&'a RestoreRegistration<'a>),
+    Manifest(&'a RestoreRegistrationRow),
 }
 
 impl PostgresEngine {
@@ -54,7 +68,7 @@ impl PostgresEngine {
         &self,
         account_id: &str,
         input: CreateTableInput,
-        registration: &RestoreRegistration<'_>,
+        registration: RestoreSource<'_>,
     ) -> Result<TableDescription, StorageError> {
         self.create_table_impl_inner(account_id, input, true, Some(registration))
             .await
@@ -107,16 +121,15 @@ impl PostgresEngine {
         account_id: &str,
         input: CreateTableInput,
         defer_active: bool,
-        restore: Option<&RestoreRegistration<'_>>,
+        restore: Option<RestoreSource<'_>>,
     ) -> Result<TableDescription, StorageError> {
         Self::validate_account_id(account_id)?;
+        let input = extenddb_storage::stream_lineage::without_disabled_specification(input);
         let table_id = uuid::Uuid::new_v4().to_string();
         let table_arn = table_arn(&self.region, account_id, &input.table_name);
         let billing_mode = input.billing_mode.unwrap_or(BillingMode::Provisioned);
-        let key_schema_json = serde_json::to_value(&input.key_schema)
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-        let attr_defs_json = serde_json::to_value(&input.attribute_definitions)
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let key_schema_json = to_catalog_json(&input.key_schema)?;
+        let attr_defs_json = to_catalog_json(&input.attribute_definitions)?;
         let billing_str = match billing_mode {
             BillingMode::Provisioned => "PROVISIONED",
             BillingMode::PayPerRequest => "PAY_PER_REQUEST",
@@ -149,33 +162,80 @@ impl PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        if let Some(RestoreRegistration { backup_arn, .. }) = restore {
-            // FOR UPDATE, not FOR SHARE: two restores of one backup must not
-            // both pass the CREATING-target check below, so they serialize on
-            // the backup row (DeleteBackup locks it the same way).
-            let available: Option<i32> = sqlx::query_scalar(
-                "SELECT 1 FROM backups WHERE backup_arn = $1 AND account_id = $2 \
-                 AND backup_status = 'AVAILABLE' FOR UPDATE",
-            )
-            .bind(backup_arn)
-            .bind(account_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-            if available.is_none() {
-                return Err(StorageError::Validation(format!(
-                    "Backup not found: {backup_arn}"
-                )));
+        match &restore {
+            Some(RestoreSource::Legacy(RestoreRegistration { backup_arn, .. })) => {
+                // FOR UPDATE, not FOR SHARE: two restores of one backup must not
+                // both pass the CREATING-target check below, so they serialize on
+                // the backup row (DeleteBackup locks it the same way).
+                let available: Option<i32> = sqlx::query_scalar(
+                    "SELECT 1 FROM backups WHERE backup_arn = $1 AND account_id = $2 \
+                     AND backup_status = 'AVAILABLE' FOR UPDATE",
+                )
+                .bind(backup_arn)
+                .bind(account_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+                if available.is_none() {
+                    return Err(StorageError::Validation(format!(
+                        "Backup not found: {backup_arn}"
+                    )));
+                }
+                // One restore of a backup at a time, as the service: while a
+                // target restored from it is CREATING the backup is in use. Same
+                // predicate as DeleteBackup's.
+                if let Some(table) =
+                    crate::backup_catalog::creating_restore_target(&mut *tx, backup_arn).await?
+                {
+                    return Err(crate::backup_catalog::backup_in_use(&table, backup_arn));
+                }
             }
-            // One restore of a backup at a time, as the service: while a
-            // target restored from it is CREATING the backup is in use. Same
-            // predicate as DeleteBackup's.
-            if let Some(table) =
-                crate::backup_catalog::creating_restore_target(&mut *tx, backup_arn).await?
-            {
-                return Err(crate::backup_catalog::backup_in_use(&table, backup_arn));
+            Some(RestoreSource::Manifest(registration)) => {
+                // The `backup_index` row FOR UPDATE: the lock
+                // `start_backup_delete` takes before its own in-use check, so
+                // a DeleteBackup and this registration order wholly one
+                // before the other, and two registrations of one backup
+                // serialize on the row before the CREATING-target check.
+                let status: Option<String> = sqlx::query_scalar(
+                    "SELECT status FROM backup_index WHERE account_id = $1 AND backup_id = $2 \
+                     FOR UPDATE",
+                )
+                .bind(account_id)
+                .bind(&registration.backup.backup_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+                if status.as_deref() != Some("AVAILABLE") {
+                    return Err(extenddb_storage::backup_catalog::backup_not_found(
+                        &registration.backup.backup_arn,
+                    ));
+                }
+                if let Some(table) = crate::backup_catalog::creating_restore_target(
+                    &mut *tx,
+                    &registration.backup.backup_arn,
+                )
+                .await?
+                {
+                    return Err(crate::backup_catalog::backup_in_use(
+                        &table,
+                        &registration.backup.backup_arn,
+                    ));
+                }
             }
+            None => {}
         }
+
+        // WarmThroughput as sent, reported back and acted on by nothing (see
+        // catalog migration 9, `0009_warm_throughput.sql`). UPDATING for the
+        // same delay the CREATING to ACTIVE flip takes.
+        let delay_secs = Self::control_plane_delay_secs(&mut tx).await?;
+        let warm_record =
+            warm_throughput_record_for_create(input.warm_throughput.as_ref(), delay_secs);
+        let warm_json = warm_record
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         // Insert table metadata, returning creation timestamp and actual status.
         // Use PG error code 23505 for robust duplicate detection instead of string matching.
@@ -193,7 +253,8 @@ impl PostgresEngine {
                (account_id, table_name, key_schema, attribute_definitions, billing_mode,
                 provisioned_throughput, stream_specification, table_status,
                 creation_date_time, table_arn, table_id, deletion_protection_enabled,
-                status_transition_at, table_class, sse_specification, on_demand_throughput)
+                status_transition_at, table_class, sse_specification, on_demand_throughput,
+                warm_throughput)
                VALUES ($1, $2, $3, $4, $5, $6, $7,
                 CASE WHEN $14 THEN 'CREATING'
                      WHEN (SELECT secs FROM delay) = 0
@@ -204,7 +265,7 @@ impl PostgresEngine {
                      THEN NULL
                      ELSE NOW() + make_interval(secs => (SELECT secs FROM delay))
                 END,
-                $11, $12, $13)
+                $11, $12, $13, $16)
                RETURNING EXTRACT(EPOCH FROM creation_date_time)::FLOAT8, table_status",
         )
         .bind(account_id)
@@ -222,6 +283,7 @@ impl PostgresEngine {
         .bind(&on_demand_json)
         .bind(defer_active)
         .bind(crate::DEFAULT_CONTROL_PLANE_DELAY_SECONDS)
+        .bind(&warm_json)
         .fetch_one(&mut *tx)
         .await;
         let (creation_epoch, actual_status): (f64, String) = match inserted {
@@ -236,24 +298,53 @@ impl PostgresEngine {
             Err(e) => return Err(StorageError::Internal(e.to_string())),
         };
 
-        if let Some(r) = restore {
-            // The job record: RUNNING under the claim's generation, with a
-            // heartbeat on the catalog's clock, so no CREATING target ever
-            // exists without an owned record.
-            sqlx::query(
-                "INSERT INTO table_restores \
-                 (table_id, source_backup_arn, source_table_arn, restore_date_time, \
-                  status, kind, owner_generation, heartbeat_at) \
-                 VALUES ($1, $2, $3, to_timestamp($4), 'RUNNING', 'legacy', $5, now())",
-            )
-            .bind(&table_id)
-            .bind(r.backup_arn)
-            .bind(r.source_table_arn)
-            .bind(r.restore_date_time)
-            .bind(crate::backup_engine::generation_column(r.owner_generation))
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        // The job record: RUNNING under the claim's generation, with a
+        // heartbeat on the catalog's clock, so no CREATING target ever
+        // exists without an owned record. `now()` is this transaction's
+        // start, not the insert's instant: a registration that waited on the
+        // `backup_index` row's lock above commits a heartbeat that old, and
+        // the data DDL after the commit adds to the age the engine's first
+        // beat (sent before the registration's reply) then refreshes.
+        match &restore {
+            Some(RestoreSource::Legacy(r)) => {
+                sqlx::query(
+                    "INSERT INTO table_restores \
+                     (table_id, source_backup_arn, source_table_arn, restore_date_time, \
+                      status, kind, owner_generation, heartbeat_at) \
+                     VALUES ($1, $2, $3, to_timestamp($4), 'RUNNING', 'legacy', $5, now())",
+                )
+                .bind(&table_id)
+                .bind(r.backup_arn)
+                .bind(r.source_table_arn)
+                .bind(r.restore_date_time)
+                .bind(crate::backup_engine::generation_column(r.owner_generation))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            }
+            Some(RestoreSource::Manifest(r)) => {
+                sqlx::query(
+                    "INSERT INTO table_restores \
+                     (table_id, source_backup_arn, source_table_arn, restore_date_time, \
+                      status, kind, store_kind, store_root, store_id, spool_host, \
+                      owner_generation, heartbeat_at) \
+                     VALUES ($1, $2, $3, to_timestamp($4), 'RUNNING', 'manifest', $5, $6, $7, \
+                      $8, $9, now())",
+                )
+                .bind(&table_id)
+                .bind(&r.backup.backup_arn)
+                .bind(&r.source_table_arn)
+                .bind(r.restore_date_time)
+                .bind(r.store.store_kind.as_str())
+                .bind(&r.store.store_root)
+                .bind(&r.store.store_id)
+                .bind(r.spool_host.as_deref())
+                .bind(crate::backup_engine::generation_column(r.owner_generation))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            }
+            None => {}
         }
 
         // Insert GSI metadata
@@ -261,12 +352,19 @@ impl PostgresEngine {
         // ProvisionedThroughput) so DescribeTable can deserialize it without
         // failing on the missing NumberOfDecreasesToday field.
         let mut gsi_index_ids: Vec<String> = Vec::new();
+        let mut gsi_warm_records = Vec::new();
         if let Some(gsis) = &input.global_secondary_indexes {
             for gsi in gsis {
-                let gsi_ks = serde_json::to_value(&gsi.key_schema)
+                let gsi_warm =
+                    warm_throughput_record_for_create(gsi.warm_throughput.as_ref(), delay_secs);
+                let gsi_warm_json = gsi_warm
+                    .as_ref()
+                    .map(serde_json::to_value)
+                    .transpose()
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
-                let gsi_proj = serde_json::to_value(&gsi.projection)
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                gsi_warm_records.push(gsi_warm);
+                let gsi_ks = to_catalog_json(&gsi.key_schema)?;
+                let gsi_proj = to_catalog_json(&gsi.projection)?;
                 let gsi_pt = gsi
                     .provisioned_throughput
                     .as_ref()
@@ -286,8 +384,8 @@ impl PostgresEngine {
                 sqlx::query(
                     r"INSERT INTO indexes
                        (table_id, index_name, index_id, index_type, key_schema, projection,
-                        index_status, provisioned_throughput)
-                       VALUES ($1, $2, $3, 'GSI', $4, $5, 'ACTIVE', $6)",
+                        index_status, provisioned_throughput, warm_throughput)
+                       VALUES ($1, $2, $3, 'GSI', $4, $5, 'ACTIVE', $6, $7)",
                 )
                 .bind(&table_id)
                 .bind(&gsi.index_name)
@@ -295,6 +393,7 @@ impl PostgresEngine {
                 .bind(&gsi_ks)
                 .bind(&gsi_proj)
                 .bind(&gsi_pt)
+                .bind(&gsi_warm_json)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -306,10 +405,8 @@ impl PostgresEngine {
         let mut lsi_index_ids: Vec<String> = Vec::new();
         if let Some(lsis) = &input.local_secondary_indexes {
             for lsi in lsis {
-                let lsi_ks = serde_json::to_value(&lsi.key_schema)
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-                let lsi_proj = serde_json::to_value(&lsi.projection)
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                let lsi_ks = to_catalog_json(&lsi.key_schema)?;
+                let lsi_proj = to_catalog_json(&lsi.projection)?;
 
                 let index_id = uuid::Uuid::new_v4().to_string();
                 sqlx::query(
@@ -363,22 +460,19 @@ impl PostgresEngine {
                 crate::vector::ensure_vector_extension_present(&self.data_pool).await?;
             }
             for vi in vis {
-                let vec_attr = serde_json::to_value(&vi.vector_attribute)
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                let vec_attr = to_catalog_json(&vi.vector_attribute)?;
                 // The request paths already collapse an empty SearchSchema, so
                 // this is for a caller that reaches the storage trait directly.
                 // Same core rule either way, so the two cannot drift.
                 let search_schema = vi
                     .search_schema_for_storage()
-                    .map(serde_json::to_value)
-                    .transpose()
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    .map(to_catalog_json)
+                    .transpose()?;
                 let proj = vi
                     .projection
                     .as_ref()
-                    .map(serde_json::to_value)
-                    .transpose()
-                    .map_err(|e| StorageError::Internal(e.to_string()))?
+                    .map(to_catalog_json)
+                    .transpose()?
                     .ok_or_else(|| {
                         // Core validation requires Projection, so reaching here
                         // means the request bypassed validation rather than that
@@ -438,22 +532,24 @@ impl PostgresEngine {
         // If data DDL fails, the catalog entry is cleaned up (see below).
 
         // Initialize stream shards and label if streams are enabled on this table.
-        let stream_label = if input
+        let stream_label = match input
             .stream_specification
             .as_ref()
-            .is_some_and(|s| s.stream_enabled)
+            .filter(|s| s.stream_enabled)
+            .and_then(|s| s.stream_view_type)
         {
-            let label = Self::init_stream_shards(
-                &mut tx,
-                &self.data_pool,
-                account_id,
-                &input.table_name,
-                &table_id,
-            )
-            .await?;
-            Some(label)
-        } else {
-            None
+            Some(view_type) => Some(
+                Self::init_stream_shards(
+                    &mut tx,
+                    &self.data_pool,
+                    account_id,
+                    &input.table_name,
+                    &table_id,
+                    view_type,
+                )
+                .await?,
+            ),
+            None => None,
         };
 
         tx.commit()
@@ -553,7 +649,8 @@ impl PostgresEngine {
 
         let gsis = input.global_secondary_indexes.as_ref().map(|gs| {
             gs.iter()
-                .map(|g| GsiDescription {
+                .zip(gsi_warm_records)
+                .map(|(g, warm)| GsiDescription {
                     index_name: g.index_name.clone(),
                     key_schema: g.key_schema.clone(),
                     projection: g.projection.clone(),
@@ -579,6 +676,8 @@ impl PostgresEngine {
                         &input.table_name,
                         &g.index_name,
                     ),
+                    warm_throughput: None,
+                    warm_throughput_record: warm,
                 })
                 .collect()
         });
@@ -701,6 +800,9 @@ impl PostgresEngine {
                 .as_ref()
                 .map(|tc| serde_json::json!({ "TableClass": tc })),
             on_demand_throughput: input.on_demand_throughput,
+            // Derived by the engine from the record; see core.
+            warm_throughput: None,
+            warm_throughput_record: warm_record,
             // Every field is populated deliberately, with no
             // `..Default::default()` spread. This response is the complete
             // description of what was just created, so a new core field should

@@ -5,9 +5,9 @@
 //! protocol, the copy, the entry points and the in-memory case. The lock
 //! is in `serve_tests`, beside the server's refusal while a migration
 //! holds it.
-//! Released catalogs are in `released_tests`, migrations 2 to 4 in
-//! `golden_tests`, refusals and rollbacks in `refusal_tests`, and the killed
-//! migrator in `crash_tests`.
+//! Released catalogs and migration 10 are in `released_tests`, migrations 2
+//! to 4, 6 and 9 in `golden_tests`, refusals and rollbacks in
+//! `refusal_tests`, and the killed migrator in `crash_tests`.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -264,13 +264,26 @@ async fn a_fresh_database_is_current_after_one_run_and_seeds_nothing() {
         status(&db).await,
         CatalogStatus::Current { version: LATEST }
     );
+    // An id that does not apply on SQLite is recorded as not_applicable.
+    let applies = MigrationId::ALL
+        .into_iter()
+        .filter(|id| !migration(*id).bodies().is_empty())
+        .count();
     assert_eq!(
         count(
             &db,
             "SELECT COUNT(*) FROM extenddb_migrations WHERE outcome = 'applied'"
         )
         .await,
-        i64::from(LATEST)
+        i64::try_from(applies).unwrap()
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM extenddb_migrations WHERE outcome = 'not_applicable'"
+        )
+        .await,
+        i64::from(LATEST) - i64::try_from(applies).unwrap()
     );
     assert_eq!(version_row(&db).await, Some(LATEST.to_string()));
     assert_eq!(
@@ -444,7 +457,7 @@ async fn a_rebuild_of_tables_keeps_its_index_shard_and_stream_rows() {
 }
 
 /// The copy is owner-only whatever the database's mode: 0644 is the mode of
-/// a catalog that 0.1.x `init` created and no server opened.
+/// a catalog that the `init` of 0.1.14 or earlier created and no server opened.
 #[cfg(unix)]
 #[tokio::test]
 async fn the_copy_is_owner_only_and_has_a_name_no_run_reuses() {

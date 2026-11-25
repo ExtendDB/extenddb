@@ -126,7 +126,7 @@ fn base_key_binds(
 }
 
 /// Column names for the base key, in key-schema order.
-fn base_key_columns(
+pub(crate) fn base_key_columns(
     base_key_schema: &[KeySchemaElement],
     attr_defs: &[AttributeDefinition],
 ) -> Vec<String> {
@@ -219,6 +219,8 @@ pub(crate) async fn maintain_vector_indexes(
 /// tolerance changes is that an expected race stops emitting an ERROR line, which
 /// otherwise trains operators to ignore the one signal that says a row was thrown
 /// away. Matches the GSI sibling, so both arms of the dispatcher behave alike.
+// Used only by the GSI propagation worker's apply path (`index.rs`).
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn apply_vector_context(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     old_item: Option<&Item>,

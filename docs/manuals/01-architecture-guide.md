@@ -15,24 +15,26 @@ applications point their AWS SDKs at extenddb and get identical DynamoDB behavio
 
 ## Cargo Workspace
 
-The project is structured as a Cargo workspace with 13 crates. Crate boundaries enforce dependency rules at compile time.
+The project is structured as a Cargo workspace with 15 crates. Crate boundaries enforce dependency rules at compile time.
 
 ```
 extenddb/
 ├── crates/
 │   ├── app/                Application/CLI library the bin crate dispatches to
 │   ├── auth/               AuthProvider trait, SigV4 verification, IAM policy engine
+│   ├── backup-store/       Backup object store (filesystem and S3)
 │   ├── bin/                CLI entry point, config loading, daemon lifecycle
 │   ├── cache/              Stale-while-revalidate cache used by the auth and server layers
 │   ├── config/             Configuration types and loading
-│   ├── core/               Pure sync Rust: types, expressions, validation, errors
+│   ├── core/               Sync Rust: types, expressions, validation, errors, crypto
 │   ├── engine/             Async operation handlers (PutItem, Query, etc.)
 │   ├── server/             HTTP server (axum), management API, web console
 │   ├── storage/            Storage trait definitions and backend-agnostic utilities
 │   ├── storage-cassandra/  Cassandra backend implementation (experimental)
 │   ├── storage-mongodb/    MongoDB backend implementation
 │   ├── storage-postgres/   PostgreSQL backend implementation (default)
-│   └── storage-sqlite/     SQLite backend implementation (embedded)
+│   ├── storage-sqlite/     SQLite backend implementation (embedded)
+│   └── wasm-adapter/       Experimental WebAssembly build of the engine (publish = false)
 ```
 
 ## Crate Dependency Graph
@@ -47,18 +49,22 @@ bin ──→ server ──→ engine ──→ core
  │
  ├──→ storage-{postgres,sqlite,mongodb,cassandra} ──→ storage ──→ core
  └──→ core
+
+wasm-adapter ──→ engine, storage-sqlite, storage, auth, core
 ```
 
 Exactly one `storage-*` backend is linked per binary, selected by mutually exclusive Cargo features at build time.
 
-Key principle: `core` depends on nothing in the workspace and has no async runtime. It contains pure sync Rust: types,
-expression parsing and evaluation, input validation, capacity calculation, and error types. Every other crate depends on `core`.
+Key principle: `core` depends on nothing in the workspace and has no async runtime. It contains sync Rust: types,
+expression parsing and evaluation, input validation, capacity calculation, error types, and the crypto module, which
+links AWS-LC through `aws-lc-rs` natively. Every crate but `cache` and `backup-store` depends on `core`, directly or
+through another crate.
 
 ## Crate Roles
 
 ### core
 
-Pure sync Rust library. No async runtime, no database drivers, no HTTP framework.
+Sync Rust library. No async runtime, no database drivers, no HTTP framework.
 
 - **types**: `AttributeValue`, `KeySchema`, `TableMetadata`, `StreamRecord`, and all DynamoDB data types
 - **expression**: Parser and evaluator for `ConditionExpression`, `FilterExpression`, `UpdateExpression`, `ProjectionExpression`, and `KeyConditionExpression`
@@ -66,6 +72,9 @@ Pure sync Rust library. No async runtime, no database drivers, no HTTP framework
 - **error**: `DynamoDbError` enum mapping every DynamoDB error code to its HTTP status and message
 - **limits**: Configurable limits matching real DynamoDB defaults (item size, batch sizes, expression depth/tokens)
 - **capacity**: RCU/WCU calculation logic
+- **crypto**: SHA-256, HMAC-SHA256, constant-time comparison, AES-256-GCM `seal`/`open` and a random fill; AWS-LC
+  through `aws-lc-rs` natively; on `wasm32`, the RustCrypto `sha2`, `hmac` and `aes-gcm` crates, `subtle` for the
+  comparison and `getrandom` over the browser's Web Crypto for randomness
 
 ### engine
 
@@ -162,6 +171,13 @@ Thin binary that wires everything together:
 - Daemon lifecycle (bind socket → fork → syslog → serve)
 - Background tasks (log level polling, throttling polling, GSI delay polling, stream record cleanup, TTL expiry, metrics persistence)
 
+### wasm-adapter
+
+Experimental WebAssembly build of the engine (`publish = false`). It compiles the engine, `storage-sqlite` over an
+in-memory database, and the crates they depend on to `wasm32-unknown-unknown`, and exposes a `wasm-bindgen` surface
+that answers a DynamoDB request by calling `engine`'s `dispatch` in process, with no server. The README section
+"Experimental: WebAssembly build" lists what it does not do and what it refuses.
+
 ## Request Lifecycle
 
 1. AWS SDK sends `POST /` with `X-Amz-Target` header and JSON body
@@ -196,14 +212,14 @@ still reports it as running, with the PID shown as unknown. Pass
 `serve --foreground --write-pid-file` to write one anyway, which restores both
 commands at the cost of needing a writable `run_dir`.
 8. Spawn background tasks (log level polling, throttling polling, GSI delay polling, stream cleanup, TTL expiry, metrics persistence)
-9. On SIGTERM/SIGINT: drain connections (5s timeout), exit
+9. On SIGTERM/SIGINT: drain connections (5s timeout), end the running backup jobs through their failure path (30s), stop the background tasks (5s, then abort) and give up the serving registration, exit
 
 ## Catalog Model
 
 extenddb uses a dual-database architecture:
 
 - **Catalog database** (e.g., `extenddb_catalog`): Stores table metadata, account/user/group/role/policy definitions, access keys, settings, stream metadata, and metrics. Shared across all accounts.
-- **Data database** (e.g., `extenddb_catalog_data`): Stores user items, GSI/LSI data, and stream records. Each table gets its own PostgreSQL table.
+- **Data database** (`extenddb` for the default catalog `extenddb_catalog`: the catalog's name without its `_catalog` suffix): Stores user items, GSI/LSI data, and stream records. Each table gets its own PostgreSQL table.
 
 On PostgreSQL, SQLite, Cassandra and MongoDB the catalog is versioned by its migration ledger, the `extenddb_migrations` table (on MongoDB a collection, in the catalog database and in the data database): the catalog version is the highest migration recorded in every store, and `serve` reads the catalog's status at startup and refuses a catalog that is behind it or carries a breaking migration it does not know. On Cassandra every account keyspace has a ledger beside the catalog keyspace's.
 A server that refuses its catalog prints the status and the command that resolves it; for pending migrations that is `extenddb migrate --yes`.
@@ -247,7 +263,7 @@ TLS is supported via rustls. `extenddb init` generates a self-signed certificate
 - CSRF tokens on all state-changing POST handlers
 - HttpOnly session cookies
 - Security headers: X-Content-Type-Options, X-Frame-Options, Referrer-Policy
-- Sessions expire after 8 hours of inactivity
+- Sessions end 8 hours after login, however active they are, when the session cookie also expires
 
 ### Input Validation
 
@@ -260,7 +276,7 @@ The management web console is a server-rendered HTML interface mounted at `/cons
 ### Features
 
 - **Login**: Admin users and IAM users (`account_id/user_name`)
-- **Dashboard**: Account and admin user counts (admin sessions only; an IAM-user session gets a link to its own account), version info, quick links
+- **Dashboard**: Account and admin user counts (admin sessions only; an IAM-user session gets a link to its own user page), version info, quick links
 - **Account management**: Create, view, delete accounts
 - **User management**: Create, delete users; view access keys, policies, tags, group memberships
 - **Access key management**: Create and delete access keys (secret shown once at creation)
@@ -277,7 +293,7 @@ The console reads all data through four of the traits that `CatalogStore` combin
 
 ### Authentication Model
 
-- Session-based authentication; sessions expire after 8 hours of inactivity
+- Session-based authentication; sessions end 8 hours after login, however active they are, when the session cookie also expires
 - Sessions stored in-memory with random tokens in HttpOnly cookies (`SameSite=Strict`, `Path=/console`)
 - Each request reads the principal's password hash from the catalog and ends the session if the principal was deleted or its password changed
 - CSRF tokens on all state-changing POST handlers
@@ -327,6 +343,6 @@ The storage backend provides durability, replication, and backup. Use that backe
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

@@ -11,7 +11,10 @@ use std::time::{Duration, Instant};
 use extenddb_storage::management_store::{OpError, OpResult, PasswordHashStore};
 use futures::future::BoxFuture;
 
-use super::{CredentialStamp, SESSION_TTL, SessionCheck, SessionStore};
+use super::{
+    CredentialStamp, SESSION_MAX_LIFETIME, SESSION_MAX_LIFETIME_SECS, SESSION_TTL, SessionCheck,
+    SessionStore,
+};
 use crate::management::CallerIdentity;
 
 const ACCOUNT: &str = "111111111111";
@@ -256,9 +259,106 @@ fn sessions_last_eight_hours_without_activity() {
     assert_eq!(SessionStore::new().ttl, SESSION_TTL);
 }
 
+#[test]
+fn sessions_last_at_most_eight_hours_after_login() {
+    assert_eq!(SESSION_MAX_LIFETIME, Duration::from_secs(8 * 3600));
+    assert_eq!(SESSION_MAX_LIFETIME_SECS, 8 * 3600);
+    assert_eq!(SessionStore::new().max_lifetime, SESSION_MAX_LIFETIME);
+    // The idle timeout is never longer than the lifetime it sits inside.
+    assert!(SESSION_TTL <= SESSION_MAX_LIFETIME);
+}
+
+/// Move a session's login time `by` into the past.
+async fn backdate_login(store: &SessionStore, token: &str, by: Duration) -> Instant {
+    let then = Instant::now()
+        .checked_sub(by)
+        .expect("the monotonic clock is past the backdate");
+    store
+        .sessions
+        .lock()
+        .await
+        .get_mut(token)
+        .expect("session exists")
+        .created_at = then;
+    then
+}
+
+#[tokio::test]
+async fn an_active_session_ends_at_its_maximum_lifetime_and_stays_ended() {
+    let store = SessionStore::with_limits(Duration::from_secs(60), Duration::from_secs(120));
+    let catalog = FakeCatalog::default();
+    let alice = admin_session(&store, &catalog, "alice", "hash-alice").await;
+    let bob = admin_session(&store, &catalog, "bob", "hash-bob").await;
+    backdate_login(&store, &alice, Duration::from_secs(121)).await;
+    backdate_login(&store, &bob, Duration::from_secs(110)).await;
+    // Both were active just now, so only the lifetime can end them.
+    assert!(last_active(&store, &alice).await.elapsed() < Duration::from_secs(60));
+
+    assert!(is_invalid(&store, &catalog, &alice).await);
+    assert!(!store.sessions.lock().await.contains_key(&alice));
+    // A later request with the same token does not bring the session back.
+    assert!(is_invalid(&store, &catalog, &alice).await);
+
+    assert!(is_valid(&store, &catalog, &bob).await);
+}
+
+#[tokio::test]
+async fn activity_does_not_extend_the_maximum_lifetime() {
+    let store = SessionStore::new();
+    let catalog = FakeCatalog::default();
+    let alice = admin_session(&store, &catalog, "alice", "hash-alice").await;
+    let login = backdate_login(&store, &alice, Duration::from_secs(60)).await;
+    backdate(&store, &alice, Duration::from_secs(30)).await;
+
+    assert!(is_valid(&store, &catalog, &alice).await);
+
+    let map = store.sessions.lock().await;
+    assert_eq!(map[&alice].created_at, login);
+    assert!(map[&alice].last_active > login + Duration::from_secs(59));
+}
+
+#[tokio::test]
+async fn creating_a_session_prunes_idle_and_outlived_sessions() {
+    let store = SessionStore::with_limits(Duration::from_secs(60), Duration::from_secs(120));
+    let catalog = FakeCatalog::default();
+    // Active just now, but logged in past the lifetime.
+    let outlived = admin_session(&store, &catalog, "alice", "hash-alice").await;
+    backdate_login(&store, &outlived, Duration::from_secs(121)).await;
+    // Within the lifetime, but idle past the idle timeout.
+    let idle = admin_session(&store, &catalog, "bob", "hash-bob").await;
+    backdate_login(&store, &idle, Duration::from_secs(61)).await;
+    backdate(&store, &idle, Duration::from_secs(61)).await;
+    {
+        // Fill the store to the pruning threshold with live sessions.
+        let mut map = store.sessions.lock().await;
+        let template = map[&outlived].identity.clone();
+        let now = Instant::now();
+        for i in map.len()..super::MAX_SESSIONS {
+            map.insert(
+                format!("filler-{i}"),
+                super::SessionEntry {
+                    identity: template.clone(),
+                    csrf_token: String::new(),
+                    stamp: CredentialStamp::of("hash-alice"),
+                    created_at: now,
+                    last_active: now,
+                },
+            );
+        }
+    }
+
+    let fresh = admin_session(&store, &catalog, "alice", "hash-alice").await;
+
+    let map = store.sessions.lock().await;
+    assert!(!map.contains_key(&outlived));
+    assert!(!map.contains_key(&idle));
+    assert!(map.contains_key(&fresh));
+    assert_eq!(map.len(), super::MAX_SESSIONS - 1);
+}
+
 #[tokio::test]
 async fn a_session_idle_longer_than_the_ttl_ends_and_stays_ended() {
-    let store = SessionStore::with_ttl(Duration::from_secs(60));
+    let store = SessionStore::with_limits(Duration::from_secs(60), SESSION_MAX_LIFETIME);
     let catalog = FakeCatalog::default();
     let alice = admin_session(&store, &catalog, "alice", "hash-alice").await;
     let bob = admin_session(&store, &catalog, "bob", "hash-bob").await;

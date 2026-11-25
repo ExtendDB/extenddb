@@ -11,15 +11,15 @@ use extenddb_core::types::{
     SseDescription, SseType, TableDescription, TableStatus,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{index_arn, stream_arn};
+use extenddb_storage::util::{index_arn, parse_warm_throughput_record, stream_arn};
 use extenddb_storage::vector_catalog::{VectorIndexCatalogRow, vector_index_descriptions};
 
 use crate::data;
 use crate::sqlite_util::parse_timestamp;
 use crate::store::SqliteEngine;
 
+sqlite_row_struct! {
 /// Catalog `tables` row (JSON columns as TEXT, timestamp as RFC 3339 TEXT).
-#[derive(sqlx::FromRow)]
 pub(crate) struct TableRow {
     pub table_name: String,
     pub key_schema: String,
@@ -38,10 +38,12 @@ pub(crate) struct TableRow {
     pub table_class: Option<String>,
     pub sse_specification: Option<String>,
     pub on_demand_throughput: Option<String>,
+    pub warm_throughput: Option<String>,
+}
 }
 
+sqlite_row_struct! {
 /// Catalog `indexes` row.
-#[derive(sqlx::FromRow)]
 pub(crate) struct IndexRow {
     pub index_name: String,
     #[allow(dead_code)]
@@ -51,14 +53,16 @@ pub(crate) struct IndexRow {
     pub projection: String,
     pub index_status: String,
     pub provisioned_throughput: Option<String>,
+    pub warm_throughput: Option<String>,
+}
 }
 
+sqlite_row_struct! {
 /// A `vector_indexes` catalog row, in `FromRow` field order.
 ///
 /// Decoding stops at this struct: the rules that turn it into a wire shape are
 /// shared with the other backends in `extenddb_storage::vector_catalog`. The JSON
 /// columns are text here, so the conversion parses them into values.
-#[derive(sqlx::FromRow)]
 pub(crate) struct VectorIndexRow {
     pub index_name: String,
     #[allow(dead_code)]
@@ -70,6 +74,7 @@ pub(crate) struct VectorIndexRow {
     pub projection: String,
     pub index_status: String,
     pub backfilling: Option<i64>,
+}
 }
 
 impl VectorIndexRow {
@@ -105,11 +110,11 @@ pub(crate) const TABLE_COLUMNS: &str = "table_name, key_schema, attribute_defini
      billing_mode, provisioned_throughput, stream_specification, table_status, \
      creation_date_time, table_size_bytes, item_count, table_arn, table_id, \
      deletion_protection_enabled, stream_label, table_class, sse_specification, \
-     on_demand_throughput";
+     on_demand_throughput, warm_throughput";
 
 /// Columns selected for an `IndexRow`, in `FromRow` field order.
 pub(crate) const INDEX_COLUMNS: &str = "index_name, index_id, index_type, key_schema, \
-     projection, index_status, provisioned_throughput";
+     projection, index_status, provisioned_throughput, warm_throughput";
 
 fn parse_json<T: serde::de::DeserializeOwned>(s: &str, ctx: &str) -> Result<T, StorageError> {
     serde_json::from_str(s).map_err(|e| StorageError::Internal(format!("{ctx}: {e}")))
@@ -231,6 +236,10 @@ impl SqliteEngine {
                         &row.table_name,
                         &idx.index_name,
                     ),
+                    warm_throughput: None,
+                    warm_throughput_record: parse_warm_throughput_record(
+                        idx.warm_throughput.as_deref(),
+                    ),
                 });
             } else {
                 lsis.push(LsiDescription {
@@ -344,6 +353,7 @@ impl SqliteEngine {
                 .on_demand_throughput
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok()),
+            warm_throughput_record: parse_warm_throughput_record(row.warm_throughput.as_deref()),
             // Any core field this backend does not populate takes its default, so
             // adding one does not break this build.
             ..Default::default()

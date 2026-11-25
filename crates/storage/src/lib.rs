@@ -17,19 +17,36 @@ pub mod diagnostics;
 pub mod diagnostics_store;
 pub mod error;
 pub mod hooks;
+#[doc(hidden)]
+#[cfg(feature = "test-util")]
+pub mod iam_leftovers_conformance;
+pub mod key_commands;
+#[doc(hidden)]
+#[cfg(feature = "test-util")]
+pub mod key_conformance;
+pub mod key_pass;
+pub mod key_ring;
+#[cfg(test)]
+mod key_tests;
 pub mod management_store;
 pub mod management_store_factory;
+#[doc(hidden)]
+#[cfg(feature = "test-util")]
+pub mod metrics_conformance;
 pub mod migrations;
 pub mod operations;
 pub mod password;
 pub mod policy_migration;
+pub mod restore_engine;
 pub mod secret_cipher;
+pub mod secret_keys;
 pub mod server_components;
 pub mod settings_store;
 pub mod snapshot;
 #[doc(hidden)]
 #[cfg(feature = "test-hooks")]
 pub mod snapshot_conformance;
+pub mod stream_lineage;
 #[doc(hidden)]
 #[cfg(feature = "test-hooks")]
 pub mod test_pause;
@@ -38,14 +55,19 @@ pub mod vector_catalog;
 pub mod vector_lifecycle;
 
 pub use backend::{Backend, BackendAlreadySet, backend_name, set_backend, try_backend};
-pub use backup_catalog::{BackupCatalog, JobClaim, JobPermit, LegacyBackupReader};
-pub use backup_definition::{BackupRestoreSource, RestoreRequest, RestoreTableOverrides};
+pub use backup_catalog::{
+    BackupCatalog, JobClaim, JobPermit, LegacyBackupReader, MaintenanceClaim,
+};
+pub use backup_definition::{
+    BackupRestoreSource, RestoreRequest, RestoreSource, RestoreTableOverrides,
+};
+pub use restore_engine::{BulkLoadFile, Finished, RestoreEngine};
 pub use snapshot::{SnapshotEngine, SnapshotInfo, TableSnapshot};
 
 pub use transact::{IdempotencyKey, TransactGetOp, TransactWriteOp};
 
 pub use server_components::{
-    BackendError, ServerComponents, ServerComponentsFactory, create_server_components,
+    BackendError, KeySource, ServerComponents, ServerComponentsFactory, create_server_components,
 };
 
 pub use hooks::{CancellationToken, ServerRuntimeHooks, WorkerContext, sleep_or_shutdown};
@@ -627,8 +649,10 @@ pub trait StreamEngine: Send + Sync {
     /// Cassandra after reading the table), and return `StorageError::TableNotFound`
     /// with the message `Requested resource not found: Stream does not exist` when the
     /// stream does not exist for that account or the shard is not one of that stream's
-    /// shards. A shard of another table, another account, or an earlier stream label on
-    /// the same table therefore yields no records.
+    /// shards (`util::shard_in_stream`). A shard of another table, another account, or
+    /// another stream of the same table therefore yields no records; a closed stream's
+    /// shards keep reading under the closed stream's ARN after the table has a newer
+    /// stream.
     fn get_stream_records(
         &self,
         account_id: &str,
@@ -698,6 +722,19 @@ pub trait StreamEngine: Send + Sync {
         &self,
         shard_id: &str,
     ) -> BoxFuture<'_, Result<Option<String>, StorageError>>;
+
+    /// Sequence number of the first record in the shard whose creation time
+    /// is at or after `at_ms` (milliseconds since the Unix epoch), or `None`
+    /// when no stored record qualifies.
+    ///
+    /// Used by `GetShardIterator` with `AT_TIMESTAMP`. The comparison is
+    /// against the stored `created_at`, which every backend takes from the
+    /// same clock read as the record's `ApproximateCreationDateTime`.
+    fn first_sequence_number_at_or_after(
+        &self,
+        shard_id: &str,
+        at_ms: i64,
+    ) -> BoxFuture<'_, Result<Option<String>, StorageError>>;
 }
 
 /// Background worker operations that require storage access.
@@ -725,6 +762,7 @@ pub trait StorageEngine:
     + StreamEngine
     + BackupCatalog
     + LegacyBackupReader
+    + RestoreEngine
     + SnapshotEngine
     + WorkerStore
     + Send
@@ -732,7 +770,7 @@ pub trait StorageEngine:
 {
 }
 
-// Blanket implementation: any type implementing all 8 traits is a StorageEngine
+// Blanket implementation: any type implementing all 9 traits is a StorageEngine
 impl<T> StorageEngine for T where
     T: TableEngine
         + DataEngine
@@ -740,6 +778,7 @@ impl<T> StorageEngine for T where
         + StreamEngine
         + BackupCatalog
         + LegacyBackupReader
+        + RestoreEngine
         + SnapshotEngine
         + WorkerStore
         + Send
@@ -762,12 +801,15 @@ pub trait CatalogStore:
     + Send
     + Sync
 {
-    /// Get the cached encryption key (if available).
+    /// The key holder that this store and its credential store share, or
+    /// `None` for a store built with no key. AssumeRole encrypts the session
+    /// secret with it before [`management_store::ManagementStore::store_session`].
     ///
-    /// Returns None if encryption key is not cached. This is used by
-    /// `cmd_serve` to construct the auth provider without re-querying
-    /// the settings table.
-    fn cached_encryption_key(&self) -> Option<String>;
+    /// The default is `None`; every backend that serves returns its key
+    /// holder.
+    fn secret_keys(&self) -> Option<&secret_keys::SecretKeys> {
+        None
+    }
 }
 
 #[cfg(test)]
