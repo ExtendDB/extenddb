@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Query request bodies the service does not read as written: a field of the
-wrong JSON type, an ExpressionAttributeValues value the service cannot read as
-one type, and an ExpressionAttributeNames map the service refuses, in both
-member orders. boto3 refuses or reshapes these bodies, so they go out as
-written. Every expected answer below was measured against the service on
-2026-10-25 (11:31 UTC), 2026-11-11 and 2026-11-19.
+wrong JSON type, a member of another JSON type that the service reads, an
+ExpressionAttributeValues value the service cannot read as one type, and an
+ExpressionAttributeNames map the service refuses, in both member orders. boto3
+refuses or reshapes these bodies, so they go out as written. Every expected
+answer below was measured against the service on 2026-10-25 (11:31 UTC),
+2026-11-11, 2026-11-19, 2026-11-23 and 2026-11-24.
 
 Dual-target: runs against the service and against extenddb with the same
 assertions.
@@ -49,46 +50,83 @@ def _raw_query(client, body: dict):
 
 
 SHAPE_FAULTS = [
+    # The service: "Unexpected field type".
     ("Limit 0 with ExpressionAttributeValues string",
      {"KeyConditionExpression": "pk = :p", "Limit": 0, "ExpressionAttributeValues": "x"}),
+    # The service: "Unexpected field type".
     ("ExpressionAttributeNames string with N bob",
      {"KeyConditionExpression": "pk = :p", "ExpressionAttributeNames": "x",
       "ExpressionAttributeValues": {":p": NB}}),
+    # The service: "STRING_VALUE cannot be converted to Integer".
     ("Limit string with N bob",
      {"KeyConditionExpression": "pk = :p", "Limit": "1", "ExpressionAttributeValues": {":p": NB}}),
+    # The service: "Start of structure or map found where not expected".
     ("AttributesToGet object with ProjectionExpression",
      {"KeyConditionExpression": "pk = :p", "AttributesToGet": {"a": 1}, "ProjectionExpression": "a",
       "ExpressionAttributeValues": {":p": SX}}),
+    # The service: no message.
     ("QueryFilter array with FilterExpression",
      {"KeyConditionExpression": "pk = :p", "QueryFilter": [1], "FilterExpression": "a = :p",
       "ExpressionAttributeValues": {":p": SX}}),
+    # The service: "NUMBER_VALUE cannot be converted to String".
     ("Select number with N bob",
      {"KeyConditionExpression": "pk = :p", "Select": 5, "ExpressionAttributeValues": {":p": NB}}),
+    # The service: "NUMBER_VALUE cannot be converted to String".
     ("Limit 0 with Select number",
      {"KeyConditionExpression": "pk = :p", "Limit": 0, "Select": 5,
       "ExpressionAttributeValues": {":p": SX}}),
     # A field of the wrong JSON type inside a value the service cannot read as
     # one type (measured 2026-11-11).
+    # The service: "Unexpected value type in payload".
     ("string beside a null in an L",
      {"KeyConditionExpression": "pk = :p",
       "ExpressionAttributeValues": {":p": SX, ":z": {"L": [None, "x"]}}}),
+    # The service: "NUMBER_VALUE cannot be converted to String".
     ("N number beside an unknown descriptor in an L",
      {"KeyConditionExpression": "pk = :p",
       "ExpressionAttributeValues": {":p": SX, ":z": {"L": [{"X": "1"}, {"N": 5}]}}}),
+    # The service: "NUMBER_VALUE cannot be converted to String".
     ("S number beside an unknown descriptor with Limit 0",
      {"KeyConditionExpression": "pk = :p", "Limit": 0,
       "ExpressionAttributeValues": {":p": SX, ":z": {"S": 5, "X": "1"}}}),
+    # The service: "Base64 encoded length is expected a multiple of 4 bytes but
+    # found: 2".
     ("B not base64 beside a null in an L",
      {"KeyConditionExpression": "pk = :p",
       "ExpressionAttributeValues": {":p": SX, ":z": {"L": [None, {"B": "!!"}]}}}),
+    # A shape fault past another fault in another member or value (measured
+    # 2026-11-23).
+    # The service: "NUMBER_VALUE cannot be converted to String".
+    ("Select number beside an unknown descriptor with Limit 0",
+     {"Limit": 0, "ExpressionAttributeValues": {":u": {"X": "1"}}, "Select": 5,
+      "KeyConditionExpression": "pk = :u"}),
+    # The service: "NUMBER_VALUE cannot be converted to String".
+    ("Select number beside an empty NS with Limit 0",
+     {"Limit": 0, "ExpressionAttributeValues": {":p": SX, ":s": {"NS": []}}, "Select": 5,
+      "KeyConditionExpression": "pk = :p"}),
+    # The service: "NUMBER_VALUE cannot be converted to String".
+    ("S number after an empty NS in another value with Limit 0",
+     {"Limit": 0, "ExpressionAttributeValues": {":p": SX, ":a": {"NS": []}, ":b": {"S": 5}},
+      "KeyConditionExpression": "pk = :p"}),
+    # The service: "NUMBER_VALUE cannot be converted to Boolean".
+    ("ConsistentRead number with an invalid Select",
+     {"ConsistentRead": 1, "Select": "NOPE", "KeyConditionExpression": "pk = :p",
+      "ExpressionAttributeValues": {":p": SX}}),
+    # The service: "Unexpected token received from parser".
+    ("ConsistentRead on with an invalid Select",
+     {"ConsistentRead": "on", "Select": "NOPE", "KeyConditionExpression": "pk = :p",
+      "ExpressionAttributeValues": {":p": SX}}),
 ]
 
 
 class TestShapeFaultsAreReportedFirst:
     """A field of the wrong JSON type anywhere in the body answers
     SerializationException ahead of the Limit, parameter mix, enum and number
-    checks (measured 2026-10-25 11:31 UTC). The message texts differ between
-    the service and extenddb, so only the error type is asserted."""
+    checks (measured 2026-10-25 11:31 UTC), also when an unknown descriptor or
+    an empty set sits in another member or value (measured 2026-11-23). The
+    message texts differ between the service and extenddb (#1012), so only the
+    error type is asserted. The comment on each row gives the service's
+    message."""
 
     @pytest.mark.parametrize("row,body", SHAPE_FAULTS, ids=[r[0] for r in SHAPE_FAULTS])
     def test_rows(self, dynamodb_client, ss_table, row, body):
@@ -113,6 +151,9 @@ SEVERAL_AV = ("Supplied AttributeValue has more than one datatypes set, must con
 X1 = {"X": "1"}
 # An S with an unknown descriptor beside it, which the service reads as an S.
 S_PLUS_X = {"S": "a", "X": "1"}
+INVALID = "One or more parameter values were invalid: "
+SS_DUP = INVALID + "Input collection [a, a] contains duplicates."
+NS_DUP = "Input collection contains duplicates"
 LIMIT_0_AT = ("Value '0' at 'limit' failed to satisfy constraint: "
               "Member must have value greater than or equal to 1")
 SELECT_MSG = ("1 validation error detected: Value 'bad' at 'select' failed to satisfy constraint: "
@@ -155,6 +196,37 @@ UNREADABLE = [
      INVALID_VALUE + NUMERIC + "aaa for key :z"),
     ("N bob then S with Limit 0", {":z": {"N": "bob", "S": "x"}}, {"Limit": 0},
      "1 validation error detected: " + LIMIT_0_AT),
+    # Beside a second type descriptor, an empty set and a set with a duplicate
+    # member are faults too: SS ahead of the numbers, NS after its own numbers
+    # and ahead of BS and L (measured 2026-11-24).
+    ("SS dup then N 1", {":z": {"SS": ["a", "a"], "N": "1"}}, {}, INVALID_VALUE + SS_DUP + " for key :z"),
+    ("SS dup then N bob", {":z": {"SS": ["a", "a"], "N": "bob"}}, {},
+     INVALID_VALUE + SS_DUP + " for key :z"),
+    ("SS dup then X", {":z": {"SS": ["a", "a"], "X": "1"}}, {}, INVALID_VALUE + SS_DUP + " for key :z"),
+    ("SS dup then L with null", {":z": {"SS": ["a", "a"], "L": [None]}}, {},
+     INVALID_VALUE + SS_DUP + " for key :z"),
+    ("S then L with SS dup", {":z": {"S": "x", "L": [{"SS": ["a", "a"]}]}}, {},
+     INVALID_VALUE + SS_DUP + " for key :z"),
+    ("NS dup then S", {":z": {"NS": ["1", "1"], "S": "x"}}, {}, INVALID_VALUE + NS_DUP + " for key :z"),
+    ("NS dup then N bob", {":z": {"NS": ["1", "1"], "N": "bob"}}, {},
+     INVALID_VALUE + NUMERIC + "bob for key :z"),
+    ("NS dup then L with N bob", {":z": {"NS": ["1", "1"], "L": [{"N": "bob"}]}}, {},
+     INVALID_VALUE + NS_DUP + " for key :z"),
+    ("NS bob bob then S", {":z": {"NS": ["bob", "bob"], "S": "x"}}, {},
+     INVALID_VALUE + NUMERIC + "bob for key :z"),
+    ("NS dup then BS dup", {":z": {"NS": ["1", "1"], "BS": ["YQ==", "YQ=="]}}, {},
+     INVALID_VALUE + NS_DUP + " for key :z"),
+    ("BS dup then N 1", {":z": {"BS": ["YQ==", "YQ=="], "N": "1"}}, {},
+     INVALID_VALUE + INVALID + "Input collection [YQ==, YQ==]of type BS contains duplicates."
+     + " for key :z"),
+    ("BS dup then N bob", {":z": {"BS": ["YQ==", "YQ=="], "N": "bob"}}, {},
+     INVALID_VALUE + NUMERIC + "bob for key :z"),
+    ("empty SS then N 1", {":z": {"SS": [], "N": "1"}}, {},
+     INVALID_VALUE + INVALID + "An string set  may not be empty for key :z"),
+    ("empty NS then S", {":z": {"NS": [], "S": "x"}}, {},
+     INVALID_VALUE + INVALID + "An number set  may not be empty for key :z"),
+    ("empty BS then N 1", {":z": {"BS": [], "N": "1"}}, {},
+     INVALID_VALUE + INVALID + "Binary sets should not be empty for key :z"),
     # A type descriptor with a null payload reads as no payload (measured
     # 2026-11-19).
     ("S null", {":z": {"S": None}}, {}, INVALID_VALUE + EMPTY_AV + " for key :z"),
@@ -178,8 +250,10 @@ class TestValuesTheServiceCannotReadAsOneType:
     beside a known one, or a known one with a null payload) is named with its
     placeholder, and beside such a value Select, ReturnConsumedCapacity and
     Limit are reported together, ahead of the parameter mix (measured
-    2026-11-11 and 2026-11-19). boto3 cannot send an unknown descriptor or a
-    null, so the bodies go out as written."""
+    2026-11-11 and 2026-11-19). Beside a second type descriptor, an empty set
+    and a set with a duplicate member are named ahead of the more than one
+    datatypes text (measured 2026-11-24). boto3 cannot send an unknown
+    descriptor or a null, so the bodies go out as written."""
 
     @pytest.mark.parametrize("row,values,extra,expected", UNREADABLE, ids=[r[0] for r in UNREADABLE])
     def test_rows(self, dynamodb_client, ss_table, row, values, extra, expected):
@@ -202,6 +276,59 @@ class TestValuesTheServiceCannotReadAsOneType:
         assert payload.get("__type", "").endswith("ValidationException"), payload
         assert payload.get("message", payload.get("Message")) == (
             INVALID_VALUE + EMPTY_AV + " for key :z")
+
+
+SELECT_NOPE = SELECT_MSG.replace("'bad'", "'NOPE'")
+
+# (row, body without TableName, the service's message), measured 2026-11-23.
+NO_SHAPE_FAULT = [
+    ("Limit 0 beside an unknown descriptor as the key value",
+     {"Limit": 0, "ExpressionAttributeValues": {":u": X1}, "KeyConditionExpression": "pk = :u"},
+     "1 validation error detected: " + LIMIT_0_AT),
+    ("ConsistentRead string with an invalid Select",
+     {"ConsistentRead": "true", "Select": "NOPE", "KeyConditionExpression": "pk = :p",
+      "ExpressionAttributeValues": {":p": SX}}, SELECT_NOPE),
+    ("ConsistentRead T with an invalid Select",
+     {"ConsistentRead": "T", "Select": "NOPE", "KeyConditionExpression": "pk = :p",
+      "ExpressionAttributeValues": {":p": SX}}, SELECT_NOPE),
+    ("ScanIndexForward string with an invalid Select",
+     {"ScanIndexForward": "true", "Select": "NOPE", "KeyConditionExpression": "pk = :p",
+      "ExpressionAttributeValues": {":p": SX}}, SELECT_NOPE),
+    ("ScanIndexForward 0 with an invalid Select",
+     {"ScanIndexForward": "0", "Select": "NOPE", "KeyConditionExpression": "pk = :p",
+      "ExpressionAttributeValues": {":p": SX}}, SELECT_NOPE),
+    ("Limit 1.5 with an invalid Select",
+     {"Limit": 1.5, "Select": "NOPE", "KeyConditionExpression": "pk = :p",
+      "ExpressionAttributeValues": {":p": SX}}, SELECT_NOPE),
+    # A null member and a null name (measured 2026-11-24).
+    ("ScanIndexForward null with an invalid Select",
+     {"ScanIndexForward": None, "Select": "NOPE", "KeyConditionExpression": "pk = :p",
+      "ExpressionAttributeValues": {":p": SX}}, SELECT_NOPE),
+    ("null name with an invalid Select",
+     {"ExpressionAttributeNames": {"#a": None}, "Select": "NOPE",
+      "KeyConditionExpression": "pk = :p", "ExpressionAttributeValues": {":p": SX}}, SELECT_NOPE),
+    ("null name with an invalid ReturnConsumedCapacity",
+     {"ExpressionAttributeNames": {"#a": None}, "ReturnConsumedCapacity": "NOPE",
+      "KeyConditionExpression": "pk = :p", "ExpressionAttributeValues": {":p": SX}},
+     RCC_MSG.replace("'bad'", "'NOPE'")),
+]
+
+
+class TestMembersTheServiceReadsAreNotShapeFaults:
+    """The service reads a ConsistentRead or ScanIndexForward string such as
+    "true", "T" or "0" as a boolean and any number in Limit as an integer, and
+    an unknown descriptor is a value it cannot read as one type. So none of
+    them answers SerializationException, and the check's answer stands
+    (measured 2026-11-23). A string such as "on" is a shape fault (see
+    SHAPE_FAULTS). The service reads a null member as an absent one and a null
+    name as an empty name, which it reports after these checks, so the
+    check's answer stands there too (measured 2026-11-24)."""
+
+    @pytest.mark.parametrize("row,body,expected", NO_SHAPE_FAULT,
+                             ids=[r[0] for r in NO_SHAPE_FAULT])
+    def test_rows(self, dynamodb_client, ss_table, row, body, expected):
+        _assert_validation(*_raw_query(dynamodb_client, {"TableName": ss_table, **body}),
+                           expected)
 
 
 INVALID_KEY = 'ExpressionAttributeNames contains invalid key: Syntax error; key: "a"'
