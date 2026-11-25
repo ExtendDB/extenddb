@@ -5,12 +5,12 @@
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use extenddb_core::error::DynamoDbError;
+use extenddb_core::error::{DynamoDbError, SERIALIZATION_FAILURE_BODY, error_document};
 use serde_json::Value;
 
-/// Hardcoded fallback body for when response serialization itself fails.
-const SERIALIZATION_FAILURE_BODY: &[u8] =
-    br#"{"__type":"com.amazonaws.dynamodb.v20120810#InternalServerError","message":"Internal error"}"#;
+#[cfg(test)]
+#[path = "response_tests.rs"]
+mod message_key_tests;
 
 /// REQ-WIRE-010: `x-amzn-RequestId` on every response.
 /// REQ-WIRE-011: `x-amz-crc32` checksum.
@@ -33,27 +33,14 @@ pub(crate) fn success_response(body: &Value, request_id: &str) -> Response {
         .into_response()
 }
 
-/// REQ-ERR-001: `__type` with prefix. REQ-ERR-002: message field.
-/// REQ-ERR-003: Omit `message` when empty (real `DynamoDB` behavior, verified 2026-05-04).
+/// REQ-ERR-001: `__type` with prefix. REQ-ERR-002: message field, under the
+/// key `error_document` picks. REQ-ERR-003: Omit the message field when empty
+/// (real `DynamoDB` behavior, verified 2026-05-04).
 pub(crate) fn error_response(error: &DynamoDbError, request_id: &str) -> Response {
-    // Fix #14: Use full_error_type() which includes the prefix
-    let mut body = serde_json::json!({
-        "__type": error.full_error_type(),
-    });
-    // Only include message field when non-empty (real DynamoDB omits it for
-    // UnknownOperationException and other errors with no message).
-    let msg = error.message();
-    if !msg.is_empty() {
-        body["message"] = serde_json::Value::String(msg.to_owned());
-    }
-    // TransactionCanceledException includes per-item CancellationReasons
-    if let Some(reasons) = error.cancellation_reasons() {
-        body["CancellationReasons"] = serde_json::to_value(reasons).unwrap_or_default();
-    }
-    // ConditionalCheckFailedException includes the old item when requested
-    if let Some(item) = error.condition_check_item() {
-        body["Item"] = serde_json::to_value(item).unwrap_or_default();
-    }
+    // The body shape (`__type`, optional message, `CancellationReasons`, `Item`)
+    // is built by the shared `error_document` helper so the wire body and the
+    // in-process body come from the same code; this transport adds the HTTP status and headers.
+    let body = error_document(error);
     let body_bytes =
         serde_json::to_vec(&body).unwrap_or_else(|_| SERIALIZATION_FAILURE_BODY.to_vec());
     let crc = crc32fast::hash(&body_bytes);
@@ -83,26 +70,28 @@ pub(crate) fn error_response(error: &DynamoDbError, request_id: &str) -> Respons
 /// rules. A failed condition counts in `ConditionalCheckFailedRequests` and not
 /// in `UserErrors`, as CloudWatch's metrics page says. `table_name` is the name
 /// `request_helpers::metric_table_name` checked, used by the metrics that carry
-/// one.
+/// one. Every metric carries `account_id`, the account the request was
+/// authenticated for.
 pub(crate) fn record_error_metrics(
     metrics: &extenddb_core::metrics::MetricsCollector,
     error: &DynamoDbError,
+    account_id: &str,
     table_name: Option<&str>,
     operation: &str,
 ) {
     match error {
         DynamoDbError::InternalServerError(_) | DynamoDbError::ServiceUnavailable(_) => {
-            metrics.record_system_error(table_name, operation);
+            metrics.record_system_error(account_id, table_name, operation);
         }
         DynamoDbError::ConditionalCheckFailedException(..) => {
-            metrics.record_conditional_check_failure(table_name, operation);
+            metrics.record_conditional_check_failure(account_id, table_name, operation);
         }
         DynamoDbError::TransactionConflictException(_) => {
-            metrics.record_user_error(None, operation);
-            metrics.record_transaction_conflict(operation);
+            metrics.record_user_error(account_id, None, operation);
+            metrics.record_transaction_conflict(account_id, operation);
         }
         _ => {
-            metrics.record_user_error(None, operation);
+            metrics.record_user_error(account_id, None, operation);
         }
     }
 }
@@ -114,6 +103,8 @@ mod tests {
     };
 
     use super::*;
+
+    const ACCOUNT: &str = "111111111111";
 
     /// The dimensions of every snapshot of `metric` in `collector`.
     fn dimensions_of(collector: &MetricsCollector, metric: MetricName) -> Vec<Vec<Dimension>> {
@@ -142,11 +133,23 @@ mod tests {
             DynamoDbError::ResourceNotFoundException("missing".to_owned()),
             DynamoDbError::TransactionConflictException("conflict".to_owned()),
         ] {
-            record_error_metrics(&collector, &error, Some("Orders"), "PutItem");
+            record_error_metrics(&collector, &error, ACCOUNT, Some("Orders"), "PutItem");
         }
         let user_errors = dimensions_of(&collector, MetricName::UserErrors);
         assert_eq!(user_errors.len(), 1, "{user_errors:?}");
         assert!(!has_table(&user_errors[0]), "{user_errors:?}");
+        // The error still names the account the request was made for, and
+        // so does the conflict.
+        assert!(
+            user_errors[0].contains(&Dimension::AccountId(ACCOUNT.to_owned())),
+            "{user_errors:?}"
+        );
+        let conflicts = dimensions_of(&collector, MetricName::TransactionConflict);
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        assert!(
+            conflicts[0].contains(&Dimension::AccountId(ACCOUNT.to_owned())),
+            "{conflicts:?}"
+        );
     }
 
     /// A failed condition counts in `ConditionalCheckFailedRequests` only.
@@ -156,6 +159,7 @@ mod tests {
         record_error_metrics(
             &collector,
             &DynamoDbError::ConditionalCheckFailedException("failed".to_owned(), None),
+            ACCOUNT,
             Some("Orders"),
             "PutItem",
         );
@@ -172,12 +176,14 @@ mod tests {
         record_error_metrics(
             &collector,
             &DynamoDbError::ConditionalCheckFailedException("failed".to_owned(), None),
+            ACCOUNT,
             Some("Orders"),
             "PutItem",
         );
         record_error_metrics(
             &collector,
             &DynamoDbError::InternalServerError("boom".to_owned()),
+            ACCOUNT,
             Some("Orders"),
             "PutItem",
         );
@@ -191,6 +197,10 @@ mod tests {
                 dims[0]
                     .iter()
                     .any(|d| matches!(d, Dimension::TableName(t) if t == "Orders")),
+                "{metric:?}: {dims:?}"
+            );
+            assert!(
+                dims[0].contains(&Dimension::AccountId(ACCOUNT.to_owned())),
                 "{metric:?}: {dims:?}"
             );
         }

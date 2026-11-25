@@ -16,6 +16,7 @@ use extenddb_storage::util::SortKeyValue;
 use extenddb_storage::util::{composite_pk_to_text, parse_sk, sk_column, sk_column_n};
 
 use super::{all_sort_key_info, index_table_name};
+use crate::catalog_json::from_catalog_json;
 use crate::gsi_queue::{GsiApplyContext, GsiIndexDef, enqueue_gsi_pending};
 
 /// Map a `sqlx` error to `StorageError`, preserving the SQLSTATE code in the
@@ -137,16 +138,13 @@ where
 
     // Every row carries the same table definitions; parse them once.
     let attribute_definitions: Vec<AttributeDefinition> = match rows.first() {
-        Some(row) => serde_json::from_value(row.6.clone())
-            .map_err(|e| StorageError::Internal(e.to_string()))?,
+        Some(row) => from_catalog_json(row.6.clone())?,
         None => Vec::new(),
     };
     rows.into_iter()
         .map(|(id, index_name, idx_type, ks_json, proj_json, delay, _)| {
-            let key_schema: Vec<KeySchemaElement> = serde_json::from_value(ks_json)
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let projection: Projection = serde_json::from_value(proj_json)
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let key_schema: Vec<KeySchemaElement> = from_catalog_json(ks_json)?;
+            let projection: Projection = from_catalog_json(proj_json)?;
             Ok(IndexMeta {
                 index_id: id,
                 index_name,

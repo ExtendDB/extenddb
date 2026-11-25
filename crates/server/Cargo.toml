@@ -26,7 +26,7 @@ backup-test-hooks = ["extenddb-engine/backup-test-hooks", "extenddb-storage/test
 extenddb-cache = { workspace = true }
 extenddb-core = { workspace = true }
 extenddb-config = { workspace = true }
-extenddb-engine = { workspace = true }
+extenddb-engine = { workspace = true, features = ["default"] }
 extenddb-storage = { workspace = true }
 extenddb-backup-store = { workspace = true }
 extenddb-auth = { workspace = true }
@@ -53,6 +53,8 @@ base64 = { workspace = true }
 time = { workspace = true }
 sha2 = { workspace = true }
 rand = { workspace = true }
+# The KEK file's bytes and text (`key_file`), wiped when they drop.
+zeroize = { workspace = true }
 axum-server = { workspace = true }
 rustls = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -66,7 +68,8 @@ libc = { workspace = true }
 [dev-dependencies]
 extenddb-cache = { path = "../cache", features = ["test-util"] }
 # The login tests count bcrypt checks with `count_verifications` against an
-# in-memory SQLite catalog.
+# in-memory SQLite catalog, and the dev-credential seeding tests run against a
+# SQLite catalog file.
 extenddb-storage = { path = "../storage", features = ["test-util"] }
 extenddb-storage-sqlite = { path = "../storage-sqlite" }
 sqlx = { workspace = true, features = ["sqlite"] }

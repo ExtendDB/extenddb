@@ -684,6 +684,22 @@ impl SqliteEngine {
             }
         }
 
+        // The WebAssembly build cannot run a vector index backfill: it is a
+        // detached tokio task timed by tokio's clock, and that build runs no
+        // tokio runtime. So a request that creates a vector index is refused
+        // here, after every check above has answered and before the commit:
+        // dropping `tx` rolls back every catalog change of the request.
+        #[cfg(target_arch = "wasm32")]
+        if !vec_created.is_empty() {
+            return Err(StorageError::Unsupported(
+                extenddb_core::error::webassembly_unsupported_message(
+                    "UpdateTable",
+                    "it cannot build a vector index; create the table with its vector indexes \
+                     instead",
+                ),
+            ));
+        }
+
         tx.commit()
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -844,6 +860,11 @@ impl SqliteEngine {
     /// That means a half-populated data table is now reachable in principle, so the
     /// guarantee rests on the engine refusing to route a search to an index that is
     /// not `ACTIVE` rather than, as before, on the backfill being one transaction.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "its only caller is update_table_impl, which on wasm32 refuses a request that \
+                  creates a vector index before the catalog commit and so never calls it there"
+    )]
     async fn build_vector_index(
         &self,
         table_id: &str,
@@ -996,7 +1017,11 @@ impl SqliteEngine {
         });
         Ok(())
     }
+}
 
+// Recovery of interrupted index builds, run only by the server's startup and GSI worker.
+#[cfg(not(target_arch = "wasm32"))]
+impl SqliteEngine {
     /// Rebuild any GSI left in `CREATING` by a crash between the catalog commit
     /// and the completion of its data-table backfill. Runs once at startup: for
     /// each such index it drops any partial data table, recreates and backfills

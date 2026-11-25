@@ -3,11 +3,13 @@
 
 // Mirrors BuiltinAuthProvider::authenticate in crates/auth/src/lib.rs. It reads
 // the Authorization header from the request headers as a string, parses it
-// with sigv4::parse::parse_authorization, and calls
-// sigv4::verify::verify_signature with "POST", "/", an empty query string, the
-// request headers and the request body. Here a fixed secret key takes the
-// place of the credential store lookup. The timestamp window check is left
-// out because it depends on the clock; the sigv4_timestamp target covers it.
+// with sigv4::parse::parse_authorization, derives the signing key for the
+// scope the header names, and calls sigv4::verify::verify_signature with
+// "POST", "/", an empty query string, the request headers and the request
+// body. Here a fixed secret key and a derivation take the place of the
+// credential cache, which holds the derived key and no plaintext secret.
+// The timestamp window check is left out because it depends on the clock;
+// the sigv4_timestamp target covers it.
 //
 // Input layout, with lines separated by '\n':
 //   - The first line is the Authorization header value. The target also
@@ -28,6 +30,7 @@
 use libfuzzer_sys::fuzz_target;
 
 use extenddb_auth::sigv4::parse::parse_authorization;
+use extenddb_auth::sigv4::signing_key::derive_signing_key;
 use extenddb_auth::sigv4::verify::verify_signature;
 
 // The AWS documentation example secret key. It is not a real credential; it
@@ -44,5 +47,9 @@ fuzz_target!(|data: &[u8]| {
     let Ok(parsed) = parse_authorization(header) else {
         return;
     };
-    let _ = verify_signature(&parsed, SECRET_KEY, "POST", "/", "", &headers, body);
+    // The cache derives one key per access key and scope date. The scope here
+    // is the header's own, so a header that names another date or region
+    // reaches the same comparison the server makes.
+    let signing_key = derive_signing_key(SECRET_KEY, &parsed.date, &parsed.region, &parsed.service);
+    let _ = verify_signature(&parsed, &signing_key, "POST", "/", "", &headers, body);
 });

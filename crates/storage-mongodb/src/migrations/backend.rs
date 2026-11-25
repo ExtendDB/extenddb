@@ -15,10 +15,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bson::{Bson, Document, doc};
-use extenddb_storage::management_store::ManagementStore;
+use extenddb_storage::management_store::{ManagementStore, SettingsStore};
 use extenddb_storage::migrations::{
-    CatalogTraces, Done, HasManagementStore, LedgerColumns, LedgerRow, LedgerWrites, Migration,
-    MigrationBackend, MigrationError, MigrationId, Released, Step, StoreKind, StoreRef,
+    CatalogTraces, Done, HasManagementStore, LedgerColumns, LedgerRow, LedgerWrites, LockedStores,
+    Migration, MigrationBackend, MigrationError, MigrationId, Released, Step, StoreKind, StoreRef,
     in_transaction, record_rows,
 };
 use futures::TryStreamExt;
@@ -103,6 +103,21 @@ impl MongoStores {
 impl HasManagementStore for MongoStores {
     fn management_store(&self) -> &dyn ManagementStore {
         &self.management
+    }
+}
+
+/// The catalog's stores for the encryption-key commands, which open them
+/// under the lock they hold as a migration does: every call checks the
+/// lease first and waits at most the request timeout. The client closes
+/// when the value drops, without the graceful shutdown of
+/// [`MongoMigrations::close`], which a boxed store cannot await.
+impl LockedStores for MongoMigrations {
+    fn management(&self) -> &dyn ManagementStore {
+        &self.stores.management
+    }
+
+    fn settings(&self) -> &dyn SettingsStore {
+        &self.stores.management
     }
 }
 

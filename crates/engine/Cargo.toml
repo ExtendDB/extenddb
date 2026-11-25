@@ -25,7 +25,6 @@ partiql = ["extenddb-core/partiql"]
 extenddb-auth = { workspace = true }
 extenddb-core = { workspace = true }
 extenddb-storage = { workspace = true }
-extenddb-backup-store = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -35,16 +34,42 @@ crc32fast = { workspace = true }
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
+futures = { workspace = true }
+web-time = { workspace = true }
+
+# Native only. extenddb-backup-store (the S3 and filesystem backup store),
+# tokio-util and bytes are used only by the store-backed backup subsystem
+# (`backup` in lib.rs), which is compiled only off wasm32, as are the
+# import/export file I/O (`files` in import_export.rs) and `private_fs`, which
+# use tokio's `fs`. The workspace tokio enables `full`, whose `net` feature
+# pulls in mio, and mio does not build for wasm32, which keeps
+# extenddb-backup-store off that target as well; the wasm32 build takes the
+# tokio entry below instead.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+extenddb-backup-store = { workspace = true }
 tokio = { workspace = true }
 # `TaskTracker` for the backup jobs the server drains at shutdown;
 # `StreamReader` and `SyncIoBridge` for the restore's in-place decode of a
 # store object on the blocking pool.
 tokio-util = { workspace = true, features = ["rt", "io", "io-util"] }
+# The chunks the backup writer hands to the upload (`backup/job/writer.rs`).
 bytes = { workspace = true }
-futures = { workspace = true }
+
+# The workspace `full` tokio feature pulls in `mio` (networking), which has no
+# wasm32 target. The engine's own wasm32 code names one tokio item,
+# `tokio::spawn` (the TTL backfill in src/ttl.rs), which needs `rt`.
+# Target-scoped and additive; native keeps the workspace `full` set above.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1", default-features = false, features = ["rt"] }
 
 [dev-dependencies]
 # `start_paused` for the tests of timers that must not depend on the wall clock.
 tokio = { workspace = true, features = ["test-util"] }
 # A storage engine for the tests that need an `OperationContext`.
 extenddb-storage-sqlite = { path = "../storage-sqlite" }
+# Scratch directories that are removed when a test panics.
+tempfile = "3"
+
+# `tests/private_modes.rs` sets umask 0.
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }

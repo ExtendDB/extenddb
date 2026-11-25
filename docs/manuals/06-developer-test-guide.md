@@ -9,7 +9,7 @@ extenddb/
 ├── Cargo.toml                 Workspace root
 ├── extenddb.sample.toml           Configuration template
 ├── crates/
-│   ├── core/                  Pure sync Rust: types, expressions, validation, errors
+│   ├── core/                  Sync Rust: types, expressions, validation, errors
 │   ├── engine/                Async operation handlers
 │   ├── storage/               Storage trait definitions
 │   ├── storage-postgres/      PostgreSQL backend
@@ -52,7 +52,7 @@ Both debug and release builds must pass before any phase exit.
 
 ### Crate Boundaries
 
-- `core` is pure sync Rust — no async runtime, no database drivers, no HTTP framework
+- `core` is sync Rust — no async runtime, no database drivers, no HTTP framework
 - `storage` defines traits and backend-agnostic utilities (ARN, key parsing)
 - `engine` contains async operation handlers that call storage traits
 - `storage-postgres` implements storage traits for PostgreSQL
@@ -371,6 +371,6 @@ Output goes to `pdfs/` (gitignored).
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

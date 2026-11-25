@@ -930,6 +930,48 @@ impl S3Store {
             .map(|done| done.deleted)
     }
 
+    /// `delete_written` (the trait's doc): one `DeleteObject`, with
+    /// `If-Match` on the entity tag the put answered when it gave one. A 412
+    /// leaves the object (another one is under the key); a missing key
+    /// (S3 answers 404 to a conditional delete of one) is gone. A 409
+    /// `ConditionalRequestConflict` (another conditional request on the key
+    /// was in flight) re-sends the conditional delete after a short
+    /// back-off, as the conditional put does, up to [`CONDITIONAL_RETRIES`]
+    /// times, after which the last answer is reported as the error it is.
+    async fn delete_written_impl(&self, written: &ObjectMeta) -> Result<bool, StoreError> {
+        validate_key(&written.key)?;
+        let full_key = self.full_key(&written.key)?;
+        let mut attempt = 0;
+        loop {
+            let mut request = self
+                .client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(&full_key);
+            if let Some(etag) = &written.etag {
+                request = request.if_match(format!("\"{etag}\""));
+            }
+            match request.send().await {
+                Ok(_) => return Ok(true),
+                Err(e) => match conditional_outcome(&e) {
+                    Some(Conditional::Present) => return Ok(false),
+                    Some(Conditional::Conflict)
+                        if written.etag.is_some() && attempt < CONDITIONAL_RETRIES =>
+                    {
+                        attempt += 1;
+                        tokio::time::sleep(conditional_backoff(attempt)).await;
+                    }
+                    _ => {
+                        return match map_sdk_error("DeleteObject", e) {
+                            StoreError::NotFound => Ok(true),
+                            other => Err(other),
+                        };
+                    }
+                },
+            }
+        }
+    }
+
     /// The requests of `delete_prefix` and `delete_prefix_before`: with a
     /// `deadline`, no request is sent at or after it, and the call returns
     /// what it deleted with `finished` false.
@@ -1366,6 +1408,13 @@ impl BackupStore for S3Store {
 
     fn delete_prefix<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<u64, StoreError>> {
         self.delete_prefix_impl(prefix).boxed()
+    }
+
+    fn delete_written<'a>(
+        &'a self,
+        written: &'a ObjectMeta,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        self.delete_written_impl(written).boxed()
     }
 
     fn delete_prefix_before<'a>(

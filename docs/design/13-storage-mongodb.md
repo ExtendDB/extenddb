@@ -111,7 +111,11 @@ field is unset when the index flips to `ACTIVE`.
 ```
 Keys include `catalog_version` (the catalog's migration id, which the
 migration runner writes with each catalog ledger row), `encryption_key`
-(base64-encoded 256-bit AES-GCM key), `data_database_name`, and
+(base64-encoded 256-bit AES-GCM key, the catalog key; absent after the switch
+to a key-encryption key file), `encryption_key_ring` (with `[auth.encryption]
+key_file` set: the data encryption key wrapped under the key-encryption key, the
+KEK's id and the state of an unfinished switch or rotation, as one JSON
+document), `data_database_name`, and
 `data_connection_string`.
 
 ### 3.6 `admin_users`
@@ -143,8 +147,14 @@ Unique index on `user_arn`.
 }
 ```
 Index on `(account_id, user_name)`. `secret_key_encrypted` is AES-256-GCM
-ciphertext of the secret access key using the `settings.encryption_key`;
-`access_key_id` is bound as additional authenticated data.
+ciphertext of the secret access key using the `settings.encryption_key`, with
+`access_key_id` bound as additional authenticated data; under the data
+encryption key of a key ring, the additional authenticated data binds the
+catalog id, the collection, the access key ID, the account, the user name and
+the expiry instead (the Security Model's Credential Storage section). The
+`extenddb encryption-key` pass rewrites each document with one `update_one` on
+its `_id` and no upsert, so a document that the TTL index deletes during the
+pass stays deleted.
 
 ### 3.9 `iam_groups`
 ```json
@@ -734,17 +744,29 @@ second-precision form.
 ### 5.6 Write conflict handling
 
 **Transient-conflict detection.** `is_transient_write_conflict` returns
-true for any of: the `TransientTransactionError` label, the
-`UnknownTransactionCommitResult` label, or a raw `WriteConflict` (code
-112). Under snapshot isolation these all mean "your write lost to a
-concurrent writer; retry the whole transaction."
+true for the `TransientTransactionError` label or a raw `WriteConflict`
+(code 112). Under snapshot isolation both mean nothing was applied and the
+transaction may be re-run; a conflict with a concurrent writer is the
+usual cause. It does not match the `UnknownTransactionCommitResult` label:
+under that label the commit may already have applied, so the body is never
+re-run, and `classify_commit_error` retries `commitTransaction` in place,
+which is idempotent.
 
 **Retry loop.** Session-scoped writes (Put / Delete / Update / TWI) wrap
 the transaction body in a `for attempt in 0..TRANSIENT_RETRY_ATTEMPTS`
 loop (50 attempts). Each attempt starts a fresh transaction, runs the
 body, and either commits, aborts and retries (transient), or aborts and
-returns (fatal). Retries sleep with jittered exponential backoff
-(`backoff_sleep`, base 50 µs).
+returns (fatal). Retries sleep with jittered exponential backoff:
+`backoff_sleep` waits a uniform 0 to 50 µs × 2^min(attempt, 8), which is at
+most 12.8 ms from the ninth attempt on and sums to at most about 550 ms
+over the 50 attempts (275 ms expected). Tokio's timer ticks every
+millisecond and rounds a sleep up to the next tick, so for the first five
+attempts (longest jitter under 1 ms) the wait is set by the tick, not by
+the jitter. The helpers that run inside the transaction (index entry
+writes, the stream shard lookup, the stream sequence counter draw and the
+stream record insert) map a transient conflict to `StorageError::Transient`
+through `write_conflict::transaction_error`, and the transaction body
+turns that into a re-run like a conflict on the data collection.
 
 **UpdateItem's OCC guard on top.** `UpdateItem` uses a `_v` version filter.
 In snapshot mode, the transaction supplies the point-in-time view used to
@@ -755,9 +777,15 @@ signal from `Transient`) and the loop restarts. The native fast path always
 emits `$inc: {_v: 1}` so a concurrent slow-path update racing against a stale
 read fails its filter and retries.
 
-**Exhaustion behavior.** Single-item retry exhaustion returns
-`StorageError::Internal` (rare in practice; the retry ceiling is high).
-`TransactWriteItems` exhaustion surfaces as
+**Exhaustion behavior.** Single-item retry exhaustion (PutItem,
+DeleteItem, UpdateItem) returns `StorageError::Transient`, built by
+`write_conflict::retry_budget_exhausted`. Its message reads
+`<operation>: could not commit in <N> attempts: <last error>` and carries
+the last error that ended an attempt: the driver's text, or a fixed
+sentence after an UpdateItem version miss. The engine logs it and answers
+HTTP 503 `ServiceUnavailable`, which the SDKs retry. The server counts
+that 503 as a system error, not under
+`TransactionConflict`. `TransactWriteItems` exhaustion surfaces as
 `StorageError::TransactionCanceled` with a synthetic per-op
 `TransactionConflict` reason so wire consumers see the DDB-canonical
 error string instead of a bare HTTP 500.
@@ -1031,7 +1059,8 @@ The backend implements every trait in `extenddb-storage`:
   subset.
 - `StreamEngine` — session-scoped per-shard sequence numbers, four
   shards per stream, CRC32 pk routing, TRIM_HORIZON / LATEST /
-  AT_SEQUENCE_NUMBER / AFTER_SEQUENCE_NUMBER iterators, 24h retention.
+  AT_SEQUENCE_NUMBER / AFTER_SEQUENCE_NUMBER / AT_TIMESTAMP iterators,
+  24h retention.
 - `MetadataEngine` — TTL lifecycle, tags, table-size tracking.
 - `BackupEngine` — CreateBackup, RestoreTableFromBackup, DeleteBackup
   via server-side `$out` aggregation.
@@ -1051,7 +1080,8 @@ The backend implements every trait in `extenddb-storage`:
 - `AuthorizationStore` — user/group/role/permissions-boundary/session
   policy lookup for IAM evaluation.
 - `MongoCredentialStore` — SigV4 credential resolution with
-  AES-GCM-decrypted secret keys.
+  AES-GCM-decrypted secret keys on a cache miss; the credential cache keeps the
+  derived signing key and wipes the secret.
 
 **Background workers** — spawned from `MongoRuntimeHooks::spawn_workers`:
 - `ttl_cleanup_worker` — sweep expired items every 60 s, emit
@@ -1152,3 +1182,14 @@ uses the compound `(shard_id, sequence_number)` index.
 configured `transaction_read_concern` (default `"snapshot"`) and
 majority write concern; up to 100 operations
 per the DDB spec. Retried on transient conflicts with jittered backoff.
+
+---
+
+## License
+
+Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
+See [LICENSE](../../LICENSE) for the full text.
+
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.
