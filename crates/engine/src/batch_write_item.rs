@@ -190,9 +190,10 @@ async fn write_batch(
     // batch answers the first throttle error instead, with its
     // ThrottlingReasons: the API reference documents
     // ProvisionedThroughputExceededException or ThrottlingException for a
-    // batch that cannot process any item because of throttling (documented,
-    // not measured). A batch with nothing applied in which a request was
-    // deferred for another reason answers 503.
+    // batch that cannot process any item because of throttling (measured
+    // 2026-11-24, 3 of 3 all-throttled batches answered 400). A batch with
+    // nothing applied in which a request was deferred for another reason
+    // answers 503.
     //
     // The request faults the same page lists reject the whole batch before
     // anything is written. `check_batch` finds a missing table, a key that

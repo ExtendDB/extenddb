@@ -254,12 +254,13 @@ pub async fn handle_batch_get_item(
     }
 
     // No key of any table could be read: the call fails with the first
-    // throttle error (API Reference; documented, not measured). "First" is the
-    // request map's iteration order, so with tables of different billing modes
-    // either error class can come out; the service's choice for that case is
-    // not measured (one table per request in the sample). A table whose every
-    // key was throttled beside a served table keeps an empty `Responses` list;
-    // unmeasured as well.
+    // throttle error (API Reference; measured 2026-11-24, 24 of 24
+    // all-throttled batches answered 400). "First" is the request map's
+    // iteration order, so with tables of different billing modes either error
+    // class can come out; the service's choice for that case is not measured
+    // (one table per request in the sample). A table whose every key was
+    // throttled beside a served table keeps an empty `Responses` list; the
+    // service left it out in 29 of 29 measured responses.
     if let Some(e) = first_throttle
         && throttled_tables.values().sum::<u32>() as usize == total_keys
     {

@@ -68,9 +68,10 @@ pub(crate) fn error_response(error: &DynamoDbError, request_id: &str) -> Respons
 ///
 /// `UserErrors` carries no table name: CloudWatch reports it per account and
 /// Region only, and a 4xx is often a request whose `TableName` broke the
-/// rules. A failed condition counts in `ConditionalCheckFailedRequests` and a
-/// throttle error in `ThrottledRequests`, neither in `UserErrors`, as
-/// CloudWatch's metrics page says. The server's own bucket records its
+/// rules. A failed condition counts in `ConditionalCheckFailedRequests` and not
+/// in `UserErrors`, as CloudWatch's metrics page says. A throttle error counts
+/// in `ThrottledRequests` and not in `UserErrors`, as the page says of a
+/// throttled request. The server's own bucket records its
 /// refusals before dispatch, so a throttle error here is one a backend
 /// reported. On `BatchGetItem` and `BatchWriteItem` it answers a batch whose
 /// every entry was throttled, the one batch CloudWatch counts in
