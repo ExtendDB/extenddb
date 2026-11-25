@@ -298,13 +298,16 @@ mod tests {
         body
     }
 
-    /// The leaves the service's check before authentication passes where
-    /// `serde_json`'s grammar refuses them (measured 2026-11-24, us-east-1, at
-    /// 63 and 20000 wrappers: unsigned, each is a
+    /// The leaves the service's check before authentication passes (measured
+    /// in us-east-1 at 63 and 20000 wrappers: unsigned, each is a
     /// `MissingAuthenticationTokenException`, and badly signed an
-    /// `InvalidSignatureException`): the numbers `01`, `1.`, `1e` and `-`, the
-    /// escape `\u12G4`, and FF, NUL and VT before a value.
-    const LOOSE_LEAVES: [&[u8]; 8] = [
+    /// `InvalidSignatureException`). On 2026-11-24: the numbers `01`, `1.`,
+    /// `1e` and `-`, the escape `\u12G4`, and FF, NUL and VT before a value,
+    /// which `serde_json`'s grammar refuses. On 2026-11-25, at the edges of the
+    /// looser rules: the numbers `1+`, `1e+5` and `1.eE-+`, whose `+` is a
+    /// number byte, and the escape `\ugggg`, whose `g` is the highest byte the
+    /// service takes after `\u`.
+    const LOOSE_LEAVES: [&[u8]; 12] = [
         br#"{"S":01}"#,
         br#"{"S":1.}"#,
         br#"{"S":1e}"#,
@@ -313,6 +316,10 @@ mod tests {
         b"{\"S\":\x0c\"leaf\"}",
         b"{\"S\":\x00\"leaf\"}",
         b"{\"S\":\x0b\"leaf\"}",
+        br#"{"S":1+}"#,
+        br#"{"S":1e+5}"#,
+        br#"{"S":1.eE-+}"#,
+        br#"{"S":"le\uggggaf"}"#,
     ];
 
     fn parse(body: &[u8]) -> Result<Value, DynamoDbError> {
@@ -475,21 +482,24 @@ mod tests {
         // Rows: a body that parses, a fault the parse meets, a fault within
         // the ceiling that only the check meets before authentication, a
         // fault past the ceiling, bodies with numbers written with leading
-        // zeros, a trailing `.` or a `-` on its own, and seven faults in the
-        // leaf of a 200 wrapper body, each with the body that spells the value
-        // the server reads, or `None` when it refuses the body. The service
-        // sends no message field for a signed body with a syntax fault
-        // (measured 2026-11-19 and 2026-11-20, us-east-1) and refuses each
-        // leaf fault before authentication (measured in us-east-1: the
-        // control byte and the unknown escape in a string on 2026-11-20,
-        // unsigned, badly signed and signed; the `\u` before the closing
-        // quote, SOH before a value, `tru`, the missing colon and the missing
-        // comma on 2026-11-24, unsigned and badly signed). It reads a number
-        // written with leading zeros as the decimal number it spells, a `-`
-        // on its own as 0 and digits that end in a `.` as the digits
-        // (measured 2026-11-21, us-east-1), so such a body is read at every
-        // depth, with the bytes of its strings as sent. The parse and the
-        // check give each row the same answer. The parse recurses, so the
+        // zeros, a trailing `.` or a `-` on its own, seven faults in the leaf
+        // of a 200 wrapper body, and four in the leaf at 63 and at 20000
+        // wrappers, each with the body that spells the value the server
+        // reads, or `None` when it refuses the body. The service sends no
+        // message field for a signed body with a syntax fault (measured
+        // 2026-11-19 and 2026-11-20, us-east-1) and refuses each leaf fault
+        // before authentication (measured in us-east-1: the control byte and
+        // the unknown escape in a string on 2026-11-20, unsigned, badly
+        // signed and signed; the `\u` before the closing quote, SOH before a
+        // value, `tru`, the missing colon and the missing comma on 2026-11-24,
+        // unsigned and badly signed; a number that starts with `+` or `.`,
+        // and `/` and `h`, the bytes on either side of the range the service
+        // takes after `\u`, on 2026-11-25, unsigned and badly signed). It
+        // reads a number written with leading zeros as the decimal number it
+        // spells, a `-` on its own as 0 and digits that end in a `.` as the
+        // digits (measured 2026-11-21, us-east-1), so such a body is read at
+        // every depth, with the bytes of its strings as sent. The parse and
+        // the check give each row the same answer. The parse recurses, so the
         // rows run on a worker-sized stack.
         let nested = |leaf: &[u8]| {
             let levels = UNAUTHENTICATED_PARSE_DEPTH + 1000;
@@ -533,6 +543,14 @@ mod tests {
             (deep_body_with_leaf(200, br#"{"S":"leaf" "T":"x"}"#), None),
             (deep_body_with_leaf(200, b"{\"S\":\"le\x01af\"}"), None),
             (deep_body_with_leaf(200, br#"{"S":"le\qaf"}"#), None),
+            (deep_body_with_leaf(63, br#"{"S":+1}"#), None),
+            (deep_body_with_leaf(20000, br#"{"S":+1}"#), None),
+            (deep_body_with_leaf(63, br#"{"S":.5}"#), None),
+            (deep_body_with_leaf(20000, br#"{"S":.5}"#), None),
+            (deep_body_with_leaf(63, br#"{"S":"le\u000/af"}"#), None),
+            (deep_body_with_leaf(20000, br#"{"S":"le\u000/af"}"#), None),
+            (deep_body_with_leaf(63, br#"{"S":"le\u000haf"}"#), None),
+            (deep_body_with_leaf(20000, br#"{"S":"le\u000haf"}"#), None),
         ];
         // Numbers the service refuses in an integer member with "Bad number
         // format" and skips outside its model, the fractions `-.5` and `1.e7`
@@ -585,7 +603,8 @@ mod tests {
         // an invalid UTF-8 byte in a string and a lone surrogate escape
         // (measured 2026-11-19, us-east-1: unsigned, each is a
         // MissingAuthenticationTokenException), and each leaf of
-        // `LOOSE_LEAVES` at 63 and at 20000 wrappers (measured 2026-11-24).
+        // `LOOSE_LEAVES` at 63 and at 20000 wrappers (measured 2026-11-24 and
+        // 2026-11-25).
         // This runs on the default test-thread stack, where a parse that
         // recursed a million levels would overflow, so it also shows that the
         // check does not recurse.
