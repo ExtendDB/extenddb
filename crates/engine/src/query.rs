@@ -384,13 +384,15 @@ pub async fn handle_query(
     // the key schema of the table or index queried picking the wording. An
     // ExclusiveStartKey or a key value size is checked after it (measured
     // 2026-10-23). Legacy KeyConditions is desugared above with an equality
-    // clause, or refused there, so it passes.
-    refuse_without_hash_equality(
-        &key_condition,
-        &query_key_info.key_schema,
-        &query_key_info.attribute_definitions,
-        effective_maps,
-    )?;
+    // clause, or refused there, so it never lacks the HASH equality.
+    if lacks_hash_equality {
+        refuse_without_hash_equality(
+            &key_condition,
+            &query_key_info.key_schema,
+            &query_key_info.attribute_definitions,
+            effective_maps,
+        )?;
+    }
 
     // When Select=ALL_PROJECTED_ATTRIBUTES, capture the index info for post-read filtering.
     let index_proj = if matches!(input.select, Some(Select::AllProjectedAttributes)) {
@@ -640,9 +642,9 @@ fn refuse_begins_with_on_number(
 /// Refuse a key condition that skipped the classification in `handle_query`:
 /// a key condition with no equality clause, and on a schema with one HASH
 /// attribute an equality on another attribute paired with a non-equality on
-/// the HASH attribute. `handle_query` calls this after the expression
-/// validations. The parse has already refused an undefined `#name` or
-/// `:value` and two conditions on one attribute.
+/// the HASH attribute. `handle_query` calls this for such a key condition
+/// only, after the expression validations. The parse has already refused an
+/// undefined `#name` or `:value` and two conditions on one attribute.
 ///
 /// The order, measured on 2026-11-01 on a schema with one HASH attribute,
 /// two samples each:
@@ -670,18 +672,12 @@ fn refuse_begins_with_on_number(
 /// check (measured 2026-10-23: `h > :n` with an N value on an S HASH
 /// attribute answers `HASH key attributes h must have equality conditions
 /// specified in the query`), so step 1 does not run there.
-///
-/// Every other key condition went through the classification in
-/// `handle_query` and passes.
 fn refuse_without_hash_equality(
     key_condition: &extenddb_core::expression::KeyCondition,
     key_schema: &[extenddb_core::types::KeySchemaElement],
     attribute_definitions: &[extenddb_core::types::AttributeDefinition],
     maps: &ExpressionMaps,
 ) -> Result<(), DynamoDbError> {
-    if !key_condition.lacks_hash_equality(key_schema, &maps.names) {
-        return Ok(());
-    }
     if !extenddb_core::types::is_multipart_key_schema(key_schema)
         && let Some(hash) = key_schema.iter().find(|ks| ks.key_type == KeyType::Hash)
     {

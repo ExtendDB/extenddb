@@ -190,11 +190,3 @@ fn multi_attribute_schema_reports_the_hash_wording_before_a_wrong_typed_value() 
     }
     assert_refusals(&[("h > :n", HASH_H)], &schema, &definitions);
 }
-
-#[test]
-fn a_key_condition_with_a_hash_equality_is_left_to_the_classification() {
-    // The classification in `handle_query` has already checked the value
-    // types of this condition; these checks do not repeat it.
-    let (schema, definitions) = string_table();
-    assert_eq!(check("pk = :n", &schema, &definitions), Ok(()));
-}
