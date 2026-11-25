@@ -180,10 +180,52 @@ pub fn validate_projected_attribute_total(projected: usize) -> Result<(), Dynamo
     Ok(())
 }
 
-/// Refuse a GSI throughput below 1 read or write unit, when one is given.
-/// Used by CreateTable for a PROVISIONED table and by UpdateTable's GSI
-/// creation. A PROVISIONED GSI given no throughput is accepted here, as
-/// before; the service's exact text for this case was not captured.
+/// DynamoDB's `ValidationException` for a `ReadCapacityUnits` or
+/// `WriteCapacityUnits` below 1, or `None` when both are at least 1.
+///
+/// `prefix` is the request path to the `ProvisionedThroughput`, for a table
+/// `"provisionedThroughput"` and for the n-th global secondary index
+/// `"globalSecondaryIndexes.<n>.member.provisionedThroughput"`. The service
+/// writes one constraint clause per member below 1, `writeCapacityUnits`
+/// first, and counts them in the lead sentence.
+pub fn provisioned_below_minimum_error(
+    read_capacity_units: i64,
+    write_capacity_units: i64,
+    prefix: &str,
+) -> Option<DynamoDbError> {
+    let mut clauses = Vec::new();
+    if write_capacity_units < 1 {
+        clauses.push(format!(
+            "Value '{write_capacity_units}' at '{prefix}.writeCapacityUnits' failed to satisfy \
+             constraint: Member must have value greater than or equal to 1"
+        ));
+    }
+    if read_capacity_units < 1 {
+        clauses.push(format!(
+            "Value '{read_capacity_units}' at '{prefix}.readCapacityUnits' failed to satisfy \
+             constraint: Member must have value greater than or equal to 1"
+        ));
+    }
+    if clauses.is_empty() {
+        return None;
+    }
+    let noun = if clauses.len() == 1 {
+        "validation error"
+    } else {
+        "validation errors"
+    };
+    Some(DynamoDbError::ValidationException(format!(
+        "{} {noun} detected: {}",
+        clauses.len(),
+        clauses.join("; ")
+    )))
+}
+
+/// Refuse an `UpdateTable` GSI `Create` throughput below 1 read or write
+/// unit, naming the index. `CreateTable`'s GSI path uses the per-member
+/// [`provisioned_below_minimum_error`] instead; this `UpdateTable` GSI surface
+/// was not measured against the service, so it keeps ExtendDB's older text. A
+/// GSI given no throughput is accepted, as before.
 ///
 /// # Errors
 ///
@@ -204,17 +246,35 @@ pub fn validate_index_throughput_minimum(
     }
 }
 
-/// [`validate_index_throughput_minimum`] for every GSI of a PROVISIONED
-/// table. A PAY_PER_REQUEST table's GSIs may carry no throughput at all,
-/// which [`validate_gsi_provisioned_throughput`] checks.
+/// Reject the first GSI of a PROVISIONED table whose `ProvisionedThroughput`
+/// has a member below 1, with the per-member [`provisioned_below_minimum_error`]
+/// and the index's 1-based position. A PAY_PER_REQUEST table's GSIs may carry
+/// no throughput at all, which [`validate_gsi_provisioned_throughput`] checks.
 fn validate_gsi_throughput_minimum(input: &CreateTableInput) -> Result<(), DynamoDbError> {
     if input.billing_mode.unwrap_or(BillingMode::Provisioned) == BillingMode::PayPerRequest {
         return Ok(());
     }
-    for gsi in input.global_secondary_indexes.iter().flatten() {
-        validate_index_throughput_minimum(&gsi.index_name, gsi.provisioned_throughput.as_ref())?;
+    for (i, gsi) in input.global_secondary_indexes.iter().flatten().enumerate() {
+        if let Some(t) = gsi.provisioned_throughput.as_ref()
+            && let Some(e) = validation_below_minimum_for_index(i + 1, t)
+        {
+            return Err(e);
+        }
     }
     Ok(())
+}
+
+/// The per-member below-1 error for the `n`-th (1-based) global secondary
+/// index of a CreateTable, with the service's `globalSecondaryIndexes` path.
+fn validation_below_minimum_for_index(
+    n: usize,
+    throughput: &crate::types::ProvisionedThroughput,
+) -> Option<DynamoDbError> {
+    provisioned_below_minimum_error(
+        throughput.read_capacity_units,
+        throughput.write_capacity_units,
+        &format!("globalSecondaryIndexes.{n}.member.provisionedThroughput"),
+    )
 }
 
 #[cfg(test)]
@@ -1010,10 +1070,12 @@ pub fn validate_provisioned_throughput(input: &CreateTableInput) -> Result<(), D
                     "No provisioned throughput specified for the table".to_owned(),
                 ));
             };
-            if pt.read_capacity_units < 1 || pt.write_capacity_units < 1 {
-                return Err(DynamoDbError::ValidationException(
-                    "One or more parameter values were invalid: ReadCapacityUnits and WriteCapacityUnits must both be greater than or equal to 1 for table".to_owned(),
-                ));
+            if let Some(e) = provisioned_below_minimum_error(
+                pt.read_capacity_units,
+                pt.write_capacity_units,
+                "provisionedThroughput",
+            ) {
+                return Err(e);
             }
         }
         BillingMode::PayPerRequest => {
@@ -3303,15 +3365,95 @@ mod tests {
     #[test]
     fn gsi_throughput_below_one_is_rejected_on_provisioned() {
         let limits = LimitsConfig::default();
-        for pt in [(0, 0), (0, 5), (5, 0), (-1, 5), (5, -1)] {
-            let err = validate_create_table(&provisioned_with_gsi(Some(pt)), &limits).unwrap_err();
-            assert_eq!(
-                err.to_string(),
-                "One or more parameter values were invalid: ReadCapacityUnits and \
-                 WriteCapacityUnits must both be greater than or equal to 1 for index: my-gsi",
-                "{pt:?}"
-            );
+        // Literal oracle strings (not rebuilt by the production algorithm), so
+        // a wrong order, noun, prefix or value echo would fail here.
+        let both = "2 validation errors detected: Value '0' at \
+            'globalSecondaryIndexes.1.member.provisionedThroughput.writeCapacityUnits' failed to \
+            satisfy constraint: Member must have value greater than or equal to 1; Value '0' at \
+            'globalSecondaryIndexes.1.member.provisionedThroughput.readCapacityUnits' failed to \
+            satisfy constraint: Member must have value greater than or equal to 1";
+        let read0 = "1 validation error detected: Value '0' at \
+            'globalSecondaryIndexes.1.member.provisionedThroughput.readCapacityUnits' failed to \
+            satisfy constraint: Member must have value greater than or equal to 1";
+        let write0 = "1 validation error detected: Value '0' at \
+            'globalSecondaryIndexes.1.member.provisionedThroughput.writeCapacityUnits' failed to \
+            satisfy constraint: Member must have value greater than or equal to 1";
+        let read_neg = "1 validation error detected: Value '-1' at \
+            'globalSecondaryIndexes.1.member.provisionedThroughput.readCapacityUnits' failed to \
+            satisfy constraint: Member must have value greater than or equal to 1";
+        let write_neg = "1 validation error detected: Value '-1' at \
+            'globalSecondaryIndexes.1.member.provisionedThroughput.writeCapacityUnits' failed to \
+            satisfy constraint: Member must have value greater than or equal to 1";
+        for ((read, write), expected) in [
+            ((0, 0), both),
+            ((0, 5), read0),
+            ((5, 0), write0),
+            ((-1, 5), read_neg),
+            ((5, -1), write_neg),
+        ] {
+            let err = validate_create_table(&provisioned_with_gsi(Some((read, write))), &limits)
+                .unwrap_err();
+            assert_eq!(err.to_string(), expected, "{:?}", (read, write));
         }
+    }
+
+    #[test]
+    fn table_throughput_below_one_is_rejected_on_provisioned() {
+        let limits = LimitsConfig::default();
+        let provisioned = |read: i64, write: i64| {
+            let mut input = base_input(
+                vec![make_ks("pk", KeyType::Hash)],
+                vec![make_ad("pk", ScalarAttributeType::S)],
+            );
+            input.billing_mode = Some(BillingMode::Provisioned);
+            input.provisioned_throughput = Some(crate::types::ProvisionedThroughput {
+                read_capacity_units: read,
+                write_capacity_units: write,
+            });
+            input
+        };
+        // Both members below 1: two clauses, writeCapacityUnits first.
+        assert_eq!(
+            validate_create_table(&provisioned(0, 0), &limits)
+                .unwrap_err()
+                .to_string(),
+            "2 validation errors detected: Value '0' at \
+             'provisionedThroughput.writeCapacityUnits' failed to satisfy constraint: Member must \
+             have value greater than or equal to 1; Value '0' at \
+             'provisionedThroughput.readCapacityUnits' failed to satisfy constraint: Member must \
+             have value greater than or equal to 1"
+        );
+        assert_eq!(
+            validate_create_table(&provisioned(0, 5), &limits)
+                .unwrap_err()
+                .to_string(),
+            "1 validation error detected: Value '0' at 'provisionedThroughput.readCapacityUnits' \
+             failed to satisfy constraint: Member must have value greater than or equal to 1"
+        );
+        assert!(validate_create_table(&provisioned(1, 1), &limits).is_ok());
+    }
+
+    #[test]
+    fn gsi_throughput_below_one_names_the_offending_index_position() {
+        let limits = LimitsConfig::default();
+        // First GSI valid, second below 1: the error names index 2.
+        let mut input = provisioned_with_gsi(Some((3, 4)));
+        let good = input.global_secondary_indexes.as_ref().unwrap()[0].clone();
+        let mut bad = good.clone();
+        bad.index_name = "second-gsi".to_owned();
+        bad.provisioned_throughput = Some(crate::types::ProvisionedThroughput {
+            read_capacity_units: 5,
+            write_capacity_units: 0,
+        });
+        input.global_secondary_indexes = Some(vec![good, bad]);
+        assert_eq!(
+            validate_create_table(&input, &limits)
+                .unwrap_err()
+                .to_string(),
+            "1 validation error detected: Value '0' at \
+             'globalSecondaryIndexes.2.member.provisionedThroughput.writeCapacityUnits' failed to \
+             satisfy constraint: Member must have value greater than or equal to 1"
+        );
     }
 
     #[test]
@@ -3321,6 +3463,47 @@ mod tests {
         // Accepted as before; RestoreTableFromBackup gives such an index the
         // table's throughput.
         assert!(validate_create_table(&provisioned_with_gsi(None), &limits).is_ok());
+    }
+
+    #[test]
+    fn provisioned_below_minimum_error_matches_the_service() {
+        // One member below 1: a single clause naming that member.
+        assert_eq!(
+            provisioned_below_minimum_error(5, 0, "provisionedThroughput")
+                .unwrap()
+                .to_string(),
+            "1 validation error detected: Value '0' at 'provisionedThroughput.writeCapacityUnits' \
+             failed to satisfy constraint: Member must have value greater than or equal to 1"
+        );
+        assert_eq!(
+            provisioned_below_minimum_error(-1, 5, "provisionedThroughput")
+                .unwrap()
+                .to_string(),
+            "1 validation error detected: Value '-1' at 'provisionedThroughput.readCapacityUnits' \
+             failed to satisfy constraint: Member must have value greater than or equal to 1"
+        );
+        // Both below 1: two clauses, writeCapacityUnits first, plural lead.
+        assert_eq!(
+            provisioned_below_minimum_error(0, 0, "provisionedThroughput")
+                .unwrap()
+                .to_string(),
+            "2 validation errors detected: Value '0' at \
+             'provisionedThroughput.writeCapacityUnits' failed to satisfy constraint: Member must \
+             have value greater than or equal to 1; Value '0' at \
+             'provisionedThroughput.readCapacityUnits' failed to satisfy constraint: Member must \
+             have value greater than or equal to 1"
+        );
+        // Both at least 1: no error.
+        assert!(provisioned_below_minimum_error(1, 1, "provisionedThroughput").is_none());
+        // Extreme i64 echoes verbatim (Long member), not a float.
+        assert_eq!(
+            provisioned_below_minimum_error(i64::MIN, 5, "provisionedThroughput")
+                .unwrap()
+                .to_string(),
+            "1 validation error detected: Value '-9223372036854775808' at \
+             'provisionedThroughput.readCapacityUnits' failed to satisfy constraint: Member must \
+             have value greater than or equal to 1"
+        );
     }
 
     #[test]

@@ -144,13 +144,15 @@ pub async fn handle_update_table(
         ));
     }
 
-    // Validate throughput values (must be > 0).
+    // Validate throughput values (must be >= 1).
     if let Some(ref tp) = input.provisioned_throughput
-        && (tp.read_capacity_units < 1 || tp.write_capacity_units < 1)
+        && let Some(e) = extenddb_core::validation::provisioned_below_minimum_error(
+            tp.read_capacity_units,
+            tp.write_capacity_units,
+            "provisionedThroughput",
+        )
     {
-        return Err(DynamoDbError::ValidationException(
-                "One or more parameter values were invalid: ReadCapacityUnits and WriteCapacityUnits must each be at least 1".to_owned(),
-            ));
+        return Err(e);
     }
 
     // A table-level WarmThroughput stands alone in its request, with the

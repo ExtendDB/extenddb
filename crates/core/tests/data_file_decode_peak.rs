@@ -80,6 +80,7 @@ fn decode_peak_of_a_line_of_empty_strings_at_the_cap() {
         encoder.write_all(&line).unwrap();
         encoder.finish().unwrap()
     };
+    #[cfg(target_os = "linux")]
     let line_len = line.len();
     drop(line);
 
