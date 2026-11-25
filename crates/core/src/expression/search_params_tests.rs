@@ -241,6 +241,20 @@ fn a_name_is_used_by_the_condition_or_the_projection() {
     );
 }
 
+/// A name with `_` is one name in the projection and in the condition.
+/// Measured on the service in eu-north-1 on 2026-11-25, twice: a
+/// SearchVectors with `ProjectionExpression` `#a_b` and the name `#a_b`
+/// answers 200.
+#[test]
+fn a_name_with_an_underscore_is_used_whole() {
+    let n = names(&[("#a_b", "Category")]);
+    assert!(check_unused_names(Some(&n), &BTreeSet::new(), "#a_b").is_ok());
+    #[cfg(feature = "search-inequality-filters")]
+    let condition = crate::expression::search_filter::name_refs("Country = :c AND #a_b = :s");
+    #[cfg(feature = "search-inequality-filters")]
+    assert!(check_unused_names(Some(&n), &condition, "").is_ok());
+}
+
 #[test]
 fn unused_keys_are_listed_in_sorted_order() {
     let v: HashMap<String, u8> = [(":b", 1), (":a", 2), (":c", 3)]

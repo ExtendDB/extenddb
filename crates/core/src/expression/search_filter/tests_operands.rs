@@ -290,3 +290,64 @@ fn the_combined_size_is_at_most_one_mebibyte() {
         }
     }
 }
+
+/// A function given the wrong number of operands, a function an update
+/// takes, and String bounds out of order. Measured on the service in
+/// eu-north-1 on 2026-11-25, each request twice, with the HASH equality
+/// before each condition; the service answers FilterExpression with the
+/// same bodies.
+#[test]
+fn function_arity_update_functions_and_string_bounds() {
+    use super::tests_support::message;
+    use crate::limits::LimitsConfig;
+
+    let values = HashMap::from([
+        (":hi".to_owned(), s("z")),
+        (":lo".to_owned(), s("a")),
+        (":v".to_owned(), s("x")),
+    ]);
+    let arity = |name: &str| {
+        p(&format!(
+            "Incorrect number of operands for operator or function; operator or function: \
+             {name}, number of operands: 2"
+        ))
+    };
+    let not_allowed = |name: &str| {
+        p(&format!(
+            "The function is not allowed in a condition expression; function: {name}"
+        ))
+    };
+    for (expr, expected) in [
+        ("attribute_exists(a, :v)", arity("attribute_exists")),
+        ("attribute_not_exists(a, :v)", arity("attribute_not_exists")),
+        ("if_not_exists(a, :v) = :v", not_allowed("if_not_exists")),
+        ("list_append(a, :v) = :v", not_allowed("list_append")),
+        (
+            "bogus_fn(a) = :v",
+            p("Invalid function name; function: bogus_fn"),
+        ),
+        (
+            "a BETWEEN :hi AND :lo",
+            p(
+                "The BETWEEN operator requires upper bound to be greater than or equal to \
+               lower bound; lower bound operand: AttributeValue: {S:z}, upper bound operand: \
+               AttributeValue: {S:a}",
+            ),
+        ),
+    ] {
+        let used = used_values(expr, &values);
+        let got = parse_search_filter(expr, None, Some(&used), 50, &LimitsConfig::default());
+        assert_eq!(got.err().map(message), Some(expected), "{expr}");
+    }
+    let used = used_values("a BETWEEN :lo AND :hi", &values);
+    assert!(
+        parse_search_filter(
+            "a BETWEEN :lo AND :hi",
+            None,
+            Some(&used),
+            50,
+            &LimitsConfig::default()
+        )
+        .is_ok()
+    );
+}
