@@ -584,5 +584,5 @@ fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
 #[path = "streams_tests.rs"]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "partiql"))]
 mod describe_limit_tests;
