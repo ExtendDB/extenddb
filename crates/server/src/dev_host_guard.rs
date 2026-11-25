@@ -180,10 +180,14 @@ fn is_loopback_name(host: &str) -> bool {
             && host[host.len() - SUFFIX.len()..].eq_ignore_ascii_case(SUFFIX))
 }
 
-/// Extract the host token from an authority or `Host`-header value: drop any
-/// port, unwrap IPv6 brackets, and ignore a single trailing dot. Returns `None`
-/// when the value has no host part or is structurally malformed, including
-/// brackets around anything but an IPv6 address.
+/// Extract the host token from an authority or `Host`-header value: drop the
+/// port, unwrap IPv6 brackets, and ignore a single trailing dot. The port is
+/// the text after the colon that follows the host, and it must be one or more
+/// ASCII digits. Returns `None` when the value has no host part or is
+/// structurally malformed: brackets around anything but an IPv6 address, or a
+/// colon followed by anything but digits, such as userinfo
+/// (`127.0.0.1:1@evil.com`), a port name, an empty port or an unbracketed IPv6
+/// address.
 fn host_label(raw: &str) -> Option<&str> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -193,7 +197,7 @@ fn host_label(raw: &str) -> Option<&str> {
         // Bracketed IPv6: [addr] or [addr]:port.
         let end = rest.find(']')?;
         let after = &rest[end + 1..];
-        if !(after.is_empty() || after.starts_with(':')) {
+        if !(after.is_empty() || after.strip_prefix(':').is_some_and(is_port)) {
             return None;
         }
         let inner = &rest[..end];
@@ -203,9 +207,7 @@ fn host_label(raw: &str) -> Option<&str> {
         inner
     } else {
         match raw.split_once(':') {
-            // A second colon means an unbracketed IPv6, which is not valid in a
-            // Host header or authority.
-            Some((_, port)) if port.contains(':') => return None,
+            Some((_, port)) if !is_port(port) => return None,
             Some((h, _)) => h,
             None => raw,
         }
@@ -215,6 +217,11 @@ fn host_label(raw: &str) -> Option<&str> {
         return None;
     }
     Some(host)
+}
+
+/// Whether `port` is one or more ASCII digits.
+fn is_port(port: &str) -> bool {
+    !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Why a request was refused. Carries the offending host where one was

@@ -126,6 +126,17 @@ fn host_label_strips_port_brackets_and_one_trailing_dot() {
     assert_eq!(host_label("[127.0.0.1]"), None);
     assert_eq!(host_label(""), None);
     assert_eq!(host_label("."), None);
+    // A port is one or more digits: userinfo, a port name or an empty port
+    // after a loopback name does not read as that name.
+    for raw in [
+        "127.0.0.1:1@evil.com",
+        "localhost:x@evil.com",
+        "127.0.0.1:abc",
+        "[::1]:abc",
+        "localhost:",
+    ] {
+        assert_eq!(host_label(raw), None, "{raw}");
+    }
 }
 
 #[test]
@@ -271,6 +282,15 @@ fn invalid_host_is_refused() {
             &[]
         ),
         Decision::Reject(RejectReason::InvalidHost(_))
+    ));
+    // An absolute-form target with userinfo and no Host header.
+    assert!(matches!(
+        evaluate(
+            &headers(&[]),
+            &uri("http://127.0.0.1:1@evil.com/management/accounts"),
+            &[]
+        ),
+        Decision::Reject(RejectReason::InvalidHost(h)) if h == "127.0.0.1:1@evil.com"
     ));
 }
 
