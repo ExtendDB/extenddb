@@ -305,37 +305,27 @@ mod storage_error_mapping_tests {
     }
 
     /// Only this mapper reads `ReturnValuesOnConditionCheckFailure`: a
-    /// backend's conditional check error reaches the client with its own
-    /// message, and with its item only under `ALL_OLD`. The mappings that
-    /// drop the item are checked in `service_error_log_tests`.
+    /// backend's conditional check error reaches a request that set it to
+    /// `ALL_OLD` with its own message and its item. The mappings that drop
+    /// the item, this one without `ALL_OLD` among them, are checked in
+    /// `service_error_log_tests`.
     #[test]
     fn a_backend_conditional_check_error_keeps_its_item_only_under_all_old() {
         let message = "The stored item does not match the condition.";
         let mut item = Item::new();
         item.insert("pk".to_owned(), AttributeValue::S("stored".to_owned()));
-        for (ccf, body) in [
-            (
-                ReturnValuesOnConditionCheckFailure::None,
-                json!({
-                    "__type": "com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException",
-                    "message": message,
-                }),
-            ),
-            (
-                ReturnValuesOnConditionCheckFailure::AllOld,
-                json!({
-                    "__type": "com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException",
-                    "message": message,
-                    "Item": {"pk": {"S": "stored"}},
-                }),
-            ),
-        ] {
-            let error = DynamoDbError::ConditionalCheckFailedException(
-                message.to_owned(),
-                Some(item.clone()),
-            );
-            let got = storage_err_to_dynamo_with_ccf(StorageError::Service(error), ccf);
-            assert_eq!(error_document(&got), body, "{ccf:?}");
-        }
+        let error = DynamoDbError::ConditionalCheckFailedException(message.to_owned(), Some(item));
+        let got = storage_err_to_dynamo_with_ccf(
+            StorageError::Service(error),
+            ReturnValuesOnConditionCheckFailure::AllOld,
+        );
+        assert_eq!(
+            error_document(&got),
+            json!({
+                "__type": "com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException",
+                "message": message,
+                "Item": {"pk": {"S": "stored"}},
+            })
+        );
     }
 }

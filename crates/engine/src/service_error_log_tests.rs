@@ -90,8 +90,9 @@ type Site = (&'static str, fn(StorageError) -> DynamoDbError);
 /// The engine functions that map a `StorageError` to a client error and are
 /// reachable from here: the six that log a storage fault (five end in a
 /// catch-all; the data path mapping names every variant) and the conditional
-/// check mapping, which delegates all but its `ALL_OLD` case to the data path
-/// mapping.
+/// check mapping, which maps the engine's own `ConditionFailed` and, under
+/// `ALL_OLD`, a backend's conditional check error itself, and delegates the
+/// rest to the data path mapping.
 fn sites() -> Vec<Site> {
     vec![
         (
