@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 mod messages;
 
-pub use messages::{ErrorMessageKey, error_message, validation_error, validation_errors};
+pub use messages::{
+    ErrorMessageKey, INVALID_STREAM_ARN, error_message, validation_error, validation_errors,
+    validation_errors_detected,
+};
 
 use crate::types::{CancellationReason, Item};
 
@@ -40,8 +43,10 @@ pub enum DynamoDbError {
     #[error("{0}")]
     TableInUseException(String),
     /// HTTP 400. `CreateBackup` on a table that does not exist or is not yet
-    /// `ACTIVE`. Measured on DynamoDB: `Table not found: <name>`. Distinct
-    /// from `ResourceNotFoundException`, which the data plane returns.
+    /// `ACTIVE`, and `DescribeContinuousBackups`, `UpdateContinuousBackups`
+    /// and `RestoreTableToPointInTime` on a table that does not exist.
+    /// Measured on DynamoDB: `Table not found: <name>`. Distinct from
+    /// `ResourceNotFoundException`, which the data plane returns.
     #[error("{0}")]
     TableNotFoundException(String),
     /// A per-table or per-account limit was exceeded.
@@ -55,6 +60,13 @@ pub enum DynamoDbError {
     LimitExceededException(String),
     #[error("{0}")]
     ConditionalCheckFailedException(String, Option<Item>),
+    /// A PartiQL `INSERT` targeted a primary key that already exists.
+    ///
+    /// `INSERT` is create-only, so a duplicate full key fails with this error
+    /// rather than `ConditionalCheckFailedException`. HTTP 400. The message is
+    /// always `Duplicate primary key exists in table`, measured on the service.
+    #[error("{0}")]
+    DuplicateItemException(String),
     #[error("{message}")]
     TransactionCanceledException {
         /// Human-readable message.
@@ -89,6 +101,21 @@ pub enum DynamoDbError {
     /// Returned when a shard iterator has expired (older than 15 minutes).
     #[error("{0}")]
     ExpiredIteratorException(String),
+    /// SP-ERR-002: HTTP 400. Returned when continuous backups (point-in-time
+    /// recovery) cannot be enabled. The service models this exception on
+    /// `UpdateContinuousBackups`; ExtendDB returns it there for
+    /// `PointInTimeRecoveryEnabled: true`, because no storage backend
+    /// implements point-in-time recovery.
+    #[error("{0}")]
+    ContinuousBackupsUnavailableException(String),
+    /// SP-ERR-002: HTTP 400. Returned by `RestoreTableToPointInTime` when
+    /// point-in-time recovery is not enabled for the source table, which in
+    /// ExtendDB is always: no storage backend implements point-in-time
+    /// recovery. The service models this exception on the restore operation,
+    /// distinct from `ContinuousBackupsUnavailableException`, which it models
+    /// on `UpdateContinuousBackups`.
+    #[error("{0}")]
+    PointInTimeRecoveryUnavailableException(String),
     #[error("{0}")]
     ServiceUnavailable(String),
     /// SP-ERR-002: Concurrent modification of the same item in a transaction.
@@ -140,12 +167,15 @@ impl DynamoDbError {
             | Self::TableNotFoundException(_)
             | Self::LimitExceededException(_)
             | Self::ConditionalCheckFailedException(..)
+            | Self::DuplicateItemException(_)
             | Self::TransactionCanceledException { .. }
             | Self::IdempotentParameterMismatchException(_)
             | Self::SerializationException(_)
             | Self::AccessDeniedException(_)
             | Self::ExpiredTokenException(_)
             | Self::ExpiredIteratorException(_)
+            | Self::ContinuousBackupsUnavailableException(_)
+            | Self::PointInTimeRecoveryUnavailableException(_)
             | Self::TransactionConflictException(_)
             | Self::ProvisionedThroughputExceededException(_)
             | Self::ThrottlingException(_)
@@ -185,6 +215,7 @@ impl DynamoDbError {
             Self::TableNotFoundException(_) => "TableNotFoundException",
             Self::LimitExceededException(_) => "LimitExceededException",
             Self::ConditionalCheckFailedException(..) => "ConditionalCheckFailedException",
+            Self::DuplicateItemException(_) => "DuplicateItemException",
             Self::TransactionCanceledException { .. } => "TransactionCanceledException",
             Self::IdempotentParameterMismatchException(_) => "IdempotentParameterMismatchException",
             Self::SerializationException(_) => "SerializationException",
@@ -192,10 +223,16 @@ impl DynamoDbError {
             Self::InternalServerError(_) => "InternalServerError",
             Self::AccessDeniedException(_) => "AccessDeniedException",
             Self::MissingAuthenticationToken(_) => "MissingAuthenticationToken",
-            Self::IncompleteSignature(_) => "IncompleteSignature",
+            Self::IncompleteSignature(_) => "IncompleteSignatureException",
             Self::UnrecognizedClientException(_) => "UnrecognizedClientException",
             Self::ExpiredTokenException(_) => "ExpiredTokenException",
             Self::ExpiredIteratorException(_) => "ExpiredIteratorException",
+            Self::ContinuousBackupsUnavailableException(_) => {
+                "ContinuousBackupsUnavailableException"
+            }
+            Self::PointInTimeRecoveryUnavailableException(_) => {
+                "PointInTimeRecoveryUnavailableException"
+            }
             Self::ServiceUnavailable(_) => "ServiceUnavailable",
             Self::TransactionConflictException(_) => "TransactionConflictException",
             Self::ProvisionedThroughputExceededException(_) => {
@@ -255,6 +292,7 @@ impl DynamoDbError {
             | Self::TableNotFoundException(m)
             | Self::LimitExceededException(m)
             | Self::ConditionalCheckFailedException(m, _)
+            | Self::DuplicateItemException(m)
             | Self::IdempotentParameterMismatchException(m)
             | Self::SerializationException(m)
             | Self::UnknownOperationException(m)
@@ -265,6 +303,8 @@ impl DynamoDbError {
             | Self::UnrecognizedClientException(m)
             | Self::ExpiredTokenException(m)
             | Self::ExpiredIteratorException(m)
+            | Self::ContinuousBackupsUnavailableException(m)
+            | Self::PointInTimeRecoveryUnavailableException(m)
             | Self::ServiceUnavailable(m)
             | Self::TransactionConflictException(m)
             | Self::ProvisionedThroughputExceededException(m)
@@ -301,6 +341,88 @@ impl DynamoDbError {
             _ => None,
         }
     }
+}
+
+/// Fallback body for when serializing an already-built response itself fails.
+///
+/// A last resort: it gives the client a well-formed DynamoDB error document
+/// (`InternalServerError`) instead of empty bytes when `serde_json` cannot
+/// serialize the response value. Every transport that writes a response body
+/// shares this one constant, so the fallback bytes are the same on the wire and
+/// over an in-process call.
+#[doc(hidden)]
+pub const SERIALIZATION_FAILURE_BODY: &[u8] =
+    br#"{"__type":"com.amazonaws.dynamodb.v20120810#InternalServerError","message":"Internal error"}"#;
+
+/// Build the DynamoDB-shaped error document for `error`.
+///
+/// Returns the JSON body a client receives for a failed request: `__type` with
+/// its namespace prefix (REQ-ERR-001), an optional message under the key
+/// `message_key` picks (REQ-ERR-002), omitted when empty
+/// (REQ-ERR-003 — real DynamoDB omits it for `UnknownOperationException` and
+/// other messageless errors), and the `CancellationReasons` /`Item` members
+/// that `TransactionCanceledException` and `ConditionalCheckFailedException`
+/// carry. This is only the body; the HTTP status line and headers belong to a
+/// transport and stay with the caller that has one. Error responses are part of
+/// the observable contract, so every entry point builds this body the same way.
+#[doc(hidden)]
+#[must_use]
+pub fn error_document(error: &DynamoDbError) -> serde_json::Value {
+    let mut body = serde_json::json!({ "__type": error.full_error_type() });
+    let message = error.message();
+    if !message.is_empty() {
+        body[message_key(error)] = serde_json::Value::String(message.to_owned());
+    }
+    if let Some(reasons) = error.cancellation_reasons() {
+        body["CancellationReasons"] = serde_json::to_value(reasons).unwrap_or_default();
+    }
+    if let Some(item) = error.condition_check_item() {
+        body["Item"] = serde_json::to_value(item).unwrap_or_default();
+    }
+    body
+}
+
+/// The key that carries the error message. `DynamoDB` sends `Message` on
+/// `TransactionCanceledException` and `IdempotentParameterMismatchException`
+/// (us-east-1, raw bodies, 2026-10-29, 2026-11-03 and 2026-11-19). It also
+/// sends `Message` on `TransactionInProgressException`, which ExtendDB does
+/// not raise, and on `AccessDeniedException` and `SerializationException`
+/// (2026-11-12 and 2026-11-19), which keep `message` here. The other errors
+/// measured carry `message`. REQ-ERR-002 in `docs/design/01-requirements.md`
+/// lists them.
+fn message_key(error: &DynamoDbError) -> &'static str {
+    match error {
+        DynamoDbError::TransactionCanceledException { .. }
+        | DynamoDbError::IdempotentParameterMismatchException(_) => "Message",
+        _ => "message",
+    }
+}
+
+/// The `SerializationException` a malformed request body produces.
+///
+/// Real DynamoDB validates request format before authentication. The message
+/// is `Start of structure or map found where not expected: ` followed by the
+/// `Display` text of the `serde_json` parse error. Every entry point that
+/// parses a raw request body builds the error from this helper so a malformed
+/// request gets the same answer on every transport.
+#[doc(hidden)]
+#[must_use]
+pub fn malformed_body_error(error: &serde_json::Error) -> DynamoDbError {
+    DynamoDbError::SerializationException(format!(
+        "Start of structure or map found where not expected: {error}"
+    ))
+}
+
+/// The message of a request the WebAssembly build refuses because it lacks
+/// the facility the request needs: `"{subject} is not supported by the ExtendDB
+/// WebAssembly build: {reason}."`.
+///
+/// Every refusal of that build, in the engine, the `SQLite` backend and the
+/// adapter, builds its message here so a caller sees one wording.
+#[doc(hidden)]
+#[must_use]
+pub fn webassembly_unsupported_message(subject: &str, reason: &str) -> String {
+    format!("{subject} is not supported by the ExtendDB WebAssembly build: {reason}.")
 }
 
 #[cfg(test)]
@@ -379,6 +501,15 @@ mod tests {
             (DynamoDbError::ValidationException(String::new()), 400),
             (DynamoDbError::ExpiredTokenException(String::new()), 400),
             (DynamoDbError::ExpiredIteratorException(String::new()), 400),
+            (
+                DynamoDbError::ContinuousBackupsUnavailableException(String::new()),
+                400,
+            ),
+            (
+                DynamoDbError::PointInTimeRecoveryUnavailableException(String::new()),
+                400,
+            ),
+            (DynamoDbError::TableNotFoundException(String::new()), 400),
             (DynamoDbError::InvalidSignatureException(String::new()), 400),
         ];
         for (err, expected) in cases {
@@ -400,5 +531,71 @@ mod tests {
             "com.amazonaws.dynamodb.v20120810#TableAlreadyExistsException"
         );
         assert_eq!(err.message(), "Table already exists: t");
+    }
+
+    #[test]
+    fn error_document_carries_type_and_message() {
+        let doc = error_document(&DynamoDbError::ValidationException("bad input".to_owned()));
+        assert_eq!(
+            doc["__type"],
+            serde_json::json!("com.amazon.coral.validate#ValidationException")
+        );
+        assert_eq!(doc["message"], serde_json::json!("bad input"));
+    }
+
+    #[test]
+    fn error_document_omits_empty_message() {
+        // REQ-ERR-003: real DynamoDB omits `message` when it is empty.
+        let doc = error_document(&DynamoDbError::UnknownOperationException(String::new()));
+        assert_eq!(
+            doc["__type"],
+            serde_json::json!("com.amazon.coral.service#UnknownOperationException")
+        );
+        assert!(doc.get("message").is_none(), "{doc}");
+    }
+
+    #[test]
+    fn error_document_includes_cancellation_reasons() {
+        let doc = error_document(&DynamoDbError::TransactionCanceledException {
+            message: "Transaction cancelled".to_owned(),
+            cancellation_reasons: vec![CancellationReason {
+                code: "ConditionalCheckFailed".to_owned(),
+                message: Some("The conditional request failed".to_owned()),
+                item: None,
+            }],
+        });
+        assert_eq!(doc["Message"], serde_json::json!("Transaction cancelled"));
+        let reasons = doc["CancellationReasons"]
+            .as_array()
+            .expect("CancellationReasons is an array");
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(
+            reasons[0]["Code"],
+            serde_json::json!("ConditionalCheckFailed")
+        );
+    }
+
+    #[test]
+    fn malformed_body_error_names_the_parse_failure() {
+        let parse_error = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
+        let err = malformed_body_error(&parse_error);
+        assert_eq!(
+            err.full_error_type(),
+            "com.amazon.coral.service#SerializationException"
+        );
+        assert!(
+            err.message()
+                .starts_with("Start of structure or map found where not expected: "),
+            "{}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn webassembly_unsupported_message_names_the_subject_build_and_reason() {
+        assert_eq!(
+            webassembly_unsupported_message("ImportTable", "it has no filesystem"),
+            "ImportTable is not supported by the ExtendDB WebAssembly build: it has no filesystem."
+        );
     }
 }

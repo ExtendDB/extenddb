@@ -319,8 +319,8 @@ impl MetadataEngine for SqliteEngine {
             let path = ttl_json_path(&ttl_attribute);
 
             let now = i64::try_from(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
+                web_time::SystemTime::now()
+                    .duration_since(web_time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
             )

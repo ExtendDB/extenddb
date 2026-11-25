@@ -25,11 +25,16 @@ use crate::types::{
     SearchSchemaElementType,
 };
 
+#[path = "search_condition_phases.rs"]
+mod phases;
+
 /// Maximum number of partition-key conditions allowed in a filter expression.
 pub const MAX_PARTITION_KEY_CONDITIONS: usize = 1;
 
 /// Maximum number of inline-filter conditions allowed in a filter expression.
-pub const MAX_INLINE_FILTER_CONDITIONS: usize = 20;
+/// Measured against the live service 2026-10-29 in us-east-1: 19 conditions are
+/// accepted and the 20th is refused, the same 18 as the search schema cap.
+pub const MAX_INLINE_FILTER_CONDITIONS: usize = 18;
 
 /// Maximum total number of equality conditions in a filter expression.
 pub const MAX_SEARCH_CONDITIONS: usize =
@@ -60,7 +65,10 @@ fn invalid(msg: impl Into<String>) -> DynamoDbError {
 /// Returns `DynamoDbError::ValidationException` when the expression uses a
 /// disallowed comparator or logical operator, references a nested attribute,
 /// repeats an attribute, exceeds the condition count, references an undefined
-/// value placeholder, or leaves a supplied value placeholder unused.
+/// value placeholder, or leaves a supplied value placeholder unused. Syntax and
+/// name and value resolution are checked over the whole expression before the
+/// count; the comparator, nested-path and duplicate checks run per comparison
+/// after it.
 pub fn validate_search_condition_expression(
     expr: &str,
     names: Option<&HashMap<String, String>>,
@@ -73,130 +81,14 @@ pub fn validate_search_condition_expression(
         ));
     }
 
-    // Only equality is supported. Every other comparator contains one of these.
-    if trimmed.contains(['<', '>', '!']) {
-        return Err(invalid(
-            "Invalid SearchConditionExpression: Invalid comparator used in \
-             SearchConditionExpression",
-        ));
-    }
-
-    // Normalize `=` into its own whitespace-delimited token, then split.
-    let normalized = trimmed.replace('=', " = ");
-    let tokens: Vec<&str> = normalized.split_whitespace().collect();
-
-    // Only AND is allowed to join conditions.
-    for tok in &tokens {
-        let upper = tok.to_ascii_uppercase();
-        if matches!(upper.as_str(), "OR" | "NOT" | "BETWEEN" | "IN") {
-            return Err(invalid(
-                "Invalid operator used in SearchConditionExpression",
-            ));
-        }
-    }
-
-    let mut conditions: Vec<SearchCondition> = Vec::new();
-    let mut referenced_values: Vec<String> = Vec::new();
-    let mut index = 0;
-
-    loop {
-        let lhs = tokens
-            .get(index)
-            .ok_or_else(|| invalid("Invalid SearchConditionExpression"))?;
-        let eq = tokens
-            .get(index + 1)
-            .ok_or_else(|| invalid("Invalid SearchConditionExpression"))?;
-        let rhs = tokens
-            .get(index + 2)
-            .ok_or_else(|| invalid("Invalid SearchConditionExpression"))?;
-        if *eq != "=" {
-            return Err(invalid("Invalid SearchConditionExpression"));
-        }
-
-        // Nested attribute access is not permitted in the filter expression.
-        if lhs.contains('.') || lhs.contains('[') {
-            return Err(invalid(
-                "SearchConditionExpression cannot have conditions on nested attributes",
-            ));
-        }
-
-        // Resolve the attribute name (#alias via ExpressionAttributeNames).
-        let attr_name = if let Some(alias) = lhs.strip_prefix('#') {
-            names
-                .and_then(|m| m.get(&format!("#{alias}")).or_else(|| m.get(alias)))
-                .cloned()
-                .ok_or_else(|| {
-                    invalid(format!(
-                        "An expression attribute name used in the expression is not defined: #{alias}"
-                    ))
-                })?
-        } else {
-            // A bare identifier must not be a reserved word. This check existed for
-            // ProjectionExpression, where its message is byte-identical to the
-            // service, but was never wired into this expression type, so
-            // `cat = :c AND bucket = :b` was accepted and returned results where the
-            // service refuses it. Measured on 2026-08-11.
-            //
-            // Applied to the bare form only, which is the point of the rule: the
-            // `#alias` branch above exists precisely so a reserved word can be used
-            // by aliasing it.
-            if crate::expression::reserved_words::is_reserved(lhs) {
-                return Err(invalid(format!(
-                    "Invalid SearchConditionExpression: Attribute name is a reserved \
-                     keyword; reserved keyword: {lhs}"
-                )));
-            }
-            (*lhs).to_owned()
-        };
-        if attr_name.contains('.') || attr_name.contains('[') {
-            return Err(invalid(
-                "SearchConditionExpression cannot have conditions on nested attributes",
-            ));
-        }
-
-        // Resolve the value placeholder (:name via ExpressionAttributeValues).
-        let placeholder = rhs
-            .strip_prefix(':')
-            .ok_or_else(|| invalid("Invalid SearchConditionExpression"))?;
-        let value = values
-            .and_then(|m| {
-                m.get(&format!(":{placeholder}"))
-                    .or_else(|| m.get(placeholder))
-            })
-            .cloned()
-            .ok_or_else(|| {
-                invalid(format!(
-                    "Invalid SearchConditionExpression: An expression attribute value used in \
-                     expression is not defined; attribute value: :{placeholder}"
-                ))
-            })?;
-        referenced_values.push(format!(":{placeholder}"));
-
-        // At most one condition per attribute.
-        if conditions.iter().any(|c| c.attribute_name == attr_name) {
-            return Err(invalid(
-                "SearchConditionExpression must only contain one condition per attribute",
-            ));
-        }
-        conditions.push(SearchCondition {
-            attribute_name: attr_name,
-            value,
-        });
-
-        match tokens.get(index + 3) {
-            None => break,
-            Some(tok) if tok.eq_ignore_ascii_case("AND") => index += 4,
-            Some(_) => return Err(invalid("Invalid SearchConditionExpression")),
-        }
-    }
-
-    if conditions.len() > MAX_SEARCH_CONDITIONS {
-        return Err(invalid(format!(
-            "Invalid SearchConditionExpression: SearchConditionExpression cannot have more than \
-             {MAX_PARTITION_KEY_CONDITIONS} partition key and more than \
-             {MAX_INLINE_FILTER_CONDITIONS} inline filter key attributes"
-        )));
-    }
+    // Phase 1 checks the whole expression and phase 2 walks the comparisons; see
+    // search_condition_phases.rs for the measured order.
+    let comparisons = phases::whole_expression(trimmed, names, values)?;
+    let referenced_values: Vec<String> = comparisons
+        .iter()
+        .filter_map(|comparison| comparison.placeholder.clone())
+        .collect();
+    let conditions = phases::each_comparison(comparisons)?;
 
     // Every supplied value placeholder must be referenced by the expression.
     if let Some(vals) = values {
@@ -508,24 +400,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_too_many_conditions() {
-        let expr = (0..=MAX_SEARCH_CONDITIONS)
-            .map(|i| format!("filter_{i} = :val_{i}"))
-            .collect::<Vec<_>>()
-            .join(" AND ");
-        let v: HashMap<String, AttributeValue> = (0..=MAX_SEARCH_CONDITIONS)
-            .map(|i| (format!(":val_{i}"), AttributeValue::S(format!("v{i}"))))
-            .collect();
-        let message = err(validate_search_condition_expression(&expr, None, Some(&v)));
-        assert!(message.contains("Invalid SearchConditionExpression"));
-        assert!(
-            message.contains(
-                "cannot have more than 1 partition key and more than 20 inline filter key"
-            )
-        );
-    }
-
-    #[test]
     fn accepts_partition_key_plus_inline_filters() {
         let n = names(&[
             ("#country", "Country"),
@@ -656,3 +530,11 @@ mod tests {
         validate_conditions_against_search_schema(&[], Some(&[]), &defs()).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "search_condition_limit_tests.rs"]
+mod limit_tests;
+
+#[cfg(test)]
+#[path = "search_condition_order_tests.rs"]
+mod order_tests;

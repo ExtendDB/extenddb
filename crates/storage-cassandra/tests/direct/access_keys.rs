@@ -16,16 +16,7 @@ mod tests {
         let engine = setup_engine().await;
         let config = test_config();
 
-        // Need encryption key for access key creation
-        use extenddb_storage::bootstrapper::helpers::generate_encryption_key;
-        let enc_key = generate_encryption_key();
-        let catalog_store = extenddb_storage_cassandra::CassandraCatalogStore::with_encryption_key(
-            engine.session_arc(),
-            config.keyspace_prefix.clone(),
-            config.datacenter.clone(),
-            config.replication_factor,
-            enc_key,
-        );
+        let catalog_store = crate::helpers::create_keyed_catalog_store(&engine, &config);
 
         let account_id = unique_test_account();
         let account_name = format!("TestAccount_{}", unique_test_id());
@@ -57,16 +48,7 @@ mod tests {
         let engine = setup_engine().await;
         let config = test_config();
 
-        // Need encryption key for session storage
-        use extenddb_storage::bootstrapper::helpers::generate_encryption_key;
-        let enc_key = generate_encryption_key();
-        let catalog_store = extenddb_storage_cassandra::CassandraCatalogStore::with_encryption_key(
-            engine.session_arc(),
-            config.keyspace_prefix.clone(),
-            config.datacenter.clone(),
-            config.replication_factor,
-            enc_key.clone(),
-        );
+        let catalog_store = crate::helpers::create_keyed_catalog_store(&engine, &config);
 
         let account_id = unique_test_account();
         let account_name = format!("TestAccount_{}", unique_test_id());

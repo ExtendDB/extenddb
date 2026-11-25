@@ -4,8 +4,12 @@
 //! Database-backed credential store for SigV4 authentication.
 //!
 //! Implements `extenddb_auth::CredentialStore` by looking up access keys and
-//! session credentials from Cassandra, decrypting secrets with AES-256-GCM.
+//! session credentials from Cassandra, decrypting secrets through the key
+//! holder (`extenddb_storage::secret_keys`), which binds each secret to the
+//! fields of its row.
 
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -16,7 +20,7 @@ use cdrs_tokio::transport::TransportTcp;
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_auth::{CredentialStore, StoredCredential};
 use extenddb_core::error::DynamoDbError;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use extenddb_storage::secret_keys::{SecretKeys, SecretRow, require_keys};
 
 type CassandraSession = Session<
     TransportTcp,
@@ -24,69 +28,56 @@ type CassandraSession = Session<
     RoundRobinLoadBalancingStrategy<TransportTcp, TcpConnectionManager>,
 >;
 
-/// Decrypt a secret key from `nonce || ciphertext` using the base64-encoded encryption key.
-fn decrypt_secret(encrypted: &[u8], key_b64: &str, aad: &str) -> Result<String, String> {
-    use aes_gcm::aead::{Aead, Payload};
-    use aes_gcm::{Aes256Gcm, KeyInit};
-    use base64::Engine;
-
-    if encrypted.len() < 28 {
-        return Err(format!(
-            "ciphertext too short: {} bytes (need at least 12-byte nonce + 16-byte auth tag)",
-            encrypted.len()
-        ));
-    }
-
-    let key_bytes = base64::engine::general_purpose::STANDARD
-        .decode(key_b64)
-        .map_err(|e| format!("decode encryption key: {e}"))?;
-
-    let key = aes_gcm::Key::<Aes256Gcm>::from_slice(&key_bytes);
-    let cipher = Aes256Gcm::new(key);
-    let nonce = aes_gcm::Nonce::from_slice(&encrypted[..12]);
-
-    let payload_with_aad = Payload {
-        msg: &encrypted[12..],
-        aad: aad.as_bytes(),
-    };
-    if let Ok(plaintext_bytes) = cipher.decrypt(nonce, payload_with_aad) {
-        return String::from_utf8(plaintext_bytes)
-            .map_err(|e| format!("decrypted secret is not valid UTF-8: {e}"));
-    }
-
-    tracing::debug!("Decrypting secret without AAD (pre-CB-11 format) for {aad}");
-    let plaintext_bytes = cipher
-        .decrypt(nonce, &encrypted[12..])
-        .map_err(|e| format!("decrypt failed both with AAD and without AAD: {e}"))?;
-
-    String::from_utf8(plaintext_bytes)
-        .map_err(|e| format!("decrypted secret is not valid UTF-8: {e}"))
-}
-
-#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct CassandraCredentialStore {
-    #[zeroize(skip)]
     session: Arc<CassandraSession>,
-    #[zeroize(skip)]
     keyspace_prefix: String,
-    encryption_key: String,
+    /// The key holder, shared with the catalog store; `None` for a store
+    /// opened without a key, which opens no stored secret.
+    keys: Option<Arc<SecretKeys>>,
 }
 
 impl CassandraCredentialStore {
     pub fn new(
         session: Arc<CassandraSession>,
         keyspace_prefix: String,
-        encryption_key: String,
+        keys: Option<Arc<SecretKeys>>,
     ) -> Self {
         Self {
             session,
             keyspace_prefix,
-            encryption_key,
+            keys,
         }
     }
 
     fn catalog_keyspace(&self) -> String {
         format!("{}_catalog", self.keyspace_prefix)
+    }
+
+    /// The key holder, or the refusal of a store opened without one.
+    fn keys(&self) -> Result<&SecretKeys, DynamoDbError> {
+        require_keys(self.keys.as_deref()).map_err(|e| {
+            tracing::error!("Credential lookup: {e:?}");
+            DynamoDbError::InternalServerError("Internal error during authentication".to_owned())
+        })
+    }
+
+    /// Whether `account_id` has a row in `accounts`. Before account deletes
+    /// removed them, a deleted account's access keys and role sessions stayed
+    /// in the catalog; a credential of an account that no longer exists is
+    /// unknown.
+    async fn account_exists(&self, account_id: &str) -> Result<bool, DynamoDbError> {
+        let query = format!(
+            "SELECT account_id FROM {}.accounts WHERE account_id = ?",
+            self.catalog_keyspace()
+        );
+        crate::cassandra_util::query_rows::<DynamoDbError>(
+            &self.session,
+            &query,
+            cdrs_tokio::query_values!(account_id),
+            "credential account_exists",
+        )
+        .await
+        .map(|rows| !rows.is_empty())
     }
 }
 
@@ -121,7 +112,7 @@ impl CassandraCredentialStore {
 
         let result = self
             .session
-            .query_with_values(&query, cdrs_tokio::query_values!(access_key_id))
+            .run(Stmt::Read, &query, cdrs_tokio::query_values!(access_key_id))
             .await
             .map_err(|e| {
                 tracing::error!("Credential lookup failed for access key {access_key_id}: {e}");
@@ -162,9 +153,17 @@ impl CassandraCredentialStore {
             tracing::error!("Failed to parse is_active: {e}");
             DynamoDbError::InternalServerError("Internal error during authentication".to_owned())
         })?;
+        if !self.account_exists(&account_id).await? {
+            return Ok(None);
+        }
 
-        let secret_key =
-            decrypt_secret(&encrypted, &self.encryption_key, access_key_id).map_err(|e| {
+        let mut secret_key = self
+            .keys()?
+            .decrypt(
+                &SecretRow::access_key(access_key_id, &account_id, &user_name),
+                &encrypted,
+            )
+            .map_err(|e| {
                 tracing::error!("Secret key decryption failed for access key {access_key_id}: {e}");
                 DynamoDbError::InternalServerError(
                     "Internal error during authentication".to_owned(),
@@ -172,7 +171,9 @@ impl CassandraCredentialStore {
             })?;
 
         Ok(Some(StoredCredential {
-            secret_key,
+            // Moved out, not copied: the plaintext has one allocation, wiped
+            // when the credential drops.
+            secret_key: std::mem::take(&mut *secret_key),
             account_id,
             principal_name: user_name,
             session_name: None,
@@ -196,7 +197,7 @@ impl CassandraCredentialStore {
 
         let result = self
             .session
-            .query_with_values(&query, cdrs_tokio::query_values!(access_key_id))
+            .run(Stmt::Read, &query, cdrs_tokio::query_values!(access_key_id))
             .await
             .map_err(|e| {
                 tracing::error!(
@@ -243,6 +244,9 @@ impl CassandraCredentialStore {
             tracing::error!("Failed to parse session_token: {e}");
             DynamoDbError::InternalServerError("Internal error during authentication".to_owned())
         })?;
+        if !self.account_exists(&account_id).await? {
+            return Ok(None);
+        }
 
         let expires_at_ms: i64 = row.get_r_by_name("expires_at").map_err(|e| {
             tracing::error!("Failed to parse expires_at: {e}");
@@ -262,8 +266,19 @@ impl CassandraCredentialStore {
             ));
         }
 
-        let secret_key =
-            decrypt_secret(&encrypted, &self.encryption_key, access_key_id).map_err(|e| {
+        let mut secret_key = self
+            .keys()?
+            .decrypt(
+                &SecretRow::session(
+                    access_key_id,
+                    &account_id,
+                    &role_name,
+                    &session_name,
+                    expires_at.unix_timestamp(),
+                ),
+                &encrypted,
+            )
+            .map_err(|e| {
                 tracing::error!(
                     "Session secret key decryption failed for access key {access_key_id}: {e}"
                 );
@@ -273,7 +288,9 @@ impl CassandraCredentialStore {
             })?;
 
         Ok(Some(StoredCredential {
-            secret_key,
+            // Moved out, not copied: the plaintext has one allocation, wiped
+            // when the credential drops.
+            secret_key: std::mem::take(&mut *secret_key),
             account_id,
             principal_name: role_name,
             session_name: Some(session_name),

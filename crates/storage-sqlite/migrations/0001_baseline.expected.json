@@ -1,0 +1,514 @@
+{
+  "objects": [
+    {
+      "type": "index",
+      "name": "idx_backup_items_arn",
+      "table": "backup_items",
+      "definition": [
+        "CREATE INDEX idx_backup_items_arn ON backup_items(backup_arn)"
+      ]
+    },
+    {
+      "type": "index",
+      "name": "idx_backups_table",
+      "table": "backups",
+      "definition": [
+        "CREATE INDEX idx_backups_table ON backups(account_id,table_name)"
+      ]
+    },
+    {
+      "type": "index",
+      "name": "idx_gsi_pending_claim",
+      "table": "gsi_pending",
+      "definition": [
+        "CREATE INDEX idx_gsi_pending_claim ON gsi_pending(worker_partition,ready_at,id)"
+      ]
+    },
+    {
+      "type": "index",
+      "name": "idx_idempotency_tokens_created",
+      "table": "idempotency_tokens",
+      "definition": [
+        "CREATE INDEX idx_idempotency_tokens_created ON idempotency_tokens(created_at)"
+      ]
+    },
+    {
+      "type": "index",
+      "name": "idx_login_attempts_principal_time",
+      "table": "login_attempts",
+      "definition": [
+        "CREATE INDEX idx_login_attempts_principal_time ON login_attempts(principal,attempted_at DESC)"
+      ]
+    },
+    {
+      "type": "index",
+      "name": "idx_login_attempts_source_ip_time",
+      "table": "login_attempts",
+      "definition": [
+        "CREATE INDEX idx_login_attempts_source_ip_time ON login_attempts(source_ip,attempted_at DESC)WHERE source_ip IS NOT NULL"
+      ]
+    },
+    {
+      "type": "index",
+      "name": "idx_metrics_bucket",
+      "table": "metrics",
+      "definition": [
+        "CREATE INDEX idx_metrics_bucket ON metrics(bucket)"
+      ]
+    },
+    {
+      "type": "index",
+      "name": "idx_stream_records_created",
+      "table": "stream_records",
+      "definition": [
+        "CREATE INDEX idx_stream_records_created ON stream_records(created_at)"
+      ]
+    },
+    {
+      "type": "index",
+      "name": "idx_stream_shards_table",
+      "table": "stream_shards",
+      "definition": [
+        "CREATE INDEX idx_stream_shards_table ON stream_shards(table_id)"
+      ]
+    },
+    {
+      "type": "index",
+      "name": "idx_table_restores_backup",
+      "table": "table_restores",
+      "definition": [
+        "CREATE INDEX idx_table_restores_backup ON table_restores(source_backup_arn)"
+      ]
+    },
+    {
+      "type": "index",
+      "name": "idx_tables_pending_transition",
+      "table": "tables",
+      "definition": [
+        "CREATE INDEX idx_tables_pending_transition ON tables(status_transition_at)WHERE status_transition_at IS NOT NULL"
+      ]
+    },
+    {
+      "type": "index",
+      "name": "idx_vector_indexes_index_id",
+      "table": "vector_indexes",
+      "definition": [
+        "CREATE UNIQUE INDEX idx_vector_indexes_index_id ON vector_indexes(index_id)"
+      ]
+    },
+    {
+      "type": "table",
+      "name": "access_keys",
+      "table": "access_keys",
+      "definition": [
+        "FOREIGN KEY(account_id,user_name)REFERENCES iam_users(account_id,user_name)ON DELETE CASCADE",
+        "access_key_id TEXT PRIMARY KEY",
+        "account_id TEXT NOT NULL",
+        "created_at TEXT NOT NULL DEFAULT(strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        "is_active INTEGER NOT NULL DEFAULT 1",
+        "secret_key_encrypted BLOB NOT NULL",
+        "user_name TEXT NOT NULL"
+      ]
+    },
+    {
+      "type": "table",
+      "name": "accounts",
+      "table": "accounts",
+      "definition": [
+        "account_id TEXT PRIMARY KEY",
+        "account_name TEXT NOT NULL UNIQUE",
+        "created_at TEXT NOT NULL DEFAULT(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+      ]
+    },
+    {
+      "type": "table",
+      "name": "admin_users",
+      "table": "admin_users",
+      "definition": [
+        "admin_name TEXT PRIMARY KEY",
+        "created_at TEXT NOT NULL DEFAULT(strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        "password_hash TEXT NOT NULL"
+      ]
+    },
+    {
+      "type": "table",
+      "name": "backup_definitions",
+      "table": "backup_definitions",
+      "definition": [
+        "backup_arn TEXT PRIMARY KEY REFERENCES backups(backup_arn)ON DELETE CASCADE",
+        "definition TEXT NOT NULL"
+      ]
+    },
+    {
+      "type": "table",
+      "name": "backup_items",
+      "table": "backup_items",
+      "definition": [
+        "backup_arn TEXT NOT NULL REFERENCES backups(backup_arn)ON DELETE CASCADE",
+        "id INTEGER PRIMARY KEY AUTOINCREMENT",
+        "item_data TEXT NOT NULL",
+        "pk TEXT NOT NULL",
+        "sk TEXT"
+      ]
+    },
+    {
+      "type": "table",
+      "name": "backups",
+      "table": "backups",
+      "definition": [
+        "account_id TEXT NOT NULL",
+        "attribute_definitions TEXT NOT NULL",
+        "backup_arn TEXT PRIMARY KEY",
+        "backup_name TEXT NOT NULL",
+        "backup_size_bytes INTEGER NOT NULL DEFAULT 0",
+        "backup_status TEXT NOT NULL DEFAULT 'AVAILABLE'",
+        "backup_type TEXT NOT NULL DEFAULT 'USER'",
+        "billing_mode TEXT NOT NULL DEFAULT 'PAY_PER_REQUEST'",
+        "created_at TEXT NOT NULL DEFAULT(strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        "item_count INTEGER NOT NULL DEFAULT 0",
+        "key_schema TEXT NOT NULL",
+        "provisioned_throughput TEXT",
+        "stream_specification TEXT",
+        "table_id TEXT NOT NULL",
+        "table_name TEXT NOT NULL"
+      ]
+    },
+    {
+      "type": "table",
+      "name": "continuous_backups",
+      "table": "continuous_backups",
+      "definition": [
+        "PRIMARY KEY(account_id,table_name)",
+        "account_id TEXT NOT NULL",
+        "earliest_restorable TEXT",
+        "latest_restorable TEXT",
+        "pitr_enabled INTEGER NOT NULL DEFAULT 0",
+        "table_name TEXT NOT NULL"
+      ]
+    },
+    {
+      "type": "table",
+      "name": "gsi_pending",
+      "table": "gsi_pending",
+      "definition": [
+        "id INTEGER PRIMARY KEY AUTOINCREMENT",
+        "index_context TEXT NOT NULL",
+        "new_item TEXT",
+        "old_item TEXT",
+        "ready_at TEXT NOT NULL DEFAULT(strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        "table_id TEXT NOT NULL",
+        "worker_partition INTEGER NOT NULL"
+      ]
+    },
+    {
+      "type": "table",
+      "name": "iam_group_members",
+      "table": "iam_group_members",
+      "definition": [
+        "FOREIGN KEY(account_id,group_name)REFERENCES iam_groups(account_id,group_name)ON DELETE CASCADE",
+        "FOREIGN KEY(account_id,user_name)REFERENCES iam_users(account_id,user_name)ON DELETE CASCADE",
+        "PRIMARY KEY(account_id,group_name,user_name)",
+        "account_id TEXT NOT NULL",
+        "group_name TEXT NOT NULL",
+        "user_name TEXT NOT NULL"
+      ]
+    },
+    {
+      "type": "table",
+      "name": "iam_groups",
+      "table": "iam_groups",
+      "definition": [
+        "PRIMARY KEY(account_id,group_name)",
+        "account_id TEXT NOT NULL REFERENCES accounts(account_id)ON DELETE CASCADE",
+        "created_at TEXT NOT NULL DEFAULT(strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        "group_arn TEXT NOT NULL UNIQUE",
+        "group_name TEXT NOT NULL"
+      ]
+    },
+    {
+      "type": "table",
+      "name": "iam_permissions_boundaries",
+      "table": "iam_permissions_boundaries",
+      "definition": [
+        "PRIMARY KEY(account_id,principal_type,principal_name)",
+        "account_id TEXT NOT NULL REFERENCES accounts(account_id)ON DELETE CASCADE",
+        "policy_document TEXT NOT NULL",
+        "principal_name TEXT NOT NULL",
+        "principal_type TEXT NOT NULL CHECK(principal_type IN('user','role'))"
+      ]
+    },
+    {
+      "type": "table",
+      "name": "iam_policies",
+      "table": "iam_policies",
+      "definition": [
+        "PRIMARY KEY(account_id,principal_type,principal_name,policy_name)",
+        "account_id TEXT NOT NULL REFERENCES accounts(account_id)ON DELETE CASCADE",
+        "created_at TEXT NOT NULL DEFAULT(strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        "policy_document TEXT NOT NULL",
+        "policy_name TEXT NOT NULL",
+        "principal_name TEXT NOT NULL",
+        "principal_type TEXT NOT NULL CHECK(principal_type IN('user','group','role'))"
+      ]
+    },
+    {
+      "type": "table",
+      "name": "iam_role_tags",
+      "table": "iam_role_tags",
+      "definition": [
+        "FOREIGN KEY(account_id,role_name)REFERENCES iam_roles(account_id,role_name)ON DELETE CASCADE",
+        "PRIMARY KEY(account_id,role_name,tag_key)",
+        "account_id TEXT NOT NULL",
+        "role_name TEXT NOT NULL",
+        "tag_key TEXT NOT NULL",
+        "tag_value TEXT NOT NULL"
+      ]
+    },
+    {
+      "type": "table",
+      "name": "iam_roles",
+      "table": "iam_roles",
+      "definition": [
+        "PRIMARY KEY(account_id,role_name)",
+        "account_id TEXT NOT NULL REFERENCES accounts(account_id)ON DELETE CASCADE",
+        "created_at TEXT NOT NULL DEFAULT(strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        "permissions_boundary_arn TEXT",
+        "role_arn TEXT NOT NULL UNIQUE",
+        "role_name TEXT NOT NULL",
+        "trust_policy TEXT NOT NULL"
+      ]
+    },
+    {
+      "type": "table",
+      "name": "iam_sessions",
+      "table": "iam_sessions",
+      "definition": [
+        "FOREIGN KEY(account_id,role_name)REFERENCES iam_roles(account_id,role_name)ON DELETE CASCADE",
+        "access_key_id TEXT NOT NULL UNIQUE",
+        "account_id TEXT NOT NULL",
+        "created_at TEXT NOT NULL DEFAULT(strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        "expires_at TEXT NOT NULL",
+        "role_name TEXT NOT NULL",
+        "secret_key_encrypted BLOB NOT NULL",
+        "session_name TEXT NOT NULL",
+        "session_policy TEXT",
+        "session_tags TEXT",
+        "session_token TEXT PRIMARY KEY"
+      ]
+    },
+    {
+      "type": "table",
+      "name": "iam_user_tags",
+      "table": "iam_user_tags",
+      "definition": [
+        "FOREIGN KEY(account_id,user_name)REFERENCES iam_users(account_id,user_name)ON DELETE CASCADE",
+        "PRIMARY KEY(account_id,user_name,tag_key)",
+        "account_id TEXT NOT NULL",
+        "tag_key TEXT NOT NULL",
+        "tag_value TEXT NOT NULL",
+        "user_name TEXT NOT NULL"
+      ]
+    },
+    {
+      "type": "table",
+      "name": "iam_users",
+      "table": "iam_users",
+      "definition": [
+        "PRIMARY KEY(account_id,user_name)",
+        "account_id TEXT NOT NULL REFERENCES accounts(account_id)ON DELETE CASCADE",
+        "created_at TEXT NOT NULL DEFAULT(strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        "password_hash TEXT",
+        "user_arn TEXT NOT NULL UNIQUE",
+        "user_name TEXT NOT NULL"
+      ]
+    },
+    {
+      "type": "table",
+      "name": "idempotency_tokens",
+      "table": "idempotency_tokens",
+      "definition": [
+        "PRIMARY KEY(account_id,token)",
+        "account_id TEXT NOT NULL",
+        "created_at TEXT NOT NULL DEFAULT(strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        "fingerprint TEXT NOT NULL",
+        "token TEXT NOT NULL"
+      ]
+    },
+    {
+      "type": "table",
+      "name": "indexes",
+      "table": "indexes",
+      "definition": [
+        "CONSTRAINT chk_propagation_delay_ms_non_negative CHECK(propagation_delay_ms IS NULL OR propagation_delay_ms >= 0)",
+        "CONSTRAINT indexes_table_id_fkey FOREIGN KEY(table_id)REFERENCES tables(table_id)ON DELETE CASCADE",
+        "PRIMARY KEY(table_id,index_name)",
+        "index_id TEXT NOT NULL",
+        "index_name TEXT NOT NULL",
+        "index_status TEXT NOT NULL DEFAULT 'ACTIVE'",
+        "index_type TEXT NOT NULL",
+        "key_schema TEXT NOT NULL",
+        "projection TEXT NOT NULL",
+        "propagation_delay_ms INTEGER",
+        "provisioned_throughput TEXT",
+        "table_id TEXT NOT NULL"
+      ]
+    },
+    {
+      "type": "table",
+      "name": "login_attempts",
+      "table": "login_attempts",
+      "definition": [
+        "attempted_at TEXT NOT NULL DEFAULT(strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        "principal TEXT NOT NULL",
+        "source_ip TEXT",
+        "success INTEGER NOT NULL"
+      ]
+    },
+    {
+      "type": "table",
+      "name": "metrics",
+      "table": "metrics",
+      "definition": [
+        "PRIMARY KEY(bucket,metric,table_name,index_name,operation)",
+        "bucket TEXT NOT NULL",
+        "count INTEGER NOT NULL DEFAULT 0",
+        "index_name TEXT NOT NULL DEFAULT ''",
+        "max REAL NOT NULL DEFAULT -9e999",
+        "metric TEXT NOT NULL",
+        "min REAL NOT NULL DEFAULT 9e999",
+        "operation TEXT NOT NULL DEFAULT ''",
+        "sum REAL NOT NULL DEFAULT 0",
+        "table_name TEXT NOT NULL DEFAULT ''"
+      ]
+    },
+    {
+      "type": "table",
+      "name": "schema_history",
+      "table": "schema_history",
+      "definition": [
+        "applied_at TEXT NOT NULL DEFAULT(strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        "filename TEXT PRIMARY KEY"
+      ]
+    },
+    {
+      "type": "table",
+      "name": "seq_counters",
+      "table": "seq_counters",
+      "definition": [
+        "name TEXT PRIMARY KEY",
+        "value INTEGER NOT NULL DEFAULT 0"
+      ]
+    },
+    {
+      "type": "table",
+      "name": "settings",
+      "table": "settings",
+      "definition": [
+        "key TEXT PRIMARY KEY",
+        "value TEXT NOT NULL"
+      ]
+    },
+    {
+      "type": "table",
+      "name": "stream_records",
+      "table": "stream_records",
+      "definition": [
+        "PRIMARY KEY(shard_id,sequence_number)",
+        "created_at TEXT NOT NULL DEFAULT(strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        "event_name TEXT NOT NULL",
+        "record_data TEXT NOT NULL",
+        "sequence_number TEXT NOT NULL",
+        "shard_id TEXT NOT NULL REFERENCES stream_shards(shard_id)ON DELETE CASCADE",
+        "table_id TEXT NOT NULL"
+      ]
+    },
+    {
+      "type": "table",
+      "name": "stream_shards",
+      "table": "stream_shards",
+      "definition": [
+        "created_at TEXT NOT NULL DEFAULT(strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        "ending_sequence_number TEXT",
+        "parent_shard_id TEXT",
+        "shard_id TEXT PRIMARY KEY",
+        "starting_sequence_number TEXT NOT NULL",
+        "table_id TEXT NOT NULL REFERENCES tables(table_id)ON DELETE CASCADE"
+      ]
+    },
+    {
+      "type": "table",
+      "name": "table_restores",
+      "table": "table_restores",
+      "definition": [
+        "restore_date_time TEXT NOT NULL",
+        "source_backup_arn TEXT NOT NULL",
+        "source_table_arn TEXT",
+        "table_id TEXT PRIMARY KEY REFERENCES tables(table_id)ON DELETE CASCADE"
+      ]
+    },
+    {
+      "type": "table",
+      "name": "tables",
+      "table": "tables",
+      "definition": [
+        "CONSTRAINT tables_table_id_unique UNIQUE(table_id)",
+        "PRIMARY KEY(account_id,table_name)",
+        "account_id TEXT NOT NULL REFERENCES accounts(account_id)ON DELETE CASCADE",
+        "attribute_definitions TEXT NOT NULL",
+        "billing_mode TEXT NOT NULL DEFAULT 'PAY_PER_REQUEST'",
+        "creation_date_time TEXT NOT NULL DEFAULT(strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        "deletion_protection_enabled INTEGER NOT NULL DEFAULT 0",
+        "item_count INTEGER NOT NULL DEFAULT 0",
+        "key_schema TEXT NOT NULL",
+        "on_demand_throughput TEXT",
+        "provisioned_throughput TEXT",
+        "sse_specification TEXT",
+        "status_transition_at TEXT",
+        "stream_label TEXT",
+        "stream_specification TEXT",
+        "table_arn TEXT NOT NULL",
+        "table_class TEXT",
+        "table_id TEXT NOT NULL",
+        "table_name TEXT NOT NULL",
+        "table_size_bytes INTEGER NOT NULL DEFAULT 0",
+        "table_status TEXT NOT NULL DEFAULT 'CREATING'",
+        "ttl_attribute TEXT",
+        "ttl_index_ready INTEGER NOT NULL DEFAULT 0"
+      ]
+    },
+    {
+      "type": "table",
+      "name": "tags",
+      "table": "tags",
+      "definition": [
+        "PRIMARY KEY(resource_arn,tag_key)",
+        "resource_arn TEXT NOT NULL",
+        "tag_key TEXT NOT NULL",
+        "tag_value TEXT NOT NULL"
+      ]
+    },
+    {
+      "type": "table",
+      "name": "vector_indexes",
+      "table": "vector_indexes",
+      "definition": [
+        "CONSTRAINT chk_vector_active_has_no_backfilling CHECK(index_status <> 'ACTIVE' OR backfilling IS NULL)",
+        "CONSTRAINT chk_vector_backfilling_bool CHECK(backfilling IS NULL OR backfilling IN(0,1))",
+        "CONSTRAINT chk_vector_dimensions_positive CHECK(dimensions > 0)",
+        "CONSTRAINT vector_indexes_table_id_fkey FOREIGN KEY(table_id)REFERENCES tables(table_id)ON DELETE CASCADE",
+        "PRIMARY KEY(table_id,index_name)",
+        "backfilling INTEGER",
+        "dimensions INTEGER NOT NULL",
+        "distance_function TEXT NOT NULL",
+        "index_id TEXT NOT NULL",
+        "index_name TEXT NOT NULL",
+        "index_status TEXT NOT NULL DEFAULT 'CREATING'",
+        "projection TEXT NOT NULL",
+        "search_schema TEXT",
+        "skipped_item_count INTEGER",
+        "table_id TEXT NOT NULL",
+        "vector_attribute TEXT NOT NULL"
+      ]
+    }
+  ]
+}

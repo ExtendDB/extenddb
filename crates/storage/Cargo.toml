@@ -6,9 +6,26 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Storage traits that every ExtendDB backend implements, with the catalog migration framework and the storage code the backends share. Internal crate of the extenddb binary, with no API stability promise."
+repository.workspace = true
+homepage.workspace = true
+
+[features]
+# `test-util` exposes `migrations::check_released`, the checksum test each
+# backend crate runs on its migration table,
+# `migrations::Runner::with_released_through`, which lets a test forget a
+# migration the release has frozen, and
+# `password::count_verifications`, which returns the bcrypt cost of each check
+# a login ran. It also compiles the counter in `verify_password` that records
+# those costs, and `iam_leftovers_conformance`, the check each backend's tests
+# run that a deleted principal or account leaves nothing behind. Production
+# code never enables it.
+test-util = []
+# Compiles the `snapshot_conformance` check that each backend's tests run
+# against a real database. Production builds do not compile it.
+test-hooks = []
 
 [dependencies]
-aes-gcm = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 bcrypt = { workspace = true }
@@ -19,10 +36,32 @@ futures = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
-tokio = { workspace = true }
 tokio-util = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+web-time = { workspace = true }
+zeroize = { workspace = true }
+
+# Native keeps the full tokio feature set from the workspace. The workspace
+# `full` feature pulls in mio (networking), which has no wasm32 target, so the
+# wasm build takes only the runtime/sync/time/macros surface the storage code
+# links (semaphores, timers and timeouts, spawn_blocking, select!).
+# None of it runs for the control-plane work reached in the browser, but it
+# must link. The native entry keeps the workspace feature set.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true }
+
+# 1.30 is the first tokio release that compiles `Semaphore::const_new`
+# (src/password.rs) without its `parking_lot` feature, which this entry does
+# not enable.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1.30", default-features = false, features = [
+    "rt",
+    "sync",
+    "time",
+    "macros",
+] }

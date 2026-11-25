@@ -11,12 +11,12 @@ The storage layer provides a trait-based abstraction for all persistent data ope
 `storage` crate with no database-specific dependencies. Backend implementations live in separate crates (e.g.,
 `storage-postgres`) and are installed once from a thin `main` via `set_backend`, one backend per binary.
 
-The trait-based design allows new storage backends to be added by implementing the storage traits and registering a
-factory function, with no changes needed to the `engine` or `server` crates. The factory pattern enables runtime
-backend selection based on configuration.
+A new storage backend implements the storage traits in its own crate and needs no change to the `engine` crate. A
+backend that cannot pin a table snapshot also needs an entry in `in_catalog_create_only` in
+`crates/server/src/backup_store.rs`, so that its CreateBackup writes the in-catalog format.
 
-**Current status**: PostgreSQL is the only supported backend. The trait architecture and plugin infrastructure provide
-the foundation for future backend implementations.
+**Current status**: four backends implement the storage traits, in `storage-postgres`, `storage-sqlite`, `storage-mongodb`
+and `storage-cassandra`. Each binary is built with one of them.
 
 Backends accepted into the ExtendDB repository must satisfy the [Backend Acceptance Criteria](../rfcs/0003-backend-acceptance-criteria.md)
 (the DynamoDB-behavioral invariants for the storage layer) and the process defined in
@@ -44,7 +44,7 @@ ExtendDB defines **13 traits** across three categories:
 - `AdminStore` — admin user management
 - `SettingsStore` — runtime settings (key-value store)
 - `MetricsStore` — historical metrics persistence and query
-- `RateLimitStore` — login rate limiting and account lockout
+- `RateLimitStore`: login rate limiting per user and source address
 - `AuthorizationStore` — policy lookups for authorization decisions
 
 **Initialization and Lifecycle** (defined in `storage/src/bootstrapper.rs`):
@@ -194,8 +194,18 @@ IAM-type entities.
 Runtime settings storage (key-value store):
 - `get_setting`, `set_setting`, `list_settings`, `cached_encryption_key`
 
-Settings include `control_plane_delay_seconds`, `log_level`, and the
-encryption key for access key secrets.
+Settings include `control_plane_delay_seconds`, `log_level`, and the key
+material for stored secrets: the catalog key (`encryption_key`) or, with
+`[auth.encryption] key_file` set, the key ring (`encryption_key_ring`) that
+holds the data encryption key wrapped under the key-encryption key in that
+file. One function in `crates/storage` loads the key from the two rows and the
+configured key source at startup and returns the one key the server uses, or a
+refusal that names the command that fixes the state (the admin guide's
+Encryption Key section). Each backend holds that key once, in the locked key
+store, and a store built without the key refuses to create, import or store a
+credential. The re-encryption pass of `extenddb encryption-key` is one driver in
+this crate; each backend adds a paged read of the credential rows, a batch write
+of ciphertexts by primary key, and the delete of one settings row.
 
 ### MetricsStore
 
@@ -207,12 +217,14 @@ storage.
 
 ### RateLimitStore
 
-Login rate limiting and account lockout:
+Login rate limiting per user and source address:
 - `count_principal_failures`, `count_ip_failures`, `record_failed_login`,
   `cleanup_old_attempts`
 
-Tracks failed login attempts by principal and source IP to mitigate clients
-sending excessive traffic.
+Records failed login attempts with the principal and the source address, and
+counts them per (principal, source address) pair and per source address, so
+the server can refuse an address that has failed too often for one principal
+or overall without locking the principal out of other addresses.
 
 ### AuthorizationStore
 
@@ -331,7 +343,7 @@ Storage backends write stream records atomically with data writes when `stream` 
 - `ConditionFailed { old_item: Option<Item> }` — condition expression evaluated to false
 - `TransactionCanceled(Vec<CancellationReason>)` — transaction failed with per-item reasons
 - `IdempotentReplay` — idempotency token matched previous request
-- `IdempotentMismatch` — idempotency token exists with different operations
+- `IdempotentMismatch`: idempotency token exists with a different fingerprint (the items or a Return field)
 - `IndexNotFound` — secondary index does not exist
 - `Internal(String)` — backend-specific error
 
@@ -567,13 +579,18 @@ The ops run in table and key order. A ConditionCheck or Delete that finds no row
 
 ### 5.6 Migrations
 
-Migrations are embedded in the binary at compile time via `include_str!` and applied in order by the
-`catalog::run_migrations` helper. Each migration is tracked in the `schema_history` table.
+The catalog migrations are the numbered list every backend shares
+([ADR-0023](../adr/0023-catalog-migrations.md)). PostgreSQL's bodies are SQL files embedded in the
+binary at compile time via `include_str!`. The shared runner applies them in id order and records
+each body in the `extenddb_migrations` ledger of the database it changed, and every id in the
+catalog's ledger. The
+`schema_history` table of a catalog that 0.1.14 or an earlier release
+created stays in place and is not read.
 
-Migration files are numbered sequentially:
+Migration files are named by id:
 ```
 migrations/
-└── 001_initial_schema.sql
+└── 0001_baseline.sql
 ```
 
 ## 6. GSI Consistency Model
@@ -672,17 +689,37 @@ This column-on-tables approach is sufficient while control plane operations map 
 Until those requirements arise, the single-column approach avoids the complexity of a separate job queue while providing
 full crash recovery.
 
-### 6.2 GSI Backfill on CreateIndex
+### 6.2 GSI backfill when UpdateTable adds an index
 
-When `UpdateTable` adds a new GSI to a table with existing data:
+When `UpdateTable` adds a new GSI to a table with existing data, the PostgreSQL backend
+(`crates/storage-postgres/src/data/gsi_build.rs`, which has the full ordering argument):
 
-1. Set the new index status to `CREATING` in `indexes`
-2. Spawn a background task that scans the base table in batches (configurable batch size, default 1000)
-3. For each batch, INSERT the projected attributes into the new GSI table
-4. On completion, set index status to `ACTIVE`
-5. During backfill, writes to the base table also write to the new GSI table (the write path checks index status and
-includes `CREATING` indexes)
-6. Queries against a `CREATING` index return `ResourceNotFoundException` (matching DynamoDB behavior)
+1. Creates the GSI's data table, then commits its `indexes` row as `CREATING`. Every write reads the catalog,
+   so from that commit on writes maintain the index the same way as an `ACTIVE` one, inline or through the
+   propagation queue.
+2. Waits one second, then takes `LOCK TABLE ... IN SHARE MODE` on the base table and releases it at once. The
+   lock waits for writes already in flight; writes arriving meanwhile queue behind it, each holding a data pool
+   connection, so the request carries a lock timeout (one second over `deadlock_timeout`) and is retried a few
+   times with growing pauses. The wait and a time check on the write side (a write that took more than 500 ms
+   from its catalog read re-reads it and queues a repair for any GSI it missed; a write with no transaction
+   queues that repair after its own statement, and loses it if the process dies in between) together cover
+   writes that read the catalog just before the index row committed: the catalog and the data tables are
+   separate databases, so no transaction can tell those writes the index exists.
+3. Scans the base table in keyset pages (256 rows, `FOR SHARE SKIP LOCKED`, skipped rows taken one at a time
+   afterwards), writing each item's current state into the index, then deletes index rows whose item is gone.
+4. Sets the status to `ACTIVE`. A build that fails for a transient reason leaves the index `CREATING`, and a
+   background worker finishes it; one that would fail every time removes the index and fails the request.
+
+Queued GSI updates apply the item's state at apply time rather than the image the row carried, so a queue row
+applied late, twice, or after the backfill wrote a newer state cannot leave the index behind the table. The
+worker reads the base row under `FOR SHARE` for that, so a queued update and a concurrent write to the same item
+now wait for each other where before they did not meet.
+
+`UpdateTable` returns after the build. While a GSI is `CREATING`, a Query or Scan naming it is answered as if the
+table had no such index (the service's response), and a GSI Create, or a Delete of another GSI, on the table is
+refused with LimitExceededException. A Delete of the building GSI and a throughput Update are not refused. DeleteTable stops the propagation queue for the table (a `vector_index_holds` row, which the
+claim query honours) and deletes its pending rows before it drops any data table, so a worker holding a claimed row
+and waiting on the base table cannot deadlock with the drop.
 
 ## 7. Pagination Token Encoding
 
@@ -730,6 +767,28 @@ WHERE pk = $gsi_pk
        OR (sk_s COLLATE "C" = $gsi_sk
            AND (base_pk COLLATE "C" > $base_pk
                 OR (base_pk = $base_pk AND base_sk_n > $base_sk))))
+```
+
+**LSI Query:** an LSI cursor compares the index sort key, then `base_pk`, then
+the base sort key. These are the three columns of the GSI cursor above, and the
+`ORDER BY` lists them in the same order. The cursor is one row comparison. On
+every column, the cursor and the `ORDER BY` run in the direction of
+`ScanIndexForward`: `>` and `ASC` forward, `<` and `DESC` in reverse. Every row of an LSI partition
+stores the queried partition key as `base_pk`. The cursor binds the start key's
+partition key for it, and request validation refuses a start key from another
+partition. So `base_pk` compares equal on every row, and the order
+and page boundaries are those of the index sort key and the base sort key.
+Including `base_pk` makes the `ORDER BY` match the ordering index
+`(pk, sk_s, base_pk, base_sk_n)` after the fixed `pk`. The index can then return
+the page in order without a sort step. With `(sk_s, base_sk_n)` alone, the index
+orders `sk_s` only, and the database sorts the rows that share an index sort
+key value. PostgreSQL adds an Incremental Sort when the key condition leaves
+several index sort key values. It adds a Sort when an equality on the index sort
+key leaves one. SQLite adds a temporary B-tree.
+```sql
+WHERE pk = $lsi_pk
+  AND (sk_s COLLATE "C", base_pk COLLATE "C", base_sk_n) > ($lsi_sk, $base_pk, $base_sk)
+ORDER BY sk_s COLLATE "C" ASC, base_pk COLLATE "C" ASC, base_sk_n ASC
 ```
 
 For GSI queries, the pagination key includes both the GSI key attributes and the base table primary key (needed to
@@ -794,6 +853,22 @@ The token is scoped to `account_id`: a `ClientRequestToken` is unique per
 account in DynamoDB, so the same token value from two accounts never collides.
 If a request arrives with the same `(account_id, token)` but a different
 fingerprint, return `IdempotentParameterMismatchException`.
+
+The fingerprint (`compute_fingerprint` in
+`crates/engine/src/transact_write_helpers.rs`) is an HMAC-SHA256 keyed by the
+token. It hashes the request's `TransactItems` JSON, then its
+`ReturnConsumedCapacity` and `ReturnItemCollectionMetrics`. Each of the two
+fields adds to the hashed input only when it is not `NONE`. The service treats
+an absent field as `NONE` and refuses a replay that changes either field. The
+stored value is the first 64 bits of the HMAC, as 16 hex characters. For a
+`TransactWriteItems` request, the fingerprint hashes the items as the request
+writes them. Some retries that the service replays therefore answer the
+mismatch in ExtendDB (see "Transactions" in
+`docs/differences-from-dynamodb.md`). ExtendDB translates an
+`ExecuteTransaction` write into a `TransactWriteItems` request before it
+computes the fingerprint. It builds the `TransactItems` from the parsed
+statements and copies the request's token and `ReturnConsumedCapacity`. The
+same fingerprint then decides the replays of the write.
 
 ## 10. Backend Plugin Architecture
 
@@ -1374,6 +1449,6 @@ backups).
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.
