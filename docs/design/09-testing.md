@@ -298,7 +298,7 @@ The PostgreSQL extension suite identified test categories the original implement
 
 ### 8.1 PartiQL (Q-5, N-3)
 
-PartiQL is deferred to post-v1 (Phase 15+). It requires a separate parser and execution engine.
+PartiQL (ExecuteStatement, BatchExecuteStatement, ExecuteTransaction) is implemented behind the default-on `partiql` build feature; see [Feature Status](../differences-from-dynamodb.md#feature-status).
 
 ### 8.2 CI Infrastructure (Q-4)
 

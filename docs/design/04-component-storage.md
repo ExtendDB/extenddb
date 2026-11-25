@@ -346,7 +346,7 @@ Storage backends write stream records atomically with data writes when `stream` 
 - `ConditionFailed { old_item: Option<Item> }`: condition expression evaluated to false
 - `TransactionCanceled(Vec<CancellationReason>)`: transaction failed with per-item reasons
 - `IdempotentReplay`: idempotency token matched previous request
-- `IdempotentMismatch`: idempotency token exists with different operations
+- `IdempotentMismatch`: idempotency token exists with a different fingerprint (the items or a Return field)
 - `IndexNotFound`: secondary index does not exist
 - `Internal(String)`: backend-specific error
 
@@ -412,10 +412,12 @@ The PostgreSQL backend uses two categories of tables:
     same way). The query builders also qualify every string key predicate and
     `ORDER BY` with `COLLATE "C"`, so results are byte-ordered on tables
     created before the columns carried the collation; on those tables the
-    indexes cannot serve the predicates (see technical debt C-11). The same
-    columns on index tables (`pk`, `sk_s`, `base_pk`, `base_sk_s`) carry the
-    collation, so a GSI or LSI cursor is a row comparison the ordering index
-    serves in one seek.
+    indexes cannot serve the predicates (see technical debt C-11). On index
+    tables created with the collated key columns, the text key columns (`pk`,
+    `sk_s`, `base_pk`, `base_sk_s` and their numbered variants) carry the
+    collation. A GSI or LSI Query cursor there is served in one seek, by the
+    ordering index, or by the primary key on a hash-only GSI (section 7 has the
+    Scan cases).
 
 - **Item storage**: `item_data` JSONB contains the complete item including key
   attributes, matching the DynamoDB model where key attributes are part of the
@@ -433,6 +435,11 @@ The PostgreSQL backend uses two categories of tables:
   details on the propagation delay model.
 
 ### 5.2 Connection Pooling
+
+The sketch below and the read replica mode of section 5.3 are a proposal, not code in this repository. Today the
+backend serves every item read and write from `data_pool`. The sketch predates the split into a catalog pool and a
+data pool: its `pool` stands for today's `data_pool`. `PostgresStorageConfig` refuses unknown fields, so a
+configuration carrying `read_replica_url` or `read_replica_pool_size` stops the server at startup.
 
 ```rust
 use sqlx::postgres::PgPoolOptions;
@@ -484,18 +491,20 @@ impl PostgresEngine {
 ### 5.3 Read Consistency Model
 
 DynamoDB supports two read consistency modes: strongly consistent and eventually consistent (the default). The
-PostgreSQL backend models this via an optional read replica.
+PostgreSQL backend in this repository serves every item read and write from `data_pool`; the `read_pool` and
+`read_replica_url` in the sketch above are a proposal for a read replica mode, not code that exists.
 
-**Single-node mode (no read replica configured):** All reads are strongly consistent regardless of the `consistent_read`
-flag. This is strictly stronger than the DynamoDB spec and compatible with all applications. The `consistent_read`
-parameter is accepted and correctly reflected in capacity calculations (eventually consistent reads consume 0.5 RCU vs
-1.0 RCU for strongly consistent).
+**Single-node mode (what the backend does today):** Base table and local secondary index reads are strongly consistent
+regardless of the `consistent_read` flag. This is strictly stronger than the DynamoDB spec and compatible with all
+applications. Global secondary index rows go through the propagation queue (section 6), so a read on a GSI can lag the
+base table, as on the service. The `consistent_read` parameter is accepted and correctly reflected in capacity
+calculations (eventually consistent reads consume 0.5 RCU vs 1.0 RCU for strongly consistent).
 
-**Read replica mode (`read_replica_url` configured):** Eventually consistent reads (`consistent_read=false`) are routed
-to a PostgreSQL streaming replica that is naturally a few milliseconds behind the primary. Strongly consistent reads
-(`consistent_read=true`) always read from the primary. This mirrors how DynamoDB achieves eventual consistency
-(via storage node replicas) and surfaces the exact class of bugs that applications may encounter in production
-DynamoDB (e.g., read-after-write without `ConsistentRead=true` returning stale data).
+**Read replica mode (proposed, `read_replica_url` configured):** Eventually consistent reads (`consistent_read=false`)
+would be routed to a PostgreSQL streaming replica that is a few milliseconds behind the primary. Strongly consistent
+reads (`consistent_read=true`) would always read from the primary. This mirrors how DynamoDB achieves eventual
+consistency through storage node replicas and surfaces the class of bugs that applications meet in production
+DynamoDB (a read after a write without `ConsistentRead=true` returning the earlier value).
 
 **Which operations are affected:**
 - `GetItem`: uses `consistent_read` field (default `false` in DynamoDB)
@@ -505,8 +514,8 @@ DynamoDB (e.g., read-after-write without `ConsistentRead=true` returning stale d
 - `TransactGetItems`: always strongly consistent (DynamoDB spec: serializable isolation)
 - All write operations: always use the primary pool
 
-The `read_pool()` helper method on `PostgresEngine` encapsulates this routing. All read implementations call
-`self.read_pool(input.consistent_read)` instead of `&self.pool` directly.
+In the proposal, a `read_pool()` helper on `PostgresEngine` encapsulates this routing and every read implementation
+calls it instead of `&self.data_pool` directly.
 
 ### 5.4 Query Translation
 
@@ -736,41 +745,142 @@ serialized as standard DynamoDB JSON.
 pub type PaginationKey = BTreeMap<String, AttributeValue>;
 ```
 
-The storage backend translates this to a SQL `WHERE` clause:
+The PostgreSQL and SQLite backends translate this to a SQL `WHERE` clause. The
+cursor compares the same columns the statement's `ORDER BY` sorts on, in the
+same order and in the same direction. So the predicate is one row comparison,
+`>` for a forward page and `<` for a reverse one. It is a plain comparison when
+the cursor has one column. In every shape below, a key index whose columns
+follow the cursor's serves the page. The page comes out in order with no sort
+step, except the Scan on an index with more than one RANGE attribute (see
+Index Scan). For the base table Scan and Query that index is the primary key.
+For a GSI or LSI it is the
+ordering index `(pk, sk_*, base_pk, base_sk_*)`. A hash-only index has no
+ordering index, because `create_index_data_table` creates one only when the
+index declares a sort key. Its page comes from the primary key
+`(pk, base_pk, base_sk_*)` or from the base-key index `(base_pk, base_sk_*)`
+with a filter on `pk`. All of this holds on tables created with the collated
+key columns. On older PostgreSQL tables the key columns keep the database
+collation, so the indexes do not serve a `COLLATE "C"` predicate or
+`ORDER BY`. The statements put `COLLATE "C"` on `base_pk` and on every string
+sort key column. Where the first cursor column other than `pk` is one of
+these, PostgreSQL reads the rows through the `pk` prefix of the key index. It
+then filters the cursor and sorts the rest, on every page (technical debt
+C-11). Where a later cursor column is one of these, PostgreSQL seeks on the
+leading columns and sorts the rest (Incremental Sort). The statements below
+show PostgreSQL. SQLite emits the same shape with `?` placeholders and without
+`COLLATE`, because its text columns already compare by byte value.
 
-**Base table pagination (forward scan):**
+The plans here are for the statements shown, which carry no sort key
+condition. With an equality on the index sort key, PostgreSQL planned a Sort
+over a Bitmap Index Scan on every GSI page. A `BETWEEN` kept the Index Scan.
+On an LSI with 50 items per sort key value, both plans of each page with an
+equality were an Index Scan at Limit 10. At Limit 101, the custom plan of the
+first page was a Sort over a Bitmap Heap Scan. SQLite seeks on the condition's
+terms and applies the cursor as a filter.
+
+**Base table Scan:**
 ```sql
-WHERE (pk = $last_pk AND sk_n > $last_sk)
-   OR pk > $last_pk
+WHERE (pk, sk_n) > ($last_pk, $last_sk)
+ORDER BY pk, sk_n
 ```
 
-**Base table pagination (reverse scan):**
+**Base table Query:** the key condition fixes `pk`, so the sort key alone is
+the cursor. `ScanIndexForward = false` flips the comparison and the sort:
 ```sql
-WHERE (pk = $last_pk AND sk_n < $last_sk)
-   OR pk < $last_pk
+WHERE pk = $pk AND sk_n > $last_sk
+ORDER BY sk_n ASC
+```
+```sql
+WHERE pk = $pk AND sk_n < $last_sk
+ORDER BY sk_n DESC
 ```
 
-**GSI pagination (forward scan):**
-GSI keys are not unique, so the base table primary key is used as a tiebreaker.
-Every column of the cursor runs in the same direction as the `ORDER BY`, so the
-predicate is one row comparison, which the ordering index on
-`(pk, sk_s, base_pk, base_sk_*)` serves as a single seek:
+**GSI Query (forward):**
+GSI keys are not unique, so the base table primary key follows the index sort
+key as a tiebreaker, in the cursor and in the `ORDER BY`:
 ```sql
 WHERE pk = $gsi_pk
   AND (sk_s COLLATE "C", base_pk COLLATE "C", base_sk_n) > ($gsi_sk, $base_pk, $base_sk)
-ORDER BY sk_s COLLATE "C", base_pk COLLATE "C", base_sk_n
+ORDER BY sk_s COLLATE "C" ASC, base_pk COLLATE "C" ASC, base_sk_n ASC
 ```
 
-For a reverse query (`ScanIndexForward = false`) the index sort key runs
-backwards while the base-key tiebreaker stays ascending, so the cursor keeps
-the expanded form:
+**GSI Query (reverse, `ScanIndexForward = false`):** every column runs
+backwards, the base-key tiebreaker included, so the cursor stays a row
+comparison and the page sequence is the exact mirror of the forward one. The
+service has the same mirror property: a reverse Query returns the forward
+order reversed, among items that share an index sort key and among the items
+of a hash-only index partition (measured 2026-09-17). An ascending tiebreaker
+under a descending sort key is not a mirror, so the reverse cursor compares
+every column, the tiebreaker included, with `<`.
 ```sql
 WHERE pk = $gsi_pk
-  AND (sk_s COLLATE "C" < $gsi_sk
-       OR (sk_s COLLATE "C" = $gsi_sk
-           AND (base_pk COLLATE "C" > $base_pk
-                OR (base_pk = $base_pk AND base_sk_n > $base_sk))))
+  AND (sk_s COLLATE "C", base_pk COLLATE "C", base_sk_n) < ($gsi_sk, $base_pk, $base_sk)
+ORDER BY sk_s COLLATE "C" DESC, base_pk COLLATE "C" DESC, base_sk_n DESC
 ```
+
+**GSI with more than one RANGE attribute:** every RANGE attribute of the index
+key schema has its own column (`sk_s`, `sk2_n`, ...), in key-schema order. All
+of them precede the base key in the cursor and in the `ORDER BY`. A GSI with
+RANGE attributes `r1` (S) and `r2` (N) over a base table with a numeric sort
+key compares four columns. The ordering index
+`(pk, sk_s, sk2_n, base_pk, base_sk_n)` serves the page in one seek in both
+directions:
+```sql
+WHERE pk = $gsi_pk
+  AND (sk_s COLLATE "C", sk2_n, base_pk COLLATE "C", base_sk_n) > ($r1, $r2, $base_pk, $base_sk)
+ORDER BY sk_s COLLATE "C" ASC, sk2_n ASC, base_pk COLLATE "C" ASC, base_sk_n ASC
+```
+
+**LSI Query:** an LSI cursor compares the index sort key, then `base_pk`, then
+the base sort key. These are the three columns of the GSI cursor above, and the
+`ORDER BY` lists them in the same order. The cursor is one row comparison. On
+every column, the cursor and the `ORDER BY` run in the direction of
+`ScanIndexForward`: `>` and `ASC` forward, `<` and `DESC` in reverse. Every row of an LSI partition
+stores the queried partition key as `base_pk`. The cursor binds the start key's
+partition key for it, and request validation refuses a start key from another
+partition. So `base_pk` compares equal on every row, and the order
+and page boundaries are those of the index sort key and the base sort key.
+Including `base_pk` makes the `ORDER BY` match the ordering index
+`(pk, sk_s, base_pk, base_sk_n)` after the fixed `pk`. The index can then return
+the page in order without a sort step. With `(sk_s, base_sk_n)` alone, the index
+orders `sk_s` only, and the database sorts the rows that share an index sort
+key value. PostgreSQL adds an Incremental Sort when the key condition leaves
+several index sort key values. It adds a Sort when an equality on the index sort
+key leaves one. SQLite adds a temporary B-tree.
+```sql
+WHERE pk = $lsi_pk
+  AND (sk_s COLLATE "C", base_pk COLLATE "C", base_sk_n) > ($lsi_sk, $base_pk, $base_sk)
+ORDER BY sk_s COLLATE "C" ASC, base_pk COLLATE "C" ASC, base_sk_n ASC
+```
+
+**Hash-only index:** there is no index sort key, so the cursor is the base
+primary key alone, `(base_pk COLLATE "C", base_sk_n) > ($base_pk, $base_sk)`
+forward and `<` in reverse.
+
+**Index Scan:** a Scan on an index has no fixed partition, so the cursor
+compares the whole index row key, `pk` first. On a GSI or LSI with one sort
+key the cursor is
+`(pk, sk_s COLLATE "C", base_pk COLLATE "C", base_sk_n) > ($last_pk, $last_sk, $base_pk, $base_sk)`,
+with `ORDER BY pk, sk_s COLLATE "C", base_pk COLLATE "C", base_sk_n`. On a
+hash-only index it is `(pk, base_pk COLLATE "C", base_sk_n) > ($last_pk, $base_pk, $base_sk)`,
+with `ORDER BY pk, base_pk COLLATE "C", base_sk_n`. The ordering index serves
+the LSI Scan with no sort step. The primary key serves the hash-only index
+Scan. A Scan on an index
+with more than one RANGE attribute compares and orders by the first RANGE
+column only (`sk_s`, `sk_n` or `sk_b`), ahead of `base_pk`. That is still a
+total order, because the cursor holds the full base key. The ordering index
+does not serve it without a sort step: PostgreSQL adds an Incremental Sort,
+SQLite a temporary B-tree.
+
+On a base table without a sort key, the Scan cursor is `pk > $last_pk` with
+`ORDER BY pk`. A Query with an `ExclusiveStartKey` on such a table is refused
+with `ValidationException` (`The provided exclusive start key is invalid`)
+before it reaches storage (`crates/engine/src/start_key.rs`), because the key
+condition fixes the only key column. The `base_sk_*` column drops out of every
+index cursor, Query and Scan alike. A GSI Query cursor is then
+`(sk_s COLLATE "C", base_pk COLLATE "C")`, a
+hash-only index Query cursor is `base_pk COLLATE "C"` alone, and an LSI cannot
+exist.
 
 For GSI queries, the pagination key includes both the GSI key attributes and the base table primary key (needed to
 uniquely identify the position, since GSI keys are not unique). This is why the GSI PostgreSQL table includes `base_pk`
@@ -834,6 +944,22 @@ The token is scoped to `account_id`: a `ClientRequestToken` is unique per
 account in DynamoDB, so the same token value from two accounts never collides.
 If a request arrives with the same `(account_id, token)` but a different
 fingerprint, return `IdempotentParameterMismatchException`.
+
+The fingerprint (`compute_fingerprint` in
+`crates/engine/src/transact_write_helpers.rs`) is an HMAC-SHA256 keyed by the
+token. It hashes the request's `TransactItems` JSON, then its
+`ReturnConsumedCapacity` and `ReturnItemCollectionMetrics`. Each of the two
+fields adds to the hashed input only when it is not `NONE`. The service treats
+an absent field as `NONE` and refuses a replay that changes either field. The
+stored value is the first 64 bits of the HMAC, as 16 hex characters. For a
+`TransactWriteItems` request, the fingerprint hashes the items as the request
+writes them. Some retries that the service replays therefore answer the
+mismatch in ExtendDB (see "Transactions" in
+`docs/differences-from-dynamodb.md`). ExtendDB translates an
+`ExecuteTransaction` write into a `TransactWriteItems` request before it
+computes the fingerprint. It builds the `TransactItems` from the parsed
+statements and copies the request's token and `ReturnConsumedCapacity`. The
+same fingerprint then decides the replays of the write.
 
 ## 10. Backend Plugin Architecture
 

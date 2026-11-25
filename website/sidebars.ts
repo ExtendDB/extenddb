@@ -186,6 +186,9 @@ const sidebars: SidebarsConfig = {
             {type: 'doc', id: 'design/testing', label: 'Test strategy'},
             {type: 'doc', id: 'design/dependency-licenses', label: 'Dependency licenses'},
             {type: 'doc', id: 'design/backup-restore', label: 'Backup and restore'},
+            {type: 'doc', id: 'design/backup-restore-bench-pr8', label: 'Backup and restore benchmarks (PR 8)'},
+            {type: 'doc', id: 'design/backup-restore-bench-pr9', label: 'Backup and restore benchmarks (PR 9)'},
+            {type: 'doc', id: 'design/backup-restore-bench-pr11', label: 'Backup and restore benchmarks (PR 11)'},
           ],
         },
         {
@@ -203,6 +206,7 @@ const sidebars: SidebarsConfig = {
             {type: 'doc', id: 'rfcs/0003-backend-acceptance-criteria', label: 'RFC 0003: Backend acceptance criteria'},
             {type: 'doc', id: 'rfcs/0000-mongodb-backend', label: 'MongoDB backend'},
             {type: 'doc', id: 'rfcs/draft-cassandra-backend', label: 'Cassandra backend (draft)'},
+            {type: 'doc', id: 'rfcs/0000-credential-encryption-key', label: 'Credential encryption key (draft)'},
           ],
         },
       ],

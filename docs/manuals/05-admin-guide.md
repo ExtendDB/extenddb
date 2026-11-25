@@ -220,7 +220,7 @@ Statistics are exposed at `/management/auth-cache-metrics` (JSON, admin-authenti
 
 ### Runtime Settings
 
-Managed via `extenddb settings set`. Changes take effect within 30 seconds without restart.
+Managed via `extenddb settings set`. Changes take effect within 30 seconds without restart. A running server logs, under no audit target, when it applies a new `log_level`, `sqlx_log_level` or `throttling_enabled` value.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
@@ -300,7 +300,7 @@ By default, control plane operations (CreateTable, DeleteTable) emulate the serv
 
 #### GSI propagation delay
 
-GSI updates are applied asynchronously with a configurable delay, simulating the DynamoDB service's eventually consistent GSI behavior. The system-wide default is 10ms. Each GSI can override this with a per-index `propagation_delay_ms` stored in the catalog.
+On PostgreSQL, SQLite and Cassandra, GSI updates are applied asynchronously after a configurable delay, simulating the DynamoDB service's eventually consistent GSI behavior. The system-wide default is 10 ms, and each GSI can override it with a per-index `propagation_delay_ms` stored in the catalog. MongoDB maintains GSIs in the write itself and reads no delay.
 
 ```bash
 # Set system-wide default to 0 for synchronous GSI updates (fast tests)
@@ -549,7 +549,7 @@ A group created later with the same name starts with no policies and no members.
         "Principal": {
           "AWS": "arn:aws:iam::123456789012:user/alice"
         },
-        "Action": "sts:AssumeRole"
+        "Action": ["sts:AssumeRole", "sts:TagSession"]
       }]
     }'
 
@@ -597,8 +597,9 @@ considered, and with no matching `Allow` assumption is implicitly denied. The
 decision is made for each STS action the call exercises: `sts:AssumeRole`
 always, and `sts:TagSession` as well when the call passes session tags. Passing
 session tags to a role whose trust policy does not allow `sts:TagSession` is
-denied. ExtendDB does not implement source identity, so `sts:SetSourceIdentity`
-is never part of the decision.
+denied with 403 `Caller is not authorized to assume this role`. ExtendDB does
+not implement source identity, so `sts:SetSourceIdentity` is never part of the
+decision.
 
 A statement matches when its `Principal` matches the caller, its `Action` (or
 `NotAction`) covers the action, and all `Condition` blocks pass. `Effect` is

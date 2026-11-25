@@ -31,6 +31,7 @@ mod sample_toml_support;
 #[cfg(test)]
 mod sample_toml_tests;
 mod snapshot_engine;
+mod stream_at_timestamp;
 mod stream_engine;
 mod stream_lifecycle;
 mod table_engine;

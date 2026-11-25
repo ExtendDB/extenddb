@@ -5,7 +5,7 @@ status: "Implemented for a single instance; the multi-instance fanout in Appendi
 
 # Component design: Authorization cache
 
-Companion to the [authentication design](05-component-auth.md) and the [HTTP server design](06-component-server.md).
+Companion to the [authentication design](05-component-auth-v3.md) and the [HTTP server design](06-component-server.md).
 
 > Note: this cache is a deliberate exception to the rule that the server
 > holds no in-process state. The exception is scoped to IAM data only

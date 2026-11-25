@@ -38,6 +38,7 @@ mod snapshot_engine;
 pub use snapshot_engine::{
     MIN_NEXT_PAGE_ROWS, MIN_PAGE_ROWS, SNAPSHOT_SLOT_BOUND, map_fetch_error, page_sql_for,
 };
+mod stream_at_timestamp;
 mod stream_engine;
 mod stream_lifecycle;
 #[doc(hidden)]
@@ -70,6 +71,13 @@ pub use catalog_store::PostgresCatalogStore;
 pub use config::PostgresStorageConfig;
 pub use config::parse_connection_string;
 pub use credential_store::DbCredentialStore;
+/// Hold a `catalog-check` comparison between its first catalog read and its
+/// second listing of the data relations.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use data::catalog_check::test_pause::{
+    CatalogCheckPause, CatalogCheckPoint, arm_catalog_check_pause,
+};
 /// Finish GSI builds left `CREATING`, once. The server runs it from a background
 /// worker; exported for its test.
 pub use data::gsi_build::reconcile_creating_gsis;
@@ -188,13 +196,17 @@ pub fn backend() -> extenddb_storage::Backend {
         diagnostics_store: |connection_string| {
             let connection_string = connection_string.to_string();
             Box::pin(async move {
-                let pool = sqlx::PgPool::connect(&connection_string)
-                    .await
-                    .map_err(|e| {
-                        extenddb_storage::diagnostics_store::DiagnosticsStoreError::ConnectionFailed(
-                            e.to_string(),
-                        )
-                    })?;
+                use extenddb_storage::diagnostics_store::DiagnosticsStoreError;
+                // Statement logging is off, as on the store's data pool, so a
+                // catalog read that waits on a lock does not print a
+                // slow-statement line in the middle of the command's report.
+                let pool = async {
+                    let options: sqlx::postgres::PgConnectOptions = connection_string.parse()?;
+                    let options = sqlx::ConnectOptions::disable_statement_logging(options);
+                    sqlx::PgPool::connect_with(options).await
+                }
+                .await
+                .map_err(|e| DiagnosticsStoreError::ConnectionFailed(e.to_string()))?;
                 Ok(Box::new(PostgresCatalogStore::new(pool))
                     as Box<dyn extenddb_storage::diagnostics::DiagnosticsStore>)
             })

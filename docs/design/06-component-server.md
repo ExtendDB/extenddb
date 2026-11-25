@@ -349,6 +349,38 @@ ExtendDB's own `AccountId` dimension.
   (omitted in the in-memory fallback path).
 - `segments` (`Vec<OperationSegments>`): per-operation latency breakdown
   (auth / authz / throttle / dispatch / response in microseconds), in-memory only.
+  Requests are summed at record time into fixed time buckets per account and
+  operation (1-second buckets for the last 5 minutes, 1-minute buckets for the
+  last 24 hours), so a window covers at least its length and at most one bucket
+  width more, and the memory per account and operation is bounded whatever the
+  request count. `LastMinute`
+  and `Last5Minutes` read the 1-second buckets; `LastHour` and `LastDay` read
+  the 1-minute buckets; `AllTime` returns the whole 24-hour ring. With the
+  `account_id` filter the breakdown reads that account's buckets; without it,
+  every account's buckets are summed per operation. The table is not a
+  dimension of this breakdown. Operations with no request in the window are
+  omitted; results are sorted by operation name.
+  Each account's operation holds a 64-byte bucket per second of the last five
+  minutes and per minute of the last day with a request. That is at most 301
+  one-second and 1,441 one-minute buckets, 111,488 bytes. So the breakdown
+  holds at most `accounts x operations x 111,488` bytes of buckets, plus the
+  keys and map entries. A pair with one request a day holds two buckets. With
+  its keys and map entries it takes 286 to 429 bytes when its account sends 3
+  to 40 operations. The cost steps up each time the account's map of
+  operations grows. It is 475 bytes with 2 operations. It is 810 bytes when its
+  account sends only that operation (release build, counting allocator, 1,000
+  accounts, 24 November 2026). A ring's allocation
+  does not shrink: a pair keeps the largest allocation it reached until a day
+  passes with no request for it. With the 40 operations the server dispatches,
+  an account that sends every operation every second holds about 4.46 MB
+  (4.25 MiB). An account that sends each operation once a day holds about
+  14 KB. `accounts` counts the accounts that sent a request in the
+  last day. The metrics prune runs every five minutes. It drops the buckets of
+  an account's operation once its newest bucket left the 24-hour ring, 1,440 to
+  about 1,446 minutes after that request. It drops the account once it holds no
+  operation. The segments are recorded only for requests that reach dispatch. A
+  request refused by authentication, authorization, throttling or the
+  point-in-time recovery check adds none.
 - `source`: `"database"` when served from the persistent `MetricsStore`,
   `"memory"` when served from the in-process `MetricsCollector` fallback.
 
@@ -497,7 +529,7 @@ All management routes use `POST /management/<action>` with JSON request/response
 }
 ```
 
-`CallerArn` is required; it identifies the principal assuming the role. It must match the format `arn:aws:iam::{account_id}:user/{user_name}`. If the format is invalid, the handler returns 400 with `{"Error": "ValidationError", "Message": "CallerArn must be a valid IAM user ARN"}`. Role chaining (a role assuming another role) is not supported; `CallerArn` must reference a user. The handler loads the caller's tags via `IdentityEngine`, builds an `AssumeRoleContext` from the caller's tags + `SessionTags` + `ExternalId`, loads the role's trust policy, and evaluates it using `evaluate_trust_policy`. If the trust policy denies the assumption, the handler returns 403 with `{"Error": "AccessDenied", "Message": "Trust policy does not allow this principal to assume the role"}`. This ensures developers can test trust policy conditions (e.g., `sts:ExternalId`, `aws:PrincipalTag/*` restrictions) through the management API.
+`CallerArn` is required; it identifies the principal assuming the role. It is the caller's ARN, such as an IAM user (`arn:aws:iam::{account_id}:user/{user_name}`) or a role session (`arn:aws:sts::{account_id}:assumed-role/{role_name}/{session_name}`). The handler does not check its format: the role's trust policy decides. The handler loads the role's trust policy and evaluates it with `evaluate_trust_policy`. That function reads the caller's tags from the catalog store (`fetch_caller_tags`) and builds an `AssumeRoleContext` from them, the `SessionTags` and the `ExternalId`. If the trust policy denies the assumption, the handler returns 403 with the body `Caller is not authorized to assume this role`. This ensures developers can test trust policy conditions (e.g., `sts:ExternalId`, `aws:PrincipalTag/*` restrictions) through the management API.
 
 ### 8.4 Error Responses
 
