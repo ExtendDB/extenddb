@@ -19,6 +19,7 @@ give the behavioral detail for each area.
 | Feature | Status |
 |---------|--------|
 | CreateTable / DeleteTable / DescribeTable / ListTables / UpdateTable | ✓ |
+| DescribeEndpoints / DescribeLimits | ✓ |
 | PutItem / GetItem / UpdateItem / DeleteItem | ✓ |
 | Query / Scan (with filter, projection, pagination) | ✓ |
 | BatchWriteItem / BatchGetItem | ✓ |
@@ -26,7 +27,7 @@ give the behavioral detail for each area.
 | Global Secondary Indexes (GSI) | ✓ |
 | Vector indexes and SearchVectors | ✓ (PostgreSQL needs pgvector; refused on MongoDB and Cassandra) |
 | Local Secondary Indexes (LSI) | ✓ |
-| DynamoDB Streams | ✓ (Cassandra: see Storage and Infrastructure) |
+| DynamoDB Streams (ListStreams, DescribeStream, GetShardIterator, GetRecords) | ✓ (Cassandra: see [Storage and Infrastructure](#storage-and-infrastructure)) |
 | ConditionExpression / FilterExpression / UpdateExpression / ProjectionExpression | ✓ |
 | KeyConditionExpression | ✓ |
 | ReturnValues / ReturnConsumedCapacity | ✓ |
@@ -37,10 +38,13 @@ give the behavioral detail for each area.
 | Legacy API (Expected, AttributeUpdates, AttributesToGet) | ✓ |
 | PartiQL (ExecuteStatement, BatchExecuteStatement, ExecuteTransaction) | ✓ (behind the `partiql` build feature, on by default; see the [PartiQL section](#partiql)) |
 | DAX | ✗ (not applicable) |
-| Global Tables | ✗ Not implemented: the Global Tables operations answer `UnknownOperationException` (see Operations Not Implemented); `UpdateTable` with `ReplicaUpdates` answers `ValidationException` |
-| On-demand backups (CreateBackup, RestoreTableFromBackup, DescribeBackup, ListBackups, DeleteBackup) | ✓: CreateBackup to the configured filesystem or S3 backup store on PostgreSQL, SQLite and MongoDB (in-catalog without one and on Cassandra); RestoreTableFromBackup from the store into every backend (a filesystem or S3 store; a backup taken on one backend restores into another once the target's catalog has a row for it: copy its prefix under the target's root and run `extenddb backup sync`, or adopt the source's root with `extenddb backup sync --adopt-store`, which moves the root to the target's catalog: stop the source's servers first, and they then report the store owned by another catalog), and of in-catalog backups (see Backup and Restore below) |
-| Point-in-time recovery | ✗ Not supported (see Backup and Restore) |
-| Import/Export (local filesystem) | ✓ (FileSource instead of S3) |
+| Global Tables | ✗ Not implemented: the Global Tables operations answer `UnknownOperationException` (see [Operations Not Implemented](#operations-not-implemented)); `UpdateTable` with `ReplicaUpdates` answers `ValidationException` |
+| On-demand backups (CreateBackup, RestoreTableFromBackup, DescribeBackup, ListBackups, DeleteBackup) | ✓: CreateBackup to the configured filesystem or S3 backup store on PostgreSQL, SQLite and MongoDB (in-catalog without one and on Cassandra); RestoreTableFromBackup from the store into every backend (a filesystem or S3 store; a backup taken on one backend restores into another once the target's catalog has a row for it: copy its prefix under the target's root and run `extenddb backup sync`, or adopt the source's root with `extenddb backup sync --adopt-store`, which moves the root to the target's catalog: stop the source's servers first, and they then report the store owned by another catalog), and of in-catalog backups (see [Backup and Restore](#backup-and-restore) below) |
+| Point-in-time recovery | ✗ Not supported: `DescribeContinuousBackups` reports it disabled, and `UpdateContinuousBackups` refuses to enable it (see [Backup and Restore](#backup-and-restore)) |
+| Import and export (ImportTable, ExportTableToPointInTime) | ✓ from and to local filesystem paths, synchronous, off until `[import]` and `[export]` paths are configured (see [Import and Export](#import-and-export)); DescribeImport, ListImports, DescribeExport and ListExports are not implemented |
+| Resource-based policies (PutResourcePolicy, GetResourcePolicy, DeleteResourcePolicy) | ✗ Not implemented |
+| Contributor Insights | ✗ Not implemented |
+| Kinesis Data Streams destinations | ✗ Not implemented |
 
 ## Storage and Infrastructure
 
@@ -68,10 +72,10 @@ give the behavioral detail for each area.
 | Federated roles | AssumeRoleWithSAML, AssumeRoleWithWebIdentity | Not implemented |
 | Role chaining | Supported | Not implemented |
 | SourceIdentity, TransitiveTagKeys | Supported | Not implemented |
-| Resource policies | Supported | Not implemented (deferred) |
+| Resource policies | Supported | Not implemented |
 | Deleting a user, group or role that still has inline policies (a user also access keys or group memberships, a group also members) | `DeleteUser`, `DeleteGroup` and `DeleteRole` refuse with `DeleteConflict` until they are removed | The delete succeeds and removes them, and the principal's boundary, tags and sessions, with the principal. A principal created later with the same name starts empty |
 | Putting an inline policy or boundary on a principal that does not exist | `NoSuchEntity` | HTTP 404 `IAM user not found` (or `group`, `role`) from the management API |
-| Table ARN as `TableName` | Accepted; the request acts on that table | Not accepted: the request is authorized against the named table and then refused with `ResourceNotFoundException` |
+| Table ARN as `TableName` | Accepted; the request acts on that table | Not accepted. The request is authorized against the named table, then DescribeTable, PutItem, UpdateItem and DeleteItem answer `ValidationException` with the `tableName` pattern message, and GetItem, Query, Scan and BatchGetItem answer `ResourceNotFoundException` (measured on SQLite) |
 | AccessDenied message for an ARN outside this deployment (caller with no policy) | Names the ARN as supplied. A table ARN in `TableName` with another partition, service or region never reaches the IAM decision: it is `ValidationException` ("Invalid AWS partition", "Invalid vendor code", "Invalid AWS region") for every principal (measured) | Names the ARN as supplied. A table ARN in `TableName` with another partition, service or region is authorized as this deployment's table, and a caller with no policy is denied naming the ARN as supplied |
 | A resource ARN in another account | Refused with the same answer for a caller allowed `dynamodb:*` on `*` and a caller with no policy. When the account exists: `AccessDeniedException` "User: <principal> is not authorized to perform: dynamodb:<action> on resource: <ARN as supplied> because no resource-based policy allows the dynamodb:<action> action", except `CreateTable`, the time-to-live, continuous-backup, backup, export and restore operations, which answer `ValidationException` "This action is only supported by accounts that match the resource owner’s account.". When it does not: `AccessDeniedException` "The caller is not authorized to access the specified resource." on `GetItem`, `PutItem`, `UpdateItem`, `Query`, `Scan` and `BatchGetItem`, the same `ValidationException` on `RestoreTableToPointInTime`, and `AccessDeniedException` "Access is denied" on the rest. A batch or transaction with tables in more than one account is `ValidationException` "Invalid request! All tables in the request must be from a single account." (measured) | The same answers, before the IAM decision and in dev mode too, where an account exists when this deployment's catalog holds it. `RestoreTableToPointInTime` and an `UpdateContinuousBackups` that enables point-in-time recovery get the point-in-time recovery refusal instead (see "Point-in-time recovery" below). `DeleteTable`, `DeleteItem` and `DeleteBackup` take the answers of `UpdateTable`, `UpdateItem` and `DescribeBackup` (not measured). A table ARN in `TableName` that also has another partition, service or region, or that names an index or backup, gets these answers too. The service answers it with a `ValidationException` (the partition, vendor or region text in the row above, or "Valid ARN format is ..." for an index or backup ARN): on `GetItem` whether or not the account exists, and on `DescribeTable` when it exists (measured; the other operations were not sent) |
 
@@ -296,9 +300,11 @@ The following operations return `UnknownOperationException`:
 
 - CreateGlobalTable, DescribeGlobalTable, ListGlobalTables, UpdateGlobalTable
 - DescribeGlobalTableSettings, UpdateGlobalTableSettings
-- DescribeContributorInsights, UpdateContributorInsights
-- DescribeKinesisStreamingDestination, EnableKinesisStreamingDestination, DisableKinesisStreamingDestination
+- DescribeContributorInsights, ListContributorInsights, UpdateContributorInsights
+- DescribeKinesisStreamingDestination, EnableKinesisStreamingDestination, DisableKinesisStreamingDestination, UpdateKinesisStreamingDestination
 - DescribeTableReplicaAutoScaling, UpdateTableReplicaAutoScaling
+- DescribeImport, ListImports, DescribeExport, ListExports
+- PutResourcePolicy, GetResourcePolicy, DeleteResourcePolicy
 
 ## Runtime Configuration
 

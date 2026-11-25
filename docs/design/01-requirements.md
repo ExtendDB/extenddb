@@ -27,8 +27,8 @@ table on the Differences from DynamoDB page is the current record.
 
 | Feature | Reason |
 |---------|--------|
-| PartiQL (ExecuteStatement, BatchExecuteStatement, ExecuteTransaction) | Implemented since this document was written: the three operations ship behind the default-on `partiql` build feature (see Feature status) |
-| Backup/Restore (CreateBackup, DeleteBackup, DescribeBackup, ListBackups, RestoreTableFromBackup, DescribeContinuousBackups, UpdateContinuousBackups, RestoreTableToPointInTime) | Implemented since this document was written: on-demand backup and restore ship, and point-in-time restore is refused (see Feature status) |
+| PartiQL (ExecuteStatement, BatchExecuteStatement, ExecuteTransaction) | Implemented since this document was written: the three operations ship behind the default-on `partiql` build feature (see [Feature Status](../differences-from-dynamodb.md#feature-status)) |
+| Backup/Restore (CreateBackup, DeleteBackup, DescribeBackup, ListBackups, RestoreTableFromBackup, DescribeContinuousBackups, UpdateContinuousBackups, RestoreTableToPointInTime) | Implemented since this document was written: on-demand backup and restore ship, and point-in-time restore is refused (see [Feature Status](../differences-from-dynamodb.md#feature-status)) |
 | Auto-scaling APIs (DescribeTableReplicaAutoScaling, UpdateTableReplicaAutoScaling) | Excluded: auto-scaling is an infrastructure concern |
 | Contributor Insights (DescribeContributorInsights, ListContributorInsights, UpdateContributorInsights) | Excluded: analytics feature, not core API |
 | Kinesis Streaming Destination (DescribeKinesisStreamingDestination, EnableKinesisStreamingDestination, DisableKinesisStreamingDestination, UpdateKinesisStreamingDestination) | Excluded: AWS-specific integration |
