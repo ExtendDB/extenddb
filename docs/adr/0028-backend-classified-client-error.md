@@ -14,9 +14,10 @@ in a catch-all that logs the error at error level and returns
 (`update_table.rs`), the streams and TTL mappings (`streams.rs`, `ttl.rs`) and
 `sanitize_storage_error` (`lib.rs`). The data path mapping (`create_table.rs`)
 names every variant, and it logs and redacts the faults among them the same
-way. The other four name a few variants and delegate the rest to one of those
-six: the conditional check mapping (`create_table.rs`), the create-backup and
-restore mappings (`backup.rs`) and the shard lookup mapping (`streams.rs`). The
+way. The other four delegate to one of those six: the conditional check
+mapping (`create_table.rs`) and the create-backup and restore mappings
+(`backup.rs`) after a few variants of their own, and the shard lookup mapping
+(`streams.rs`) after its check of the shard id length. The
 server's authorization read delegates to the data path mapping. The redaction
 is the rule the security model documents: driver text, SQL, paths and
 connection details never reach a client (`docs/manuals/10-security-model.md`,
@@ -57,9 +58,9 @@ the conditional check mapping returns the item, to a request that set
 `ReturnValuesOnConditionCheckFailure` to `ALL_OLD`.
 
 Two answers outside these functions depend on the error's class. In a
-`BatchExecuteStatement` response, a statement's entry carries the code that the
-API Reference lists for the class (`BatchStatementError`), and
-`InternalServerError` for `ServiceUnavailable`, which the list does not have.
+`BatchExecuteStatement` response, the entry of a statement that failed with a
+throttle, an item collection size limit or an internal error carries the code
+that the API Reference lists for that class (`BatchStatementError`).
 The server reads a table's key schema before the IAM decision, which needs it
 for `dynamodb:LeadingKeys`, so that read treats a `ResourceNotFoundException`
 as a missing table: a caller the IAM decision refuses gets the refusal, not the
