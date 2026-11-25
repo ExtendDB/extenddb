@@ -416,6 +416,17 @@ Under `off`, for an account the setting leaves out, and in a build without the `
 
 **Who is affected.** A deployment with a policy that gates `SearchVectors` on `dynamodb:Attributes`. A `Deny` on an attribute no longer refuses a search that projects it, and a `Deny` gated on `Null` `true` refuses every search, a projected one included. DynamoDB answers both the same way (measured 2026-11-21). An `Allow` gated on `ForAllValues` now grants every search its `Action` covers, because the key is absent. A bare negated operator over the key, such as `StringNotEquals` `{"dynamodb:Attributes": "x"}`, now matches every search, as IAM matches one on an absent key: a `Deny` gated on it refuses every search, a projected one included, and an `Allow` gated on it grants every search its `Action` covers. Earlier releases matched it on no search. This answer follows from the two measurements above and was not sent to DynamoDB under such a policy. A caller that a policy denies and that sends a request failing one of the checks gets `ValidationException` where it got `AccessDeniedException`, and on a backend without vector search a denied caller gets that refusal where it got `AccessDeniedException`. No catalog migration is required.
 
+### v1.1.0: latency `segments` are summed into time buckets
+
+**What changed** (#398). The latency `segments` that `/metrics` and the console's `/console/metrics-data` return come from time buckets per account and operation. 1.0.0 kept one record per request for 24 hours. Each operation's count and means are still exact over the requests that the window covers. Four things change:
+
+- A window of `W` seconds returns at least the last `W` seconds and at most one bucket width more: up to 1 second more for `LastMinute` and `Last5Minutes`, and up to 60 seconds more for `LastHour` and `LastDay`. 1.0.0 cut each window exactly `W` seconds before the query.
+- `AllTime` returns the same as `LastDay`. 1.0.0 returned every record it held, 24 hours to 24 hours and 5 minutes of requests.
+- The operations are sorted by name. 1.0.0 returned them in no fixed order.
+- The segment memory is bounded: at most 111,488 bytes of buckets for each operation of each account that sent it in the last day, about 4.46 MB for an account that sends all 40 operations every second. 1.0.0 kept about 250 bytes for each request that reached dispatch in the last 24 hours, so the sizing rule in the deployment guide's [Process Memory](11-deployment-guide.md#process-memory) section stops applying after the upgrade.
+
+No catalog migration or configuration change is required.
+
 ### v1.0.0: Cassandra reads and writes at `LOCAL_QUORUM`
 
 **What changed.** The Cassandra backend runs its reads and writes at `LOCAL_QUORUM`. 0.1.15 ran many of them at `ONE`, the driver's default, in each area: items (the reads of GetItem, Query and Scan among them), transactions, TTL, streams, the catalog, IAM and `init`. A read with `ConsistentRead` `false` also runs at `LOCAL_QUORUM`. A lightweight transaction runs Paxos at `LOCAL_SERIAL` and commits at `LOCAL_QUORUM`. 0.1.15 ran many of its lightweight transactions at those levels already, and others, among them the admin user creation and most IAM writes, at the driver's defaults, `SERIAL` and `ONE`. Batches ran at `LOCAL_QUORUM` before and still do. No setting changes these levels (#945).
