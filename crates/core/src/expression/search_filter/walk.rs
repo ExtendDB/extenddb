@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use super::grammar::{Call, Element, Node, Operand};
 use crate::expression::CompareOp;
-use crate::expression::resolver::{attribute_type_code, number_value};
+use crate::expression::resolver::attribute_type_code;
 use crate::types::AttributeValue;
 
 /// The most values an IN list takes.
@@ -365,55 +365,13 @@ pub(super) fn resolved_path(elements: &[Element], maps: &Maps<'_>) -> String {
 }
 
 /// When both bounds are values: the same type, then the lower bound not
-/// above the upper bound.
+/// above the upper bound, with the check and the operand display that
+/// ConditionExpression uses.
 fn between_bounds(low: &Operand, high: &Operand, maps: &Maps<'_>) -> Result<(), String> {
     let (Some(lo), Some(hi)) = (literal(low, maps), literal(high, maps)) else {
         return Ok(());
     };
-    let bounds = || {
-        format!(
-            "lower bound operand: AttributeValue: {{{}}}, upper bound operand: \
-             AttributeValue: {{{}}}",
-            shown(lo),
-            shown(hi)
-        )
-    };
-    let above = match (lo, hi) {
-        (AttributeValue::S(l), AttributeValue::S(h)) => l > h,
-        (AttributeValue::B(l), AttributeValue::B(h)) => l > h,
-        (AttributeValue::N(l), AttributeValue::N(h)) => match (number_value(l), number_value(h)) {
-            (Some(l), Some(h)) => l > h,
-            _ => false,
-        },
-        _ => {
-            return Err(format!(
-                "The BETWEEN operator requires same data type for lower and upper bounds; {}",
-                bounds()
-            ));
-        }
-    };
-    if above {
-        return Err(format!(
-            "The BETWEEN operator requires upper bound to be greater than or equal to lower \
-             bound; {}",
-            bounds()
-        ));
-    }
-    Ok(())
-}
-
-/// A bound as the BETWEEN messages show it: `N:5`, `S:US`, or `B:` and the
-/// base64 of the bytes.
-fn shown(value: &AttributeValue) -> String {
-    use base64::Engine as _;
-    match value {
-        AttributeValue::S(s) => format!("S:{s}"),
-        AttributeValue::N(n) => format!("N:{n}"),
-        AttributeValue::B(b) => {
-            format!("B:{}", base64::engine::general_purpose::STANDARD.encode(b))
-        }
-        other => attribute_type_code(other).to_owned(),
-    }
+    crate::expression::evaluator::between_bounds_fault(lo, hi, None, None).map_or(Ok(()), Err)
 }
 
 /// The number of operators in `node`: each AND, OR, NOT, comparison, BETWEEN,

@@ -139,6 +139,14 @@ fn between_bounds_are_checked_while_the_tree_is_built() {
                    AttributeValue: {S:US}",
                 ),
             ),
+            (
+                "a BETWEEN :b AND :s",
+                p(
+                    "The BETWEEN operator requires same data type for lower and upper bounds; \
+                   lower bound operand: AttributeValue: {B:aGk=}, upper bound operand: \
+                   AttributeValue: {S:US}",
+                ),
+            ),
             ("a BETWEEN :t AND :t", ordering("BETWEEN", "BOOL")),
             (
                 "a BETWEEN a AND :n",

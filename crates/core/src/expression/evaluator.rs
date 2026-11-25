@@ -84,25 +84,16 @@ pub fn evaluate_condition_at(
             if matches!(low.as_ref(), Expr::Placeholder(_))
                 && matches!(high.as_ref(), Expr::Placeholder(_))
                 && let (Some(l), Some(h)) = (lo.as_deref(), hi.as_deref())
+                && let Some(fault) = between_bounds_fault(
+                    l,
+                    h,
+                    placeholder_numeric(low, maps),
+                    placeholder_numeric(high, maps),
+                )
             {
-                let l_type = attribute_type_code(l);
-                let h_type = attribute_type_code(h);
-                if l_type != h_type {
-                    return Err(DynamoDbError::ValidationException(format!(
-                        "Invalid ConditionExpression: The BETWEEN operator requires same data type for lower and upper bounds; lower bound operand: AttributeValue: {{{}}}, upper bound operand: AttributeValue: {{{}}}",
-                        format_attribute_value(l),
-                        format_attribute_value(h)
-                    )));
-                }
-                let lpn = placeholder_numeric(low, maps);
-                let hpn = placeholder_numeric(high, maps);
-                if compare_values(l, h, CompareOp::Gt, lpn, hpn, NumberPrecision::Exact) {
-                    return Err(DynamoDbError::ValidationException(format!(
-                        "Invalid ConditionExpression: The BETWEEN operator requires upper bound to be greater than or equal to lower bound; lower bound operand: AttributeValue: {{{}}}, upper bound operand: AttributeValue: {{{}}}",
-                        format_attribute_value(l),
-                        format_attribute_value(h)
-                    )));
-                }
+                return Err(DynamoDbError::ValidationException(format!(
+                    "Invalid ConditionExpression: {fault}"
+                )));
             }
             match (&val, &lo, &hi) {
                 (Some(v), Some(l), Some(h)) => {
@@ -413,11 +404,51 @@ fn evaluate_size<'a>(
 }
 
 /// Format an `AttributeValue` for error messages (e.g. `N:5`, `S:hello`).
+/// The fault of two BETWEEN bounds that are both values, without the
+/// expression prefix: bounds of different types, then a lower bound above the
+/// upper bound. Numbers compare exactly, whatever the precision of the
+/// expression. `low_parsed` and `high_parsed` are the pre-parsed numbers of
+/// placeholder bounds, when the caller has them.
+pub(crate) fn between_bounds_fault(
+    low: &AttributeValue,
+    high: &AttributeValue,
+    low_parsed: Option<ParsedNumber<'_>>,
+    high_parsed: Option<ParsedNumber<'_>>,
+) -> Option<String> {
+    let fault = if attribute_type_code(low) != attribute_type_code(high) {
+        "The BETWEEN operator requires same data type for lower and upper bounds"
+    } else if compare_values(
+        low,
+        high,
+        CompareOp::Gt,
+        low_parsed,
+        high_parsed,
+        NumberPrecision::Exact,
+    ) {
+        "The BETWEEN operator requires upper bound to be greater than or equal to lower bound"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "{fault}; lower bound operand: AttributeValue: {{{}}}, upper bound operand: \
+         AttributeValue: {{{}}}",
+        format_attribute_value(low),
+        format_attribute_value(high)
+    ))
+}
+
+/// A value as the service shows an operand in a message: `S:US`, `N:5`, or
+/// `B:` and the base64 of the bytes (measured 2026-11-25 in eu-north-1 on the
+/// BETWEEN bounds of ConditionExpression, FilterExpression and
+/// SearchConditionExpression).
 fn format_attribute_value(val: &AttributeValue) -> String {
+    use base64::Engine as _;
     match val {
         AttributeValue::S(s) => format!("S:{s}"),
         AttributeValue::N(n) => format!("N:{n}"),
-        AttributeValue::B(_) => "B:<binary>".to_owned(),
+        AttributeValue::B(b) => {
+            format!("B:{}", base64::engine::general_purpose::STANDARD.encode(b))
+        }
         _ => format!("{}:<value>", attribute_type_code(val)),
     }
 }

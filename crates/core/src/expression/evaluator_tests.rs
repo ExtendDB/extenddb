@@ -251,6 +251,41 @@ fn between_out_of_range() {
     assert!(!eval("age BETWEEN :lo AND :hi", &item, HashMap::new(), values).unwrap());
 }
 
+/// A Binary bound shows as `B:` and the base64 of its bytes, as DynamoDB
+/// shows it for ConditionExpression, FilterExpression and
+/// SearchConditionExpression (eu-north-1, 2026-11-25, each request twice:
+/// `Tag BETWEEN :a AND :b` with `:a` `{"B": "Ag=="}` and `:b` `{"B": "AQ=="}`,
+/// and with `:a` `{"B": "AQ=="}` and `:b` `{"S": "x"}`).
+#[test]
+fn between_bound_faults_show_binary_bounds_in_base64() {
+    let item = simple_item();
+    let bin = |b: &[u8]| AttributeValue::B(b.to_vec());
+    let cases = [
+        (
+            bin(&[2]),
+            bin(&[1]),
+            "Invalid ConditionExpression: The BETWEEN operator requires upper bound to be \
+             greater than or equal to lower bound; lower bound operand: AttributeValue: \
+             {B:Ag==}, upper bound operand: AttributeValue: {B:AQ==}",
+        ),
+        (
+            bin(&[1]),
+            AttributeValue::S("x".into()),
+            "Invalid ConditionExpression: The BETWEEN operator requires same data type for \
+             lower and upper bounds; lower bound operand: AttributeValue: {B:AQ==}, upper \
+             bound operand: AttributeValue: {S:x}",
+        ),
+    ];
+    for (lo, hi, want) in cases {
+        let values = HashMap::from([("a".to_owned(), lo), ("b".to_owned(), hi)]);
+        let err = eval("Tag BETWEEN :a AND :b", &item, HashMap::new(), values).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(m) if m == want),
+            "{err:?}"
+        );
+    }
+}
+
 #[test]
 fn in_expression_match() {
     let item = simple_item();
