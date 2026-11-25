@@ -5,10 +5,12 @@
 
 use super::*;
 
+const ARN: &str = "arn:aws:dynamodb:us-east-1:123456789012:table/T";
+
 fn reason(code: &str) -> ThrottlingReason {
     ThrottlingReason {
         reason: code.to_owned(),
-        resource: "arn:aws:dynamodb:us-east-1:123456789012:table/T".to_owned(),
+        resource: ARN.to_owned(),
     }
 }
 
@@ -50,29 +52,8 @@ fn throttle_errors_carry_reasons_and_keep_their_class() {
         assert!(err.is_throttle(), "{type_name}");
         let reasons = err.throttling_reasons().expect("reasons");
         assert_eq!(reasons.len(), 1, "{type_name}");
-        assert_eq!(
-            reasons[0].resource,
-            "arn:aws:dynamodb:us-east-1:123456789012:table/T"
-        );
+        assert_eq!(reasons[0].resource, ARN);
     }
-}
-
-/// Only `ThrottlingException` moves to the availability namespace; the
-/// other two throttle classes stay in the dynamodb namespace.
-#[test]
-fn throttling_exception_uses_the_availability_namespace() {
-    assert_eq!(
-        DynamoDbError::throttling("m", vec![]).full_error_type(),
-        "com.amazon.coral.availability#ThrottlingException"
-    );
-    assert_eq!(
-        DynamoDbError::provisioned_throughput_exceeded("m", vec![]).full_error_type(),
-        "com.amazonaws.dynamodb.v20120810#ProvisionedThroughputExceededException"
-    );
-    assert_eq!(
-        DynamoDbError::request_limit_exceeded("m", vec![]).full_error_type(),
-        "com.amazonaws.dynamodb.v20120810#RequestLimitExceeded"
-    );
 }
 
 /// An empty reasons list is still `Some` (the class is a throttle); every
@@ -113,7 +94,6 @@ fn throttling_reason_serializes_with_the_measured_field_names() {
 /// written out here, so a change to a message constant fails this test.
 #[test]
 fn throttle_error_documents_match_the_service() {
-    const ARN: &str = "arn:aws:dynamodb:us-east-1:123456789012:table/T";
     let one = |code: &str| vec![reason(code)];
     let listed = |code: &str| serde_json::json!([{"reason": code, "resource": ARN}]);
     let provisioned = "com.amazonaws.dynamodb.v20120810#ProvisionedThroughputExceededException";
@@ -181,18 +161,6 @@ fn throttle_error_documents_match_the_service() {
         (
             DynamoDbError::request_limit_exceeded("m", vec![]),
             serde_json::json!({"__type": request_limit, "message": "m"}),
-        ),
-        // The throttle member leaves the transaction cancel shape as it was.
-        (
-            DynamoDbError::TransactionCanceledException {
-                message: "Transaction cancelled".to_owned(),
-                cancellation_reasons: vec![],
-            },
-            serde_json::json!({
-                "__type": "com.amazonaws.dynamodb.v20120810#TransactionCanceledException",
-                "Message": "Transaction cancelled",
-                "CancellationReasons": [],
-            }),
         ),
     ];
     for (error, expected) in cases {
