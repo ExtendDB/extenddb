@@ -454,6 +454,55 @@ class TestExpressionMapsUnderTheExtendedGrammar:
                       ExpressionAttributeNames=u, ExpressionAttributeValues=us),
                  P + 'Syntax error; token: "=", near: "= = :us"')
 
+    def test_a_doubled_name_marker_is_a_syntax_error(self, grammar_table):
+        """``##c`` is a syntax error at its first ``#``, whatever ``#c`` names.
+
+        Measured on the live service in eu-north-1 on 2026-11-25, each request
+        twice with the same answer.
+        """
+        for names, values, expr, near in [
+            ({"#c": "cat"}, {":v": {"S": "c1"}}, "##c = :v", "##c"),
+            ({"#c": "Category"}, {":v": {"S": "a"}}, "##c = :v", "##c"),
+            ({"#c": "Category"}, {":us": {"S": "US"}, ":v": {"S": "a"}},
+             "Country = :us AND ##c = :v", "AND ##c"),
+        ]:
+            _refused(
+                _raw(grammar_table, SearchConditionExpression=expr,
+                     ExpressionAttributeNames=names, ExpressionAttributeValues=values),
+                P + f'Syntax error; token: "#", near: "{near}"',
+            )
+
+    def test_the_combined_size_limit(self, grammar_table):
+        """The expression and every substitution, counted at each use, take at
+        most 1,048,576 bytes.
+
+        The condition is ``Country = :h AND <attribute> IN (:v, ...)`` with
+        ``:v`` used 100 times, sized so that the bytes of the expression, of
+        the name ``Category`` when it is written ``#c``, of ``:h`` and of each
+        use of ``:v`` add up to the total. Measured on the live service in
+        eu-north-1 on 2026-11-25, each request twice with the same answer:
+        1,048,574 to 1,048,576 bytes answer 200 and 1,048,577, 1,048,578 and
+        1,048,600 answer the size refusal.
+        """
+        uses = 100
+        for attribute, names in [("Category", None), ("#c", {"#c": "Category"})]:
+            expr = f"Country = :h AND {attribute} IN ({', '.join([':v'] * uses)})"
+            fixed = len(expr) + (len("Category") if names else 0)
+            for total, served in [(1_048_576, True), (1_048_577, False)]:
+                each = (total - fixed) // uses
+                head = total - fixed - uses * each
+                fields = {
+                    "SearchConditionExpression": expr,
+                    "ExpressionAttributeValues": {":h": {"S": "U" * head}, ":v": {"S": "x" * each}},
+                }
+                if names:
+                    fields["ExpressionAttributeNames"] = names
+                resp = _raw(grammar_table, **fields)
+                if served:
+                    assert resp.status_code == 200, (total, attribute, resp.text)
+                else:
+                    _refused(resp, P + "Expression size has exceeded the maximum allowed size;")
+
     def test_the_projection_is_read_before_the_condition(self, grammar_table):
         _refused(
             _raw(grammar_table, ProjectionExpression="#p", SearchConditionExpression="Country = = :us",
