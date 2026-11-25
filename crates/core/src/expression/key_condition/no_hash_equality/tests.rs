@@ -357,6 +357,18 @@ fn a_multi_attribute_schema_with_an_equality_is_left_to_the_classifier() {
     assert!(!kc.lacks_hash_equality(&multi_range_schema(), &HashMap::new()));
 }
 
+#[test]
+fn a_key_schema_with_no_hash_attribute_is_an_internal_error() {
+    match parse("pk > :x")
+        .refuse_without_hash_equality(&[element("sk", KeyType::Range)], &HashMap::new())
+    {
+        Err(DynamoDbError::InternalServerError(msg)) => {
+            assert_eq!(msg, "key schema without a HASH attribute");
+        }
+        other => panic!("expected an internal error, got {other:?}"),
+    }
+}
+
 /// The placeholder names of `operands_naming(attribute)` for `expr`.
 fn operand_names(expr: &str, attribute: &str, names: &HashMap<String, String>) -> Vec<String> {
     parse(expr)

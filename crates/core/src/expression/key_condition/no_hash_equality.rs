@@ -161,7 +161,8 @@ impl KeyCondition {
     ///
     /// # Errors
     ///
-    /// Returns `ValidationException` for the conditions above.
+    /// Returns `ValidationException` for the conditions above, and
+    /// `InternalServerError` for a key schema with no HASH attribute.
     pub fn refuse_without_hash_equality(
         &self,
         key_schema: &[KeySchemaElement],
@@ -171,19 +172,22 @@ impl KeyCondition {
             return Ok(());
         }
 
-        let hash_attrs: Vec<&str> = hash_key_elements(key_schema)
-            .iter()
-            .map(|ks| ks.attribute_name.as_str())
-            .collect();
-
         if is_multipart_key_schema(key_schema) {
+            let hash_attrs: Vec<&str> = hash_key_elements(key_schema)
+                .iter()
+                .map(|ks| ks.attribute_name.as_str())
+                .collect();
             return Err(DynamoDbError::ValidationException(format!(
                 "HASH key attributes {} must have equality conditions specified in the query",
                 hash_attrs.join(", ")
             )));
         }
 
-        let pk_attr = hash_attrs.first().copied().unwrap_or_default();
+        let Some(pk_attr) = single_hash_attr(key_schema) else {
+            return Err(DynamoDbError::InternalServerError(
+                "key schema without a HASH attribute".to_owned(),
+            ));
+        };
         let message = if self.operands_naming(pk_attr, names).is_empty() {
             format!("Query condition missed key schema element: {pk_attr}")
         } else {
