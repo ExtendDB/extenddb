@@ -43,9 +43,11 @@ pub(super) fn gsi_info() -> IndexInfo {
 }
 
 /// A local secondary index on `Events`: the table's partition key with
-/// `created` as the sort key. The service serves an LSI read strongly
-/// consistent on request. An LSI needs a table with a range key, which is why
-/// it sits on `Events` and not on `Orders`.
+/// `created` as the sort key, projecting the keys only, so a PartiQL read
+/// that names another attribute reads each row's item back from the table.
+/// The service serves an LSI read strongly consistent on request. An LSI
+/// needs a table with a range key, which is why it sits on `Events` and not
+/// on `Orders`.
 pub(super) fn lsi_info() -> IndexInfo {
     IndexInfo {
         index_name: LSI.to_owned(),
@@ -56,7 +58,7 @@ pub(super) fn lsi_info() -> IndexInfo {
             key_element("created", KeyType::Range),
         ],
         projection: Projection {
-            projection_type: ProjectionType::All,
+            projection_type: ProjectionType::KeysOnly,
             non_key_attributes: None,
         },
     }

@@ -7,13 +7,16 @@
 //! that a local secondary index read carries the client's value on `Query`
 //! and `Scan`; that a global secondary index read reaches storage with
 //! `consistent_read: false` because the handler refuses `ConsistentRead:
-//! true` on a GSI before storage is called, on `Query` and on `Scan`; and
-//! that the export scan asks for a consistent read.
+//! true` on a GSI before storage is called, on `Query` and on `Scan`; that
+//! the export scan asks for a consistent read; and, in [`partiql`], the
+//! value of the three reads the PartiQL layer makes on its own.
 //!
 //! The storage double in [`recording`] records every read call with the
 //! options it received; the handlers run end to end above it.
 
 mod fixtures;
+#[cfg(feature = "partiql")]
+mod partiql;
 mod recording;
 
 use std::collections::HashMap;
