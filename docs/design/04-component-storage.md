@@ -433,6 +433,11 @@ The PostgreSQL backend uses two categories of tables:
 
 ### 5.2 Connection Pooling
 
+The sketch below and the read replica mode of section 5.3 are a proposal, not code in this repository. Today the
+backend serves every item read and write from `data_pool`. The sketch predates the split into a catalog pool and a
+data pool: its `pool` stands for today's `data_pool`. `PostgresStorageConfig` refuses unknown fields, so a
+configuration carrying `read_replica_url` or `read_replica_pool_size` stops the server at startup.
+
 ```rust
 use sqlx::postgres::PgPoolOptions;
 
@@ -483,18 +488,20 @@ impl PostgresEngine {
 ### 5.3 Read Consistency Model
 
 DynamoDB supports two read consistency modes: strongly consistent and eventually consistent (the default). The
-PostgreSQL backend models this via an optional read replica.
+PostgreSQL backend in this repository serves every item read and write from `data_pool`; the `read_pool` and
+`read_replica_url` in the sketch above are a proposal for a read replica mode, not code that exists.
 
-**Single-node mode (no read replica configured):** All reads are strongly consistent regardless of the `consistent_read`
-flag. This is strictly stronger than the DynamoDB spec and compatible with all applications. The `consistent_read`
-parameter is accepted and correctly reflected in capacity calculations (eventually consistent reads consume 0.5 RCU vs
-1.0 RCU for strongly consistent).
+**Single-node mode (what the backend does today):** Base table and local secondary index reads are strongly consistent
+regardless of the `consistent_read` flag. This is strictly stronger than the DynamoDB spec and compatible with all
+applications. Global secondary index rows go through the propagation queue (section 6), so a read on a GSI can lag the
+base table, as on the service. The `consistent_read` parameter is accepted and correctly reflected in capacity
+calculations (eventually consistent reads consume 0.5 RCU vs 1.0 RCU for strongly consistent).
 
-**Read replica mode (`read_replica_url` configured):** Eventually consistent reads (`consistent_read=false`) are routed
-to a PostgreSQL streaming replica that is naturally a few milliseconds behind the primary. Strongly consistent reads
-(`consistent_read=true`) always read from the primary. This mirrors how DynamoDB achieves eventual consistency
-— via storage node replicas — and surfaces the exact class of bugs that applications may encounter in production
-DynamoDB (e.g., read-after-write without `ConsistentRead=true` returning stale data).
+**Read replica mode (proposed, `read_replica_url` configured):** Eventually consistent reads (`consistent_read=false`)
+would be routed to a PostgreSQL streaming replica that is a few milliseconds behind the primary. Strongly consistent
+reads (`consistent_read=true`) would always read from the primary. This mirrors how DynamoDB achieves eventual
+consistency through storage node replicas and surfaces the class of bugs that applications meet in production
+DynamoDB (a read after a write without `ConsistentRead=true` returning the earlier value).
 
 **Which operations are affected:**
 - `GetItem`: uses `consistent_read` field (default `false` in DynamoDB)
@@ -504,8 +511,8 @@ DynamoDB (e.g., read-after-write without `ConsistentRead=true` returning stale d
 - `TransactGetItems`: always strongly consistent (DynamoDB spec — serializable isolation)
 - All write operations: always use the primary pool
 
-The `read_pool()` helper method on `PostgresEngine` encapsulates this routing. All read implementations call
-`self.read_pool(input.consistent_read)` instead of `&self.pool` directly.
+In the proposal, a `read_pool()` helper on `PostgresEngine` encapsulates this routing and every read implementation
+calls it instead of `&self.data_pool` directly.
 
 ### 5.4 Query Translation
 
