@@ -19,10 +19,10 @@ use crate::CassandraEngine;
 /// [`CassandraEngine::renew_delete_lease`] from the deadline it read. Until
 /// then the row is left to the call that claimed it. When a statement of the
 /// removal fails after the claim or the take, the actor moves the deadline to
-/// the current time (`release_delete_lease`), so the sweep's next pass takes
-/// the row. A call whose process stops after the claim leaves the row to the
-/// sweep, which removes the table after the deadline; with no deadline the
-/// sweep would never select the row, and the name would stay taken. A
+/// the current time (`release_delete_lease`). The sweep's next pass then
+/// takes the row. A call whose process stops after the claim leaves the row
+/// to the sweep, which removes the table after the deadline; with no deadline
+/// the sweep would never select the row, and the name would stay taken. A
 /// removal that stops part way, the call's or the sweep's, keeps the catalog
 /// row, since the row delete is its last statement, and a later pass takes
 /// the row over once the deadline written by the last claim, renewal or
@@ -33,6 +33,11 @@ use crate::CassandraEngine;
 /// remaining drops a second time. The renewal before the name-keyed deletes
 /// is what keeps two actors apart: an actor whose renewal does not apply
 /// leaves those deletes and the row delete to the actor that holds the row.
+///
+/// The deadline comes from this server's clock, and the sweep's select
+/// compares it with the clock of the Cassandra node that runs the select. A
+/// server S seconds behind that node writes a lease of 300 minus S seconds.
+/// A server S seconds ahead of the node writes a lease of 300 plus S seconds.
 const DELETE_CLAIM_LEASE_SECS: i64 = 300;
 
 fn lease_deadline_ms() -> i64 {
@@ -155,14 +160,14 @@ impl CassandraEngine {
     }
 
     /// Hands a row this actor holds back to the control-plane sweep after a
-    /// statement of its removal failed: moves the deadline `held_ms` that the
-    /// actor's claim, take or last renewal wrote to the current time, with the
-    /// compare-and-set the renewal uses, so the sweep's next pass selects the
-    /// row and takes it. The swap does not apply when the row was taken over
-    /// or removed since, and then there is nothing to hand back. A swap that
-    /// fails is logged, and the row waits for `held_ms` as it does when the
-    /// actor's process stops; so does a row whose renewal applied but whose
-    /// answer was lost, since its deadline is then not `held_ms`.
+    /// statement of its removal failed. It moves the deadline `held_ms`, which
+    /// the actor's claim, take or last renewal wrote, to the current time with
+    /// the compare-and-set the renewal uses. The sweep's next pass then
+    /// selects the row and takes it. The swap does not apply when the row was
+    /// taken over or removed since, and then there is nothing to hand back. A
+    /// swap that fails is logged, and the row waits for `held_ms` as it does
+    /// when the actor's process stops. So does a row whose renewal applied but
+    /// whose answer was lost, since its deadline is then not `held_ms`.
     async fn release_delete_lease(
         &self,
         account_id: &str,
@@ -317,9 +322,8 @@ impl CassandraEngine {
 
         // The claim and the removal run in a task of their own, which the call
         // awaits, as the PostgreSQL backend's drops do. A request dropped from
-        // here on (its client closed the connection) detaches the task, so it
-        // does not stop the removal after the claim and leave the row to the
-        // lease.
+        // here on (its client closed the connection) detaches the task. The
+        // task then finishes the removal, so the row is not left to the lease.
         let claim = matches!(caller, DeleteTableCaller::Client);
         let engine = self.clone();
         let account_id = account_id.to_owned();
@@ -353,9 +357,10 @@ impl CassandraEngine {
                 // The failed removal handed the row back to the sweep. The
                 // wake has the poller start its next pass at once, and that
                 // pass takes the row and finishes the removal. A failure
-                // inside the sweep does not wake the poller: the poller runs
-                // that pass, and a wake from inside it would keep it polling
-                // every second for as long as the failure lasts.
+                // inside the sweep does not wake the poller, because the
+                // poller runs that pass. A wake from inside the pass would
+                // keep the poller polling every second while the failure
+                // lasts.
                 engine.control_plane_notify.notify_one();
             }
             removed
@@ -376,17 +381,18 @@ impl CassandraEngine {
     /// EXISTS`, the TTL entries are cleared, and the index metadata goes after
     /// the index tables, so a removal that stops part way leaves the ids the
     /// next attempt needs. The tags are keyed on the table ARN, which carries
-    /// no table id. They are deleted last, after the renewal, while the
-    /// catalog row still holds the name, so a `CreateTable` of the name is
-    /// refused until the row delete releases it, and a tag write that landed
-    /// during the drops is removed with them. The renewal is the fence: an
-    /// actor whose lease was taken over, or whose row was removed or created
-    /// again under the name, stops before that delete. It holds while the two
-    /// statements after the renewal finish within the lease it wrote.
+    /// no table id. They are deleted after the renewal, while the catalog row
+    /// still holds the name, and the row delete runs last. So a `CreateTable`
+    /// of the name is refused until the row delete frees the name. A tag
+    /// write that landed during the drops goes with the table. The
+    /// renewal is the fence: an actor whose lease was taken over, or whose row
+    /// was removed or created again under the name, stops before the tag
+    /// delete. It holds while the two statements after the renewal finish
+    /// within the lease it wrote.
     ///
     /// When a statement fails, the actor hands the row back to the sweep
-    /// (`release_delete_lease`) before it returns the error, so the sweep's
-    /// next pass runs the removal again without waiting for the lease.
+    /// (`release_delete_lease`) before it returns the error. The sweep's next
+    /// pass then runs the removal again without waiting for the lease.
     pub(crate) async fn remove_claimed_table(
         &self,
         account_id: &str,

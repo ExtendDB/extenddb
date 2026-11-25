@@ -485,7 +485,7 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 ### Table stuck in CREATING or DELETING state
 
-**Cause:** The background transition poller processes status changes when notified by CreateTable/DeleteTable, or on a 60-second defensive sweep. If the server was stopped while a table was in a transitional state, the transition completes on the next server startup.
+**Cause:** The background transition poller processes status changes when notified by CreateTable/DeleteTable, or on a 60-second defensive sweep. If the server was stopped while a table was in a transitional state, the transition completes on the next server startup. On Cassandra, a `DeleteTable` claim that the stopped server left waits for its deadline instead (the third cause below).
 
 A second cause, on PostgreSQL only, is a session holding any lock on one of the table's relations (the base data table, a GSI or LSI data table, or a vector-index data table): a reader (a table snapshot, an in-catalog backup, a Scan or Query, `pg_dump`, any client transaction that read the table), an open write transaction, an index build, or `VACUUM`. DeleteTable then returns `DELETING` instead of dropping the tables in the request: at once for a reader, and after about a second for any other holder, which is how long its drops wait before they give up. The poller then checks the table for holders about once a second without waiting on them, and drops it at the first check that finds none, so the table disappears within about a second of the last holder's release however many tables are waiting this way, also when the server was restarted in between. A table snapshot or an in-catalog backup that ends also wakes the poller, which then checks at once. Until then a CreateTable of the same name is refused with `ResourceInUseException`, and a DeleteTable of the table is refused with `ResourceInUseException` (`Table is being deleted: <table_name>`). A table that stays `DELETING` for longer has a long-running holder. To find it, list the table's relations on the catalog database:
 
@@ -511,13 +511,13 @@ SELECT l.pid, l.mode, a.query_start, l.relation::regclass AS relation, a.query
                         FROM unnest(ARRAY['_ddb_<table_id>', '_ddb_<index_id>']) AS n);
 ```
 
-A third cause, on Cassandra only, is a `DeleteTable` that stopped after it claimed the table's row. The server process stopped, or a statement after the claim failed. The claim keeps the row `DELETING` until its deadline, 300 s after the claim or after the call's renewal of it. The 60-second sweep removes the table at its first pass after the deadline, so the table disappears within about 6 minutes. Until then a `DeleteTable` of the table is refused with `ResourceInUseException` (`Table is being deleted: <table_name>`).
+A third cause, on Cassandra only, is a `DeleteTable` whose server process stopped after the call claimed the table's row. The claim keeps the row `DELETING` until its deadline, 300 s after the claim or after the call's renewal of it. A restart does not move the deadline. The 60-second sweep removes the table at its first pass after the deadline, so the table disappears within about 6 minutes. Until then the server refuses a `DeleteTable` of the table with `ResourceInUseException` (`Table is being deleted: <table_name>`). When a `DeleteTable` fails after its claim, the call moves the deadline to the current time. It also wakes the sweep, which removes the table at its next pass.
 
 **Fix:** If a table appears stuck:
 1. Check that extenddb is running (`extenddb status`).
 2. Wait for the configured `control_plane_delay_seconds` (default: 0.25) — the poller is woken immediately when a table enters a transitional state.
 3. On PostgreSQL, look for a session holding a lock on the table (above); the delete finishes within about a second of its end.
-4. If the server was restarted, transitions are recovered automatically at startup.
+4. If the server was restarted, transitions are recovered automatically at startup, except a Cassandra `DeleteTable` claim, which waits for its deadline (step 5).
 5. On Cassandra, wait about 6 minutes for a table that a stopped `DeleteTable` claimed: the sweep removes it after the claim's deadline (above).
 
 ### Data tables without a catalog row (PostgreSQL, separate data database)

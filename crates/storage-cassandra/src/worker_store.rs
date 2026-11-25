@@ -90,7 +90,7 @@ impl CassandraEngine {
         }
 
         // DELETING → removed. Only a DeleteTable claim, its renewals and the
-        // release of a failed removal give a DELETING row a deadline, so a row
+        // release of a failed removal give a DELETING row a deadline. So a row
         // here is a claim whose call stopped, a call still running past its
         // lease, or a removal by a call or an earlier pass that failed or
         // stopped part way.

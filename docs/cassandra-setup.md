@@ -441,7 +441,12 @@ backend is experimental rather than production-ready.
   before opening a table to writes, or quiesce it briefly while enable and
   backfill complete.
 - **Clock synchronization.** Keep Cassandra coordinators and ExtendDB hosts
-  time-synchronized; request batches use explicit timestamps.
+  time-synchronized. Request batches use explicit timestamps, and the
+  `DeleteTable` lease uses the clocks too. The server sets the deadline of
+  the lease from its own clock, 300 s after the claim. The control-plane
+  sweep compares that deadline with the clock of the Cassandra node. A server
+  S seconds behind the node writes a lease of 300 minus S seconds. A server S
+  seconds ahead of the node writes a lease of 300 plus S seconds.
 - **No vector search.** The Cassandra backend does not implement vector indexes
   or `SearchVectors`; every vector operation is refused.
 

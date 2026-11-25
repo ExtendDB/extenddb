@@ -5,12 +5,14 @@
 //!
 //! A `DeleteTable` claims the catalog row as `DELETING` with a deadline five
 //! minutes ahead. The control-plane sweep takes a row whose deadline has
-//! passed with a compare-and-set on that deadline, and the actor that holds
-//! the row renews it with the same swap before the delete keyed on the name
-//! (the tags), which runs last, then deletes the row on its table id. These
-//! tests put a second actor beside the one that holds the row, and a table
-//! created into the name in between, and check that the newer table keeps its
-//! catalog row and its tags.
+//! passed with a compare-and-set on that deadline. The actor that holds the
+//! row renews it with the same swap, deletes the tags (the delete keyed on
+//! the name), and last deletes the row on its table id. These tests put a
+//! second actor beside the one that holds the row, and a table created into
+//! the name in between, and check that the newer table keeps its catalog row
+//! and its tags. An actor whose removal fails moves the deadline to the
+//! current time, so the sweep's next pass finishes the removal. A
+//! `DeleteTable` whose request is dropped after its claim still finishes it.
 //!
 //! Rows with a deadline in the past are visible to every sweep in this binary,
 //! so the tests wait on the state they expect rather than on the sweep they
@@ -409,10 +411,10 @@ async fn tag_rows(engine: &CassandraEngine, arn: &str) -> usize {
 
 /// A `DeleteTable` of a table with two indexes whose first index table drop
 /// fails, after the claim. The call answers that error and hands the row back
-/// to the sweep: the row's deadline is no later than the current time, so the
-/// sweep's next pass takes the row rather than waiting five minutes for the
-/// lease. The index tables go before their metadata, so the metadata outlives
-/// the failed drop, and that pass drops both index tables.
+/// to the sweep. The row's deadline is then no later than the current time.
+/// So the sweep's next pass takes the row without waiting five minutes for
+/// the lease. The index tables go before their metadata, so the metadata
+/// outlives the failed drop, and that pass drops both index tables.
 #[cfg(feature = "test-hooks")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_delete_that_fails_after_its_claim_is_finished_by_the_next_sweep() {
@@ -507,10 +509,10 @@ async fn index_table_names(engine: &CassandraEngine, table_id: &str) -> Vec<Stri
     .collect()
 }
 
-/// A `DeleteTable` whose request is dropped once its claim has applied, as a
+/// A `DeleteTable` whose request is dropped once its claim applies, as a
 /// request is when its client closes the connection. The claim and the
-/// removal run in a task that the request only awaits, so the table is still
-/// removed, within seconds rather than after the five-minute lease.
+/// removal run in a task that the request only awaits. So the table is still
+/// removed, within seconds and not after the five-minute lease.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_delete_whose_request_is_dropped_after_its_claim_still_removes_the_table() {
     if crate::helpers::skip_without_cassandra() {
