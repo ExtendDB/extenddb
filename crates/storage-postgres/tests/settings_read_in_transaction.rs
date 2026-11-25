@@ -15,7 +15,7 @@ use extenddb_storage::management_store::SettingsStore;
 use extenddb_storage::migrations::MigrationId;
 use extenddb_storage_postgres::PostgresCatalogStore;
 use migrations_support::{Scratch, base_conn, pool, skip};
-use sqlx::PgPool;
+use sqlx::{Executor, PgPool, Row};
 
 /// The test's own deadline for one read.
 const DEADLINE: Duration = Duration::from_secs(10);
@@ -24,14 +24,18 @@ const DEADLINE: Duration = Duration::from_secs(10);
 /// transaction block, its start time, whether it is read-only, and the two
 /// settings a bounded read sets.
 async fn state(conn: &PgPool) -> (bool, String, String, String, String) {
-    sqlx::query_as(
-        "SELECT statement_timestamp() <> transaction_timestamp(), \
-         transaction_timestamp()::text, current_setting('transaction_read_only'), \
-         current_setting('statement_timeout'), current_setting('lock_timeout')",
-    )
-    .fetch_one(conn)
-    .await
-    .expect("read the session state")
+    // Sent as a simple query: the extended protocol sets the statement's
+    // start again at Execute, so the first column would be true outside a
+    // block too.
+    let row = conn
+        .fetch_one(
+            "SELECT statement_timestamp() <> transaction_timestamp(), \
+             transaction_timestamp()::text, current_setting('transaction_read_only'), \
+             current_setting('statement_timeout'), current_setting('lock_timeout')",
+        )
+        .await
+        .expect("read the session state");
+    (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4))
 }
 
 /// A one-connection pool on the catalog whose connection is in a
