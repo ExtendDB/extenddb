@@ -85,13 +85,15 @@ pub(crate) async fn handle_request(
 
     // --- Pre-auth operation validation ---
     // Real DynamoDB validates the operation name before checking authentication.
-    // An unknown operation returns UnknownOperationException even without auth headers.
-    if !extenddb_engine::is_known_operation(&operation) {
-        return error_response(
-            &DynamoDbError::UnknownOperationException(String::new()),
-            &request_id,
-        );
-    }
+    // An unknown operation returns UnknownOperationException even without auth
+    // headers. `extenddb_engine::check_operation` is the first of the engine's
+    // two steps, and `admit` below is the second; the module doc of
+    // extenddb-engine's `src/pre_dispatch.rs` says which checks belong in the
+    // engine rather than here.
+    let known_operation = match extenddb_engine::check_operation(&operation) {
+        Ok(known_operation) => known_operation,
+        Err(e) => return error_response(&e, &request_id),
+    };
 
     // --- Pre-auth body validation ---
     // The service checks the request's JSON syntax before authentication at
@@ -147,20 +149,24 @@ pub(crate) async fn handle_request(
         }
     };
 
-    // Point-in-time recovery is not in this release: a restore and an enable
-    // are refused here, for every caller and before any table is read, where
-    // the service would authorize them first.
-    if let Some(e) = extenddb_engine::refuse_point_in_time_recovery(&operation, &input) {
-        tracing::warn!(
-            request_id = %request_id,
-            operation = %operation,
-            principal = crate::authz_resource::cross_account::principal_arn(&identity),
-            "Point-in-time recovery refused"
-        );
-        record_error_metrics(&state.metrics, &e, &account_id, None, &operation);
-        state.metrics.record_request_count(&account_id, &operation);
-        return error_response(&e, &request_id);
-    }
+    // Point-in-time recovery is not in this release: `admit` refuses a restore
+    // and an enable here, for every caller and before any table is read, where
+    // the service would authorize them first. The point-in-time refusal is the
+    // only one `admit` makes, so the log line names it.
+    let input: Value = match known_operation.with_body(input).admit() {
+        Ok(input) => input,
+        Err(e) => {
+            tracing::warn!(
+                request_id = %request_id,
+                operation = %operation,
+                principal = crate::authz_resource::cross_account::principal_arn(&identity),
+                "Point-in-time recovery refused"
+            );
+            record_error_metrics(&state.metrics, &e, &account_id, None, &operation);
+            state.metrics.record_request_count(&account_id, &operation);
+            return error_response(&e, &request_id);
+        }
+    };
 
     // --- Authz segment ---
     let authz_start = std::time::Instant::now();

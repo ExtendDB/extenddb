@@ -118,12 +118,8 @@ pub fn catalog_key_id(kek: &[u8; KEY_LEN], catalog_key: &SecretKeys) -> KeyId {
 }
 
 fn key_id(kek: &[u8; KEY_LEN], message: &[u8]) -> KeyId {
-    let tag = aws_lc_rs::hmac::sign(
-        &aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, kek),
-        message,
-    );
-    let tag = &tag.as_ref()[..8];
-    KeyId(tag.iter().map(|b| format!("{b:02x}")).collect())
+    let tag = extenddb_core::crypto::hmac_sha256(kek, message);
+    KeyId(tag[..8].iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Parse the contents of a KEK file (section 2): 32 bytes in standard base64
