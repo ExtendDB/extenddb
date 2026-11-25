@@ -54,6 +54,13 @@ pub fn length_clause(name: &str, (min, max): (usize, usize)) -> Option<&'static 
     }
 }
 
+/// The deployment's table name bounds `(min, max)`: the `[limits]` values
+/// `min_table_name_length` and `max_table_name_length`, 3 and 255 by default.
+#[must_use]
+pub fn table_name_bounds(limits: &LimitsConfig) -> (usize, usize) {
+    (limits.min_table_name_length, limits.max_table_name_length)
+}
+
 /// Where the service reports the table name of a `TransactItems` action:
 /// `transactItems.<n>.member.<op>.tableName`, with `n` counted from 1 and the
 /// action's member name (`ConditionCheck`) in lower camel case.
@@ -100,7 +107,7 @@ pub fn validate_request_items_keys<'a>(
     keys: impl IntoIterator<Item = &'a String>,
     limits: &LimitsConfig,
 ) -> Result<(), DynamoDbError> {
-    let bounds = (limits.min_table_name_length, limits.max_table_name_length);
+    let bounds = table_name_bounds(limits);
     let refused = keys
         .into_iter()
         .filter(|k| !k.is_empty() && !k.starts_with("arn:") && length_clause(k, bounds).is_some())
@@ -144,7 +151,7 @@ pub fn validate_transact_write_names(
             }
         }
     }
-    let bounds = (limits.min_table_name_length, limits.max_table_name_length);
+    let bounds = table_name_bounds(limits);
     let faults: Vec<(&str, &str, &str)> = names
         .iter()
         .filter_map(|(name, location)| {
