@@ -15,11 +15,18 @@ unless exactly the expected number list the feature in `default`, then
 writes the edits and checks with `cargo tree` that nothing in the workspace
 enables the feature. CI builds, lints and tests the tree it leaves.
 
-Usage: devtools/compile-out-search-inequality-filters
+With `--check on` it edits nothing and checks the tree as it is: in the
+browser build (`-p extenddb-wasm-adapter`), extenddb-core, extenddb-engine
+and extenddb-storage-sqlite must all carry the feature (`on`) or all lack
+it (`off`). Without `--check`, the script runs that check with `off` after
+its edits.
+
+Usage: devtools/compile-out-search-inequality-filters [--check on|off]
 """
 
 from __future__ import annotations
 
+import argparse
 import re
 import subprocess
 import sys
@@ -27,6 +34,8 @@ from pathlib import Path
 
 FEATURE = "search-inequality-filters"
 CRATES = 8
+BROWSER = "extenddb-wasm-adapter"
+BROWSER_CRATES = ("extenddb-core", "extenddb-engine", "extenddb-storage-sqlite")
 
 
 def feature_tree(root: Path, *args: str) -> str:
@@ -37,6 +46,16 @@ def feature_tree(root: Path, *args: str) -> str:
         capture_output=True,
         text=True,
     ).stdout
+
+
+def check_browser(root: Path, want: bool) -> list[str]:
+    """The crates of the browser build whose feature state is not `want`."""
+    wrong = []
+    for crate in BROWSER_CRATES:
+        tree = feature_tree(root, "-p", BROWSER, "-i", crate)
+        if (f'{crate} feature "{FEATURE}"' in tree) != want:
+            wrong.append(crate)
+    return wrong
 
 
 def compile_out(root: Path) -> int:
@@ -63,13 +82,33 @@ def compile_out(root: Path) -> int:
     if f'feature "{FEATURE}"' in tree:
         print(f"error: the workspace still enables {FEATURE}:\n{tree}", file=sys.stderr)
         return 1
+    wrong = check_browser(root, False)
+    if wrong:
+        print(f"error: the browser build still enables {FEATURE} on {wrong}", file=sys.stderr)
+        return 1
     for name in names:
         print(f"removed {FEATURE} from the default list of {name}")
     return 0
 
 
 def main() -> int:
-    return compile_out(Path(__file__).resolve().parent.parent)
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--check", choices=["on", "off"])
+    args = parser.parse_args()
+    root = Path(__file__).resolve().parent.parent
+    if args.check is None:
+        return compile_out(root)
+    wrong = check_browser(root, args.check == "on")
+    if wrong:
+        state = "lack" if args.check == "on" else "carry"
+        print(
+            f"error: in the browser build ({BROWSER}), {', '.join(wrong)} {state} {FEATURE}, "
+            f"and {', '.join(BROWSER_CRATES)} must all be {args.check}",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"{BROWSER}: {', '.join(BROWSER_CRATES)} all have {FEATURE} {args.check}")
+    return 0
 
 
 if __name__ == "__main__":

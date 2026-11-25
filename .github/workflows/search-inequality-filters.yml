@@ -18,15 +18,18 @@ concurrency:
 # workflows build, lint and test it, and their wire tests run with the
 # search_inequality_filters setting absent, which gives every account the
 # extended grammar. These jobs cover what they do not: the workspace built,
-# linted and tested with the feature compiled out, and the vector wire tests
-# with the setting written as `off` and as `all`, and against the build with
-# the feature compiled out.
+# linted and tested with the feature compiled out, the feature state of the
+# browser build, and the vector wire tests with the setting written as `off`
+# and as `all`, and against the build with the feature compiled out.
 #
-# The crates take their internal dependencies with default features, so no
-# cargo command line compiles the feature out.
-# devtools/compile-out-search-inequality-filters removes it from the default
-# list of every crate that declares it, which compiles it out of the
-# workspace, and checks that nothing enables it.
+# Most crates take their internal dependencies with default features, so no
+# cargo command line compiles the feature out. The workspace takes
+# extenddb-engine with its default features off, so extenddb-wasm-adapter,
+# the browser build, names the feature for the engine, core and the SQLite
+# backend itself. devtools/compile-out-search-inequality-filters removes the
+# feature from the default list of every crate that declares it, which
+# compiles it out of the workspace, and checks that nothing enables it; with
+# `--check on` it checks that the browser build enables it on all three.
 jobs:
   compiled-out:
     runs-on: extenddb_ubuntu-2404_4-core
@@ -40,6 +43,8 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Check that the browser build enables the feature on the engine, core and SQLite
+        run: devtools/compile-out-search-inequality-filters --check on
       - name: Compile the feature out
         run: devtools/compile-out-search-inequality-filters
       - name: Lint the workspace with the feature compiled out
