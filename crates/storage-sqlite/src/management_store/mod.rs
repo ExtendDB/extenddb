@@ -781,14 +781,15 @@ impl ManagementStore for SqliteCatalogStore {
 }
 
 #[cfg(test)]
-mod migration_tests {
+pub(crate) mod migration_tests {
     use super::*;
     use extenddb_storage::management_store::ManagementStore;
     use extenddb_storage::policy_migration::migrate_resource_tag_condition_keys;
     use serde_json::json;
     use sqlx::sqlite::SqlitePoolOptions;
 
-    async fn store() -> SqliteCatalogStore {
+    /// A migrated in-memory catalog store with a key holder.
+    pub(crate) async fn store() -> SqliteCatalogStore {
         // One connection keeps the in-memory database alive for the test.
         let pool = SqlitePoolOptions::new()
             .max_connections(1)

@@ -11,15 +11,18 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
-# `test-util` exposes `migrations::check_released`, the checksum test each
-# backend crate runs on its migration table,
+# `test-util` exposes test helpers, among them `migrations::check_released`,
+# the checksum test each backend crate runs on its migration table,
 # `migrations::Runner::with_released_through`, which lets a test forget a
-# migration the release has frozen, and
-# `password::count_verifications`, which returns the bcrypt cost of each check
-# a login ran. It also compiles the counter in `verify_password` that records
-# those costs, and `iam_leftovers_conformance`, the check each backend's tests
-# run that a deleted principal or account leaves nothing behind. Production
-# code never enables it.
+# migration the release has frozen, and `password::count_verifications`,
+# which returns the bcrypt cost of each check a login ran. It also compiles
+# the counter in `verify_password` that records those costs, and the checks
+# that each backend's tests run with their own store:
+# `iam_leftovers_conformance` (a deleted principal or account leaves nothing
+# behind), `key_conformance` (the encryption-key commands and startup cases),
+# `metrics_conformance` (the metrics store keeps accounts apart) and
+# `session_data_conformance` (a role session's data is read by its access
+# key). Production code never enables it.
 test-util = []
 # Compiles the `snapshot_conformance` check that each backend's tests run
 # against a real database. Production builds do not compile it.

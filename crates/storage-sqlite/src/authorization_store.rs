@@ -289,3 +289,16 @@ impl AuthorizationStore for SqliteCatalogStore {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use extenddb_storage::session_data_conformance::{Expectations, run};
+
+    /// Same-name sessions of one role each read their own session data
+    /// (`extenddb_storage::session_data_conformance`).
+    #[tokio::test]
+    async fn a_session_reads_its_own_data_by_its_access_key() {
+        let store = crate::management_store::migration_tests::store().await;
+        run(&store, "111111111111", Expectations::default()).await;
+    }
+}
