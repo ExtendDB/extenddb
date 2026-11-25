@@ -31,9 +31,9 @@ use extenddb_core::expression::{
     Expr, ExpressionMaps, KeyCondition, PathElement, SortKeyCondition,
 };
 use extenddb_core::types::{
-    AttributeDefinition, EMPTY_ATTRIBUTE_VALUE, MULTI_ATTRIBUTE_VALUE, QueryInput,
+    AttributeDefinition, AttributeValue, EMPTY_ATTRIBUTE_VALUE, MULTI_ATTRIBUTE_VALUE, QueryInput,
 };
-use extenddb_core::validation::number::NOT_A_NUMBER;
+use extenddb_core::validation::number::{NOT_A_NUMBER, NUMBER_SET_DUPLICATES, has_equal_numbers};
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 
@@ -52,11 +52,13 @@ pub const LIMIT_BELOW_ONE: &str = "1 validation error detected: Value at 'Limit'
 /// out.
 const NULL_VALUE: &str = "The supplied Item contains a null AttributeValue";
 
-/// The type descriptors of an AttributeValue, in the order the service reads
+/// The type descriptors of an AttributeValue, in the order the service checks
 /// the payloads of a value with several type descriptors (see
-/// [`first_fault`]). Core's list is a private constant of its `partiql`
-/// module, as for [`NULL_VALUE`].
-const TYPE_DESCRIPTORS: [&str; 10] = ["S", "N", "B", "SS", "NS", "BS", "M", "L", "NULL", "BOOL"];
+/// [`first_fault`]): a duplicate `SS` member ahead of the numbers (measured
+/// 2026-11-24), `N` ahead of `NS`, `NS` ahead of `BS`, and `NS` and `M` ahead
+/// of `L`. Core's list is a private constant of its `partiql` module, as for
+/// [`NULL_VALUE`].
+const TYPE_DESCRIPTORS: [&str; 10] = ["SS", "S", "N", "B", "NS", "BS", "M", "L", "NULL", "BOOL"];
 
 /// The members of the two enums the request-time checks read.
 const RETURN_CONSUMED_CAPACITY: &[&str] = &["INDEXES", "TOTAL", "NONE"];
@@ -88,10 +90,11 @@ const SELECT: &[&str] = &[
 ///
 /// The checks read the raw body, so a field that does not deserialize (an
 /// invalid `Select`, for one) does not stop the ones before it. When a check
-/// fails, the body is deserialized as a [`QueryInput`], and a
-/// `SerializationException` from that (a field of the wrong JSON shape
-/// anywhere in the body) is the answer instead, as the service reports a shape
-/// fault ahead of every validation (measured 2026-10-25: a `Limit` of 0 with a
+/// fails, each member of the body is deserialized on its own as part of a
+/// [`QueryInput`] (see `shape_fault_first`), and a `SerializationException`
+/// from that (a member of the wrong JSON type, in any member order) is the
+/// answer instead, as the service reports a shape fault ahead of every
+/// validation (measured 2026-10-25: a `Limit` of 0 with a
 /// string `ExpressionAttributeValues`, a string `ExpressionAttributeNames` with
 /// an `N` value that is not a number, and a `Limit` of 0 with `Select: 5` all
 /// answer `SerializationException`). A `ValidationException` the deserializer
@@ -123,30 +126,120 @@ pub fn validate_query_request_body(body: &Value) -> Result<(), DynamoDbError> {
 }
 
 /// When a request-time check has failed with `check`, the deserializer's
-/// `SerializationException` for `body` if there is one, else `check`. The two
-/// enum fields stay in the body: an enum value that is a string but not a
-/// member deserializes to a `ValidationException`, which this ignores, and one
-/// of another JSON type is a shape fault the service reports ahead of the
-/// checks (measured 2026-10-25: `Select: 5` with a `Limit` of 0 answers
-/// `SerializationException: NUMBER_VALUE cannot be converted to String`).
+/// `SerializationException` for a member of `body` if there is one, else
+/// `check`. The service reports a member of the wrong JSON type ahead of the
+/// checks whatever the member order (measured 2026-11-23, each body twice:
+/// `Select: 5` beside `{"X": "1"}` or an empty `NS`, and `{"S": 5}` after an
+/// empty `NS` in another value, each with a `Limit` of 0, answer
+/// `SerializationException: NUMBER_VALUE cannot be converted to String` on
+/// `Query`, and the first of them on `Scan` too). So each member is
+/// deserialized on its own as a `T`, beside the body's `TableName` (the one
+/// member `T` must have), and each `ExpressionAttributeValues` entry on its
+/// own. The answer is the first shape fault in the map's iteration order (see
+/// [`first_fault`]). Inside one member or entry, the deserializer stops at the
+/// first fault.
 ///
-/// An AttributeValue with an unknown type descriptor is not a shape fault to
-/// the service: `Limit: 0` beside `{"X": "1"}` answers the `Limit`
-/// `ValidationException` (measured 2026-10-25), so the deserializer's
-/// `SerializationException` for that message does not preempt the check.
+/// These are not shape faults here:
+///
+/// - an enum value that is a string but not a member, which deserializes to a
+///   `ValidationException`. One of another JSON type is a shape fault
+///   (measured 2026-10-25: `Select: 5` with a `Limit` of 0 answers
+///   `SerializationException: NUMBER_VALUE cannot be converted to String`);
+/// - an AttributeValue with an unknown type descriptor, a value the service
+///   cannot read as one type: `Limit: 0` beside `{"X": "1"}` answers the
+///   `Limit` `ValidationException` (measured 2026-10-25 and 2026-11-23);
+/// - a member the service reads from a JSON type that `T` refuses: a string
+///   in `ConsistentRead` or `ScanIndexForward` that the service reads as a
+///   boolean (see [`BOOLEAN_TEXTS`]), and any number in `Limit`. Measured
+///   2026-11-23: `ConsistentRead: "true"` or `"T"`, `ScanIndexForward:
+///   "true"` or `"0"`, and `Limit: 1.5` beside `Select: "NOPE"` answer the
+///   `Select` text on `Query`, as `ConsistentRead: "true"` does on `Scan`, and
+///   `ConsistentRead: "yes"` with a table that does not exist answers
+///   `ResourceNotFoundException`. `ConsistentRead: "on"` answers
+///   `SerializationException: Unexpected token received from parser`, and
+///   `ConsistentRead: 1` `SerializationException: NUMBER_VALUE cannot be
+///   converted to Boolean`. The handler's own deserialization still refuses
+///   every string in these members;
+/// - a null member, which the service reads as an absent one (see
+///   [`present`]), and a null name in `ExpressionAttributeNames`, which it
+///   reads as an empty name and reports after these checks. Measured
+///   2026-11-24, each body twice: `ScanIndexForward: null` beside `Select:
+///   "NOPE"` answers the `Select` text, and alone, with a table that does not
+///   exist, `ResourceNotFoundException`; `ExpressionAttributeNames: {"#a":
+///   null}` beside `Select: "NOPE"` or `ReturnConsumedCapacity: "NOPE"`
+///   answers that enum's text, beside `{"N": "bob"}` the numeric text in the
+///   `ExpressionAttributeValues contains invalid value` form, and alone
+///   `ExpressionAttributeNames contains invalid value: Empty attribute name
+///   for key #a`. The handler's own deserialization still refuses both.
 pub(crate) fn shape_fault_first<T: DeserializeOwned>(
     body: &Value,
     check: DynamoDbError,
 ) -> DynamoDbError {
-    match serde_json::from_value::<T>(body.clone()) {
-        Err(e) => match crate::deserialize_error(e) {
-            DynamoDbError::SerializationException(msg) if msg.contains(UNKNOWN_TYPE_DESCRIPTOR) => {
-                check
+    let read = |name: &str, value: Value| {
+        let mut one: Map<String, Value> = body
+            .get("TableName")
+            .map(|table_name| ("TableName".to_owned(), table_name.clone()))
+            .into_iter()
+            .collect();
+        one.insert(name.to_owned(), value);
+        shape_fault::<T>(Value::Object(one))
+    };
+    body.as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(name, _)| present(body, name))
+        .find_map(|(name, value)| match (name.as_str(), value) {
+            ("ConsistentRead" | "ScanIndexForward", Value::String(text))
+                if BOOLEAN_TEXTS
+                    .iter()
+                    .any(|word| word.eq_ignore_ascii_case(text)) =>
+            {
+                None
             }
-            shape @ DynamoDbError::SerializationException(_) => shape,
-            _ => check,
-        },
-        Ok(_) => check,
+            ("Limit", Value::Number(_)) => None,
+            ("ExpressionAttributeNames", Value::Object(names)) => read(
+                name,
+                Value::Object(
+                    names
+                        .iter()
+                        .filter(|(_, alias)| !alias.is_null())
+                        .map(|(key, alias)| (key.clone(), alias.clone()))
+                        .collect(),
+                ),
+            ),
+            ("ExpressionAttributeValues", Value::Object(entries)) => {
+                entries.iter().find_map(|(key, entry)| {
+                    read(
+                        name,
+                        Value::Object(Map::from_iter([(key.clone(), entry.clone())])),
+                    )
+                })
+            }
+            _ => read(name, value.clone()),
+        })
+        .unwrap_or(check)
+}
+
+/// The strings the service reads as a boolean, in any ASCII case: the first
+/// five as true, the others as false. It refuses every other string with
+/// `SerializationException`. Measured 2026-11-10 for each of them in
+/// `UpdateContinuousBackups` `PointInTimeRecoveryEnabled`, 2026-11-11 for
+/// `"yes"` and `"TRUE"` in `GetItem` `ConsistentRead` and `"no"` in `Query`
+/// `ScanIndexForward`, and 2026-11-23 on `Query` for `"T"`, `"0"` and the
+/// refused `"on"`.
+const BOOLEAN_TEXTS: [&str; 10] = ["true", "t", "yes", "y", "1", "false", "f", "no", "n", "0"];
+
+/// The deserializer's `SerializationException` for `body` as a `T`, unless it
+/// is the one for an AttributeValue with an unknown type descriptor.
+fn shape_fault<T: DeserializeOwned>(body: Value) -> Option<DynamoDbError> {
+    match serde_json::from_value::<T>(body).map_err(crate::deserialize_error) {
+        Err(DynamoDbError::SerializationException(msg))
+            if msg.contains(UNKNOWN_TYPE_DESCRIPTOR) =>
+        {
+            None
+        }
+        Err(shape @ DynamoDbError::SerializationException(_)) => Some(shape),
+        _ => None,
     }
 }
 
@@ -232,7 +325,9 @@ fn validate_no_parameter_mix(body: &Value) -> Result<(), DynamoDbError> {
 /// The checks the `ExpressionAttributeNames` deserializer makes, on the raw
 /// body: an empty map, a key that is not `#` and a name, a key over 255 bytes,
 /// and an empty name, with the deserializer's text. A map or name of another
-/// JSON type is a shape fault, which this leaves to the shape fault check.
+/// JSON type is a shape fault, which this leaves to the shape fault check, and
+/// a null name is left to the handler's deserializer (see
+/// [`shape_fault_first`]).
 ///
 /// # Errors
 ///
@@ -305,6 +400,9 @@ enum Fault<'a> {
     /// A number the number rules refuse for its magnitude or precision, with
     /// their text.
     Refused(String),
+    /// An empty set, or a set two of whose members have one value, beside a
+    /// second type descriptor, with the text of that path (see [`set_fault`]).
+    Set(String),
 }
 
 impl Fault<'_> {
@@ -332,14 +430,19 @@ impl Fault<'_> {
             Fault::SeveralTypes => MULTI_ATTRIBUTE_VALUE.to_owned(),
             Fault::NotANumber("") => NOT_A_NUMBER.to_owned(),
             Fault::NotANumber(text) => format!("{NOT_A_NUMBER}: {text}"),
-            Fault::Refused(msg) => msg,
+            Fault::Refused(msg) | Fault::Set(msg) => msg,
         }
     }
 }
 
 /// The first fault in `value` (`member` is its name when it is the value of an
-/// `M` member): a null or no type descriptor, then the numbers in `N`, `NS`
-/// and every value an `L` or `M` holds, then more than one type descriptor.
+/// `M` member): a null or no type descriptor, then the payloads in the order
+/// of [`TYPE_DESCRIPTORS`] (the numbers in `N` and `NS`, and every value an
+/// `L` or `M` holds), then more than one type descriptor. With `sets`, an
+/// empty set and a set two of whose members have one value are faults too,
+/// `SS` ahead of the numbers and `NS` after its own numbers (see
+/// [`set_fault`]); without it, the deserializer reports them after the
+/// request-time checks.
 /// `L` items are visited in document order and `M` members in the map's
 /// iteration order: sorted by key without the `preserve_order` feature of
 /// `serde_json`, in document order with it, as in the MongoDB build (bson
@@ -356,8 +459,11 @@ impl Fault<'_> {
 /// (measured 2026-11-19: `{"N": "bob", "S": "x"}` and `{"S": "x", "N": "bob"}`
 /// answer the numeric text for `bob`, `{"N": "1", "S": "x"}` the more than one
 /// datatypes text, `{"S": "x", "L": [null]}` the null text, and `N` is read
-/// ahead of `NS`, `NS` and `M` ahead of `L`).
-fn first_fault<'a>(value: &'a Value, member: Option<&'a str>) -> Option<Fault<'a>> {
+/// ahead of `NS`, `NS` and `M` ahead of `L`; measured 2026-11-24: `{"SS":
+/// ["a", "a"], "N": "bob"}` answers the duplicate text, `{"NS": ["1", "1"],
+/// "N": "bob"}` the numeric text, and `{"NS": ["1", "1"], "L": [{"N":
+/// "bob"}]}` the duplicate text).
+fn first_fault<'a>(value: &'a Value, member: Option<&'a str>, sets: bool) -> Option<Fault<'a>> {
     let Value::Object(map) = value else {
         return value.is_null().then_some(Fault::Null(member));
     };
@@ -372,17 +478,51 @@ fn first_fault<'a>(value: &'a Value, member: Option<&'a str>) -> Option<Fault<'a
             ("NS", Value::Array(members)) => members
                 .iter()
                 .filter_map(Value::as_str)
-                .find_map(number_fault),
-            ("L", Value::Array(items)) => items.iter().find_map(|item| first_fault(item, None)),
+                .find_map(number_fault)
+                .or_else(|| sets.then(|| set_fault(descriptor, members)).flatten()),
+            ("SS" | "BS", Value::Array(members)) if sets => set_fault(descriptor, members),
+            ("L", Value::Array(items)) => {
+                items.iter().find_map(|item| first_fault(item, None, sets))
+            }
             ("M", Value::Object(members)) => members
                 .iter()
-                .find_map(|(name, inner)| first_fault(inner, Some(name))),
+                .find_map(|(name, inner)| first_fault(inner, Some(name), sets)),
             _ => None,
         });
     match payloads.len() {
         0 => Some(Fault::Empty),
         1 => fault,
         _ => fault.or(Some(Fault::SeveralTypes)),
+    }
+}
+
+/// The service's refusal of a set of type `descriptor` whose `members` are
+/// strings, beside a second type descriptor: [`NUMBER_SET_DUPLICATES`] for an
+/// `NS` two of whose members have one value, else the deserializer's text for
+/// an empty set or an `SS` or `BS` that holds a member twice. Measured
+/// 2026-11-24, each body twice, as `ExpressionAttributeValues contains invalid
+/// value: ... for key :z`: `{"SS": ["a", "a"], "N": "1"}` answers `One or more
+/// parameter values were invalid: Input collection [a, a] contains
+/// duplicates.`, `{"NS": ["1", "1"], "S": "x"}` `Input collection contains
+/// duplicates`, `{"BS": ["YQ==", "YQ=="], "N": "1"}` `One or more parameter
+/// values were invalid: Input collection [YQ==, YQ==]of type BS contains
+/// duplicates.`, and an empty `SS`, `NS` or `BS` beside a second descriptor
+/// the deserializer's empty set text. A member of another JSON type is left
+/// to the shape fault check.
+fn set_fault<'a>(descriptor: &str, members: &[Value]) -> Option<Fault<'a>> {
+    if !members.iter().all(Value::is_string) {
+        return None;
+    }
+    if descriptor == "NS" && has_equal_numbers(members) {
+        return Some(Fault::Set(NUMBER_SET_DUPLICATES.to_owned()));
+    }
+    let set = Value::Object(Map::from_iter([(
+        descriptor.to_owned(),
+        Value::Array(members.to_vec()),
+    )]));
+    match serde_json::from_value::<AttributeValue>(set).map_err(crate::deserialize_error) {
+        Err(DynamoDbError::ValidationException(msg)) => Some(Fault::Set(msg)),
+        _ => None,
     }
 }
 
@@ -427,7 +567,7 @@ fn validate_expression_attribute_value_numbers(
 ) -> Result<(), DynamoDbError> {
     match sorted_entries(values)
         .into_iter()
-        .find_map(|(_, value)| first_fault(value, None))
+        .find_map(|(_, value)| first_fault(value, None, false))
     {
         Some(fault) => Err(DynamoDbError::ValidationException(
             fault.request_time_text(),

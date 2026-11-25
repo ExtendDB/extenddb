@@ -1,6 +1,8 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashSet;
+
 use crate::error::DynamoDbError;
 
 pub mod operations;
@@ -18,6 +20,25 @@ pub(super) const MIN_MAGNITUDE: i64 = MIN_EXPONENT as i64 + 1;
 /// The service's text for a value that is not a number. A malformed value
 /// is named after a colon; an empty one is not.
 pub const NOT_A_NUMBER: &str = "The parameter cannot be converted to a numeric value";
+
+/// The service's refusal of a number set two of whose members have one
+/// value, the same at any depth and for members written alike. Measured
+/// 2026-11-06 on a statement parameter (`{"NS": ["1", "1.0"]}`, `{"NS":
+/// ["1", "1"]}`, and inside a map and a list), and 2026-11-24 on a `Query`
+/// `ExpressionAttributeValues` entry beside a second type descriptor, as
+/// `ExpressionAttributeValues contains invalid value: ... for key :z`.
+pub const NUMBER_SET_DUPLICATES: &str = "Input collection contains duplicates";
+
+/// Whether two members of a number set have one value: `1` and `1.0` do.
+/// A member that is not a string is skipped.
+#[must_use]
+pub fn has_equal_numbers(items: &[serde_json::Value]) -> bool {
+    let mut values = HashSet::with_capacity(items.len());
+    items
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .any(|text| !values.insert(normalize_number(text).unwrap_or_else(|_| text.to_owned())))
+}
 
 /// Why a string is not a number `DynamoDB` can store, as
 /// [`normalize_number`] reports it.
