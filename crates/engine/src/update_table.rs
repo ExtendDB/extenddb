@@ -242,7 +242,15 @@ pub async fn handle_update_table(
                 &input,
                 existing.billing_mode_summary.as_ref(),
             );
-            crate::gsi_updates::refuse_bare_updates(&input, pay_per_request)?;
+            let stored_on_demand = existing
+                .billing_mode_summary
+                .as_ref()
+                .is_some_and(|s| s.billing_mode == BillingMode::PayPerRequest);
+            crate::gsi_updates::refuse_bare_updates(
+                &input,
+                pay_per_request,
+                !pay_per_request && !stored_on_demand,
+            )?;
         }
         if touches_warm {
             crate::warm_throughput::validate_warm_throughput_updates(&input, &existing)?;

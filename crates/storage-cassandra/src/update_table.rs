@@ -175,6 +175,42 @@ impl CassandraEngine {
                 self.merged_index_warm_throughput(&table_id, &action.index_name, spec)
                     .await?;
             }
+            // A provisioned index's new ProvisionedThroughput, in the shape
+            // the create path writes, in the indexes batch. The engine has
+            // checked the units and that the table is PROVISIONED before and
+            // after the request. A missing index is refused before anything
+            // is written, as for WarmThroughput.
+            if let Some(action) = &update.update
+                && let Some(pt) = action.provisioned_throughput_units()
+            {
+                let index_type: Option<String> = query_optional(
+                    &self.session,
+                    &format!(
+                        "SELECT index_type FROM {catalog_ks}.indexes \
+                         WHERE table_id = ? AND index_name = ?"
+                    ),
+                    cdrs_tokio::query_values!(table_id.as_str(), action.index_name.as_str()),
+                    "update_table gsi throughput",
+                )
+                .await?
+                .and_then(|row| row.get_by_name("index_type").ok().flatten());
+                if index_type.as_deref() != Some("GSI") {
+                    return Err(StorageError::IndexNotFound(action.index_name.clone()));
+                }
+                let pt_json = serde_json::to_string(&pt)
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                add_index_op!(
+                    format!(
+                        "UPDATE {catalog_ks}.indexes SET provisioned_throughput = ? \
+                         WHERE table_id = ? AND index_name = ?"
+                    ),
+                    cdrs_tokio::query_values!(
+                        pt_json.as_str(),
+                        table_id.as_str(),
+                        action.index_name.as_str()
+                    )
+                );
+            }
         }
 
         // Stream specification: the catalog columns go in the tables LWT; the

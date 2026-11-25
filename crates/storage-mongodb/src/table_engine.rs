@@ -1031,6 +1031,51 @@ impl MongoEngine {
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
         }
 
+        // A provisioned index's new ProvisionedThroughput, in the shape the
+        // create path writes. The engine has checked the units and that the
+        // table is PROVISIONED before and after the request. An Update naming
+        // no GSI of the table is IndexNotFound, as for WarmThroughput.
+        let throughput_updates: Vec<_> = input
+            .global_secondary_index_updates
+            .iter()
+            .flatten()
+            .filter_map(|u| u.update.as_ref())
+            .filter_map(|u| {
+                u.provisioned_throughput_units()
+                    .map(|pt| (&u.index_name, pt))
+            })
+            .collect();
+        if !throughput_updates.is_empty() {
+            let table_doc = tables_coll
+                .find_one(doc! {
+                    "_id": { "account_id": account_id, "table_name": &input.table_name },
+                })
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?
+                .ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
+            let table_id = table_doc
+                .get_str("table_id")
+                .map_err(|_| StorageError::Internal("missing table_id".to_owned()))?;
+            let indexes = self.catalog_db.collection::<Document>("indexes");
+            for (index_name, pt) in throughput_updates {
+                let pt_bson =
+                    bson::to_bson(&pt).map_err(|e| StorageError::Internal(e.to_string()))?;
+                let written = indexes
+                    .update_one(
+                        doc! {
+                            "_id": { "table_id": table_id, "index_name": index_name },
+                            "index_type": "GSI",
+                        },
+                        doc! { "$set": { "provisioned_throughput": pt_bson } },
+                    )
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                if written.matched_count == 0 {
+                    return Err(StorageError::IndexNotFound(index_name.clone()));
+                }
+            }
+        }
+
         // Handle GSI updates
         if let Some(gsi_updates) = &input.global_secondary_index_updates {
             // Persist the request's attribute definitions, merged into the stored

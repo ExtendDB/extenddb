@@ -5,9 +5,10 @@
 //! two measured bodies and the metric records they leave, the index ARN they
 //! name, the write charged to an index only when its item carries the index
 //! key, the local secondary index served from the table's buckets, the index
-//! deleted by `UpdateTable`, the index set kept across a table throughput
-//! update, the index read that does not consult the table's read bucket, and
-//! the registration of the indexes on the first request after a restart.
+//! deleted by `UpdateTable`, the index raised by `UpdateTable`, the index set
+//! kept across a table throughput update, the index read that does not
+//! consult the table's read bucket, and the registration of the indexes on
+//! the first request after a restart.
 
 use std::sync::Arc;
 
@@ -280,7 +281,7 @@ async fn index_write_throttle_names_the_index_message_and_arn() {
 /// index on the first write and the second is refused with the index reason.
 #[tokio::test]
 async fn a_write_is_charged_to_an_index_only_when_its_item_carries_the_index_key() {
-    let (state, account_id) = build_state().await;
+    let (state, _) = build_state().await;
     let mut without_key = item(2_000);
     without_key["sk"] = json!({"S": "s"});
     let mut with_key = without_key.clone();
@@ -367,6 +368,80 @@ async fn deleting_the_index_stops_its_write_refusals() {
     assert_eq!(status, 200, "{body}");
     let (status, body) = call(&state, "PutItem", put).await;
     assert_eq!(status, 200, "{body}");
+}
+
+/// `UpdateTable` raising the index's `ProvisionedThroughput` is the way out
+/// the refusal names: the response and `DescribeTable` show the new units,
+/// and the index's buckets take the new rate from the response, so the write
+/// the index was holding back is served at once. The index is drained by
+/// writes of new items that carry its key (one unit each, one second of
+/// burst at 1 WCU). At the old rate the debt of about one unit takes a second
+/// to repay; the retries below stop after 200 ms.
+#[tokio::test]
+async fn raising_the_index_throughput_ends_its_write_refusals() {
+    let (state, _) = build_state().await;
+    let table = "index-raised";
+    create_indexed_table(&state, table, 1000, 1000, 1, 1).await;
+    let put = |n: usize| {
+        let mut it = indexed_item();
+        it["pk"] = json!({"S": format!("k{n}")});
+        json!({"TableName": table, "Item": it})
+    };
+    let mut refused = None;
+    for n in 0..10 {
+        let (status, body) = call(&state, "PutItem", put(n)).await;
+        if status != 200 {
+            refused = Some(body);
+            break;
+        }
+    }
+    let refused = refused.expect("the index at 1 WCU refuses within ten writes");
+    assert_eq!(
+        refused["ThrottlingReasons"][0]["reason"], "IndexWriteProvisionedThroughputExceeded",
+        "{refused}"
+    );
+    let raised = json!({"ReadCapacityUnits": 5, "WriteCapacityUnits": 1000});
+    let (status, body) = call(
+        &state,
+        "UpdateTable",
+        json!({
+            "TableName": table,
+            "GlobalSecondaryIndexUpdates": [{"Update": {
+                "IndexName": GSI,
+                "ProvisionedThroughput": raised,
+            }}],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let units = |description: &Value| {
+        let pt = &description["GlobalSecondaryIndexes"][0]["ProvisionedThroughput"];
+        (
+            pt["ReadCapacityUnits"].clone(),
+            pt["WriteCapacityUnits"].clone(),
+        )
+    };
+    assert_eq!(
+        units(&body["TableDescription"]),
+        (json!(5), json!(1000)),
+        "{body}"
+    );
+    let (_, described) = call(&state, "DescribeTable", json!({"TableName": table})).await;
+    assert_eq!(
+        units(&described["Table"]),
+        (json!(5), json!(1000)),
+        "{described}"
+    );
+    let mut last = Value::Null;
+    for _ in 0..20 {
+        let (status, body) = call(&state, "PutItem", put(10)).await;
+        if status == 200 {
+            return;
+        }
+        last = body;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the write is still refused 200 ms after the raise: {last}");
 }
 
 /// An index read is served from the index's read bucket and does not consult

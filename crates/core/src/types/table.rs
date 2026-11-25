@@ -1153,11 +1153,12 @@ pub struct DeleteGsiAction {
 /// Update an existing GSI.
 ///
 /// `WarmThroughput` is stored and reported (see [`super::WarmThroughputRecord`]).
-/// `ProvisionedThroughput` and `OnDemandThroughput` are recognized by the
-/// deserializer but an update of either is not yet implemented: they are read
-/// as opaque values only so that the engine refuses an `Update` carrying
-/// either, with or without `WarmThroughput`, instead of accepting it and
-/// dropping the member.
+/// `ProvisionedThroughput` is stored as the index's throughput on a table
+/// that is PROVISIONED before and after the request. Both throughput members
+/// are read as opaque values, so that the engine answers a malformed one
+/// with the service's member-path sentence and refuses an `Update` carrying
+/// `OnDemandThroughput`, with or without `WarmThroughput`, instead of
+/// accepting it and dropping the member.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct UpdateGsiAction {
     #[serde(rename = "IndexName")]
@@ -1172,10 +1173,18 @@ pub struct UpdateGsiAction {
 
 impl UpdateGsiAction {
     /// Whether the action carries `ProvisionedThroughput` or
-    /// `OnDemandThroughput`, which ExtendDB does not apply to an index.
+    /// `OnDemandThroughput`.
     #[must_use]
     pub fn carries_throughput(&self) -> bool {
         self.provisioned_throughput.is_some() || self.on_demand_throughput.is_some()
+    }
+
+    /// The action's `ProvisionedThroughput`, or `None` when it carries none or
+    /// one that is not a throughput (which the engine refuses before a backend
+    /// sees the request).
+    #[must_use]
+    pub fn provisioned_throughput_units(&self) -> Option<ProvisionedThroughput> {
+        serde_json::from_value(self.provisioned_throughput.clone()?).ok()
     }
 }
 

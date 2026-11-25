@@ -26,11 +26,22 @@
 //!   at all: "The only Updates for index: <name> when TableThroughputMode is
 //!   PAY_PER_REQUEST can be to OnDemandThroughput, WarmThroughput" (T3d,
 //!   T3e). The stored billing mode is known only once the table is read, so
-//!   [`refuse_bare_updates`] runs after the read. ExtendDB does not change an
-//!   index's throughput, so every other `Update` without `WarmThroughput` (one
-//!   carrying only `OnDemandThroughput`, any on a provisioned table, the
-//!   index update of a switch to PROVISIONED) is refused as not yet
-//!   supported, as before this rule existed.
+//!   [`refuse_bare_updates`] runs after the read. An `Update` carrying
+//!   `ProvisionedThroughput` and no `OnDemandThroughput` on a table that is
+//!   PROVISIONED before and after the request is applied: the backend stores
+//!   it as the index's throughput, and the server's index buckets take the
+//!   new rate from the response. Every other `Update` without
+//!   `WarmThroughput` (one carrying `OnDemandThroughput` on a provisioned
+//!   table, the index update of a switch to PROVISIONED) is refused as not
+//!   yet supported, as before this rule existed.
+//! - The units of an `Update`'s `ProvisionedThroughput` (measured 2026-11-25
+//!   on a table name that does not exist, each request twice): a missing or
+//!   null unit is `Value null at '<path>' failed to satisfy constraint: Member
+//!   must not be null`, a unit below 1 is `Value '<n>' at '<path>' failed to
+//!   satisfy constraint: Member must have value greater than or equal to 1`,
+//!   with `<path>`
+//!   `globalSecondaryIndexUpdates.<n>.member.update.provisionedThroughput.<unit>`,
+//!   the write units listed before the read units, ahead of the table read.
 //!
 //! A `Create` has a valid name, a key schema of defined attributes, and (when
 //! given) a throughput of at least 1 unit each; a `Delete` has a valid name.
@@ -71,9 +82,8 @@ pub fn index_warm_throughput_only_operation(name: &str) -> String {
 }
 
 /// Whether any `Update` element carries no `WarmThroughput`: nothing but its
-/// index name, or a throughput ExtendDB does not apply to an index. Such an
-/// element needs the table's billing mode for its sentence, so the caller
-/// reads the table first.
+/// index name, or a throughput. Such an element needs the table's billing
+/// mode for its answer, so the caller reads the table first.
 #[must_use]
 pub(crate) fn has_bare_update(input: &UpdateTableInput) -> bool {
     input
@@ -87,15 +97,18 @@ pub(crate) fn has_bare_update(input: &UpdateTableInput) -> bool {
         })
 }
 
-/// Refuse every `Update` element that carries no `WarmThroughput`.
-/// `pay_per_request` is the billing mode the table has after the request: the
-/// request's `BillingMode` when it carries one, the stored mode otherwise.
+/// Refuse every `Update` element that carries no `WarmThroughput`, except one
+/// carrying `ProvisionedThroughput` and no `OnDemandThroughput` on a table
+/// that `stays_provisioned` (PROVISIONED before and after the request), which
+/// the backend stores. `pay_per_request` is the billing mode the table has
+/// after the request: the request's `BillingMode` when it carries one, the
+/// stored mode otherwise.
 ///
 /// Under PAY_PER_REQUEST an element carrying `ProvisionedThroughput` or
 /// nothing at all answers the measured sentence (rows T3d, T3e). Every other
-/// such element (only `OnDemandThroughput`, which that sentence names as
-/// allowed, or any element under PROVISIONED, where the service changes the
-/// index's throughput) answers ExtendDB's own "not yet supported".
+/// refused element (only `OnDemandThroughput`, which that sentence names as
+/// allowed, or any other element under PROVISIONED) answers ExtendDB's own
+/// "not yet supported".
 ///
 /// # Errors
 ///
@@ -103,13 +116,19 @@ pub(crate) fn has_bare_update(input: &UpdateTableInput) -> bool {
 pub(crate) fn refuse_bare_updates(
     input: &UpdateTableInput,
     pay_per_request: bool,
+    stays_provisioned: bool,
 ) -> Result<(), DynamoDbError> {
     if let Some(upd) = input
         .global_secondary_index_updates
         .iter()
         .flatten()
         .filter_map(|u| u.update.as_ref())
-        .find(|a| a.warm_throughput.is_none())
+        .find(|a| {
+            let stored = stays_provisioned
+                && a.provisioned_throughput.is_some()
+                && a.on_demand_throughput.is_none();
+            a.warm_throughput.is_none() && !stored
+        })
     {
         let on_demand_rule =
             upd.provisioned_throughput.is_some() || upd.on_demand_throughput.is_none();
@@ -161,6 +180,50 @@ fn validate_update_index_name(
         }
         other => other,
     }
+}
+
+/// The units of the `ProvisionedThroughput` of the `Update` at `position`
+/// (0-based): each one present, as an integer of at least 1, answered with
+/// the measured member-path clauses, the write units first (module doc). A
+/// member that is not an object or a unit that is not an integer is answered
+/// as the request's deserializer answers a malformed throughput.
+fn validate_update_throughput(
+    throughput: &serde_json::Value,
+    position: usize,
+) -> Result<(), DynamoDbError> {
+    let mut clauses = Vec::new();
+    if throughput.is_object() {
+        for (key, member) in [
+            ("WriteCapacityUnits", "writeCapacityUnits"),
+            ("ReadCapacityUnits", "readCapacityUnits"),
+        ] {
+            let path = format!(
+                "globalSecondaryIndexUpdates.{}.member.update.provisionedThroughput.{member}",
+                position + 1
+            );
+            match throughput.get(key) {
+                None | Some(serde_json::Value::Null) => clauses.push(format!(
+                    "Value null at '{path}' failed to satisfy constraint: Member must not be null"
+                )),
+                Some(units) => {
+                    if let Some(n) = units.as_i64().filter(|n| *n < 1) {
+                        clauses.push(format!(
+                            "Value '{n}' at '{path}' failed to satisfy constraint: Member must \
+                             have value greater than or equal to 1"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if !clauses.is_empty() {
+        return Err(DynamoDbError::ValidationException(
+            extenddb_core::error::validation_errors_detected(&clauses),
+        ));
+    }
+    serde_json::from_value::<extenddb_core::types::ProvisionedThroughput>(throughput.clone())
+        .map(drop)
+        .map_err(crate::deserialize_error)
 }
 
 /// Apply the element rules to `input`.
@@ -223,6 +286,9 @@ pub(crate) fn validate_gsi_updates(input: &UpdateTableInput) -> Result<(), Dynam
                 return Err(DynamoDbError::ValidationException(
                     index_warm_throughput_only_operation(&upd.index_name),
                 ));
+            }
+            if let Some(throughput) = &upd.provisioned_throughput {
+                validate_update_throughput(throughput, position)?;
             }
         }
         // Create and Delete names are validated the way CreateTable does,
@@ -288,6 +354,11 @@ mod tests {
             DynamoDbError::ValidationException(m) => m,
             other => panic!("{other:?}"),
         }
+    }
+
+    /// The `ValidationException` text of a refusal, `None` when accepted.
+    fn refusal(result: Result<(), DynamoDbError>) -> Option<String> {
+        result.is_err().then(|| message(result))
     }
 
     fn create(name: &str) -> Value {
@@ -397,9 +468,10 @@ mod tests {
 
     /// An Update without WarmThroughput: on an on-demand table one carrying
     /// ProvisionedThroughput or nothing answers the measured sentence (rows
-    /// T3d, T3e); one carrying only OnDemandThroughput, and every one on a
-    /// provisioned table (the index update of a switch to PROVISIONED
-    /// included), answers ExtendDB's "not yet supported".
+    /// T3d, T3e); on a provisioned table one carrying ProvisionedThroughput
+    /// alone is accepted (`None`), and one carrying only OnDemandThroughput
+    /// or nothing answers ExtendDB's "not yet supported", as does any on an
+    /// on-demand table carrying only OnDemandThroughput.
     #[test]
     fn an_update_without_warm_throughput_answers_by_the_billing_mode_after_the_request() {
         let provisioned = json!({ "ReadCapacityUnits": 3, "WriteCapacityUnits": 3 });
@@ -407,7 +479,8 @@ mod tests {
         let on_demand_sentence = "One or more parameter values were invalid: The only Updates \
              for index: gsi when TableThroughputMode is PAY_PER_REQUEST can be to \
              OnDemandThroughput, WarmThroughput";
-        let not_yet = "UpdateGlobalSecondaryIndex is not yet supported";
+        let not_yet = Some("UpdateGlobalSecondaryIndex is not yet supported");
+        let on_demand_sentence = Some(on_demand_sentence);
         for (update, pay_per_request, expected) in [
             (json!({ "IndexName": "gsi" }), true, on_demand_sentence),
             (
@@ -429,6 +502,11 @@ mod tests {
             (
                 json!({ "IndexName": "gsi", "ProvisionedThroughput": provisioned }),
                 false,
+                None,
+            ),
+            (
+                json!({ "IndexName": "gsi", "ProvisionedThroughput": provisioned, "OnDemandThroughput": on_demand }),
+                false,
                 not_yet,
             ),
             (
@@ -441,9 +519,85 @@ mod tests {
             validate_gsi_updates(&request).expect("the element rules pass; the mode decides");
             assert!(has_bare_update(&request));
             assert_eq!(
-                message(refuse_bare_updates(&request, pay_per_request)),
-                expected,
+                refusal(refuse_bare_updates(
+                    &request,
+                    pay_per_request,
+                    !pay_per_request
+                )),
+                expected.map(str::to_owned),
                 "{update} pay_per_request={pay_per_request}"
+            );
+        }
+    }
+
+    /// The units of an Update's ProvisionedThroughput, measured 2026-11-25 on
+    /// a table name that does not exist (each request twice): each row the
+    /// throughput sent and the answer, or `None` for none (the service then
+    /// answered ResourceNotFoundException).
+    #[test]
+    fn an_update_throughput_is_checked_with_the_measured_member_sentences() {
+        let at = |unit: &str| {
+            format!("'globalSecondaryIndexUpdates.1.member.update.provisionedThroughput.{unit}'")
+        };
+        let below = |n: i64, unit: &str| {
+            format!(
+                "1 validation error detected: Value '{n}' at {} failed to satisfy constraint: \
+                 Member must have value greater than or equal to 1",
+                at(unit)
+            )
+        };
+        let null = |unit: &str| {
+            format!(
+                "Value null at {} failed to satisfy constraint: Member must not be null",
+                at(unit)
+            )
+        };
+        let rows = [
+            (
+                json!({ "ReadCapacityUnits": 5, "WriteCapacityUnits": 5 }),
+                None,
+            ),
+            (
+                json!({ "ReadCapacityUnits": 1_000_000_000, "WriteCapacityUnits": 5 }),
+                None,
+            ),
+            (
+                json!({ "ReadCapacityUnits": 0, "WriteCapacityUnits": 5 }),
+                Some(below(0, "readCapacityUnits")),
+            ),
+            (
+                json!({ "ReadCapacityUnits": 5, "WriteCapacityUnits": 0 }),
+                Some(below(0, "writeCapacityUnits")),
+            ),
+            (
+                json!({ "ReadCapacityUnits": -1, "WriteCapacityUnits": 5 }),
+                Some(below(-1, "readCapacityUnits")),
+            ),
+            (
+                json!({ "ReadCapacityUnits": 5 }),
+                Some(format!(
+                    "1 validation error detected: {}",
+                    null("writeCapacityUnits")
+                )),
+            ),
+            (
+                json!({}),
+                Some(format!(
+                    "2 validation errors detected: {}; {}",
+                    null("writeCapacityUnits"),
+                    null("readCapacityUnits")
+                )),
+            ),
+        ];
+        for (throughput, expected) in rows {
+            let request = input(json!([{ "Update": {
+                "IndexName": "gsi",
+                "ProvisionedThroughput": throughput,
+            }}]));
+            assert_eq!(
+                refusal(validate_gsi_updates(&request)),
+                expected,
+                "{throughput}"
             );
         }
     }
@@ -475,7 +629,8 @@ mod tests {
         assert_eq!(
             message(refuse_bare_updates(
                 &switch,
-                pay_per_request_after(&switch, Some(&stored))
+                pay_per_request_after(&switch, Some(&stored)),
+                false
             )),
             "UpdateGlobalSecondaryIndex is not yet supported"
         );
@@ -484,7 +639,8 @@ mod tests {
         assert_eq!(
             message(refuse_bare_updates(
                 &stay,
-                pay_per_request_after(&stay, Some(&stored))
+                pay_per_request_after(&stay, Some(&stored)),
+                false
             )),
             "One or more parameter values were invalid: The only Updates for index: gsi when \
              TableThroughputMode is PAY_PER_REQUEST can be to OnDemandThroughput, WarmThroughput"
@@ -502,12 +658,12 @@ mod tests {
         assert!(has_bare_update(&bare));
         assert!(!has_bare_update(&input(json!([warm_update("gsi")]))));
         assert_eq!(
-            message(refuse_bare_updates(&bare, true)),
+            message(refuse_bare_updates(&bare, true, false)),
             "One or more parameter values were invalid: The only Updates for index: gsi when \
              TableThroughputMode is PAY_PER_REQUEST can be to OnDemandThroughput, WarmThroughput"
         );
-        assert!(message(refuse_bare_updates(&bare, false)).contains("not yet supported"));
-        refuse_bare_updates(&input(json!([warm_update("gsi")])), true).expect("warm update");
+        assert!(message(refuse_bare_updates(&bare, false, true)).contains("not yet supported"));
+        refuse_bare_updates(&input(json!([warm_update("gsi")])), true, false).expect("warm update");
     }
 
     #[test]
