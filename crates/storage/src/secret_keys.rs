@@ -310,8 +310,8 @@ impl SecretKeys {
         secret_cipher::seal(self.key.expose(), secret.as_bytes(), &self.aad(row))
     }
 
-    /// Decrypt the stored secret of `row`. The plaintext is wiped when the
-    /// result drops.
+    /// Decrypt the stored secret of `row`. The returned string is wiped when
+    /// it drops.
     ///
     /// # Errors
     ///

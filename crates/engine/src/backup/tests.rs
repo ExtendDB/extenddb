@@ -39,6 +39,7 @@ use futures::{StreamExt, TryStreamExt};
 use serde_json::{Value, json};
 
 use super::*;
+use crate::backup_requests::{BACKUP_ARN_NOT_VALID, list_backups};
 
 mod migrate_legacy;
 
@@ -6955,7 +6956,7 @@ async fn describe_backup_survives_a_definition_that_does_not_read() {
         let fake = fake_with_backup("AVAILABLE", source(Some(definition("PROVISIONED"))));
         *fake.source_error.lock().unwrap() = Some(err);
         // The backup operations' mapping reports both as a 500
-        // (`storage_err_to_dynamo` in backup.rs), which SDKs retry.
+        // (`storage_err_to_dynamo` in backup_requests.rs), which SDKs retry.
         match describe_backup(&*fake, ACCOUNT, REGION, &own(&arn_text)).await {
             Err(DynamoDbError::InternalServerError(_)) => {}
             other => panic!("{what} must reach the client as an error: {other:?}"),
