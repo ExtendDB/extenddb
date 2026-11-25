@@ -35,36 +35,13 @@ pub(super) fn check_request(
     mut body: Value,
     limits: &LimitsConfig,
 ) -> Result<CheckedRequest, DynamoDbError> {
-    // Pre-scanned before typed deserialization, sequentially: Query stops at
-    // the FIRST invalid enum, checking ReturnConsumedCapacity ahead of Select.
-    // Measured 2026-08-24 (us-east-1): both invalid answers "1 validation
-    // error detected" naming returnConsumedCapacity alone. (Scan is the
-    // opposite on both counts: it aggregates, select-first; see handle_scan.)
-    crate::validate_enum_fields(
-        &body,
-        &[crate::EnumField {
-            json_name: "ReturnConsumedCapacity",
-            valid: &["INDEXES", "TOTAL", "NONE"],
-            clause: crate::EnumClause::Named("returnConsumedCapacity"),
-        }],
-    )?;
+    crate::query_key_values::validate_query_request_body(&body)?;
     // The service checks Select after Limit, the request's parameters, the
     // FilterExpression and the KeyConditionExpression checks below (measured
     // 2026-11-11), so an invalid Select is left out of the typed input and its
-    // error waits for those checks.
-    let select_check = crate::validate_enum_fields(
-        &body,
-        &[crate::EnumField {
-            json_name: "Select",
-            valid: &[
-                "SPECIFIC_ATTRIBUTES",
-                "COUNT",
-                "ALL_ATTRIBUTES",
-                "ALL_PROJECTED_ATTRIBUTES",
-            ],
-            clause: crate::EnumClause::Named("select"),
-        }],
-    );
+    // error waits for those checks. A shape fault elsewhere in the body is
+    // reported ahead of it (see `validate_query_select`).
+    let select_check = crate::query_key_values::validate_query_select(&body);
     if select_check.is_err()
         && let Some(fields) = body.as_object_mut()
     {
@@ -79,16 +56,6 @@ pub(super) fn check_request(
             return Err(crate::deserialize_error(err));
         }
     };
-
-    // Validate Limit >= 1 (REQ-QUERY-001). The service checks Limit ahead of
-    // every other fault measured (2026-11-11, us-east-1).
-    if let Some(limit) = input.limit
-        && limit < 1
-    {
-        return Err(DynamoDbError::ValidationException(
-                "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1".to_owned(),
-            ));
-    }
 
     // Build expression maps from request (used for expression-based parameters)
     let maps = build_expression_maps(
@@ -117,10 +84,13 @@ pub(super) fn check_request(
 }
 
 /// Refuse a `Query` body whose `KeyConditionExpression` has two conditions on
-/// one attribute, with the first fault [`check_request`] finds in it. `names`
-/// is the body's `ExpressionAttributeNames` without the `#`. Authorization
-/// calls this before the IAM decision, as the service refuses such a request
-/// for every principal (measured 2026-11-19, us-east-1).
+/// one attribute, or whose `Select` is invalid, with the first fault
+/// [`check_request`] finds in it. `names` is the body's
+/// `ExpressionAttributeNames` without the `#`. Authorization calls this before
+/// the IAM decision. The service refuses a duplicate for every principal
+/// (measured 2026-11-19, us-east-1). For an invalid `Select`, every principal
+/// gets the `Select` text or a fault that `check_request` reports ahead of it.
+/// That answer is not measured for a principal the policy denies.
 ///
 /// # Errors
 ///
@@ -130,16 +100,18 @@ pub fn refuse_duplicate_key_condition(
     names: &HashMap<String, String>,
     limits: &LimitsConfig,
 ) -> Result<(), DynamoDbError> {
-    let Some(kce) = body.get("KeyConditionExpression").and_then(Value::as_str) else {
-        return Ok(());
-    };
-    let duplicate = tokenize_for(
-        kce,
-        limits.max_expression_tokens,
-        ExpressionKind::KeyCondition,
-    )
-    .is_ok_and(|tokens| has_duplicate_key_condition(&tokens, names));
-    if duplicate {
+    let duplicate = body
+        .get("KeyConditionExpression")
+        .and_then(Value::as_str)
+        .is_some_and(|kce| {
+            tokenize_for(
+                kce,
+                limits.max_expression_tokens,
+                ExpressionKind::KeyCondition,
+            )
+            .is_ok_and(|tokens| has_duplicate_key_condition(&tokens, names))
+        });
+    if duplicate || crate::query_key_values::validate_query_select(body).is_err() {
         check_request(body.clone(), limits)?;
     }
     Ok(())
@@ -209,6 +181,33 @@ mod tests {
     fn a_key_condition_without_a_duplicate_goes_on_to_authorization() {
         for kce in ["pk = :own AND sk = :b", "pk > :own"] {
             assert!(refuse(kce, json!({})).is_ok(), "{kce}");
+        }
+    }
+
+    /// An invalid `Select` is refused before authorization, after the filter
+    /// fault the service reports ahead of it (H3).
+    #[test]
+    fn an_invalid_select_is_refused_before_authorization() {
+        let select = "1 validation error detected: Value 'BOGUS' at 'select' failed to satisfy \
+                      constraint: Member must satisfy enum value set: [SPECIFIC_ATTRIBUTES, \
+                      COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]";
+        let rows = [
+            ("pk = :own", json!({"Select": "BOGUS"}), select),
+            ("pk > :own", json!({"Select": "BOGUS"}), select),
+            (
+                "pk = :own",
+                json!({"Select": "BOGUS", "FilterExpression": "#q = :own"}),
+                "Invalid FilterExpression: An expression attribute name used in the document \
+                 path is not defined; attribute name: #q",
+            ),
+        ];
+        for (kce, extra, want) in rows {
+            let label = format!("{kce} {extra}");
+            let got = refuse(kce, extra);
+            assert!(
+                matches!(&got, Err(DynamoDbError::ValidationException(msg)) if msg == want),
+                "{label}: {got:?}"
+            );
         }
     }
 }

@@ -14,9 +14,7 @@
 //! Two shapes reach the refusal:
 //!
 //! - one or two clauses, none an equality (`pk > :x`, `sk > :x AND zz > :y`).
-//!   `sk_condition` is the first clause, or the second when only the second
-//!   is a `begins_with` (`sk > :x AND begins_with(pk, :n)`), so that the
-//!   engine sees the `begins_with`. The other clause is kept as its operands
+//!   `sk_condition` is the first clause. The second is kept as its operands
 //!   in `extra_sk_conditions`, one `(path, operand)` entry per operand (two
 //!   for `BETWEEN`), so that the references of both clauses are counted as
 //!   used.
@@ -57,29 +55,19 @@ impl KeyCondition {
     /// a well-formed expression; it carries no meaning while `pk_path` is
     /// empty.
     ///
-    /// `sk_condition` keeps one clause whole: the first, or the second when
-    /// only the second is a `begins_with`, because the engine reads the
-    /// operator of a `begins_with` there. The other clause is kept as its
-    /// operands in `extra_sk_conditions`.
+    /// `sk_condition` keeps the first clause whole. The second clause is kept
+    /// as its operands in `extra_sk_conditions`.
     pub(super) fn without_equality(
         first: SortKeyCondition,
         second: Option<SortKeyCondition>,
     ) -> Self {
         let pk_value = first_operand(&first).clone();
-        let is_begins_with =
-            |clause: &SortKeyCondition| matches!(clause, SortKeyCondition::BeginsWith { .. });
-        let (whole, other) = match second {
-            Some(second) if is_begins_with(&second) && !is_begins_with(&first) => {
-                (second, Some(first))
-            }
-            second => (first, second),
-        };
-        let extra_sk_conditions = other.map_or_else(Vec::new, |clause| operands(&clause));
+        let extra_sk_conditions = second.map_or_else(Vec::new, |clause| operands(&clause));
         Self {
             pk_path: Vec::new(),
             pk_value,
             extra_pk_conditions: Vec::new(),
-            sk_condition: Some(whole),
+            sk_condition: Some(first),
             extra_sk_conditions,
         }
     }

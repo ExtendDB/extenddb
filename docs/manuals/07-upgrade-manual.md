@@ -388,6 +388,17 @@ Catalog upgrades change the schema; behavior changes alter how the running serve
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
 
+### v1.1.0: latency `segments` are summed into time buckets
+
+**What changed** (#398). The latency `segments` that `/metrics` and the console's `/console/metrics-data` return come from time buckets per account and operation. 1.0.0 kept one record per request for 24 hours. Each operation's count and means are still exact over the requests that the window covers. Four things change:
+
+- A window of `W` seconds returns at least the last `W` seconds and at most one bucket width more: up to 1 second more for `LastMinute` and `Last5Minutes`, and up to 60 seconds more for `LastHour` and `LastDay`. 1.0.0 cut each window exactly `W` seconds before the query.
+- `AllTime` returns the same as `LastDay`. 1.0.0 returned every record it held, 24 hours to 24 hours and 5 minutes of requests.
+- The operations are sorted by name. 1.0.0 returned them in no fixed order.
+- The segment memory is bounded: at most 111,488 bytes of buckets for each operation of each account that sent it in the last day, about 4.46 MB for an account that sends all 40 operations every second. 1.0.0 kept about 250 bytes for each request that reached dispatch in the last 24 hours, so the sizing rule in the deployment guide's [Process Memory](11-deployment-guide.md#process-memory) section stops applying after the upgrade.
+
+No catalog migration or configuration change is required.
+
 ### v1.1.0: `Query` refuses a second condition on one key attribute
 
 **What changed** (#484). Some `Query` requests that 1.0.0 ran now get `ValidationException`, as DynamoDB answers them:

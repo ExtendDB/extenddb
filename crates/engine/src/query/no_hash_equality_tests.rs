@@ -4,8 +4,7 @@
 //! The order of the checks `refuse_without_hash_equality` runs on a key
 //! condition that skipped the classification in `handle_query`. Every
 //! expected refusal was measured on the service: `pk > :x` on 2026-10-21,
-//! the value type rules and `begins_with` with a second clause on
-//! 2026-11-01, the rest on 2026-10-23.
+//! the value type rules on 2026-11-01, the rest on 2026-10-23.
 
 use std::collections::HashMap;
 
@@ -19,9 +18,6 @@ use super::refuse_without_hash_equality;
 
 const TYPE_MISMATCH: &str = "One or more parameter values were invalid: Condition parameter \
                              type does not match schema type";
-const BEGINS_WITH_ON_N: &str = "Invalid KeyConditionExpression: Incorrect operand type for \
-                                operator or function; operator or function: begins_with, \
-                                operand type: N";
 const NOT_SUPPORTED: &str = "Query key condition not supported";
 const MISSED_PK: &str = "Query condition missed key schema element: pk";
 const MISSED_G: &str = "Query condition missed key schema element: g";
@@ -111,36 +107,11 @@ fn single_attribute_schema_reports_a_wrong_typed_value_before_the_wording() {
 }
 
 #[test]
-fn single_attribute_schema_reports_begins_with_on_a_number_key_before_the_wording() {
-    // Rows 6 and 6b.
+fn a_number_value_on_a_number_key_gets_the_wording() {
+    // Row 6b. Row 6, `begins_with(pk, :n)`, is refused by the parse.
     let schema = [key("pk", KeyType::Hash)];
     let definitions = [definition("pk", ScalarAttributeType::N)];
-    assert_refusals(
-        &[
-            ("begins_with(pk, :n)", BEGINS_WITH_ON_N),
-            ("pk > :n", NOT_SUPPORTED),
-        ],
-        &schema,
-        &definitions,
-    );
-}
-
-#[test]
-fn begins_with_on_a_number_hash_attribute_is_reported_in_either_clause() {
-    // HASH `pk` (N) and RANGE `sk` (S), as measured.
-    let schema = [key("pk", KeyType::Hash), key("sk", KeyType::Range)];
-    let definitions = [
-        definition("pk", ScalarAttributeType::N),
-        definition("sk", ScalarAttributeType::S),
-    ];
-    assert_refusals(
-        &[
-            ("begins_with(pk, :n) AND sk > :x", BEGINS_WITH_ON_N),
-            ("sk > :x AND begins_with(pk, :n)", BEGINS_WITH_ON_N),
-        ],
-        &schema,
-        &definitions,
-    );
+    assert_refusals(&[("pk > :n", NOT_SUPPORTED)], &schema, &definitions);
 }
 
 #[test]
