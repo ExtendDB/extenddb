@@ -402,9 +402,10 @@ fn message_key(error: &DynamoDbError) -> &'static str {
 ///
 /// Real DynamoDB validates request format before authentication. The message
 /// is `Start of structure or map found where not expected: ` followed by the
-/// `Display` text of the `serde_json` parse error. Every entry point that
-/// parses a raw request body builds the error from this helper so a malformed
-/// request gets the same answer on every transport.
+/// `Display` text of the `serde_json` parse error. The engine's
+/// `parse_request` builds its error from this helper. The HTTP server parses
+/// a request body with its own parser (`crates/server/src/request_parse.rs`),
+/// whose answer to a body can differ.
 #[doc(hidden)]
 #[must_use]
 pub fn malformed_body_error(error: &serde_json::Error) -> DynamoDbError {

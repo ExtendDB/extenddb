@@ -51,7 +51,7 @@ mod list_tables;
 #[cfg(feature = "partiql")]
 mod partiql;
 mod pre_dispatch;
-pub use pre_dispatch::{ParsedRequest, parse_request};
+pub use pre_dispatch::{KnownOperation, ParsedRequest, check_operation, parse_request};
 // `private_fs` creates the private directories the filesystem-backed
 // import/export use; it has no wasm32 consumer and uses unix/windows file
 // APIs, so it is compiled only off wasm.
@@ -121,8 +121,8 @@ use extenddb_core::types::TableKeyInfo;
 ///
 /// Real `DynamoDB` validates the operation name before checking authentication.
 /// An unknown operation with no auth headers returns `UnknownOperationException`,
-/// not `MissingAuthenticationToken`. `parse_request` applies this check, and
-/// the server calls it before auth.
+/// not `MissingAuthenticationToken`. `check_operation` applies this check:
+/// the server calls it before auth, and `parse_request` calls it first.
 #[must_use]
 pub fn is_known_operation(operation: &str) -> bool {
     matches!(

@@ -83,17 +83,38 @@ pub(crate) async fn handle_request(
         Err(e) => return error_response(&e, &request_id),
     };
 
-    // --- Pre-auth request checks ---
-    // Real DynamoDB validates the operation name, then the request format
-    // (empty body, invalid JSON), before checking authentication: an unknown
-    // operation returns UnknownOperationException even without auth headers,
-    // and a malformed request gets 400 regardless of auth state.
-    // `extenddb_engine::parse_request` makes both checks, in that order; the
-    // module doc of extenddb-engine's `src/pre_dispatch.rs` says which checks
-    // belong in the engine rather than here.
-    let request = match extenddb_engine::parse_request(&operation, &body) {
-        Ok(request) => request,
+    // --- Pre-auth operation validation ---
+    // Real DynamoDB validates the operation name before checking authentication.
+    // An unknown operation returns UnknownOperationException even without auth
+    // headers. `extenddb_engine::check_operation` is the first of the engine's
+    // two steps, and `admit` below is the second; the module doc of
+    // extenddb-engine's `src/pre_dispatch.rs` says which checks belong in the
+    // engine rather than here.
+    let known_operation = match extenddb_engine::check_operation(&operation) {
+        Ok(known_operation) => known_operation,
         Err(e) => return error_response(&e, &request_id),
+    };
+
+    // --- Pre-auth body validation ---
+    // The service checks the request's JSON syntax before authentication at
+    // every depth but refuses an over deep body only after it (measured
+    // 2026-11-19: unsigned, a 20000 wrapper PutItem is
+    // MissingAuthenticationTokenException, and the same body without its last
+    // byte SerializationException). A body within serde_json's default depth
+    // is parsed here, as it always was. A deeper one only has its syntax
+    // checked, by a walk that does not recurse, until the caller is
+    // authenticated, so no unauthenticated request makes this thread recurse
+    // past that depth (see request_parse).
+    let depth = crate::request_parse::nesting_depth(&body);
+    let pre_auth_input = if depth <= crate::request_parse::UNAUTHENTICATED_PARSE_DEPTH {
+        match crate::request_parse::parse_request_value(&body, depth) {
+            Ok(v) => Some(v),
+            Err(e) => return error_response(&e, &request_id),
+        }
+    } else if let Err(e) = crate::request_parse::check_request_syntax(&body, depth) {
+        return error_response(&e, &request_id);
+    } else {
+        None
     };
 
     // --- Auth segment ---
@@ -104,6 +125,16 @@ pub(crate) async fn handle_request(
     };
     #[allow(clippy::cast_precision_loss)]
     let auth_us = auth_start.elapsed().as_micros() as f64;
+
+    // A body deeper than the pre-auth depth is parsed now, on a thread whose
+    // stack `REQUEST_WORKER_STACK_SIZE` sizes for the ceiling.
+    let input: Value = match pre_auth_input {
+        Some(v) => v,
+        None => match crate::request_parse::parse_request_value(&body, depth) {
+            Ok(v) => v,
+            Err(e) => return error_response(&e, &request_id),
+        },
+    };
 
     let account_id: Arc<str> = match &identity {
         extenddb_auth::AuthIdentity::User { account_id, .. }
@@ -116,7 +147,7 @@ pub(crate) async fn handle_request(
     // and an enable here, for every caller and before any table is read, where
     // the service would authorize them first. The point-in-time refusal is the
     // only one `admit` makes, so the log line names it.
-    let input: Value = match request.admit() {
+    let input: Value = match known_operation.with_body(input).admit() {
         Ok(input) => input,
         Err(e) => {
             tracing::warn!(

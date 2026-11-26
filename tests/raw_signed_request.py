@@ -29,8 +29,17 @@ def signed_post(
     body: Any,
     session_token: str | None = None,
 ) -> requests.Response:
-    """POST ``body`` as JSON to ``operation`` under the DynamoDB JSON-1.0 protocol."""
-    payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
+    """POST ``body`` as JSON to ``operation`` under the DynamoDB JSON-1.0 protocol.
+
+    ``body`` is JSON-encoded here unless it is already ``bytes``: a body nested
+    too deep for ``json.dumps`` to build without recursing is passed as the raw
+    bytes it should be sent as.
+    """
+    payload = (
+        bytes(body)
+        if isinstance(body, (bytes, bytearray))
+        else json.dumps(body, separators=(",", ":")).encode("utf-8")
+    )
     headers = {
         "X-Amz-Target": f"DynamoDB_20120810.{operation}",
         "Content-Type": "application/x-amz-json-1.0",

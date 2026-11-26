@@ -271,6 +271,9 @@ fn check_request_timeout_secs(secs: u64) -> Result<(), String> {
 /// after it stopped, the PID file is removed and a fatal message is written
 /// to the configured [`LogTarget`].
 ///
+/// The runtime this runs on must give its threads at least
+/// [`crate::REQUEST_WORKER_STACK_SIZE`] of stack; see [`crate::start_server`].
+///
 /// # Errors
 ///
 /// Returns an error if logging init, backend component creation, cache
