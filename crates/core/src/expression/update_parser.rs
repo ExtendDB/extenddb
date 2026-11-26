@@ -19,10 +19,13 @@
 //! A parenthesized value and a function call each nest one level. Past
 //! `max_expression_depth` levels the expression is refused before the parser
 //! recurses further, so the stack a parse takes stays bounded whatever the
-//! size and token limits allow.
+//! size and token limits allow. The call that crosses the limit is checked by
+//! name, and a call the semantic pass refuses gets that refusal instead of the
+//! depth error. No other call is checked.
 
 use super::ast::{ArithOp, Expr, UpdateAction};
 use super::parser_common;
+use super::semantics::check_update_call_name;
 use super::tokenizer::Token;
 use crate::error::DynamoDbError;
 
@@ -60,59 +63,45 @@ impl Nesting {
     }
 }
 
+/// One `SET`, `REMOVE`, `ADD`, or `DELETE` section of a parsed update
+/// expression: its keyword and the range of actions it holds, in expression
+/// order. A keyword may appear more than once in the parse; the semantic pass
+/// reports the repetition after it has checked the section's own actions, as
+/// Amazon DynamoDB does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateSection {
+    pub keyword: &'static str,
+    pub actions: std::ops::Range<usize>,
+}
+
+/// The grammar-level result of parsing an `UpdateExpression`: the actions in
+/// expression order and the sections that group them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedUpdate {
+    pub actions: Vec<UpdateAction>,
+    pub sections: Vec<UpdateSection>,
+}
+
 /// Parse an update expression token stream into a list of actions, with the
-/// default depth limit.
+/// grammar-only checks plus the repeated-section rule, and the default depth
+/// limit.
+///
+/// Callers that go on to run [`validate_update_semantics`](super::semantics::validate_update_semantics) should use
+/// [`parse_update_sections`] instead; this entry point serves the storage
+/// crates' tests and other callers that need only a parsed action list.
 ///
 /// # Errors
 ///
 /// Returns `ValidationException` for syntax errors or depth exceeded.
 pub fn parse_update(tokens: &[Token]) -> Result<Vec<UpdateAction>, DynamoDbError> {
-    parser_common::check_redundant_parens(tokens).map_err(|msg| {
-        DynamoDbError::ValidationException(format!("Invalid UpdateExpression: {msg}"))
-    })?;
-
-    let mut pos = 0;
-    let mut actions = Vec::new();
-    let mut nesting = Nesting::new(DEFAULT_MAX_DEPTH);
-
-    while pos < tokens.len() {
-        match &tokens[pos] {
-            Token::Set => {
-                pos += 1;
-                parse_set_actions(tokens, &mut pos, &mut actions, &mut nesting)?;
-            }
-            Token::Remove => {
-                pos += 1;
-                parse_remove_actions(tokens, &mut pos, &mut actions)?;
-            }
-            Token::Add => {
-                pos += 1;
-                parse_add_actions(tokens, &mut pos, &mut actions)?;
-            }
-            Token::Delete => {
-                pos += 1;
-                parse_delete_actions(tokens, &mut pos, &mut actions)?;
-            }
-            _ => {
-                return Err(validation_err(
-                    "Invalid UpdateExpression: expected SET, REMOVE, ADD, or DELETE",
-                ));
-            }
-        }
-    }
-
-    if actions.is_empty() {
-        return Err(validation_err(
-            "Invalid UpdateExpression: expression must contain at least one action",
-        ));
-    }
-
-    Ok(actions)
+    let parsed = parse_update_sections(tokens, None, DEFAULT_MAX_DEPTH)?;
+    check_sections_unique(&parsed.sections)?;
+    Ok(parsed.actions)
 }
 
 /// Parse an update expression with DynamoDB-compatible syntax error
-/// messages, nesting at most `max_depth` levels of parentheses and function
-/// calls.
+/// messages, including the repeated-section rule, nesting at most
+/// `max_depth` levels of parentheses and function calls.
 ///
 /// # Errors
 ///
@@ -122,40 +111,87 @@ pub fn parse_update_from(
     source: &str,
     max_depth: usize,
 ) -> Result<Vec<UpdateAction>, DynamoDbError> {
+    let parsed = parse_update_sections(tokens, Some(source), max_depth)?;
+    check_sections_unique(&parsed.sections)?;
+    Ok(parsed.actions)
+}
+
+/// Grammar pass over an `UpdateExpression`.
+///
+/// Only syntax is checked here: the section keywords, the shape of each
+/// action, and balanced parentheses. Any identifier followed by `(` parses
+/// as a function call with its name kept as written, operand counts are not
+/// checked, and a section keyword may repeat. Amazon DynamoDB reports every
+/// syntax error ahead of every semantic one, so the semantic rules (function
+/// names, operand counts and types, undefined references, repeated sections,
+/// overlapping paths) run afterwards in [`validate_update_semantics`](super::semantics::validate_update_semantics) over
+/// the returned tree.
+///
+/// `source`, when given, enables the service's `Syntax error; token: ...,
+/// near: ...` wording for an unexpected token at section level.
+///
+/// The parse nests at most `max_depth` levels of parentheses and function
+/// calls.
+///
+/// # Errors
+///
+/// Returns `ValidationException` for syntax errors or depth exceeded.
+pub fn parse_update_sections(
+    tokens: &[Token],
+    source: Option<&str>,
+    max_depth: usize,
+) -> Result<ParsedUpdate, DynamoDbError> {
     parser_common::check_redundant_parens(tokens).map_err(|msg| {
         DynamoDbError::ValidationException(format!("Invalid UpdateExpression: {msg}"))
     })?;
 
     let mut pos = 0;
     let mut actions = Vec::new();
+    let mut sections: Vec<UpdateSection> = Vec::new();
     let mut nesting = Nesting::new(max_depth);
 
     while pos < tokens.len() {
-        match &tokens[pos] {
+        let start = actions.len();
+        let keyword = match &tokens[pos] {
             Token::Set => {
                 pos += 1;
                 parse_set_actions(tokens, &mut pos, &mut actions, &mut nesting)?;
+                "SET"
             }
             Token::Remove => {
                 pos += 1;
                 parse_remove_actions(tokens, &mut pos, &mut actions)?;
+                "REMOVE"
             }
             Token::Add => {
                 pos += 1;
                 parse_add_actions(tokens, &mut pos, &mut actions)?;
+                "ADD"
             }
             Token::Delete => {
                 pos += 1;
                 parse_delete_actions(tokens, &mut pos, &mut actions)?;
+                "DELETE"
             }
             token => {
-                let token_text = token_display_text(token);
-                let near = build_near_context(source, &token_text);
-                return Err(validation_err(&format!(
-                    "Invalid UpdateExpression: Syntax error; token: \"{token_text}\", near: \"{near}\""
-                )));
+                return Err(match source {
+                    Some(source) => {
+                        let token_text = token_display_text(token);
+                        let near = build_near_context(source, &token_text);
+                        validation_err(&format!(
+                            "Invalid UpdateExpression: Syntax error; token: \"{token_text}\", near: \"{near}\""
+                        ))
+                    }
+                    None => validation_err(
+                        "Invalid UpdateExpression: expected SET, REMOVE, ADD, or DELETE",
+                    ),
+                });
             }
-        }
+        };
+        sections.push(UpdateSection {
+            keyword,
+            actions: start..actions.len(),
+        });
     }
 
     if actions.is_empty() {
@@ -164,7 +200,24 @@ pub fn parse_update_from(
         ));
     }
 
-    Ok(actions)
+    Ok(ParsedUpdate { actions, sections })
+}
+
+/// Each of SET, REMOVE, ADD, and DELETE may open one section. The first
+/// repeated section in order of appearance is named.
+pub(crate) fn check_sections_unique(sections: &[UpdateSection]) -> Result<(), DynamoDbError> {
+    for (i, section) in sections.iter().enumerate() {
+        if sections[..i].iter().any(|s| s.keyword == section.keyword) {
+            return Err(repeated_section_err(section.keyword));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn repeated_section_err(keyword: &str) -> DynamoDbError {
+    validation_err(&format!(
+        "Invalid UpdateExpression: The \"{keyword}\" section can only be used once in an update expression;"
+    ))
 }
 
 fn token_display_text(token: &Token) -> String {
@@ -277,7 +330,17 @@ fn parse_value_expr(
     Ok(left)
 }
 
-/// Parse a SET operand: path, placeholder, or function call (`if_not_exists`, `list_append`).
+/// Parse a SET operand: path, placeholder, or function call.
+///
+/// Any identifier followed by `(` is a function call, with the name kept as
+/// written. This pass checks grammar only: whether the name exists, its case,
+/// and its operand count are checked afterwards by
+/// `validate_update_semantics`, over the whole parsed expression. The call
+/// that crosses the depth limit is the exception: that pass never runs, so its
+/// name is checked here (see `depth_tests.rs`). Amazon DynamoDB reports every
+/// syntax error before any semantic error (measured 2026-10-14: `SET x =
+/// foo(x), b = ` reports the syntax error at the end, not the unknown function
+/// name), and deferring the semantic checks gives the same precedence.
 fn parse_set_operand(
     tokens: &[Token],
     pos: &mut usize,
@@ -294,11 +357,10 @@ fn parse_set_operand(
             Ok(expr)
         }
         Token::Ident(name) => {
-            let fn_lower = name.to_ascii_lowercase();
-            if is_set_function(&fn_lower)
-                && *pos + 1 < tokens.len()
-                && tokens[*pos + 1] == Token::LParen
-            {
+            if *pos + 1 < tokens.len() && tokens[*pos + 1] == Token::LParen {
+                if nesting.depth >= nesting.max_depth {
+                    check_update_call_name(name)?;
+                }
                 nesting.enter()?;
                 let call = parse_set_function_call(tokens, pos, nesting)?;
                 nesting.leave();
@@ -333,7 +395,7 @@ fn parse_set_function_call(
     nesting: &mut Nesting,
 ) -> Result<Expr, DynamoDbError> {
     let name = match &tokens[*pos] {
-        Token::Ident(n) => n.to_ascii_lowercase(),
+        Token::Ident(n) => n.clone(),
         _ => {
             return Err(validation_err(
                 "Invalid UpdateExpression: expected function name",
@@ -343,21 +405,23 @@ fn parse_set_function_call(
     *pos += 1;
     parser_common::expect_token(tokens, pos, &Token::LParen, "(", "UpdateExpression")?;
 
-    let mut args = Vec::new();
-    if *pos < tokens.len() && tokens[*pos] != Token::RParen {
+    // The grammar requires at least one operand between the parentheses. A
+    // call with an empty operand list, `foo()`, is a grammar error on the
+    // service, reported at the `)` with the text below, before the function
+    // name is looked at (measured 2026-10-14).
+    if *pos < tokens.len() && tokens[*pos] == Token::RParen {
+        return Err(validation_err(
+            "Invalid UpdateExpression: Syntax error; token: \")\", near: \"()\"",
+        ));
+    }
+    let mut args = vec![parse_set_operand(tokens, pos, nesting)?];
+    while *pos < tokens.len() && tokens[*pos] == Token::Comma {
+        *pos += 1;
         args.push(parse_set_operand(tokens, pos, nesting)?);
-        while *pos < tokens.len() && tokens[*pos] == Token::Comma {
-            *pos += 1;
-            args.push(parse_set_operand(tokens, pos, nesting)?);
-        }
     }
 
     parser_common::expect_token(tokens, pos, &Token::RParen, ")", "UpdateExpression")?;
     Ok(Expr::Function { name, args })
-}
-
-fn is_set_function(name: &str) -> bool {
-    matches!(name, "if_not_exists" | "list_append")
 }
 
 /// Parse ADD actions: `ADD path value (, path value)*`
@@ -398,7 +462,7 @@ fn parse_delete_actions(
     Ok(())
 }
 
-/// Parse a value for ADD/DELETE — only placeholders are valid.
+/// Parse a value for ADD/DELETE. Only placeholders are valid.
 fn parse_add_delete_value(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbError> {
     if *pos >= tokens.len() {
         return Err(validation_err(

@@ -42,6 +42,7 @@
 //!
 //! [`validate_and_normalize_number`]: super::validate_and_normalize_number
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use super::{MAX_MAGNITUDE, MAX_SIGNIFICANT_DIGITS, MIN_MAGNITUDE, NumberFault, normalize_number};
@@ -165,6 +166,40 @@ pub fn expected_values(
             .map_err(single_write)?;
     }
     Ok(())
+}
+
+/// Refuse the `AttributeValueList` of a legacy `ScanFilter`, `QueryFilter` or
+/// `KeyConditions` entry holding a number the service cannot read, with no
+/// prefix. An empty number answers with the colon, on its own and inside an
+/// `NS`, `L` or `M`. Measured on a top-level value on 2026-10-24, and on
+/// 2026-11-12 inside `NS`, `L`, `M` and an `M` in an `L`, in all three maps.
+///
+/// The rules check each number as `read` gives it, and a refusal names that
+/// text. The engine passes its fold of the Unicode decimal digits of the Basic
+/// Multilingual Plane to ASCII digits, as the service reads those digits
+/// (#565). Measured on a table that does not exist, each body twice, in all
+/// three maps: one U+FF11 answers `ResourceNotFoundException` (2026-11-24),
+/// and so does one inside an `NS`, an `L` and an `M` (2026-11-25). Also on
+/// 2026-11-25, `a` then U+FF11 answers the number message for `a1`, on its
+/// own and inside an `L`. U+00E9, `1` then U+00E9, U+00B2, U+00BD, U+2160,
+/// U+FF0D then `1`, `1` then U+FF0E then `5`, and U+1D7CF answer it for the
+/// value as sent, and so does U+00E9 inside an `NS`, an `L` and an `M`.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` with the service's text.
+pub fn condition_values(
+    values: &[AttributeValue],
+    read: fn(&str) -> Cow<'_, str>,
+) -> Result<(), DynamoDbError> {
+    let mut numbers = Vec::new();
+    for value in values {
+        collect_numbers(value, &mut numbers);
+    }
+    numbers
+        .into_iter()
+        .try_for_each(|n| number_text(EmptyText::WithColon, &read(n)))
+        .map_err(bare)
 }
 
 /// Refuse a `PutItem` item holding a number the service cannot read or a

@@ -59,7 +59,7 @@ class TestExpressionErrorPrefix:
             ConditionExpression="status = :v",
             ExpressionAttributeValues={":v": {"S": "x"}},
         ))
-        assert msg == f"Invalid ConditionExpression: {RESERVED}"
+        assert msg == f"1 validation error detected: Invalid ConditionExpression: {RESERVED}"
 
     def test_condition_prefix_delete(self, dynamodb_client, hash_table):
         msg = _msg(lambda: dynamodb_client.delete_item(
@@ -67,7 +67,7 @@ class TestExpressionErrorPrefix:
             ConditionExpression="status = :v",
             ExpressionAttributeValues={":v": {"S": "x"}},
         ))
-        assert msg == f"Invalid ConditionExpression: {RESERVED}"
+        assert msg == f"1 validation error detected: Invalid ConditionExpression: {RESERVED}"
 
     def test_update_prefix(self, dynamodb_client, hash_table):
         msg = _msg(lambda: dynamodb_client.update_item(
@@ -75,7 +75,7 @@ class TestExpressionErrorPrefix:
             UpdateExpression="SET status = :v",
             ExpressionAttributeValues={":v": {"S": "x"}},
         ))
-        assert msg == f"Invalid UpdateExpression: {RESERVED}"
+        assert msg == f"1 validation error detected: Invalid UpdateExpression: {RESERVED}"
 
     def test_key_condition_prefix(self, dynamodb_client, hash_table):
         msg = _msg(lambda: dynamodb_client.query(

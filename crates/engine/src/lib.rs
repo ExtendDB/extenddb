@@ -7,6 +7,7 @@
 //! inputs, dispatches operations by name, and translates storage errors into
 //! `DynamoDB`-format error responses.
 
+mod attribute_updates;
 // The store-backed backup subsystem depends on an S3/filesystem store,
 // networking and background threads that have no wasm32 target, so it is
 // compiled only off wasm; on wasm32 `dispatch` refuses its four operations
@@ -50,6 +51,7 @@ mod legacy_filter;
 mod list_tables;
 #[cfg(feature = "partiql")]
 mod partiql;
+mod per_table_capacity;
 mod pre_dispatch;
 pub use pre_dispatch::{ParsedRequest, parse_request};
 // `private_fs` creates the private directories the filesystem-backed

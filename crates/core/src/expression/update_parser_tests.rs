@@ -1,6 +1,8 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
+//! The update-expression parser tests.
+
 use super::*;
 use crate::expression::ast::{ArithOp, Expr, PathElement, UpdateAction};
 use crate::expression::tokenizer::tokenize;
@@ -153,7 +155,7 @@ fn parse_list_index_in_set() {
 #[test]
 fn parse_empty_expression_rejected() {
     let tokens = tokenize("").unwrap();
-    // Empty tokens — parse_update should fail
+    // Empty tokens, so parse_update must fail.
     let err = parse_update(&tokens).unwrap_err();
     assert!(
         matches!(err, DynamoDbError::ValidationException(msg) if msg.contains("at least one action"))

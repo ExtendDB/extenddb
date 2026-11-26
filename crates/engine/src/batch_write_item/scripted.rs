@@ -187,6 +187,7 @@ pub(super) fn table(name: &str) -> TableKeyInfo {
         local_secondary_indexes: vec![],
         stream_specification: None,
         vector_indexes: vec![],
+        creation_date_time: 0.0,
     }
 }
 

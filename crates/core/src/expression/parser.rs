@@ -19,11 +19,17 @@
 //! function_call → function_name '(' operand ( ',' operand )* ')'
 //! ```
 //!
-//! A parenthesized condition, a `NOT` and a `size` call read as an operand
-//! each nest one level, up to `max_depth`.
+//! A parenthesized condition, a `NOT` and a function call read as an operand
+//! each nest one level, up to `max_depth`. A function call that is the
+//! condition itself nests none. Past `max_depth`, the call that crosses the
+//! limit is checked by name, as an operand, and a call the semantic pass
+//! refuses there gets that refusal instead of the depth error. No other call
+//! is checked.
 
 use super::ast::{CompareOp, Expr};
+use super::kind::ExpressionKind;
 use super::parser_common;
+use super::semantics::check_condition_call_name;
 use super::tokenizer::Token;
 use crate::error::DynamoDbError;
 
@@ -136,19 +142,24 @@ fn parse_primary(
         return Ok(expr);
     }
 
-    // Try function call: ident followed by '('
-    if let Token::Ident(name) = &tokens[*pos] {
-        let fn_name_lower = name.to_ascii_lowercase();
-        if is_function_name(&fn_name_lower)
-            && *pos + 1 < tokens.len()
-            && tokens[*pos + 1] == Token::LParen
-        {
-            return parse_function_call(tokens, pos, depth, max_depth);
-        }
-    }
-
-    // Operand — then check for comparator, BETWEEN, or IN
-    let left = parse_operand(tokens, pos, depth, max_depth)?;
+    // Operand (a path, a placeholder, or a function call), then a comparator,
+    // BETWEEN, or IN. A function call with nothing after it is the condition
+    // itself. This pass checks grammar only: whether that function may stand
+    // alone, whether its name exists, and how many operands it takes are
+    // checked afterwards by `validate_condition_semantics`, over the whole
+    // parsed tree. Amazon DynamoDB reports every syntax error before any
+    // semantic error, so `foo(pk) AND` is reported as the syntax error at the
+    // end, not as the unknown function name that comes first in the text.
+    // Deferring the semantic checks here gives the same precedence.
+    //
+    // `parse_operand` counts a function call as one nesting level. A call
+    // that is the condition itself is not an operand and nests no level, so
+    // it is parsed here directly.
+    let left = if is_condition_call(tokens, *pos) {
+        parse_function_call(tokens, pos, depth, max_depth)?
+    } else {
+        parse_operand(tokens, pos, depth, max_depth)?
+    };
 
     if *pos < tokens.len() {
         if let Some(op) = try_comparator(&tokens[*pos]) {
@@ -191,6 +202,10 @@ fn parse_primary(
         }
     }
 
+    if matches!(left, Expr::Function { .. }) {
+        return Ok(left);
+    }
+
     // Bare operand is not a valid condition on its own
     Err(validation_err(
         "Invalid ConditionExpression: expected comparison operator or function call",
@@ -216,13 +231,14 @@ fn parse_operand(
             Ok(expr)
         }
         Token::Ident(name) => {
-            // size(path) is a function that returns a value, usable as an operand
-            if name.eq_ignore_ascii_case("size")
-                && *pos + 1 < tokens.len()
-                && tokens[*pos + 1] == Token::LParen
-            {
+            // A function call, `size(path)` or any other name, nests one
+            // level. Its name is checked by `validate_condition_semantics`.
+            // When this call crosses the limit, that pass never runs, so its
+            // name is checked here (see `depth_tests.rs`).
+            if *pos + 1 < tokens.len() && tokens[*pos + 1] == Token::LParen {
                 *depth += 1;
                 if *depth > max_depth {
+                    check_condition_call_name(name, true, ExpressionKind::Condition)?;
                     return Err(validation_err(
                         "Invalid ConditionExpression: expression nesting depth exceeded",
                     ));
@@ -251,7 +267,7 @@ fn parse_function_call(
     max_depth: usize,
 ) -> Result<Expr, DynamoDbError> {
     let name = match &tokens[*pos] {
-        Token::Ident(n) => n.to_ascii_lowercase(),
+        Token::Ident(n) => n.clone(),
         _ => {
             return Err(validation_err(
                 "Invalid ConditionExpression: expected function name",
@@ -262,13 +278,22 @@ fn parse_function_call(
 
     parser_common::expect_token(tokens, pos, &Token::LParen, "(", "ConditionExpression")?;
 
-    let mut args = Vec::new();
-    if *pos < tokens.len() && tokens[*pos] != Token::RParen {
+    // The grammar requires at least one operand between the parentheses. A
+    // call with an empty operand list, `foo()` or `attribute_exists()`, is a
+    // grammar error on the service, reported at the `)` with the text below,
+    // before the function name or its operand count is looked at (measured
+    // 2026-10-14 and again 2026-10-23, where `attribute_exists()` and `foo()`
+    // both answered this text; `begins_with(pk)` with one operand is instead
+    // the semantic operand-count error from `validate_condition_semantics`).
+    if *pos < tokens.len() && tokens[*pos] == Token::RParen {
+        return Err(validation_err(
+            "Invalid ConditionExpression: Syntax error; token: \")\", near: \"()\"",
+        ));
+    }
+    let mut args = vec![parse_operand(tokens, pos, depth, max_depth)?];
+    while *pos < tokens.len() && tokens[*pos] == Token::Comma {
+        *pos += 1;
         args.push(parse_operand(tokens, pos, depth, max_depth)?);
-        while *pos < tokens.len() && tokens[*pos] == Token::Comma {
-            *pos += 1;
-            args.push(parse_operand(tokens, pos, depth, max_depth)?);
-        }
     }
 
     parser_common::expect_token(tokens, pos, &Token::RParen, ")", "ConditionExpression")?;
@@ -288,11 +313,31 @@ fn try_comparator(token: &Token) -> Option<CompareOp> {
     }
 }
 
-fn is_function_name(name: &str) -> bool {
-    matches!(
-        name,
-        "attribute_exists" | "attribute_not_exists" | "attribute_type" | "begins_with" | "contains"
-    )
+/// Whether the tokens at `pos` start a function call with no comparator,
+/// `BETWEEN` or `IN` after its closing parenthesis, that is, a call that is
+/// the condition itself and not an operand.
+fn is_condition_call(tokens: &[Token], pos: usize) -> bool {
+    if !matches!(tokens.get(pos), Some(Token::Ident(_)))
+        || tokens.get(pos + 1) != Some(&Token::LParen)
+    {
+        return false;
+    }
+    let mut open = 0_usize;
+    for (i, token) in tokens.iter().enumerate().skip(pos + 1) {
+        match token {
+            Token::LParen => open += 1,
+            Token::RParen => {
+                open -= 1;
+                if open == 0 {
+                    return !tokens.get(i + 1).is_some_and(|next| {
+                        try_comparator(next).is_some() || matches!(next, Token::Between | Token::In)
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn validation_err(msg: &str) -> DynamoDbError {
