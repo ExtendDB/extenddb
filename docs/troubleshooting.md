@@ -330,7 +330,13 @@ The last ring write of `rotate` is conditional too, on the two-DEK ring of its f
 
 **Cause:** The server keeps the key that opens stored secrets and the cached signing keys in memory it locks out of swap and core dumps, sized by `[auth.cache] max_entries` (two 32-byte slots per entry, 640,000 bytes for the default, plus one buffer per runtime worker thread). The process's memlock limit is below that size: 64 KiB is the kernel default before Linux 5.16, and `mlock` of 1 MiB fails with `ENOMEM` under it. With `key_file` set the server refuses to start and names the memlock limit it needs; without `key_file` it logs a warning and starts with the keys in unlocked memory.
 
-**Fix:** Raise the limit: `LimitMEMLOCK=16M` in the systemd unit, `--ulimit memlock=` for a container, or a smaller `max_entries`. To start anyway with `key_file` set, `[auth.encryption] require_locked_memory = false` turns the refusal into a warning. The startup log line names the protection in force: `memfd_secret`, locked pages, or none. `serve` sets the key store up before it reads the catalog, so a refusal from the catalog (one of the entries above) can follow at the next start once the limit is raised.
+**Fix:** Raise the limit: `LimitMEMLOCK=16M` in the systemd unit, `--ulimit memlock=` for a container, or a smaller `max_entries`. To start anyway with `key_file` set, `[auth.encryption] require_locked_memory = false` turns the refusal into a warning. The startup log line names the protection in force: `memfd_secret`, locked pages, or none. On kernels that count `memfd_secret` pages per user, locked pages can also mean that this user's stores together exceed the limit. See the admin guide's Memory locking section. `serve` sets the key store up before it reads the catalog, so a refusal from the catalog (one of the entries above) can follow at the next start once the limit is raised.
+
+### The server dies with a bus error at startup
+
+**Cause:** ExtendDB 1.0.0 fills its `memfd_secret` key store with writes from the process. Kernels with upstream commit 97d34aa65c29 refuse a page when the user's stores together exceed the limit. Writing that page ends the process with SIGBUS before the server logs its startup line. The shell reports a bus error and exit status 135. systemd logs `status=7/BUS`.
+
+**Fix:** Upgrade to a release after 1.0.0, whose store uses locked pages in that case. On 1.0.0, raise the memlock limit to the sum of that user's stores.
 
 ### A request fails with `InternalServerError` (HTTP 500) after a key change
 

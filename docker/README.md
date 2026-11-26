@@ -209,6 +209,11 @@ the default cache size needs, so pass `--ulimit memlock=16777216:16777216` to
 a server that cannot lock its memory refuses to start and names the limit it
 needs. `--cap-add IPC_LOCK` alone does not raise the limit for uid 10001.
 
+On kernels with upstream commit 97d34aa65c29, containers that run as uid 10001
+on one host without a user namespace share one `memfd_secret` page count. A
+server whose store does not fit in the remaining limit uses locked pages
+(`key_store=locked pages`).
+
 The switch to the KEK file and a later key replacement run while no server
 runs, as one-off containers with the same secret: a one-off swarm service, a
 `podman run`, or a Kubernetes Job while the Deployment has 0 replicas. Each runs
