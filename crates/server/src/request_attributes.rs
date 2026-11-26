@@ -61,8 +61,11 @@
 //!   projected name, and (measured 2026-11-10) under a Deny on the index's
 //!   sort key, so the index's sort key is not in the key. The other rules for
 //!   a local secondary index follow from that key content.
-//! - `SearchVectors`: the paths in `ProjectionExpression`. A `SearchVectors`
-//!   with no `ProjectionExpression` leaves the key absent.
+//! - `SearchVectors`: the key is absent, whatever `ProjectionExpression` and
+//!   `SearchConditionExpression` name, as on the service (measured
+//!   2026-11-21): a Deny gated on `Null` `true` refused each `SearchVectors`
+//!   sent, a projected one included, and a Deny on an attribute refused none,
+//!   whether the projection or the condition named it.
 //! - `BatchGetItem`: per table, the table's key attributes, `AttributesToGet`,
 //!   and the paths in `ProjectionExpression`, as for `GetItem`. The names in
 //!   `Keys` are not read: on a table that does not exist, under a Deny on the
@@ -118,12 +121,13 @@
 //! key attributes that the key already holds, so the service cannot show
 //! whether it adds names of its own there.
 //!
-//! An expression is read with the tokenizer and parser the engine uses, under
-//! the same size, token and depth limits, so on every operation other than
-//! `SearchVectors` an expression the engine accepts gives all its names here.
-//! `SearchVectors` matches a `#name` against `ExpressionAttributeNames` keys
-//! with their leading `#` removed, so it accepts keys this module does not
-//! resolve, and its `SearchConditionExpression` is not read here (both #729).
+//! This module reads each expression the list above puts in the key with the
+//! engine's tokenizer and parser. The same size, token and depth limits
+//! apply, so an expression the engine accepts gives all its names here. This
+//! module finds a `#name` in `ExpressionAttributeNames` as written. On every
+//! operation the engine refuses a key that is not `#` followed by letters,
+//! digits and underscores. So this module and the engine resolve each
+//! placeholder to the same name.
 //! An expression the parser refuses gives none, and the engine refuses the
 //! same request without reading or writing an item. A key condition also
 //! goes through the engine's reserved-word check when
@@ -172,7 +176,6 @@ pub(crate) fn single_table_attributes(
             names.map_keys(input.get("ScanFilter"));
             names.range_read(input);
         }
-        "SearchVectors" => names.projection(input.get("ProjectionExpression")),
         _ => return None,
     }
     names.finish()

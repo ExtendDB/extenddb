@@ -13,6 +13,34 @@ type against a running server.
 An IndexName outside ``[a-zA-Z0-9_.-]+`` (``vidx/extra``) gets ValidationException
 for every caller, before the policy decision, as Query and Scan do.
 
+The ``ROWS`` that run under ``deny(ssn)``, ``allow-all`` and the
+``deny(null)`` rows that expect AccessDeniedException were measured on
+DynamoDB in us-east-1 on 2026-11-21, each request twice with the same answer.
+The ``deny(ssn)`` rows ran under a session policy that allows ``dynamodb:*``
+and denies ``dynamodb:*`` under ``ForAnyValue:StringEquals
+{"dynamodb:Attributes": ["ssn"]}``, the ``deny(null)`` rows under one that
+denies under ``Null {"dynamodb:Attributes": "true"}``, and the ``allow-all``
+rows with no session policy. The service sets no ``dynamodb:Attributes``
+value on a SearchVectors request: it serves a projection of ``ssn`` under
+``deny(ssn)``, and refuses every search under ``deny(null)``.
+
+The four ``deny(null)`` rows that expect ValidationException were not sent to
+DynamoDB under the ``Null`` session policy. They rest on three measurements.
+On 2026-11-21 in us-east-1 a Deny gated on ``Null`` ``true`` refused every
+SearchVectors sent. On 2026-11-24 in us-east-1 the same four requests, sent on
+a table ARN in another account, which the service refuses at its
+authorization decision, each answered ValidationException, so the service
+makes these checks ahead of that decision. Each row's message is the one the
+service answers for the same request without a policy.
+
+The ``deny(not-x)`` and ``allow(not-x)`` rows were not sent to DynamoDB
+either. They gate the statement on a bare ``StringNotEquals
+{"dynamodb:Attributes": "x"}``. IAM matches a bare negated operator on an
+absent multivalued key, measured on IAM for ``dynamodb:Attributes``, and the
+service leaves the key absent on every SearchVectors, as the ``deny(null)``
+rows show. So the Deny refuses every search, a projected one included, and
+the Allow grants a search.
+
 The principals are builtin-IAM users provisioned through the management API.
 The module skips when the backend does not support vector indexes, unless
 ``EXTENDDB_EXPECT_VECTORS=1``, which makes that a failure.
@@ -38,10 +66,13 @@ from botocore.awsrequest import AWSRequest
 from botocore.credentials import Credentials
 
 from management_helpers import ManagementClient
-from test_search_vectors_condition_limit import _expect_vectors
+from search_vectors_wire import expect_vectors as _expect_vectors
+from search_vectors_wire import message as _error_message
 
 REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 VECTOR = [{"N": "0.1"}, {"N": "0.2"}, {"N": "0.3"}, {"N": "0.4"}]
+KEY = {"pk": {"S": "p1"}}
+SSN_ITEM = {"ssn": {"S": "123-45-6789"}}
 
 ALLOW_ALL = {
     "Version": "2012-10-17",
@@ -138,7 +169,8 @@ def principal(mgmt, account_id):
 
 @pytest.fixture(scope="module")
 def vector_table(principal):
-    """A table with one item and an ACTIVE vector index ``vidx``."""
+    """A table with one item and an ACTIVE vector index ``vidx`` whose search
+    schema holds ``cat`` and ``ssn``, as the measured table's did."""
     expected = _expect_vectors()
     admin = principal(ALLOW_ALL)
     name = f"sv{uuid.uuid4().hex[:10]}"
@@ -146,7 +178,9 @@ def vector_table(principal):
         "CreateTable",
         {
             "TableName": name,
-            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "AttributeDefinitions": [
+                {"AttributeName": a, "AttributeType": "S"} for a in ("pk", "cat", "ssn")
+            ],
             "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
             "BillingMode": "PAY_PER_REQUEST",
             "VectorIndexes": [
@@ -155,6 +189,10 @@ def vector_table(principal):
                     "Dimensions": 4,
                     "DistanceFunction": "COSINE",
                     "VectorAttribute": {"AttributeName": "emb"},
+                    "SearchSchema": [
+                        {"AttributeName": a, "SearchSchemaElementType": "INLINE_FILTER"}
+                        for a in ("cat", "ssn")
+                    ],
                     "Projection": {"ProjectionType": "ALL"},
                 }
             ],
@@ -176,18 +214,18 @@ def vector_table(principal):
                 break
             assert time.monotonic() < deadline, f"{name} did not become ACTIVE: {table}"
             time.sleep(0.05)
-        item = {"pk": {"S": "p1"}, "emb": {"L": VECTOR}}
+        item = {**KEY, "emb": {"L": VECTOR}, "cat": {"S": "c1"}, **SSN_ITEM}
         put = admin.post("PutItem", {"TableName": name, "Item": item})
         assert put.status_code == 200, put.text
-        yield {"name": name, "table_arn": table["TableArn"]}
+        yield {"name": name, "table_arn": table["TableArn"], "admin": admin}
     finally:
         admin.post("DeleteTable", {"TableName": name})
 
 
-def _search(p: Principal, table: str, index: str = "vidx") -> requests.Response:
+def _search(p: Principal, table: str, index: str = "vidx", **members) -> requests.Response:
     return p.post(
         "SearchVectors",
-        {"TableName": table, "IndexName": index, "SearchVector": VECTOR, "TopK": 5},
+        {"TableName": table, "IndexName": index, "SearchVector": VECTOR, "TopK": 5, **members},
     )
 
 
@@ -264,3 +302,266 @@ def test_index_name_outside_the_pattern_is_refused_before_authorization(
     resp = _search(principal(policy), vector_table["name"], "vidx/extra")
     assert resp.status_code == 400, resp.text
     assert _error_type(resp) == "ValidationException", resp.text
+
+
+# -- deny(ssn) ---------------------------------------------------------------
+
+DENY_SSN = {
+    "Version": "2012-10-17",
+    "Statement": [
+        {"Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"},
+        {
+            "Effect": "Deny",
+            "Action": "dynamodb:*",
+            "Resource": "*",
+            "Condition": {"ForAnyValue:StringEquals": {"dynamodb:Attributes": ["ssn"]}},
+        },
+    ],
+}
+
+
+def _bare_not_equals(effect: str) -> dict:
+    statement = {
+        "Effect": effect,
+        "Action": "dynamodb:*" if effect == "Deny" else "dynamodb:SearchVectors",
+        "Resource": "*",
+        "Condition": {"StringNotEquals": {"dynamodb:Attributes": "x"}},
+    }
+    allow = [{"Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"}]
+    return {
+        "Version": "2012-10-17",
+        "Statement": (allow if effect == "Deny" else []) + [statement],
+    }
+
+
+DENY_NULL = {
+    "Version": "2012-10-17",
+    "Statement": [
+        {"Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"},
+        {
+            "Effect": "Deny",
+            "Action": "dynamodb:*",
+            "Resource": "*",
+            "Condition": {"Null": {"dynamodb:Attributes": "true"}},
+        },
+    ],
+}
+SSN_VALUE = {":v": SSN_ITEM["ssn"]}
+CAT_ONLY = [{"cat": {"S": "c1"}}]
+DENIED = "perform: dynamodb:SearchVectors on resource:"
+TOP_K_OF_ZERO = (
+    "1 validation error detected: Value at 'TopK' failed to satisfy constraint: "
+    "Member must have value greater than or equal to 1"
+)
+
+
+LONG_KEY = "#" + "a" * 255
+
+
+def _invalid_key(key: str) -> str:
+    return f'ExpressionAttributeNames contains invalid key: Syntax error; key: "{key}"'
+
+
+# The measured rows: the policy, the members added to the search, then the
+# error type and message, or None and the items the search returns.
+ROWS = {
+    "projection-of-ssn": (
+        "deny(ssn)",
+        {"ProjectionExpression": "ssn"},
+        None,
+        [SSN_ITEM],
+    ),
+    "projection-of-cat-and-ssn": (
+        "deny(ssn)",
+        {"ProjectionExpression": "cat, ssn"},
+        None,
+        [{"cat": {"S": "c1"}, **SSN_ITEM}],
+    ),
+    "null-projection-of-cat": (
+        "deny(null)",
+        {"ProjectionExpression": "cat"},
+        "AccessDeniedException",
+        DENIED,
+    ),
+    "null-no-projection": ("deny(null)", {}, "AccessDeniedException", DENIED),
+    "null-condition-on-cat": (
+        "deny(null)",
+        {
+            "SearchConditionExpression": "cat = :v",
+            "ExpressionAttributeValues": SSN_VALUE,
+        },
+        "AccessDeniedException",
+        DENIED,
+    ),
+    "null-key-without-hash-before-the-policy": (
+        "deny(null)",
+        {"ProjectionExpression": "#n", "ExpressionAttributeNames": {"n": "cat"}},
+        "ValidationException",
+        _invalid_key("n"),
+    ),
+    "null-empty-map-before-the-policy": (
+        "deny(null)",
+        {"ProjectionExpression": "cat", "ExpressionAttributeNames": {}},
+        "ValidationException",
+        "ExpressionAttributeNames must not be empty",
+    ),
+    "null-top-k-of-zero-before-the-policy": (
+        "deny(null)",
+        {"TopK": 0, "ProjectionExpression": "cat"},
+        "ValidationException",
+        TOP_K_OF_ZERO,
+    ),
+    "null-unused-name-before-the-policy": (
+        "deny(null)",
+        {
+            "SearchConditionExpression": "cat = :v",
+            "ExpressionAttributeNames": {"#u": "ssn"},
+            "ExpressionAttributeValues": SSN_VALUE,
+        },
+        "ValidationException",
+        "Value provided in ExpressionAttributeNames unused in expressions: keys: {#u}",
+    ),
+    "not-x-no-projection": ("deny(not-x)", {}, "AccessDeniedException", DENIED),
+    "not-x-projection-of-cat": (
+        "deny(not-x)",
+        {"ProjectionExpression": "cat"},
+        "AccessDeniedException",
+        DENIED,
+    ),
+    "not-x-allow-grants-a-projection": (
+        "allow(not-x)",
+        {"ProjectionExpression": "cat"},
+        None,
+        CAT_ONLY,
+    ),
+    "projection-key-without-hash": (
+        "deny(ssn)",
+        {"ProjectionExpression": "#n", "ExpressionAttributeNames": {"n": "ssn"}},
+        "ValidationException",
+        _invalid_key("n"),
+    ),
+    "projection-key-with-two-hashes": (
+        "deny(ssn)",
+        {"ProjectionExpression": "#n", "ExpressionAttributeNames": {"##n": "ssn"}},
+        "ValidationException",
+        _invalid_key("##n"),
+    ),
+    "condition-key-without-hash": (
+        "deny(ssn)",
+        {
+            "SearchConditionExpression": "#s = :v",
+            "ExpressionAttributeNames": {"s": "ssn"},
+            "ExpressionAttributeValues": SSN_VALUE,
+            "ProjectionExpression": "cat",
+        },
+        "ValidationException",
+        _invalid_key("s"),
+    ),
+    "condition-on-ssn": (
+        "deny(ssn)",
+        {
+            "SearchConditionExpression": "ssn = :v",
+            "ExpressionAttributeValues": SSN_VALUE,
+            "ProjectionExpression": "cat",
+        },
+        None,
+        CAT_ONLY,
+    ),
+    "condition-on-ssn-by-placeholder": (
+        "deny(ssn)",
+        {
+            "SearchConditionExpression": "#s = :v",
+            "ExpressionAttributeNames": {"#s": "ssn"},
+            "ExpressionAttributeValues": SSN_VALUE,
+            "ProjectionExpression": "cat",
+        },
+        None,
+        CAT_ONLY,
+    ),
+    "empty-map": (
+        "allow-all",
+        {"ProjectionExpression": "cat", "ExpressionAttributeNames": {}},
+        "ValidationException",
+        "ExpressionAttributeNames must not be empty",
+    ),
+    "key-of-256-bytes": (
+        "allow-all",
+        {"ProjectionExpression": LONG_KEY, "ExpressionAttributeNames": {LONG_KEY: "ssn"}},
+        "ValidationException",
+        "ExpressionAttributeNames contains invalid key: The expression attribute map "
+        "contains a key that is too long; size of key: 256",
+    ),
+    "empty-name": (
+        "allow-all",
+        {"ProjectionExpression": "#n", "ExpressionAttributeNames": {"#n": ""}},
+        "ValidationException",
+        "ExpressionAttributeNames contains invalid value: Empty attribute name for key #n",
+    ),
+    "top-k-of-zero-before-the-key-check": (
+        "allow-all",
+        {"TopK": 0, "ProjectionExpression": "#n", "ExpressionAttributeNames": {"n": "ssn"}},
+        "ValidationException",
+        TOP_K_OF_ZERO,
+    ),
+    "value-not-a-string-text-tracked-by-1012": (
+        "allow-all",
+        {"ProjectionExpression": "#n", "ExpressionAttributeNames": {"n": 5}},
+        "SerializationException",
+        "invalid type: integer `5`, expected a string",
+    ),
+}
+
+
+@pytest.fixture(scope="module")
+def deny_ssn(principal):
+    return principal(DENY_SSN)
+
+
+@pytest.fixture(scope="module")
+def deny_null(principal):
+    return principal(DENY_NULL)
+
+
+@pytest.fixture(scope="module")
+def bare_not_equals(principal):
+    return {
+        "deny(not-x)": principal(_bare_not_equals("Deny")),
+        "allow(not-x)": principal(_bare_not_equals("Allow")),
+    }
+
+
+def test_the_deny_on_ssn_refuses_a_get_item_of_ssn(deny_ssn, vector_table):
+    # The control: the policy is in force for this principal.
+    resp = deny_ssn.post(
+        "GetItem",
+        {"TableName": vector_table["name"], "Key": KEY, "ProjectionExpression": "ssn"},
+    )
+    assert resp.status_code == 400, resp.text
+    assert _error_type(resp) == "AccessDeniedException", resp.text
+    message = _error_message(resp)
+    assert "perform: dynamodb:GetItem on resource:" in message, message
+    assert "with an explicit deny in an identity-based policy" in message, message
+
+
+@pytest.mark.parametrize("row", list(ROWS))
+def test_search_expression_attribute_names(
+    deny_ssn, deny_null, bare_not_equals, vector_table, row
+):
+    policy, members, error, expected = ROWS[row]
+    principals = {"deny(ssn)": deny_ssn, "deny(null)": deny_null, **bare_not_equals}
+    p = principals.get(policy, vector_table["admin"])
+    resp = _search(p, vector_table["name"], **members)
+    if error is None:
+        assert resp.status_code == 200, f"{row}: {resp.text}"
+        assert [r["Item"] for r in resp.json()["SearchResults"]] == expected, row
+    else:
+        assert resp.status_code == 400, f"{row}: {resp.text}"
+        assert _error_type(resp) == error, f"{row}: {resp.text}"
+        message = _error_message(resp)
+        if error in ("SerializationException", "AccessDeniedException"):
+            # The service ends the first text with the position in the body,
+            # and ExtendDB puts a sentence of its own before it. The second
+            # names the principal and the resource.
+            assert expected in message, f"{row}: {message}"
+        else:
+            assert message == expected, f"{row}: {message}"

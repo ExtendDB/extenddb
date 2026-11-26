@@ -58,6 +58,12 @@ exact path is verified would make a recall regression indistinguishable from a
 scan defect. The partition predicate and the inline filters are evaluated in SQL
 so that `LIMIT` applies after filtering rather than before.
 
+Amended with ADR-0031: the partition predicate and the inline-filter equalities
+are still evaluated in SQL. A search condition they cannot express, a range,
+`IN`, `OR`, `NOT`, a function or a Number equality, is evaluated in ExtendDB on
+the rows the SQL returns in score order, page by page, until `top_k` rows match,
+so `top_k` still applies after filtering.
+
 **4. A score that PostgreSQL cannot compute is bounded in SQL, not in Rust.**
 
 pgvector accumulates distances in single precision, so for vectors of ordinary

@@ -19,6 +19,9 @@ use sqlx::PgPool;
 
 use crate::data::catalog_check::CheckFailure;
 
+#[path = "catalog_settings_read.rs"]
+mod settings_read;
+
 /// PostgreSQL-backed catalog store for settings, metrics, and rate limiting.
 ///
 /// Holds a connection pool to the catalog database. Created once at startup
@@ -92,6 +95,16 @@ impl extenddb_storage::management_store::SettingsStore for PostgresCatalogStore 
                     })?;
             Ok(row.map(|(v,)| v))
         })
+    }
+
+    fn get_setting_bounded(
+        &self,
+        key: &str,
+    ) -> futures::future::BoxFuture<'_, OpResult<Option<String>>> {
+        Box::pin(settings_read::get_setting_bounded(
+            self.pool.clone(),
+            key.to_string(),
+        ))
     }
 
     fn set_setting(&self, key: &str, value: &str) -> futures::future::BoxFuture<'_, OpResult<()>> {

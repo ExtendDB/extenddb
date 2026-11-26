@@ -109,6 +109,29 @@ pub fn validate_search_condition_expression(
     Ok(conditions)
 }
 
+/// The `ExpressionAttributeNames` keys the equality-only grammar can resolve
+/// in `expr`, for the unused-names check.
+#[must_use]
+pub fn search_condition_name_refs(expr: &str) -> std::collections::BTreeSet<&str> {
+    phases::name_refs(expr)
+}
+
+/// The refusal of a search condition that omits a declared HASH attribute,
+/// in both grammars. Measured against the service 2026-08-19 (us-east-1).
+pub(crate) const HASH_ATTRIBUTES_MISSING: &str =
+    "SearchConditionExpression must have all HASH attributes in configured SearchSchema";
+
+/// The refusal of a condition on an attribute outside the search schema, in
+/// both grammars. Wording measured against the service on 2026-08-11; the
+/// service's own grammar slip ("attributes that is not") is reproduced
+/// because clients receive it.
+pub(crate) fn not_in_search_schema(attribute: &str) -> String {
+    format!(
+        "SearchConditionExpression must not contain any attributes that is not in \
+         SearchSchema. Invalid attribute: {attribute}"
+    )
+}
+
 /// Validate resolved filter conditions against a vector index search schema.
 ///
 /// Enforces that every referenced attribute belongs to the search schema, that
@@ -141,12 +164,7 @@ pub fn validate_conditions_against_search_schema(
             .iter()
             .any(|condition| condition.attribute_name == element.attribute_name);
         if !present {
-            return Err(invalid(
-                // Measured against the service 2026-08-19 (us-east-1): an
-                // expression that omits a declared HASH attribute is refused
-                // with exactly this text.
-                "SearchConditionExpression must have all HASH attributes in configured SearchSchema",
-            ));
+            return Err(invalid(HASH_ATTRIBUTES_MISSING));
         }
     }
 
@@ -162,11 +180,7 @@ pub fn validate_conditions_against_search_schema(
             .iter()
             .any(|element| element.attribute_name == condition.attribute_name);
         if !in_schema {
-            return Err(invalid(format!(
-                "SearchConditionExpression must not contain any attributes that is not in \
-                 SearchSchema. Invalid attribute: {}",
-                condition.attribute_name
-            )));
+            return Err(invalid(not_in_search_schema(&condition.attribute_name)));
         }
     }
 

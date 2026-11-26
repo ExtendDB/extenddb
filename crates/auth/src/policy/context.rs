@@ -177,6 +177,11 @@ pub struct RequestParams {
     /// Attribute names being read/written (for `dynamodb:Attributes`).
     /// `None` when not applicable.
     pub attributes: Option<Vec<String>>,
+    /// Whether the service leaves `dynamodb:Attributes` absent on this request
+    /// as ExtendDB does, so that a bare negated operator over the absent key
+    /// matches as it does in IAM. `true` for `SearchVectors`, which sets no
+    /// value for the key on the service.
+    pub attributes_absent_on_service: bool,
     /// The Select parameter value (for `dynamodb:Select`).
     pub select: Option<String>,
     /// The `ReturnValues` parameter value (for `dynamodb:ReturnValues`).
@@ -249,6 +254,9 @@ pub struct RequestContext {
     pub leading_keys: Option<Vec<String>>,
     /// Attribute names being read/written.
     pub attributes: Option<Vec<String>>,
+    /// Whether the service leaves `dynamodb:Attributes` absent on this
+    /// request (see [`RequestParams::attributes_absent_on_service`]).
+    pub attributes_absent_on_service: bool,
     /// The Select parameter value.
     pub select: Option<String>,
     /// The `ReturnValues` parameter value.
@@ -321,6 +329,7 @@ impl RequestContext {
             resource_tags,
             leading_keys: params.leading_keys,
             attributes: params.attributes,
+            attributes_absent_on_service: params.attributes_absent_on_service,
             select: params.select,
             return_values: params.return_values,
             return_consumed_capacity: params.return_consumed_capacity,
@@ -474,23 +483,27 @@ impl ConditionContext for RequestContext {
 
     fn bare_negated_matches_absent_multivalued_key(&self, key: &str) -> bool {
         // IAM matches a bare negated operator on any absent multivalued key.
-        // ExtendDB applies that only to `aws:TagKeys`, which it populates on
+        // ExtendDB applies that to `aws:TagKeys`, which it populates on
         // exactly the three operations the AWS service authorization reference
         // lists it for (TagResource, UntagResource, CreateTable with Tags), so
-        // its absence here is the service's absence. `dynamodb:LeadingKeys` is
-        // left absent on query shapes the extractor cannot pin to a partition
-        // value, where the service populates it. `dynamodb:Attributes` is
-        // absent only on a `SearchVectors` with no `ProjectionExpression`
-        // (#729) and, on a table that does not exist, on a `GetItem`,
-        // transaction `Get` or `BatchGetItem` that names no attribute outside
-        // its keys, a `Query` whose key condition the key condition parser
-        // refuses and that names none elsewhere, and a `Scan` that names none.
-        // On the service the key is present on a `Scan` that names no
-        // attribute, and an Allow gated on a bare `StringNotEquals` over it
-        // grants no `Scan` (measured 2026-11-01).
-        // For those two keys an absent key keeps the no-match rule, so an
-        // Allow gated on a bare negated operator over them grants nothing.
-        super::casefold::case_fold(key) == "aws:tagkeys"
+        // its absence here is the service's absence. It applies it to
+        // `dynamodb:Attributes` on a `SearchVectors`, where the service sets
+        // no value for the key whatever the projection and the condition name
+        // (measured 2026-11-21: a Deny gated on `Null` `true` refused every
+        // search, a projected one included), and ExtendDB sets none either.
+        // `dynamodb:LeadingKeys` is left absent on query shapes the extractor
+        // cannot pin to a partition value, where the service populates it.
+        // `dynamodb:Attributes` is otherwise absent only on a table that does
+        // not exist, on a `GetItem`, transaction `Get` or `BatchGetItem` that
+        // names no attribute outside its keys, a `Query` whose key condition
+        // the key condition parser refuses and that names none elsewhere, and
+        // a `Scan` that names none. On the service the key is present on a
+        // `Scan` that names no attribute, and an Allow gated on a bare
+        // `StringNotEquals` over it grants no `Scan` (measured 2026-11-01).
+        // For those cases an absent key keeps the no-match rule, so an Allow
+        // gated on a bare negated operator over them grants nothing.
+        let key = super::casefold::case_fold(key);
+        key == "aws:tagkeys" || (key == "dynamodb:attributes" && self.attributes_absent_on_service)
     }
 }
 

@@ -207,6 +207,8 @@ mod table_engine;
 mod table_helpers;
 mod update_table;
 mod vector_bench;
+#[cfg(all(test, feature = "search-inequality-filters"))]
+mod vector_filter_tests;
 mod vector_search;
 mod warm_throughput;
 mod worker;

@@ -11,6 +11,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
+default = ["search-inequality-filters"]
 # Developer mode: plain HTTP on loopback, open authorization (SigV4
 # authentication still enforced), seeded dev credential. A build-time profile
 # for local development and CI. The thin bin enforces that it is paired with the
@@ -18,6 +19,15 @@ homepage.workspace = true
 dev-mode = ["extenddb-config/dev-mode"]
 mongodb-test-hooks = ["extenddb-server/mongodb-test-hooks"]
 backup-test-hooks = ["extenddb-server/backup-test-hooks"]
+# SearchVectors inequality filters: the extended SearchConditionExpression
+# grammar (comparators, BETWEEN, IN, OR, NOT, attribute_exists and
+# attribute_not_exists) for the accounts the `search_inequality_filters`
+# runtime setting names, every account when it is absent. On by default.
+# The workspace takes the server without its default features, so this
+# feature decides the server's: with it off, the server and the engine are
+# built without it, SearchVectors accepts only an AND of equalities, and
+# `settings` has no `search_inequality_filters` key.
+search-inequality-filters = ["extenddb-server/search-inequality-filters"]
 
 [dependencies]
 extenddb-auth = { workspace = true }
