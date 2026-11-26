@@ -269,9 +269,9 @@ def test_disable_while_disabled_is_refused(run):
 def test_disable_response_omits_the_specification_and_keeps_the_latest_stream(run):
     assert run["disable"]["status"] == 200, run["disable"]
     desc = run["disable"]["response"]["TableDescription"]
-    # The service answers TableStatus UPDATING here; ExtendDB applies every
-    # UpdateTable change at once and answers ACTIVE, for stream changes as for
-    # billing-mode changes, so the status is not asserted.
+    # The service answers TableStatus UPDATING here; ExtendDB answers UPDATING
+    # for control_plane_delay_seconds, which can end before the response, so
+    # the status is not asserted.
     assert "StreamSpecification" not in desc
     enabled = run["describe_enabled"]
     assert desc["LatestStreamArn"] == enabled["LatestStreamArn"]

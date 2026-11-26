@@ -18,8 +18,8 @@ use extenddb_core::types::{
 use extenddb_storage::TableEngine;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{
-    effective_attribute_definitions, index_arn, merge_attribute_definitions, sk_info, stream_arn,
-    table_arn,
+    effective_attribute_definitions, enters_updating, index_arn, merge_attribute_definitions,
+    reported_status, sk_info, stream_arn, table_arn,
 };
 
 use crate::MongoEngine;
@@ -968,6 +968,14 @@ impl MongoEngine {
             }
         }
 
+        if enters_updating(&input) {
+            let delay_secs = self.control_plane_delay_seconds().await;
+            if delay_secs > 0.0 {
+                let at = bson::DateTime::now().timestamp_millis() + (delay_secs * 1000.0) as i64;
+                update_doc.insert("status_transition_at", bson::DateTime::from_millis(at));
+            }
+        }
+
         if !update_doc.is_empty() {
             let mut filter = active_table_filter(&table_filter);
             filter.extend(stream_guard);
@@ -1533,13 +1541,18 @@ impl MongoEngine {
             .to_string();
 
         let status_str = doc.get_str("table_status").unwrap_or("ACTIVE");
-        let table_status = match status_str {
+        let stored_status = match status_str {
             "CREATING" => TableStatus::Creating,
             "ACTIVE" => TableStatus::Active,
             "DELETING" => TableStatus::Deleting,
             "UPDATING" => TableStatus::Updating,
             _ => TableStatus::Active,
         };
+        let table_status = reported_status(
+            stored_status,
+            doc.get_datetime("status_transition_at").ok().copied(),
+            bson::DateTime::now(),
+        );
 
         let creation_dt = doc
             .get_datetime("creation_date_time")

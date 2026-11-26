@@ -38,6 +38,8 @@ pub use warm_throughput::{
     warm_throughput_record_for_update, warm_throughput_record_json, warm_throughput_updating_until,
 };
 
+use extenddb_core::types::{TableStatus, UpdateTableInput};
+
 /// Whether an UpdateTable's GSI actions must be refused because the GSIs named
 /// in `building` are `CREATING`: any Create, or a Delete of a GSI that is not
 /// one of them. The service answers both with LimitExceededException ("Only 1
@@ -56,6 +58,39 @@ pub fn building_refuses(
                 .as_ref()
                 .is_some_and(|d| !building.contains(&d.index_name))
     })
+}
+
+/// Whether an UpdateTable opens an `UPDATING` window of
+/// `control_plane_delay_seconds` on its table. Amazon DynamoDB answers
+/// `TableStatus: UPDATING` to a `ProvisionedThroughput` change, a `BillingMode`
+/// switch either way, a `TableClass` change and a stream change, and a
+/// `DescribeTable` sent right after reports `UPDATING` too, until the change
+/// applies; it answers `ACTIVE` to a `DeletionProtectionEnabled`, an
+/// `OnDemandThroughput` or a `WarmThroughput` change alone (measured in
+/// us-east-1 on 2026-11-13, 2026-11-14 and 2026-11-17, the stream disable on
+/// 2026-10-24). Storage keeps the table `ACTIVE` and writes the window's end
+/// to `status_transition_at`; [`reported_status`] reads it back.
+#[must_use]
+pub fn enters_updating(input: &UpdateTableInput) -> bool {
+    input.billing_mode.is_some()
+        || input.provisioned_throughput.is_some()
+        || input.table_class.is_some()
+        || input.stream_specification.is_some()
+}
+
+/// The status a description reports for a table stored as `stored` whose
+/// `status_transition_at` is `transition_at`, at `now` on the clock that
+/// wrote it: `UPDATING` for an `ACTIVE` table inside its window.
+#[must_use]
+pub fn reported_status<T: PartialOrd>(
+    stored: TableStatus,
+    transition_at: Option<T>,
+    now: T,
+) -> TableStatus {
+    match transition_at {
+        Some(at) if stored == TableStatus::Active && at > now => TableStatus::Updating,
+        _ => stored,
+    }
 }
 
 #[cfg(test)]

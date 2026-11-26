@@ -19,10 +19,11 @@ use extenddb_core::types::{
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{
-    building_refuses, effective_attribute_definitions, warm_throughput_record_for_create,
-    warm_throughput_record_json,
+    building_refuses, effective_attribute_definitions, enters_updating,
+    warm_throughput_record_for_create, warm_throughput_record_json,
 };
 
+use crate::sqlite_util::format_timestamp;
 use crate::store::SqliteEngine;
 
 /// Refuse a GSI Create, or a Delete of a GSI other than the one building, while
@@ -696,6 +697,23 @@ impl SqliteEngine {
                      instead",
                 ),
             ));
+        }
+
+        if enters_updating(&input) {
+            let delay_secs = Self::control_plane_delay_secs(&mut tx).await?;
+            if delay_secs > 0.0 {
+                let at = format_timestamp(
+                    time::OffsetDateTime::now_utc() + time::Duration::seconds_f64(delay_secs),
+                );
+                update_col(
+                    &mut tx,
+                    account_id,
+                    &input.table_name,
+                    "status_transition_at",
+                    &at,
+                )
+                .await?;
+            }
         }
 
         tx.commit()

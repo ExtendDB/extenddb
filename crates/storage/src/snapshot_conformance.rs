@@ -1716,16 +1716,17 @@ where
 
 /// Checks that a snapshot cannot be opened on a missing or non-`ACTIVE`
 /// table. `hooks` is the caller's [`hooks_lock`] guard. `table` must not
-/// exist; `set_updating` flips that table's catalog
-/// status to `UPDATING` through the backend test's own catalog access, so
-/// every backend covers the non-`ACTIVE` refusal with the same assertion.
+/// exist; `set_creating` flips that table's catalog status to `CREATING`
+/// through the backend test's own catalog access, so every backend covers
+/// the non-`ACTIVE` refusal with the same assertion. (A table inside an
+/// UpdateTable window reports `UPDATING` and opens as an ACTIVE one does.)
 pub async fn run_refusals<E, F, Fut, S, SFut>(
     hooks: &HooksGuard,
     engine: &E,
     account: &str,
     table: &str,
     pump: F,
-    set_updating: S,
+    set_creating: S,
 ) where
     E: SnapshotEngine + TableEngine + Send + Sync,
     F: FnMut() -> Fut,
@@ -1749,7 +1750,7 @@ pub async fn run_refusals<E, F, Fut, S, SFut>(
         .open_table_snapshot(account, table)
         .await
         .expect("an ACTIVE table opens");
-    set_updating(table.to_owned()).await;
+    set_creating(table.to_owned()).await;
     let err = engine
         .open_table_snapshot(account, table)
         .await

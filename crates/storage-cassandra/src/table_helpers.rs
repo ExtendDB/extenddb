@@ -12,7 +12,9 @@ use extenddb_core::types::{
     TableStatus,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{index_arn, parse_warm_throughput_record, stream_arn};
+use extenddb_storage::util::{
+    index_arn, parse_warm_throughput_record, reported_status, stream_arn,
+};
 
 use crate::CassandraEngine;
 
@@ -128,7 +130,7 @@ impl CassandraEngine {
         let table_status_str: String = table_row
             .get_r_by_name("table_status")
             .map_err(|e| StorageError::Internal(format!("Parse table_status: {e}")))?;
-        let table_status = match table_status_str.as_str() {
+        let stored_status = match table_status_str.as_str() {
             "ACTIVE" => TableStatus::Active,
             "CREATING" => TableStatus::Creating,
             "DELETING" => TableStatus::Deleting,
@@ -139,6 +141,14 @@ impl CassandraEngine {
                 )));
             }
         };
+        let transition_at: Option<i64> = table_row
+            .get_by_name("status_transition_at")
+            .map_err(|e| StorageError::Internal(format!("Parse status_transition_at: {e}")))?;
+        let table_status = reported_status(
+            stored_status,
+            transition_at,
+            chrono::Utc::now().timestamp_millis(),
+        );
 
         let creation_timestamp: i64 = table_row
             .get_r_by_name("created_at")

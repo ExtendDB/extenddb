@@ -323,7 +323,7 @@ where
         + 'static,
 {
     let desc = match probe {
-        Ok(desc) if desc.table_status == TableStatus::Active => desc,
+        Ok(desc) if desc.table_status.serves() => desc,
         Ok(_) => {
             return Err(create_backup_storage_err_to_dynamo(
                 StorageError::TableNotActive(table_name.to_owned()),

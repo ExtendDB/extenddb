@@ -337,7 +337,7 @@ async fn snapshot_is_consistent_under_concurrent_writes(shared: bool) {
                 .expect("pump");
         },
         |table| async move {
-            sqlx::query("UPDATE tables SET table_status = 'UPDATING' WHERE table_name = $1")
+            sqlx::query("UPDATE tables SET table_status = 'CREATING' WHERE table_name = $1")
                 .bind(table)
                 .execute(&catalog)
                 .await
@@ -1067,7 +1067,7 @@ async fn snapshot_marker_and_key_order(shared: bool) {
     drop(snapshot);
 
     // A table that is not ACTIVE is refused before any data read.
-    sqlx::query("UPDATE tables SET table_status = 'UPDATING' WHERE table_name = 'ordered'")
+    sqlx::query("UPDATE tables SET table_status = 'CREATING' WHERE table_name = 'ordered'")
         .execute(&s.catalog)
         .await
         .expect("flip status");

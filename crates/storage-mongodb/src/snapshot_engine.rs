@@ -229,7 +229,7 @@ impl MongoEngine {
             .await?;
         // One rule for "is this table ACTIVE": the description's, as
         // DescribeTable reports it.
-        if description.table_status != extenddb_core::types::TableStatus::Active {
+        if !description.table_status.serves() {
             return Err(StorageError::TableNotActive(table_name.to_owned()));
         }
         drop_deleting_indexes(&mut description);
@@ -611,13 +611,13 @@ mod tests {
         })
     }
 
-    async fn set_updating(engine: &MongoEngine, table: &str) {
+    async fn set_creating(engine: &MongoEngine, table: &str) {
         engine
             .catalog_db
             .collection::<Document>("tables")
             .update_one(
                 doc! { "_id": { "account_id": ACCOUNT, "table_name": table } },
-                doc! { "$set": { "table_status": "UPDATING" } },
+                doc! { "$set": { "table_status": "CREATING" } },
             )
             .await
             .expect("flip status");
@@ -655,7 +655,7 @@ mod tests {
             },
             |table| {
                 let engine = &*engine;
-                async move { set_updating(engine, &table).await }
+                async move { set_creating(engine, &table).await }
             },
         )
         .await;
@@ -737,7 +737,7 @@ mod tests {
             .build();
         let mut trailing = 0;
         for _ in 0..20 {
-            set_updating(&engine, "lagging").await;
+            set_creating(&engine, "lagging").await;
             tables
                 .update_one(id.clone(), doc! { "$set": { "table_status": "ACTIVE" } })
                 .write_concern(unjournaled.clone())
