@@ -1,0 +1,54 @@
+# Temporary diagnostic. It sets up the locked key store of extenddb-auth
+# under several memlock limits on the 4-core runner group, on Arm and on
+# Ubuntu 22.04. It runs main, pull request 1409 and the read pre-fault
+# change. We delete the branch after the run.
+name: diag-secmem-verify
+
+on:
+  push:
+    branches: [diag/secmem-verify]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [main, pr1409, prefault]
+        runner: [extenddb_ubuntu-2404_4-core]
+        n: [1, 2, 3, 4]
+        include:
+          - { variant: main, runner: ubuntu-24.04-arm, n: 1 }
+          - { variant: pr1409, runner: ubuntu-24.04-arm, n: 1 }
+          - { variant: prefault, runner: ubuntu-24.04-arm, n: 1 }
+          - { variant: main, runner: ubuntu-22.04, n: 1 }
+          - { variant: pr1409, runner: ubuntu-22.04, n: 1 }
+          - { variant: prefault, runner: ubuntu-22.04, n: 1 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: diag
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: src
+          ref: ${{ matrix.variant == 'main' && 'main' || (matrix.variant == 'pr1409' && 'refs/pull/1409/head' || '40d54c55583e7ff682c9f69850def9ca46f33bae') }}
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Host
+        run: |
+          echo "variant=${{ matrix.variant }} runner=${{ matrix.runner }} image=${ImageVersion:-unset} kernel=$(uname -r) arch=$(uname -m)"
+          echo "memlock=$(ulimit -l)"
+          git -C src log -1 --format='source=%h %s'
+      - name: Store under several memlock limits
+        run: |
+          mkdir -p src/crates/auth/examples
+          cp diag/crates/auth/examples/secmem_diag.rs src/crates/auth/examples/
+          cd src && cargo run -q -p extenddb-auth --example secmem_diag
+      - name: secmem unit tests
+        if: always()
+        run: cd src && cargo test -q -p extenddb-auth --lib secmem -- --test-threads=1
