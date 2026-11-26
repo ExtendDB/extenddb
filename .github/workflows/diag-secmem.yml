@@ -1,0 +1,56 @@
+# Temporary diagnostic. It runs the memlock child test of the secmem module
+# of extenddb-auth on the 4-core runner group and prints the test's output.
+# It also probes memfd_secret under a 64 KiB memlock limit. We delete the
+# branch after the run.
+name: diag-secmem
+
+on:
+  push:
+    branches: [diag/secmem-memlock]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        n: [1, 2, 3, 4, 5, 6]
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Host
+        run: |
+          echo "image=${ImageVersion:-unset} kernel=$(uname -r)"
+          echo "memlock=$(ulimit -l)"
+          id
+          grep -E '^Cap(Inh|Prm|Eff|Bnd|Amb)' /proc/self/status
+      - name: memfd_secret under a 64 KiB memlock limit
+        run: |
+          python3 - <<'EOF'
+          import ctypes, mmap, os, resource
+          libc = ctypes.CDLL(None, use_errno=True)
+          resource.setrlimit(resource.RLIMIT_MEMLOCK, (64 * 1024, 64 * 1024))
+          fd = libc.syscall(447, os.O_CLOEXEC)
+          if fd < 0:
+              print("memfd_secret failed:", os.strerror(ctypes.get_errno()))
+              raise SystemExit(0)
+          print("memfd_secret fd", fd)
+          for size in (32 * 1024, 1024 * 1024):
+              try:
+                  os.ftruncate(fd, size)
+                  m = mmap.mmap(fd, size)
+                  print(size, "bytes: ftruncate and mmap succeeded")
+                  m.close()
+              except OSError as e:
+                  print(size, "bytes:", type(e).__name__, e.errno, e.strerror)
+          EOF
+      - name: The child test, with its output
+        env:
+          EXTENDDB_TEST_MEMLOCK_CHILD: "1"
+        run: cargo test -p extenddb-auth --lib -- --exact secmem::tests::memlock_limit_child_process --nocapture --test-threads=1
