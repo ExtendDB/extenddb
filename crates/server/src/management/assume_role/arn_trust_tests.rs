@@ -21,6 +21,7 @@ use super::{
 };
 use extenddb_auth::policy::context::AssumeRoleContext;
 use extenddb_auth::policy::document::PolicyDocument;
+use extenddb_core::limits::DEFAULT_MAX_POLICY_DOCUMENT_BYTES;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 
@@ -270,7 +271,7 @@ fn assume_role_refuses_a_session_policy_the_write_check_refuses() {
         ),
     ] {
         assert_eq!(
-            check_session_policy(&session_policy(value)),
+            check_session_policy(&session_policy(value), DEFAULT_MAX_POLICY_DOCUMENT_BYTES),
             Err(format!(
                 "MalformedPolicyDocument: Arn condition on aws:PrincipalArn holds {value:?}: \
                  {problem}"
@@ -283,7 +284,7 @@ fn assume_role_refuses_a_session_policy_the_write_check_refuses() {
         "Effect": "Allow", "Action": "dynamodb:*", "Resource": "*",
         "Condition": {"IpAddress": {"aws:SourceIp": "nope"}}}]});
     assert!(
-        check_session_policy(&cidr)
+        check_session_policy(&cidr, DEFAULT_MAX_POLICY_DOCUMENT_BYTES)
             .is_err_and(|m| m.starts_with("MalformedPolicyDocument: malformed CIDR")),
     );
     for value in [
@@ -292,7 +293,7 @@ fn assume_role_refuses_a_session_policy_the_write_check_refuses() {
         "arn:aws:iam::123456789012:user/${aws:username}",
     ] {
         assert_eq!(
-            check_session_policy(&session_policy(value)),
+            check_session_policy(&session_policy(value), DEFAULT_MAX_POLICY_DOCUMENT_BYTES),
             Ok(()),
             "{value:?}"
         );
@@ -312,18 +313,47 @@ fn assume_role_accepts_a_session_policy_whose_sid_a_policy_write_refuses() {
     // check, so it keeps issuing it.
     let mut sp = read_session_policy();
     sp["Statement"][0]["Sid"] = json!("Read-Only");
-    assert!(PolicyDocument::from_json_for_write(&sp.to_string()).is_err());
+    assert!(
+        PolicyDocument::from_json_for_write(&sp.to_string(), DEFAULT_MAX_POLICY_DOCUMENT_BYTES)
+            .is_err()
+    );
     assert!(PolicyDocument::from_json(&sp.to_string()).is_ok());
-    assert_eq!(check_session_policy(&sp), Ok(()));
+    assert_eq!(
+        check_session_policy(&sp, DEFAULT_MAX_POLICY_DOCUMENT_BYTES),
+        Ok(())
+    );
 }
 
 #[test]
 fn assume_role_accepts_a_session_policy_whose_version_a_policy_write_refuses() {
     let mut sp = read_session_policy();
     sp["Version"] = json!("2020-01-01");
-    assert!(PolicyDocument::from_json_for_write(&sp.to_string()).is_err());
+    assert!(
+        PolicyDocument::from_json_for_write(&sp.to_string(), DEFAULT_MAX_POLICY_DOCUMENT_BYTES)
+            .is_err()
+    );
     assert!(PolicyDocument::from_json(&sp.to_string()).is_ok());
-    assert_eq!(check_session_policy(&sp), Ok(()));
+    assert_eq!(
+        check_session_policy(&sp, DEFAULT_MAX_POLICY_DOCUMENT_BYTES),
+        Ok(())
+    );
+}
+
+#[test]
+fn assume_role_refuses_a_session_policy_over_the_configured_size_limit() {
+    // The request path parses a stored session policy with the configured
+    // `max_policy_document_bytes`, so AssumeRole refuses one it would not
+    // load: at the limit it is accepted, one byte over it is not.
+    let sp = read_session_policy();
+    let at = sp.to_string().len();
+    assert_eq!(check_session_policy(&sp, at), Ok(()));
+    assert_eq!(
+        check_session_policy(&sp, at - 1),
+        Err(format!(
+            "MalformedPolicyDocument: policy document exceeds maximum size ({} bytes)",
+            at - 1
+        ))
+    );
 }
 
 #[test]

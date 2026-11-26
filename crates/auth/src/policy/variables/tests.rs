@@ -4,6 +4,7 @@
 //! Unit tests for policy variable parsing, expansion and token matching.
 
 use super::*;
+use extenddb_core::limits::DEFAULT_MAX_POLICY_DOCUMENT_BYTES;
 use std::collections::HashMap;
 
 struct Ctx(HashMap<String, Vec<String>>);
@@ -72,7 +73,7 @@ fn a_write_refuses_a_version_that_is_not_one_of_the_two_values() {
         r#""2012-10-17T""#,
     ] {
         let json = format!(r#"{{"Version":{version},{stmt}}}"#);
-        let refused = PolicyDocument::from_json_for_write(&json)
+        let refused = PolicyDocument::from_json_for_write(&json, DEFAULT_MAX_POLICY_DOCUMENT_BYTES)
             .err()
             .map(|e| e.0);
         let expected =
@@ -85,12 +86,18 @@ fn a_write_refuses_a_version_that_is_not_one_of_the_two_values() {
     for version in ["2012-10-17", "2008-10-17"] {
         let json = format!(r#"{{"Version":"{version}",{stmt}}}"#);
         assert!(
-            PolicyDocument::from_json_for_write(&json).is_ok(),
+            PolicyDocument::from_json_for_write(&json, DEFAULT_MAX_POLICY_DOCUMENT_BYTES).is_ok(),
             "{version}"
         );
     }
     // A missing Version is refused by each write path before parsing.
-    assert!(PolicyDocument::from_json_for_write(&format!("{{{stmt}}}")).is_ok());
+    assert!(
+        PolicyDocument::from_json_for_write(
+            &format!("{{{stmt}}}"),
+            DEFAULT_MAX_POLICY_DOCUMENT_BYTES
+        )
+        .is_ok()
+    );
 }
 
 // --- parse_reference ---

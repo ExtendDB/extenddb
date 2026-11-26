@@ -9,6 +9,7 @@
 //! other values of the same class.
 
 use super::*;
+use extenddb_core::limits::DEFAULT_MAX_POLICY_DOCUMENT_BYTES;
 use serde_json::json;
 
 /// Unterminated on every path: no `}` follows the `${`.
@@ -221,7 +222,9 @@ fn identity_statements(version: &str, statements: &Value) -> String {
 }
 
 fn write_error(json: &str) -> String {
-    PolicyDocument::from_json_for_write(json).expect_err(json).0
+    PolicyDocument::from_json_for_write(json, DEFAULT_MAX_POLICY_DOCUMENT_BYTES)
+        .expect_err(json)
+        .0
 }
 
 const STRING_OPS: &[&str] = &[
@@ -414,20 +417,23 @@ fn identity_accepts_terminated_values() {
             for op in STRING_OPS {
                 let doc = identity(version, op, "aws:ResourceTag/owner", &json!(v));
                 assert!(
-                    PolicyDocument::from_json_for_write(&doc).is_ok(),
+                    PolicyDocument::from_json_for_write(&doc, DEFAULT_MAX_POLICY_DOCUMENT_BYTES)
+                        .is_ok(),
                     "{version} {op} {v}"
                 );
             }
             for op in ARN_OPS {
                 let doc = identity(version, op, "aws:PrincipalArn", &json!(format!("{ARN}{v}")));
                 assert!(
-                    PolicyDocument::from_json_for_write(&doc).is_ok(),
+                    PolicyDocument::from_json_for_write(&doc, DEFAULT_MAX_POLICY_DOCUMENT_BYTES)
+                        .is_ok(),
                     "{version} {op} {v}"
                 );
             }
             let doc = identity_resource(version, "Resource", &format!("{TABLE}{v}"));
             assert!(
-                PolicyDocument::from_json_for_write(&doc).is_ok(),
+                PolicyDocument::from_json_for_write(&doc, DEFAULT_MAX_POLICY_DOCUMENT_BYTES)
+                    .is_ok(),
                 "{version} {v}"
             );
         }
@@ -470,7 +476,7 @@ fn identity_checks_every_array_element_and_statement_but_not_keys() {
 
         let doc = identity(version, "StringEquals", "aws:ResourceTag/${x", &json!("a"));
         assert!(
-            PolicyDocument::from_json_for_write(&doc).is_ok(),
+            PolicyDocument::from_json_for_write(&doc, DEFAULT_MAX_POLICY_DOCUMENT_BYTES).is_ok(),
             "{version} key"
         );
     }

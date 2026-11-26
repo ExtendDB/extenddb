@@ -310,9 +310,12 @@ async fn put_policy(
     let invalid = if doc.get("Version").is_none() || doc.get("Statement").is_none() {
         Some("Policy document must contain Version and Statement".to_owned())
     } else {
-        extenddb_auth::policy::document::PolicyDocument::from_json_for_write(&doc.to_string())
-            .err()
-            .map(|e| format!("Invalid policy document: {e}"))
+        extenddb_auth::policy::document::PolicyDocument::from_json_for_write(
+            &doc.to_string(),
+            state.max_policy_document_bytes,
+        )
+        .err()
+        .map(|e| format!("Invalid policy document: {e}"))
     };
     if let Some(msg) = invalid {
         let nav = html::nav_bar(&identity_label(&session.identity));

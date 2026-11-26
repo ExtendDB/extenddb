@@ -8,6 +8,7 @@
 //! same rules as a value written in full (issue #665).
 
 use super::*;
+use extenddb_core::limits::DEFAULT_MAX_POLICY_DOCUMENT_BYTES;
 
 const PRINCIPAL: &str = "aws:PrincipalArn";
 const BOB: &str = "arn:aws:iam::123456789012:user/bob";
@@ -124,7 +125,7 @@ fn the_only_me_policy_loads_and_evaluates_as_written() {
     let value = "arn:aws:iam::${aws:PrincipalAccount}:user/${aws:username}";
     let statement = gated("Allow", "ArnEquals", value);
     let json = format!(r#"{{"Version":"2012-10-17","Statement":[{statement}]}}"#);
-    assert!(PolicyDocument::from_json_for_write(&json).is_err());
+    assert!(PolicyDocument::from_json_for_write(&json, DEFAULT_MAX_POLICY_DOCUMENT_BYTES).is_err());
     let caller = |user: &str| {
         Ctx::empty()
             .with(PRINCIPAL, vec![BOB])
@@ -268,7 +269,7 @@ fn a_value_whose_quoted_default_leaves_five_fields_fails_closed() {
         r#"{{"Version":"2012-10-17","Statement":[{}]}}"#,
         gated("Allow", "ArnLike", QUOTED_COLON)
     );
-    assert!(PolicyDocument::from_json_for_write(&json).is_err());
+    assert!(PolicyDocument::from_json_for_write(&json, DEFAULT_MAX_POLICY_DOCUMENT_BYTES).is_err());
     let closed = [AuthzDecision::Deny; 2];
     assert_eq!(
         by_caller("2012-10-17", QUOTED_COLON),
@@ -327,7 +328,7 @@ fn a_value_whose_first_field_is_a_variable_fails_closed_when_expanded() {
         r#"{{"Version":"2012-10-17","Statement":[{}]}}"#,
         gated("Allow", "ArnLike", VARIABLE_FIRST)
     );
-    assert!(PolicyDocument::from_json_for_write(&json).is_err());
+    assert!(PolicyDocument::from_json_for_write(&json, DEFAULT_MAX_POLICY_DOCUMENT_BYTES).is_err());
     let closed = [AuthzDecision::Deny; 3];
     assert_eq!(
         by_kind("2012-10-17", VARIABLE_FIRST),
