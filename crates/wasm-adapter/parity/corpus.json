@@ -3451,6 +3451,194 @@
       ]
     },
     {
+      "name": "search grammar: CreateTable with a HASH and a Number INLINE_FILTER search schema succeeds",
+      "op": "CreateTable",
+      "body": {
+        "TableName": "SvFilter",
+        "KeySchema": [
+          {
+            "AttributeName": "pk",
+            "KeyType": "HASH"
+          }
+        ],
+        "AttributeDefinitions": [
+          {
+            "AttributeName": "pk",
+            "AttributeType": "S"
+          },
+          {
+            "AttributeName": "Country",
+            "AttributeType": "S"
+          },
+          {
+            "AttributeName": "Price",
+            "AttributeType": "N"
+          }
+        ],
+        "BillingMode": "PAY_PER_REQUEST",
+        "VectorIndexes": [
+          {
+            "IndexName": "vidx",
+            "Dimensions": 3,
+            "DistanceFunction": "COSINE",
+            "VectorAttribute": {
+              "AttributeName": "emb"
+            },
+            "SearchSchema": [
+              {
+                "AttributeName": "Country",
+                "SearchSchemaElementType": "HASH"
+              },
+              {
+                "AttributeName": "Price",
+                "SearchSchemaElementType": "INLINE_FILTER"
+              }
+            ],
+            "Projection": {
+              "ProjectionType": "ALL"
+            }
+          }
+        ]
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/TableDescription/VectorIndexes/0/IndexStatus",
+          "equals": "ACTIVE"
+        }
+      ]
+    },
+    {
+      "name": "search grammar: PutItem cheap with Price 5 writes the item",
+      "op": "PutItem",
+      "body": {
+        "TableName": "SvFilter",
+        "Item": {
+          "pk": {
+            "S": "cheap"
+          },
+          "Country": {
+            "S": "US"
+          },
+          "Price": {
+            "N": "5"
+          },
+          "emb": {
+            "L": [
+              {
+                "N": "1"
+              },
+              {
+                "N": "0"
+              },
+              {
+                "N": "0"
+              }
+            ]
+          }
+        }
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "",
+          "equals": {}
+        }
+      ]
+    },
+    {
+      "name": "search grammar: PutItem dear with Price 20 writes the item",
+      "op": "PutItem",
+      "body": {
+        "TableName": "SvFilter",
+        "Item": {
+          "pk": {
+            "S": "dear"
+          },
+          "Country": {
+            "S": "US"
+          },
+          "Price": {
+            "N": "20"
+          },
+          "emb": {
+            "L": [
+              {
+                "N": "1"
+              },
+              {
+                "N": "1"
+              },
+              {
+                "N": "0"
+              }
+            ]
+          }
+        }
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "",
+          "equals": {}
+        }
+      ]
+    },
+    {
+      "name": "search grammar: SearchVectors with a range condition returns only the item it selects",
+      "op": "SearchVectors",
+      "body": {
+        "TableName": "SvFilter",
+        "IndexName": "vidx",
+        "SearchVector": [
+          {
+            "N": "1"
+          },
+          {
+            "N": "0"
+          },
+          {
+            "N": "0"
+          }
+        ],
+        "TopK": 2,
+        "SearchConditionExpression": "Country = :c AND Price > :p",
+        "ExpressionAttributeValues": {
+          ":c": {
+            "S": "US"
+          },
+          ":p": {
+            "N": "10"
+          }
+        }
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/SearchResults/0/Item/pk/S",
+          "equals": "dear"
+        },
+        {
+          "path": "/SearchResults/1",
+          "absent": true
+        }
+      ]
+    },
+    {
+      "name": "search grammar: DeleteTable deletes the search schema table",
+      "op": "DeleteTable",
+      "body": {
+        "TableName": "SvFilter"
+      },
+      "error": null,
+      "checks": [
+        {
+          "path": "/TableDescription/TableName",
+          "equals": "SvFilter"
+        }
+      ]
+    },
+    {
       "name": "table names: Query with a TableName outside the pattern answers ResourceNotFoundException",
       "op": "Query",
       "body": {

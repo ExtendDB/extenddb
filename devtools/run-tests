@@ -48,6 +48,14 @@
 #                               expected outcome from it, so it is required
 #                               (the Rust integration suite's backup tests read
 #                               it too and fail when it is unset).
+#   EXTENDDB_TEST_SEARCH_INEQUALITY_FILTERS
+#                               when set, the value of the
+#                               search_inequality_filters runtime setting
+#                               (off, all, or account IDs), written before any
+#                               suite starts; a server that refuses it is an
+#                               error. Unset leaves the setting as it is; an
+#                               absent setting gives every account the
+#                               extended grammar.
 #
 # REQ-TEST-001, D-1, D-2, D-3, D-4, D-5
 
@@ -125,6 +133,12 @@ Environment (--extenddb with an integration suite):
   EXTENDDB_TEST_BACKUP_STORE  where the server writes its backups: filesystem,
                               s3 or none (required for --pytest; the Rust
                               integration suite's backup tests read it too)
+  EXTENDDB_TEST_SEARCH_INEQUALITY_FILTERS
+                              value for the search_inequality_filters setting,
+                              written before any suite starts (optional;
+                              unset, nothing is written and the server keeps
+                              the value it has, which an earlier run may have
+                              written)
 Environment (--real-dynamodb): EXTENDDB_TEST_ENDPOINT and EXTENDDB_ADMIN_PASSWORD
   unset; AWS credentials from the SDK's chain or AWS_ACCESS_KEY_ID.
 EOF
@@ -409,6 +423,19 @@ if $NEEDS_INTEGRATION && [[ "$TARGET" != "real-dynamodb" ]]; then
         if "$BINARY" settings --config "$CONFIG_FOR_SETTINGS" set allow_credential_import true 2>/dev/null; then
             echo "  ✓ allow_credential_import set to true"
         fi
+    fi
+    # The SearchVectors grammar setting. The suites read it and never change
+    # it, so parallel workers all see the value written here.
+    if [[ -n "${EXTENDDB_TEST_SEARCH_INEQUALITY_FILTERS:-}" ]]; then
+        if [[ ! -x "$BINARY" || ! -f "$CONFIG_FOR_SETTINGS" ]]; then
+            echo "error: EXTENDDB_TEST_SEARCH_INEQUALITY_FILTERS is set and there is no $BINARY or $CONFIG_FOR_SETTINGS to write it with."
+            exit 1
+        fi
+        if ! "$BINARY" settings --config "$CONFIG_FOR_SETTINGS" set search_inequality_filters "$EXTENDDB_TEST_SEARCH_INEQUALITY_FILTERS"; then
+            echo "error: the server refused search_inequality_filters=$EXTENDDB_TEST_SEARCH_INEQUALITY_FILTERS: a build without the search-inequality-filters feature has no such key, and a build with it takes only an empty value, off, all, or a comma-separated list of 12-digit account IDs."
+            exit 1
+        fi
+        echo "  ✓ search_inequality_filters set to $EXTENDDB_TEST_SEARCH_INEQUALITY_FILTERS"
     fi
 
     # Import/export paths. The Python tests write fixtures via tempfile, which
@@ -706,8 +733,14 @@ if $RUN_PYTEST \
         CLI_ARGS+=(-k "$FILTER")
     fi
     if [[ -n "$SHARD" ]]; then shard_suite cli "${CLI_ARGS[@]}"; CLI_ARGS=("${SHARD_CMD[@]}"); fi
-    if "${CLI_ARGS[@]}" 2>&1 | tee "$CLI_OUTFILE"; then
+    # pytest exits 5 when it selects no test, which a --filter aimed at
+    # another suite does here.
+    CLI_RC=0
+    "${CLI_ARGS[@]}" 2>&1 | tee "$CLI_OUTFILE" || CLI_RC=${PIPESTATUS[0]}
+    if (( CLI_RC == 0 )); then
         echo "  ✓ CLI lifecycle tests passed"
+    elif (( CLI_RC == 5 )) && [[ -n "$FILTER" ]]; then
+        echo "  - CLI lifecycle tests: none matches the filter"
     else
         echo "  ✗ CLI lifecycle tests failed"
         PASS=false
@@ -742,8 +775,14 @@ if $RUN_PYTEST && [[ "$TARGET" != "real-dynamodb" ]]; then
             if [[ -n "$FILTER" ]]; then
                 WIRE_ARGS+=(-k "$FILTER")
             fi
-            if EXTENDDB_BINARY="$WIRE_BINARY" "${WIRE_ARGS[@]}" 2>&1 | tee "$WIRE_OUTFILE"; then
+            # pytest exits 5 when it selects no test, which a --filter aimed at
+            # another suite does here.
+            WIRE_RC=0
+            EXTENDDB_BINARY="$WIRE_BINARY" "${WIRE_ARGS[@]}" 2>&1 | tee "$WIRE_OUTFILE" || WIRE_RC=${PIPESTATUS[0]}
+            if (( WIRE_RC == 0 )); then
                 echo "  ✓ Backup store wire tests passed"
+            elif (( WIRE_RC == 5 )) && [[ -n "$FILTER" ]]; then
+                echo "  - Backup store wire tests: none matches the filter"
             else
                 echo "  ✗ Backup store wire tests failed"
                 PASS=false

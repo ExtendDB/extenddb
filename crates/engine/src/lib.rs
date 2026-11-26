@@ -51,6 +51,8 @@ mod list_tables;
 #[cfg(feature = "partiql")]
 mod partiql;
 mod pre_dispatch;
+#[cfg(test)]
+mod test_context;
 pub use pre_dispatch::{ParsedRequest, parse_request};
 // `private_fs` creates the private directories the filesystem-backed
 // import/export use; it has no wasm32 consumer and uses unix/windows file
@@ -64,6 +66,8 @@ mod read_helpers;
 mod request_limits;
 mod scan;
 mod search_vectors;
+mod search_vectors_extended;
+mod search_vectors_params;
 mod start_key;
 pub mod stream_capture;
 mod streams;
@@ -97,7 +101,12 @@ pub use put_item::handle_put_item;
 pub use query::handle_query;
 pub use request_limits::check_request_item_counts;
 pub use scan::handle_scan;
-pub use search_vectors::handle_search_vectors;
+pub use search_vectors::{
+    CheckedSearchVectors, check_search_vectors_request, handle_checked_search_vectors,
+    handle_search_vectors,
+};
+#[cfg(all(feature = "search-inequality-filters", not(target_arch = "wasm32")))]
+pub use search_vectors_extended::{install_search_filter_settings, search_filter_settings_changed};
 pub use streams::{SHARD_ITERATOR_EXPIRED_MESSAGE, ShardIteratorClass, classify_shard_iterator};
 pub use streams::{ShardIterator, decode_shard_iterator, encode_shard_iterator};
 pub use streams::{
