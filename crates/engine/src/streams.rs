@@ -16,25 +16,45 @@ use crate::OperationContext;
 use crate::serialize_output;
 use crate::streams_iterator_params as iterator_params;
 
+/// Largest `Limit` `DescribeStream` accepts. The API Reference gives the
+/// range 1 to 100 ("The upper limit is 100", minimum value 1,
+/// <https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_streams_DescribeStream.html>);
+/// the service's refusals are quoted in `streams/describe_limit_tests.rs`.
+const DESCRIBE_STREAM_LIMIT_MAX: i64 = 100;
+
 /// Handle `DescribeStream`.
 ///
 /// # Errors
 ///
 /// Returns [`DynamoDbError::ResourceNotFoundException`] if the stream does not exist.
-/// Returns [`DynamoDbError::ValidationException`] on invalid input.
+/// Returns [`DynamoDbError::ValidationException`] on invalid input, including
+/// a `Limit` below 1 or above 100.
 pub async fn handle_describe_stream(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
     let input: DescribeStreamInput = serde_json::from_value(body)
         .map_err(|e| DynamoDbError::SerializationException(e.to_string()))?;
+    // The service names every failed member constraint in one message before
+    // it looks the stream up, and refuses a Limit above 100 only once it has
+    // found the stream (measured in us-east-1; the answers are quoted in
+    // streams/describe_limit_tests.rs).
+    let mut clauses = Vec::new();
     if let Some(start) = &input.exclusive_start_shard_id
         && start.chars().count() < SHARD_ID_MIN_LEN
     {
-        return Err(DynamoDbError::ValidationException(constraint(
+        clauses.push(clause(
             "exclusiveStartShardId",
             "have length greater than or equal to 28",
-        )));
+        ));
+    }
+    if input.limit.is_some_and(|limit| limit < 1) {
+        clauses.push(clause("limit", "have value greater than or equal to 1"));
+    }
+    if !clauses.is_empty() {
+        return Err(DynamoDbError::ValidationException(
+            extenddb_core::error::validation_errors_detected(&clauses),
+        ));
     }
 
     let desc = ctx
@@ -42,6 +62,15 @@ pub async fn handle_describe_stream(
         .describe_stream(&ctx.account_id, &input)
         .await
         .map_err(storage_to_dynamo)?;
+    if input
+        .limit
+        .is_some_and(|limit| limit > DESCRIBE_STREAM_LIMIT_MAX)
+    {
+        return Err(DynamoDbError::ValidationException(format!(
+            "One or more parameter values were invalid: Limit cannot be greater than \
+             the maximum: {DESCRIBE_STREAM_LIMIT_MAX}"
+        )));
+    }
 
     let output = DescribeStreamOutput {
         stream_description: desc,
@@ -554,3 +583,6 @@ fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
 #[cfg(test)]
 #[path = "streams_tests.rs"]
 mod tests;
+
+#[cfg(all(test, feature = "partiql"))]
+mod describe_limit_tests;

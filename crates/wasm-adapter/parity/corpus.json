@@ -2858,25 +2858,17 @@
       }
     },
     {
-      "name": "DescribeStream with a Limit above 2^32 returns all four shards and no LastEvaluatedShardId",
+      "name": "DescribeStream with a Limit above 2^32 is refused as a Limit above 100, not read as a Limit of 1",
       "op": "DescribeStream",
       "body": {
         "StreamArn": "${strmArn}",
         "Limit": 4294967297
       },
-      "error": null,
+      "error": "ValidationException",
       "checks": [
         {
-          "path": "/StreamDescription/Shards/3/ShardId",
-          "present": true
-        },
-        {
-          "path": "/StreamDescription/Shards/4",
-          "absent": true
-        },
-        {
-          "path": "/StreamDescription/LastEvaluatedShardId",
-          "absent": true
+          "path": "/message",
+          "equals": "One or more parameter values were invalid: Limit cannot be greater than the maximum: 100"
         }
       ]
     },
