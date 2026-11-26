@@ -63,7 +63,8 @@ pub(crate) use wasm_sqlx::*;
 #[doc(hidden)]
 pub mod wasm_sqlx_for_tests {
     pub use crate::wasm_sqlx::{
-        Error, Executor, FromRow, Row, SqlitePool, query, query_as, query_scalar, raw_sql, sqlite,
+        AssertSqlSafe, Error, Executor, FromRow, Row, SqlitePool, query, query_as, query_scalar,
+        raw_sql, sqlite,
     };
 
     /// A fresh pool builder from the shim's crate-private

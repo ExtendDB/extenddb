@@ -77,9 +77,11 @@ impl Scratch {
 
 async fn drop_databases(admin: &PgPool, names: &[String]) {
     for name in names {
-        let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
-            .execute(admin)
-            .await;
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"
+        )))
+        .execute(admin)
+        .await;
     }
 }
 
@@ -162,7 +164,7 @@ async fn scratch() -> Scratch {
         names: vec![catalog_name.clone(), data_name.clone()],
     };
     for name in [&catalog_name, &data_name] {
-        sqlx::query(&format!("CREATE DATABASE \"{name}\""))
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{name}\"")))
             .execute(&admin)
             .await
             .expect("create a scratch database");
@@ -456,10 +458,12 @@ async fn record_columns(
 }
 
 async fn rows_in(db: &PgPool, physical: &str) -> i64 {
-    sqlx::query_scalar(&format!("SELECT count(*) FROM {physical}"))
-        .fetch_one(db)
-        .await
-        .expect("count rows")
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM {physical}"
+    )))
+    .fetch_one(db)
+    .await
+    .expect("count rows")
 }
 
 async fn base_rows(s: &Scratch, table_id: &str) -> i64 {

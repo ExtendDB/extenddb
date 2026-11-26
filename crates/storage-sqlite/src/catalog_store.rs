@@ -236,7 +236,7 @@ impl MetricsStore for SqliteCatalogStore {
             }
             sql.push_str(" ORDER BY bucket");
 
-            let mut q = sqlx::query_as::<_, DbMetricsRow>(&sql)
+            let mut q = sqlx::query_as::<_, DbMetricsRow>(sqlx::AssertSqlSafe(sql))
                 .bind(&start_str)
                 .bind(&end_str);
             for value in [&account_id, &table_name, &metric].into_iter().flatten() {

@@ -13,7 +13,7 @@ use extenddb_storage::server_components::KeySource;
 use extenddb_storage_postgres::{CatalogCheckPoint, PostgresCatalogStore, arm_catalog_check_pause};
 use sqlx::Connection;
 
-use crate::support::{ACCOUNT, Deployment, TABLE, base_conn, hold, skip};
+use crate::support::{ACCOUNT, Deployment, TABLE, base_conn, hold, skip, without_server_line};
 
 /// A table with a GSI, an LSI and a vector index has every relation the
 /// engine created named by the catalog: nothing orphaned, nothing missing.
@@ -52,10 +52,12 @@ async fn a_relation_the_catalog_names_is_reported_missing() {
     let gsi = d.index_relation(TABLE, "gsi1").await;
     assert!(d.relation_exists(&gsi).await, "{gsi}");
     let elsewhere = format!("_ddb_{}", uuid::Uuid::new_v4());
-    sqlx::query(&format!("ALTER TABLE \"{gsi}\" RENAME TO \"{elsewhere}\""))
-        .execute(&d.data)
-        .await
-        .expect("rename the GSI relation");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE \"{gsi}\" RENAME TO \"{elsewhere}\""
+    )))
+    .execute(&d.data)
+    .await
+    .expect("rename the GSI relation");
 
     let check = d
         .diagnostics
@@ -71,10 +73,12 @@ async fn a_relation_the_catalog_names_is_reported_missing() {
         }]
     );
 
-    sqlx::query(&format!("ALTER TABLE \"{elsewhere}\" RENAME TO \"{gsi}\""))
-        .execute(&d.data)
-        .await
-        .expect("rename it back");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE \"{elsewhere}\" RENAME TO \"{gsi}\""
+    )))
+    .execute(&d.data)
+    .await
+    .expect("rename it back");
     let check = d
         .diagnostics
         .check_storage_relations(&KeySource::CatalogKey)
@@ -382,7 +386,7 @@ async fn the_check_lists_the_relations_the_search_path_reaches() {
             d.data_db
         ),
     ] {
-        sqlx::query(&statement)
+        sqlx::query(sqlx::AssertSqlSafe(statement.as_str()))
             .execute(&d.data)
             .await
             .unwrap_or_else(|e| panic!("{statement}: {e}"));
@@ -434,7 +438,7 @@ async fn other_catalog_failures_do_not_report_index_changes() {
         .expect("the check gave up within 10 s");
         match check {
             Err(DiagError::QueryFailed(msg)) => assert_eq!(
-                msg,
+                without_server_line(&msg),
                 format!("error returned from database: {error}"),
                 "{held}"
             ),
@@ -448,7 +452,7 @@ async fn other_catalog_failures_do_not_report_index_changes() {
         .expect("the drop gave up within 10 s");
         match drop {
             Err(DiagError::QueryFailed(msg)) => assert_eq!(
-                msg,
+                without_server_line(&msg),
                 format!("error returned from database: {error}"),
                 "drop: {held}"
             ),

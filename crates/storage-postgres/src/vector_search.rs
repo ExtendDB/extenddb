@@ -348,13 +348,14 @@ impl VectorSearchEngine for PostgresEngine {
 
             // Bound as a typed vector rather than a text literal, so the value that
             // reaches the server is the same f32 sequence the engine validated.
-            let mut query = sqlx::query_as::<_, (f64, Vector, serde_json::Value)>(&sql)
-                .bind(Vector::from(query_vector))
-                // Bytes, matching the BYTEA column: the unscoped sentinel contains
-                // a NUL, so a text comparison would not even be storable.
-                .bind(partition.into_bytes())
-                .bind(top_k)
-                .bind(query_norm);
+            let mut query =
+                sqlx::query_as::<_, (f64, Vector, serde_json::Value)>(sqlx::AssertSqlSafe(sql))
+                    .bind(Vector::from(query_vector))
+                    // Bytes, matching the BYTEA column: the unscoped sentinel contains
+                    // a NUL, so a text comparison would not even be storable.
+                    .bind(partition.into_bytes())
+                    .bind(top_k)
+                    .bind(query_norm);
             for (name, value) in &filters {
                 let value_json = serde_json::to_string(value)
                     .map_err(|e| StorageError::Internal(format!("filter value: {e}")))?;

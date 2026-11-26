@@ -207,13 +207,13 @@ impl MetadataEngine for PostgresEngine {
             let data_table = data::data_table_name(&table_id);
 
             let count_sql = format!("SELECT COUNT(*) FROM {data_table}");
-            let (item_count,): (i64,) = sqlx::query_as(&count_sql)
+            let (item_count,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(count_sql))
                 .fetch_one(&self.data_pool)
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
             let size_sql = format!("SELECT COALESCE(pg_total_relation_size('{data_table}'), 0)");
-            let (table_size,): (i64,) = sqlx::query_as(&size_sql)
+            let (table_size,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(size_sql))
                 .fetch_one(&self.data_pool)
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -322,10 +322,12 @@ impl MetadataEngine for PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
             if invalid == Some((false,)) {
-                sqlx::query(&format!("DROP INDEX IF EXISTS \"{index_name}\""))
-                    .execute(&self.data_pool)
-                    .await
-                    .map_err(|e| StorageError::Internal(format!("Drop invalid TTL index: {e}")))?;
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "DROP INDEX IF EXISTS \"{index_name}\""
+                )))
+                .execute(&self.data_pool)
+                .await
+                .map_err(|e| StorageError::Internal(format!("Drop invalid TTL index: {e}")))?;
             }
 
             let sql = format!(
@@ -333,7 +335,7 @@ impl MetadataEngine for PostgresEngine {
                  ON {data_table} (((item_data->'{ttl_attribute}'->>'N')::BIGINT)) \
                  WHERE (item_data->'{ttl_attribute}'->>'N') IS NOT NULL"
             );
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(sql))
                 .execute(&self.data_pool)
                 .await
                 .map_err(|e| StorageError::Internal(format!("TTL index creation failed: {e}")))?;
@@ -390,7 +392,7 @@ impl MetadataEngine for PostgresEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
             let sql = format!("DROP INDEX IF EXISTS \"{index_name}\"");
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(sql))
                 .execute(&self.data_pool)
                 .await
                 .map_err(|e| StorageError::Internal(format!("TTL index drop failed: {e}")))?;
@@ -436,7 +438,7 @@ impl MetadataEngine for PostgresEngine {
                  ORDER BY (item_data->$1->>'N')::BIGINT \
                  LIMIT $3"
             );
-            let rows: Vec<(serde_json::Value,)> = sqlx::query_as(&sql)
+            let rows: Vec<(serde_json::Value,)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(&ttl_attribute)
                 .bind(now_i64)
                 .bind(limit_i64)

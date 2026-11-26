@@ -20,7 +20,10 @@ use super::tests::{
 /// blobs in hex, and NULL as `NULL`.
 async fn dump(db: &Path, sql: &str) -> String {
     let pool = plain_pool(db).await;
-    let rows = sqlx::query(sql).fetch_all(&pool).await.expect(sql);
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .fetch_all(&pool)
+        .await
+        .expect(sql);
     pool.close().await;
     let mut out = format!("-- {sql}\n");
     for row in rows {

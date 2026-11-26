@@ -182,7 +182,7 @@ mod tests {
             .await
             .expect("admin connection");
         for name in &databases {
-            sqlx::query(&format!("CREATE DATABASE \"{name}\""))
+            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{name}\"")))
                 .execute(&admin)
                 .await
                 .expect("create database");
@@ -210,9 +210,11 @@ mod tests {
             written.push(tables);
         }
         for name in &databases {
-            let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
-                .execute(&admin)
-                .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"
+            )))
+            .execute(&admin)
+            .await;
         }
         admin.close().await;
         let err = result.expect_err("an empty catalog database is not a catalog");

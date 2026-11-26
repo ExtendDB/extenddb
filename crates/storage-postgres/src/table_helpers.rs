@@ -164,10 +164,10 @@ impl PostgresEngine {
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let vector_rows: Vec<VectorIndexRow> = sqlx::query_as(&format!(
+        let vector_rows: Vec<VectorIndexRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {VECTOR_INDEX_COLUMNS} FROM vector_indexes WHERE table_id = $1 \
              ORDER BY index_name"
-        ))
+        )))
         .bind(&row.table_id)
         .fetch_all(&mut *conn)
         .await

@@ -260,7 +260,7 @@ impl VectorSearchEngine for SqliteEngine {
             // not allocate proportionally to its size. This is the reason the
             // row-per-vector layout was chosen over a packed blob per partition.
             use futures::TryStreamExt;
-            let mut stream = sqlx::query_as::<_, (Vec<u8>, String)>(&sql)
+            let mut stream = sqlx::query_as::<_, (Vec<u8>, String)>(sqlx::AssertSqlSafe(sql))
                 .bind(&partition)
                 .fetch(&self.pool);
 

@@ -22,7 +22,7 @@ use sqlx::PgPool;
 /// Run `sql` on `url`, panicking with it on an error.
 async fn run(url: &str, sql: &str) {
     let p = pool(url, 1).await;
-    sqlx::raw_sql(sql)
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
         .execute(&p)
         .await
         .unwrap_or_else(|e| panic!("{sql}: {e}"));
@@ -37,9 +37,11 @@ fn as_role(base: &str, role: &str, password: &str, database: &str) -> String {
 
 async fn drop_roles(admin: &PgPool, roles: &[&str]) {
     for role in roles {
-        let _ = sqlx::query(&format!("DROP ROLE IF EXISTS \"{role}\""))
-            .execute(admin)
-            .await;
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP ROLE IF EXISTS \"{role}\""
+        )))
+        .execute(admin)
+        .await;
     }
 }
 

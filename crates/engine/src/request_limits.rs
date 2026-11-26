@@ -1,8 +1,8 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Count limits of the batch and transaction operations, and the
-//! `ValidationException` each limit returns.
+//! Count limits of the batch and transaction operations, the length limit of a
+//! `ClientRequestToken`, and the `ValidationException` each limit returns.
 //!
 //! The handlers check these limits on the parsed request. The server checks
 //! them on the raw request body before authorization, through
@@ -33,6 +33,27 @@ pub(crate) const MAX_BATCH_GET_KEYS: usize = 100;
 pub(crate) const MAX_BATCH_WRITE_ITEMS: usize = 25;
 /// Maximum number of items in one `TransactGetItems` or `TransactWriteItems`.
 pub(crate) const MAX_TRANSACT_ITEMS: usize = 100;
+
+/// The longest `ClientRequestToken`, in code points.
+pub(crate) const MAX_CLIENT_REQUEST_TOKEN: usize = 36;
+
+/// The constraint an empty string or list fails.
+pub(crate) const AT_LEAST_ONE: &str = "Member must have length greater than or equal to 1";
+
+/// The constraint a value of 1 to `max` code points fails, if any. The
+/// `TransactWriteItems` token check and the PartiQL request checks share it.
+pub(crate) fn length_constraint(value: &str, max: usize) -> Option<String> {
+    let length = value.chars().count();
+    if length == 0 {
+        Some(AT_LEAST_ONE.to_owned())
+    } else if length > max {
+        Some(format!(
+            "Member must have length less than or equal to {max}"
+        ))
+    } else {
+        None
+    }
+}
 
 /// Check the item count of a transaction. `member` is `TransactGetItem` or
 /// `TransactWriteItem`. Over the limit, the message lists the member name once

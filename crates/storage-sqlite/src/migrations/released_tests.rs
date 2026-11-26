@@ -149,10 +149,12 @@ async fn row_counts(db: &Path) -> BTreeMap<String, i64> {
     .expect("tables");
     let mut counts = BTreeMap::new();
     for table in tables {
-        let n: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM \"{table}\""))
-            .fetch_one(&pool)
-            .await
-            .expect("count");
+        let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM \"{table}\""
+        )))
+        .fetch_one(&pool)
+        .await
+        .expect("count");
         counts.insert(table, n);
     }
     pool.close().await;
@@ -510,19 +512,20 @@ async fn a_reconverge_keeps_what_a_later_migration_added() {
         let db = db.to_path_buf();
         async move {
             let pool = plain_pool(&db).await;
-            let columns: Vec<String> =
-                sqlx::query_scalar(&format!("SELECT name FROM pragma_table_info('{table}')"))
-                    .fetch_all(&pool)
-                    .await
-                    .expect("columns");
-            let rows: Vec<String> = sqlx::query_scalar(&format!(
+            let columns: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT name FROM pragma_table_info('{table}')"
+            )))
+            .fetch_all(&pool)
+            .await
+            .expect("columns");
+            let rows: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT {} FROM {table} ORDER BY rowid",
                 columns
                     .iter()
                     .map(|c| format!("quote({c})"))
                     .collect::<Vec<_>>()
                     .join(" || '|' || ")
-            ))
+            )))
             .fetch_all(&pool)
             .await
             .expect("rows");
