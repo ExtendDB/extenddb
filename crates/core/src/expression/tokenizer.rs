@@ -196,6 +196,12 @@ pub fn tokenize_with_limit(input: &str, max_tokens: usize) -> Result<Vec<Token>,
     Ok(tokens)
 }
 
+pub(super) const SYNTAX_ERROR: &str = "Syntax error; token: ";
+
+pub(super) fn syntax_error(token: &str, near: &str) -> String {
+    format!("{SYNTAX_ERROR}\"{token}\", near: \"{near}\"")
+}
+
 /// Tokenize with an expression type prefix for DynamoDB-compatible error messages.
 ///
 /// On invalid characters, produces: `"Invalid {expr_type}: Syntax error; token: "{tok}", near: "{near}"`
