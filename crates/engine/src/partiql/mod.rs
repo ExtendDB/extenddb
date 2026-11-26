@@ -52,7 +52,7 @@ mod expr_bridge;
 mod index_read;
 mod item_depth;
 mod next_token;
-mod request_checks;
+pub(crate) mod request_checks;
 mod returning;
 mod select;
 mod snapshot;
