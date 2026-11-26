@@ -336,7 +336,7 @@ The last ring write of `rotate` is conditional too, on the two-DEK ring of its f
 
 **Cause:** ExtendDB 1.0.0 fills its `memfd_secret` key store with writes from the process. Kernels with upstream commit 97d34aa65c29 refuse a page when the user's stores together exceed the limit. Writing that page ends the process with SIGBUS before the server logs its startup line. The shell reports a bus error and exit status 135. systemd logs `status=7/BUS`.
 
-**Fix:** Upgrade to a release after 1.0.0, whose store uses locked pages in that case. On 1.0.0, raise the memlock limit to the sum of that user's stores.
+**Fix:** Upgrade to a release after 1.0.0. Its store falls back to `mlock`. The server starts with locked pages when the process's own limit covers its store. Otherwise it refuses or warns, as the entry above describes. On 1.0.0, raise the memlock limit to the sum of that user's stores.
 
 ### A request fails with `InternalServerError` (HTTP 500) after a key change
 

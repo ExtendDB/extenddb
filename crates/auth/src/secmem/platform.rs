@@ -102,8 +102,9 @@ pub(super) fn lock_with(
         match memfd_secret(len) {
             Ok(region) => return Ok((region, Protection::MemfdSecret)),
             Err(e) if matches!(e.errno, libc::ENOSYS | libc::EPERM | libc::EAGAIN) => {}
-            // The pre-fault failed and the secret pages are unmapped.
-            // Under a low memlock limit the mlock path gives the refusal.
+            // The pre-fault failed: /dev/zero did not open, or the kernel
+            // refused a page. The secret pages are unmapped. The mlock path
+            // locks the store, or gives the refusal under a low limit.
             Err(e) if matches!(e.call, "read" | "open") => {}
             Err(e) => return Err(e),
         }
@@ -219,8 +220,9 @@ fn memfd_secret(len: usize) -> Result<Region, LockError> {
 }
 
 /// Fill the `len` bytes at `ptr` with reads from /dev/zero, so that the
-/// kernel takes every page fault. A page the kernel refuses ends the copy
-/// with a short count and then EFAULT, and sends no signal.
+/// kernel takes every page fault. When the kernel refuses a page, a read
+/// that filled earlier pages returns a short count, and the read at the
+/// refused page returns EFAULT. The kernel sends no signal.
 ///
 /// # Safety
 ///
