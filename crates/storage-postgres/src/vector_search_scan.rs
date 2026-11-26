@@ -196,7 +196,7 @@ mod tests {
         let scan_query = query.clone();
         let search = async {
             let mut scan = ScanConnection::begin(&pool).await.expect("begin");
-            sqlx::query(&scan_query)
+            sqlx::query(sqlx::AssertSqlSafe(scan_query.as_str()))
                 .execute(scan.connection())
                 .await
                 .expect("the statement");
@@ -294,8 +294,12 @@ mod tests {
             uuid::Uuid::new_v4().simple()
         );
         let statement = query.clone();
-        let sleeper =
-            tokio::spawn(async move { sqlx::query(&statement).execute(&mut *conn).await.is_ok() });
+        let sleeper = tokio::spawn(async move {
+            sqlx::query(sqlx::AssertSqlSafe(statement.as_str()))
+                .execute(&mut *conn)
+                .await
+                .is_ok()
+        });
         let start = std::time::Instant::now();
         while !still_running(&observer, &query, Duration::ZERO).await {
             assert!(

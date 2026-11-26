@@ -94,7 +94,7 @@ where
         .expect("connect to the server");
     let outcome = AssertUnwindSafe(async {
         for db in [&catalog, &data] {
-            sqlx::query(&format!("CREATE DATABASE \"{db}\""))
+            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{db}\"")))
                 .execute(&admin)
                 .await
                 .expect("create the database");
@@ -108,9 +108,11 @@ where
     for db in [&catalog, &data] {
         // FORCE ends the engine's pooled connections, which a panic leaves
         // open.
-        let dropped = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{db}\" WITH (FORCE)"))
-            .execute(&admin)
-            .await;
+        let dropped = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE IF EXISTS \"{db}\" WITH (FORCE)"
+        )))
+        .execute(&admin)
+        .await;
         if let Err(e) = dropped {
             eprintln!("could not drop {db}: {e}");
         }

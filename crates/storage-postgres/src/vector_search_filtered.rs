@@ -119,7 +119,7 @@ impl ScanStatement {
         limit: i64,
         after: Option<(f64, String)>,
     ) -> QueryAs<'q, Postgres, (f64, String), PgArguments> {
-        let mut query = sqlx::query_as::<_, (f64, String)>(sql)
+        let mut query = sqlx::query_as::<_, (f64, String)>(sqlx::AssertSqlSafe(sql))
             .bind(self.vector.clone())
             .bind(self.partition.clone())
             .bind(limit)
@@ -156,7 +156,7 @@ async fn offer_page(
     );
     for batch in page.chunks(ITEM_BATCH) {
         let rids: Vec<&str> = batch.iter().map(|(_, rid)| rid.as_str()).collect();
-        let mut items = sqlx::query_as::<_, (i64, Json<Item>)>(&sql)
+        let mut items = sqlx::query_as::<_, (i64, Json<Item>)>(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(rids)
             .fetch(scan.connection());
         let mut position = 0usize;
@@ -263,7 +263,7 @@ async fn read_embeddings(
         "SELECT ctid::text, embedding FROM {} WHERE ctid = ANY($1::text[]::tid[])",
         statement.vec_table
     );
-    let rows: Vec<(String, Vector)> = sqlx::query_as(&sql)
+    let rows: Vec<(String, Vector)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(rids)
         .fetch_all(scan.connection())
         .await

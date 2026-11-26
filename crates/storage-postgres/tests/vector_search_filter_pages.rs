@@ -183,10 +183,10 @@ async fn delete_rows(url: &str, ids: &[&str]) {
     .await
     .expect("find the vector table");
     assert_eq!(tables.len(), 1, "{tables:?}");
-    let deleted = sqlx::query(&format!(
+    let deleted = sqlx::query(sqlx::AssertSqlSafe(format!(
         "DELETE FROM \"{}\" WHERE item_data -> 'id' ->> 'S' = ANY($1)",
         tables[0]
-    ))
+    )))
     .bind(ids)
     .execute(&pool)
     .await
