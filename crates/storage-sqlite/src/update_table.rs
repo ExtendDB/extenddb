@@ -269,6 +269,26 @@ impl SqliteEngine {
             }
         }
 
+        // The stream change is decided before any other column is written, so a
+        // refused one writes nothing else. A disable of an already disabled
+        // stream is refused, and the transaction then holds only the close of
+        // the shards the first disable left open, which is committed.
+        if let Some(spec) = &input.stream_specification
+            && let Some(refusal) = Self::apply_stream_specification(
+                &mut tx,
+                account_id,
+                &input.table_name,
+                &table_id,
+                spec,
+            )
+            .await?
+        {
+            tx.commit()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            return Err(refusal);
+        }
+
         if let Some(bm) = &input.billing_mode {
             let s = match bm {
                 BillingMode::Provisioned => "PROVISIONED",
@@ -313,24 +333,6 @@ impl SqliteEngine {
                 &j,
             )
             .await?;
-        }
-        if let Some(spec) = &input.stream_specification
-            && let Some(refusal) = Self::apply_stream_specification(
-                &mut tx,
-                account_id,
-                &input.table_name,
-                &table_id,
-                spec,
-            )
-            .await?
-        {
-            // A disable of an already disabled stream: the request is refused,
-            // and the transaction holds only the close of the shards the first
-            // disable left open (a stream change travels alone in the request).
-            tx.commit()
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            return Err(refusal);
         }
 
         // WarmThroughput on the table and on updated indexes: stored as sent,

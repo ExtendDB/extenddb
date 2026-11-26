@@ -480,3 +480,42 @@ async fn a_disable_refused_on_a_disabled_stream_closes_the_shards_it_left_open()
     assert_eq!(closed_by_enable, 4);
     engine.pool.close().await;
 }
+
+/// A refused disable writes none of the request's other members, on a table
+/// that never had a stream (the transaction rolls back) and on one whose
+/// stream is already disabled (the transaction commits the shard close). The
+/// engine refuses TableClass beside a stream change before storage is
+/// reached; OnDemandThroughput reaches this path through it.
+#[tokio::test]
+async fn a_refused_disable_writes_no_other_member() {
+    let engine = engine().await;
+    create(&engine, "never", false).await;
+    create(&engine, "off", true).await;
+    set_stream(&engine, "off", serde_json::json!({"StreamEnabled": false}))
+        .await
+        .unwrap();
+    for name in ["never", "off"] {
+        let input = serde_json::json!({
+            "TableName": name,
+            "StreamSpecification": {"StreamEnabled": false},
+            "TableClass": "STANDARD_INFREQUENT_ACCESS",
+            "OnDemandThroughput": {"MaxReadRequestUnits": 100, "MaxWriteRequestUnits": 100},
+        });
+        match engine
+            .update_table(ACCOUNT, serde_json::from_value(input).unwrap())
+            .await
+        {
+            Err(StorageError::Validation(m)) => {
+                assert_eq!(
+                    m,
+                    format!("Table has no stream to disable: TableName: {name}")
+                );
+            }
+            other => panic!("{name}: {other:?}"),
+        }
+        let table = describe_table(&engine, name).await;
+        assert_eq!(table.table_class_summary, None, "{name}");
+        assert_eq!(table.on_demand_throughput, None, "{name}");
+    }
+    engine.pool.close().await;
+}
