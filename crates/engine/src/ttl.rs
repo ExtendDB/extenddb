@@ -225,8 +225,8 @@ fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
         // TTL on a table with an asynchronously propagated GSI): a client
         // error, which SDKs do not retry.
         StorageError::Validation(msg) => DynamoDbError::ValidationException(msg),
-        StorageError::TableNotFound(_name) => {
-            DynamoDbError::ResourceNotFoundException("Requested resource not found".to_string())
+        e @ StorageError::TableNotFound(_) => {
+            crate::create_table::storage_err_to_dynamo_naming_table(e)
         }
         StorageError::TableNotActive(name) => {
             DynamoDbError::ResourceInUseException(format!("Table {name} is not in ACTIVE state"))

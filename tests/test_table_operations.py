@@ -15,7 +15,7 @@ import uuid
 
 import pytest
 from botocore.exceptions import ClientError
-from conftest import _is_real_dynamodb, config_value, configured_backend, wait_for_active
+from conftest import _is_real_dynamodb, config_value, configured_backend, scoped_table, wait_for_active
 class TestCreateTable:
     """CreateTable operation tests."""
 
@@ -542,3 +542,46 @@ class TestContainsDuplicateOperand:
         assert err["Code"] == "ValidationException"
         assert "first operand must be distinct" in err["Message"]
         assert "[val]" in err["Message"]
+
+
+# DynamoDB's answers for a table that does not exist (measured 2026-11-18):
+# the table operations name the table, also when TableName is the table's
+# ARN. The item operations answer the same text without the name.
+THROUGHPUT = {"ProvisionedThroughput": {"ReadCapacityUnits": 6, "WriteCapacityUnits": 6}}
+TTL_ON = {"TimeToLiveSpecification": {"Enabled": True, "AttributeName": "ttl"}}
+MISSING_TABLE_REQUESTS = [
+    # (operation, parameters, TableName is the table's ARN)
+    ("describe_table", {}, False),
+    ("delete_table", {}, False),
+    ("update_table", THROUGHPUT, False),
+    ("update_table", {"GlobalSecondaryIndexUpdates": [{"Delete": {"IndexName": "gsi1"}}]}, False),
+    ("update_table", THROUGHPUT, True),
+    ("describe_time_to_live", {}, False),
+    ("update_time_to_live", TTL_ON, False),
+]
+
+
+@pytest.fixture(scope="module")
+def table_arn_prefix(dynamodb_client):
+    """The caller's table ARN up to the table name (`arn:...:table/`), read
+    from the ARN of a table this fixture creates and deletes."""
+    with scoped_table(dynamodb_client) as name:
+        arn = dynamodb_client.describe_table(TableName=name)["Table"]["TableArn"]
+    return arn[: -len(name)]
+
+
+class TestMissingTable:
+    """The answer of a table operation for a table that does not exist."""
+
+    @pytest.mark.parametrize(("operation", "params", "by_arn"), MISSING_TABLE_REQUESTS)
+    def test_the_answer_names_the_table(
+        self, request, dynamodb_client, unique_table_name, operation, params, by_arn
+    ):
+        prefix = request.getfixturevalue("table_arn_prefix") if by_arn else ""
+        with pytest.raises(ClientError) as exc_info:
+            getattr(dynamodb_client, operation)(TableName=prefix + unique_table_name, **params)
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ResourceNotFoundException"
+        assert err["Message"] == (
+            f"Requested resource not found: Table: {unique_table_name} not found"
+        )

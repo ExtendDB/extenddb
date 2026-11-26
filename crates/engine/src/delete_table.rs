@@ -7,7 +7,7 @@ use extenddb_core::types::{DeleteTableInput, DeleteTableOutput};
 use extenddb_core::validation::validate_table_name;
 
 use crate::OperationContext;
-use crate::create_table::storage_err_to_dynamo;
+use crate::create_table::storage_err_to_dynamo_naming_table;
 use crate::serialize_output;
 
 pub async fn handle_delete_table(
@@ -23,7 +23,7 @@ pub async fn handle_delete_table(
         .storage
         .delete_table(&ctx.account_id, input)
         .await
-        .map_err(storage_err_to_dynamo)?;
+        .map_err(storage_err_to_dynamo_naming_table)?;
 
     // Drop the cached TableKeyInfo so subsequent requests see the deletion
     // (or get a fresh negative-cache entry) immediately.

@@ -123,9 +123,12 @@ pub async fn handle_create_table(
 pub fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> DynamoDbError {
     use extenddb_storage::error::StorageError;
     match e {
-        StorageError::TableNotFound(name) => DynamoDbError::ResourceNotFoundException(
-            error_message(ErrorMessageKey::TableNotFound, &[&name]),
-        ),
+        // The item operations answer a missing table without its name
+        // (measured on DynamoDB). The table operations name it, see
+        // `storage_err_to_dynamo_naming_table`.
+        StorageError::TableNotFound(_) => {
+            DynamoDbError::ResourceNotFoundException("Requested resource not found".to_owned())
+        }
         StorageError::TableAlreadyExists(name) => DynamoDbError::ResourceInUseException(
             error_message(ErrorMessageKey::TableAlreadyExists, &[&name]),
         ),
@@ -257,12 +260,80 @@ pub(crate) fn storage_err_to_dynamo_with_ccf(
     }
 }
 
+/// Like [`storage_err_to_dynamo`], but a missing table is answered with its
+/// name, as `DynamoDB` answers the table operations (measured 2026-11-18).
+/// A table ARN is answered with the name of its table, not with the ARN.
+pub(crate) fn storage_err_to_dynamo_naming_table(
+    e: extenddb_storage::error::StorageError,
+) -> DynamoDbError {
+    match e {
+        extenddb_storage::error::StorageError::TableNotFound(name) => {
+            let table = extenddb_core::arn::parse(&name).map_or(name, |arn| arn.table);
+            DynamoDbError::ResourceNotFoundException(error_message(
+                ErrorMessageKey::TableNotFound,
+                &[&table],
+            ))
+        }
+        other => storage_err_to_dynamo(other),
+    }
+}
+
 #[cfg(test)]
 mod storage_error_mapping_tests {
     use extenddb_core::error::DynamoDbError;
     use extenddb_storage::error::StorageError;
 
     use super::storage_err_to_dynamo;
+
+    /// `DynamoDB`'s answers for a table that does not exist (measured
+    /// 2026-11-18): a table operation names the table, and an item
+    /// operation does not.
+    #[tokio::test]
+    async fn a_missing_table_is_named_by_the_table_operations() {
+        use serde_json::json;
+
+        let rows = [
+            (
+                "DescribeTable",
+                json!({}),
+                "Requested resource not found: Table: missing-table not found",
+            ),
+            (
+                "GetItem",
+                json!({"Key": {"pk": {"S": "a"}}}),
+                "Requested resource not found",
+            ),
+        ];
+        // An empty catalog, so each lookup finds no table.
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let path = dir.path().join("catalog.db");
+        let path = path.to_str().expect("a UTF-8 path");
+        extenddb_storage_sqlite::migrations::migrate(
+            path,
+            "1.0.0-test",
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .expect("the catalog migrates");
+        let mut ctx = crate::partiql::test_context::context(None).await;
+        ctx.storage = std::sync::Arc::new(
+            extenddb_storage_sqlite::SqliteEngine::new(path, 1, "us-east-1", 409_600)
+                .await
+                .expect("the catalog opens"),
+        );
+        for (operation, mut body, expected) in rows {
+            body["TableName"] = json!("missing-table");
+            let answer = crate::dispatch(operation, body.clone(), &ctx, "")
+                .await
+                .map(|result| result.body);
+            match answer {
+                Err(DynamoDbError::ResourceNotFoundException(message)) => {
+                    assert_eq!(message, expected, "{operation} {body}");
+                }
+                other => panic!("{operation} {body}: {other:?}"),
+            }
+        }
+    }
 
     /// A snapshot the backend discarded is retryable, like a transient error.
     #[test]
