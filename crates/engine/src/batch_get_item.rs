@@ -165,6 +165,11 @@ pub async fn handle_batch_get_item(
         extenddb_core::validation::number::operations::batch_get_keys(keys)?;
     }
 
+    extenddb_core::validation::table_name_length::validate_request_items_keys(
+        input.request_items.keys(),
+        &ctx.limits,
+    )?;
+
     let mut responses: HashMap<String, Vec<Item>> = HashMap::new();
     let mut total_rcu: f64 = 0.0;
     let mut total_pre_proj_bytes: usize = 0;

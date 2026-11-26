@@ -21,6 +21,7 @@
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::BackupSummary;
+use extenddb_core::validation::table_name_length::table_name_bounds;
 use extenddb_storage::backup_catalog::TimeBounds;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{BackupCatalog, LegacyBackupReader};
@@ -133,12 +134,6 @@ pub(crate) fn validate_name_member(
                 .join("; ")
         ))),
     }
-}
-
-/// The length bounds for a `TableName` member: the deployment's, which
-/// default to the model's 3 to 255.
-fn table_name_bounds(limits: &LimitsConfig) -> (usize, usize) {
-    (limits.min_table_name_length, limits.max_table_name_length)
 }
 
 /// The `TableName` of `CreateBackup` and `ListBackups`, which the service

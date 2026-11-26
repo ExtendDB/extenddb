@@ -2576,7 +2576,7 @@
       ]
     },
     {
-      "name": "table names: GetItem with a TableName outside the pattern answers ResourceNotFoundException",
+      "name": "table names: GetItem with a TableName outside the pattern answers the pattern clause",
       "op": "GetItem",
       "body": {
         "TableName": "bad name!",
@@ -2586,11 +2586,11 @@
           }
         }
       },
-      "error": "ResourceNotFoundException",
+      "error": "ValidationException",
       "checks": [
         {
           "path": "/message",
-          "equals": "Requested resource not found"
+          "equals": "1 validation error detected: Value 'bad name!' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
         }
       ]
     },
@@ -3471,7 +3471,7 @@
       ]
     },
     {
-      "name": "table names: GetItem with a two-character TableName outside the pattern answers ResourceNotFoundException",
+      "name": "table names: GetItem with a two-character TableName outside the pattern answers the length clause alone",
       "op": "GetItem",
       "body": {
         "TableName": "a!",
@@ -3481,16 +3481,16 @@
           }
         }
       },
-      "error": "ResourceNotFoundException",
+      "error": "ValidationException",
       "checks": [
         {
           "path": "/message",
-          "equals": "Requested resource not found"
+          "equals": "1 validation error detected: Value 'a!' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3"
         }
       ]
     },
     {
-      "name": "table names: GetItem with a 301-character TableName outside the pattern answers ResourceNotFoundException",
+      "name": "table names: GetItem with a 301-character TableName outside the pattern answers the length clause alone",
       "op": "GetItem",
       "body": {
         "TableName": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy!",
@@ -3500,11 +3500,11 @@
           }
         }
       },
-      "error": "ResourceNotFoundException",
+      "error": "ValidationException",
       "checks": [
         {
           "path": "/message",
-          "equals": "Requested resource not found"
+          "equals": "1 validation error detected: Value 'yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy!' at 'tableName' failed to satisfy constraint: Member must have length less than or equal to 255"
         }
       ]
     },
@@ -3535,6 +3535,32 @@
       ]
     },
     {
+      "name": "table names: BatchWriteItem with a two-character RequestItems key outside the pattern answers the map keys sentence",
+      "op": "BatchWriteItem",
+      "body": {
+        "RequestItems": {
+          "a!": [
+            {
+              "PutRequest": {
+                "Item": {
+                  "pk": {
+                    "S": "x"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "1 validation error detected: Value 'a!' at 'requestItems' failed to satisfy constraint: Map keys must satisfy constraint: [Member must have length less than or equal to 255, Member must have length greater than or equal to 3, Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+]"
+        }
+      ]
+    },
+    {
       "name": "table names: TransactWriteItems with a member TableName outside the pattern answers ResourceNotFoundException",
       "op": "TransactWriteItems",
       "body": {
@@ -3556,6 +3582,31 @@
         {
           "path": "/message",
           "equals": "Requested resource not found"
+        }
+      ]
+    },
+    {
+      "name": "table names: TransactWriteItems with a two-character member TableName outside the pattern answers the length clause alone",
+      "op": "TransactWriteItems",
+      "body": {
+        "TransactItems": [
+          {
+            "Put": {
+              "TableName": "a!",
+              "Item": {
+                "pk": {
+                  "S": "x"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "1 validation error detected: Value 'a!' at 'transactItems.1.member.put.tableName' failed to satisfy constraint: Member must have length greater than or equal to 3"
         }
       ]
     },
@@ -3800,7 +3851,7 @@
       ]
     },
     {
-      "name": "table names: GetItem with an empty TableName answers ResourceNotFoundException",
+      "name": "table names: GetItem with an empty TableName answers the length clause at TableName",
       "op": "GetItem",
       "body": {
         "TableName": "",
@@ -3810,11 +3861,25 @@
           }
         }
       },
-      "error": "ResourceNotFoundException",
+      "error": "ValidationException",
       "checks": [
         {
           "path": "/message",
-          "equals": "Requested resource not found"
+          "equals": "1 validation error detected: Value at 'TableName' failed to satisfy constraint: Member must have length greater than or equal to 1"
+        }
+      ]
+    },
+    {
+      "name": "table names: DescribeTable with an empty TableName answers the length clause of an empty name",
+      "op": "DescribeTable",
+      "body": {
+        "TableName": ""
+      },
+      "error": "ValidationException",
+      "checks": [
+        {
+          "path": "/message",
+          "equals": "1 validation error detected: Value '' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 1"
         }
       ]
     },

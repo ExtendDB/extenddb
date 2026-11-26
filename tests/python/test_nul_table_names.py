@@ -1,7 +1,7 @@
 # Copyright 2026 ExtendDB contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""U+0000 in index names and table names.
+"""U+0000 in index names and table names, and table names of a bad length.
 
 DynamoDB refuses U+0000 inside an index name or a table name with the member
 pattern ValidationException. Measured against the service with SDK parameter
@@ -26,7 +26,13 @@ recorded here as a comment; the server places the check before authorization
 import pytest
 from botocore.exceptions import ClientError
 
-from helpers import assert_member_pattern, unique_name, wait_for_active, wait_for_deleted
+from helpers import (
+    assert_member_pattern,
+    assert_validation,
+    unique_name,
+    wait_for_active,
+    wait_for_deleted,
+)
 
 NUL = "\u0000"
 PATTERN = "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
@@ -270,3 +276,173 @@ class TestNulInTableArn:
         assert resp["Error"]["Message"] == (
             f"Invalid TableArn: Invalid ResourceArn provided as input {nul_arn}"
         )
+
+
+N256 = "n" * 256
+K256 = "k" * 256
+LEN3 = "Member must have length greater than or equal to 3"
+LEN255 = "Member must have length less than or equal to 255"
+EMPTY = (
+    "1 validation error detected: Value at 'TableName' failed to satisfy constraint: "
+    "Member must have length greater than or equal to 1"
+)
+
+
+def _at(value: str, location: str, clause: str) -> str:
+    return f"Value '{value}' at '{location}' failed to satisfy constraint: {clause}"
+
+
+def _one(value: str, location: str, clause: str) -> str:
+    return f"1 validation error detected: {_at(value, location, clause)}"
+
+
+def _key(pk: str) -> dict:
+    return {"pk": {"S": pk}, "sk": {"S": "b"}}
+
+
+def _put(table: str, pk: str) -> dict:
+    return {"Put": {"TableName": table, "Item": _key(pk)}}
+
+
+# Issue #1056: a table name shorter than 3 or longer than 255 characters, and
+# an empty one, measured on 2026-11-13, 2026-11-14 and 2026-11-18 (us-east-1).
+# Each row is (call, expected): a message, or ("requestItems", key) for the
+# map-key sentence, whose quoted value is compared as in
+# TestNulInNestedTableNames. `t` is a table keyed on pk and sk.
+LENGTH_ROWS = [
+    pytest.param(
+        lambda c, t: c.get_item(TableName="ab", Key={"pk": {"S": "a"}}),
+        _one("ab", "tableName", LEN3),
+        id="GetItem-short",
+    ),
+    pytest.param(
+        lambda c, t: c.get_item(TableName=N256, Key=_key("a")),
+        _one(N256, "tableName", LEN255),
+        id="GetItem-long",
+    ),
+    pytest.param(
+        lambda c, t: c.get_item(TableName="", Key={"pk": {"S": "a"}}), EMPTY, id="GetItem-empty"
+    ),
+    pytest.param(
+        lambda c, t: c.put_item(TableName="", Item={"pk": {"S": "a"}}), EMPTY, id="PutItem-empty"
+    ),
+    pytest.param(
+        lambda c, t: c.describe_table(TableName=""),
+        f"2 validation errors detected: {_at('', 'tableName', LEN3)}; {_at('', 'tableName', PATTERN)}",
+        id="DescribeTable-empty",
+    ),
+    pytest.param(
+        lambda c, t: c.transact_write_items(
+            TransactItems=[
+                _put(t, "a"),
+                {
+                    "Update": {
+                        "TableName": "ab",
+                        "Key": _key("c"),
+                        "UpdateExpression": "SET v = :v",
+                        "ExpressionAttributeValues": {":v": {"S": "x"}},
+                    }
+                },
+            ]
+        ),
+        _one("ab", "transactItems.2.member.update.tableName", LEN3),
+        id="TransactWriteItems-short",
+    ),
+    pytest.param(
+        lambda c, t: c.transact_write_items(
+            TransactItems=[
+                _put(t, "a"),
+                _put(t, "c"),
+                {"Delete": {"TableName": N256, "Key": _key("d")}},
+            ]
+        ),
+        _one(N256, "transactItems.3.member.delete.tableName", LEN255),
+        id="TransactWriteItems-long",
+    ),
+    pytest.param(
+        lambda c, t: c.transact_write_items(
+            TransactItems=[_put("ab", "a"), {"Delete": {"TableName": N256, "Key": _key("c")}}]
+        ),
+        "2 validation errors detected: "
+        f"{_at('ab', 'transactItems.1.member.put.tableName', LEN3)}; "
+        f"{_at(N256, 'transactItems.2.member.delete.tableName', LEN255)}",
+        id="TransactWriteItems-short-and-long",
+    ),
+    pytest.param(
+        lambda c, t: c.transact_write_items(
+            TransactItems=[_put("ab", "a"), {"Delete": {"TableName": "bad name", "Key": _key("c")}}]
+        ),
+        "2 validation errors detected: "
+        f"{_at('ab', 'transactItems.1.member.put.tableName', LEN3)}; "
+        f"{_at('bad name', 'transactItems.2.member.delete.tableName', PATTERN)}",
+        id="TransactWriteItems-short-and-pattern",
+    ),
+    pytest.param(
+        lambda c, t: c.batch_get_item(RequestItems={"ab": {"Keys": [{"pk": {"S": "a"}}]}}),
+        ("requestItems", "ab"),
+        id="BatchGetItem-short",
+    ),
+    pytest.param(
+        lambda c, t: c.batch_get_item(RequestItems={"ab": {"Keys": [{"pk": {"S": 'a"b\\c\nd'}}]}}),
+        ("requestItems", "ab"),
+        id="BatchGetItem-short-escaped-value",
+    ),
+    pytest.param(
+        lambda c, t: c.batch_get_item(
+            RequestItems={
+                K256: {
+                    "ConsistentRead": True,
+                    "ExpressionAttributeNames": {"#p": "pk"},
+                    "Keys": [{"pk": {"S": "a"}}],
+                    "ProjectionExpression": "#p",
+                }
+            }
+        ),
+        ("requestItems", K256),
+        id="BatchGetItem-long",
+    ),
+    pytest.param(
+        lambda c, t: c.batch_write_item(
+            RequestItems={"ab": [{"PutRequest": {"Item": {"pk": {"S": "a"}}}}]}
+        ),
+        ("requestItems", "ab"),
+        id="BatchWriteItem-short",
+    ),
+]
+
+
+class TestTableNameLengths:
+    """The service refuses these names with ValidationException before it
+    looks a table up; the TransactWriteItems rows list every action's fault."""
+
+    @pytest.fixture(scope="class")
+    def keyed_table(self, raw_client):
+        name = unique_name("len")
+        raw_client.create_table(
+            TableName=name,
+            BillingMode="PAY_PER_REQUEST",
+            KeySchema=[
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"},
+            ],
+            AttributeDefinitions=[
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "S"},
+            ],
+        )
+        wait_for_active(raw_client, name)
+        yield name
+        try:
+            raw_client.delete_table(TableName=name)
+            wait_for_deleted(raw_client, name)
+        except Exception:
+            pass
+
+    @pytest.mark.parametrize("call,expected", LENGTH_ROWS)
+    def test_a_name_of_a_bad_length_is_refused(self, raw_client, keyed_table, call, expected):
+        with pytest.raises(ClientError) as exc:
+            call(raw_client, keyed_table)
+        if isinstance(expected, tuple):
+            TestNulInNestedTableNames._request_items_error(exc.value, expected[1])
+        else:
+            assert_validation(exc.value, expected)
