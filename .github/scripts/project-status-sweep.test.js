@@ -87,7 +87,7 @@ function fakeGithub({ pages, workflows = [], failUpdates = 0, linkedById = {}, f
   };
 }
 
-const OPTIONS = ['Todo', 'In Progress', 'Needs review', 'Review', 'Done'].map((name) => ({ id: `OPT_${name}`, name }));
+const OPTIONS = ['Todo', 'In Progress', 'Changes requested', 'Needs review', 'Review', 'Done'].map((name) => ({ id: `OPT_${name}`, name }));
 
 const boardPage = (nodes, { hasNextPage = false, remaining = 4000, field = { id: 'F', options: OPTIONS } } = {}) => ({
   rateLimit: { cost: 9, remaining },
@@ -151,17 +151,36 @@ test('an approval moves a PR to Review', () => {
   assert.equal(prStatus(pr({ verdicts: { nodes: [verdict(user('bob'), 'APPROVED')] } })), 'Review');
 });
 
-test('changes requested sends a PR back to In Progress', () => {
+test('changes requested moves a PR to Changes requested', () => {
   const p = pr({
     verdicts: { nodes: [verdict(user('bob'), 'CHANGES_REQUESTED')] },
     reviews: { nodes: [review(user('bob'), 'CHANGES_REQUESTED'), review(user('alice'), 'COMMENTED')] },
   });
-  assert.equal(prStatus(p), 'In Progress');
+  assert.equal(prStatus(p), 'Changes requested');
 });
 
 test('one approval does not outweigh another reviewer requesting changes', () => {
   const p = pr({ verdicts: { nodes: [verdict(user('bob'), 'APPROVED'), verdict(user('cat'), 'CHANGES_REQUESTED')] } });
+  assert.equal(prStatus(p), 'Changes requested');
+});
+
+test('a draft PR with changes requested stays In Progress', () => {
+  const p = pr({ isDraft: true, verdicts: { nodes: [verdict(user('bob'), 'CHANGES_REQUESTED')] } });
   assert.equal(prStatus(p), 'In Progress');
+});
+
+test('a bot requesting changes does not move a PR to Changes requested', () => {
+  assert.equal(prStatus(pr({ verdicts: { nodes: [verdict(bot('some-bot'), 'CHANGES_REQUESTED')] } })), 'Needs review');
+});
+
+test("the author's own changes-requested verdict does not count", () => {
+  assert.equal(prStatus(pr({ verdicts: { nodes: [verdict(user('alice'), 'CHANGES_REQUESTED')] } })), 'Needs review');
+});
+
+test('a dismissed changes-requested review (no longer a verdict) is Review, not Changes requested', () => {
+  // GitHub drops a dismissed review from latestOpinionatedReviews; it stays in reviews.
+  const p = pr({ reviews: { nodes: [review(user('bob'), 'DISMISSED')] } });
+  assert.equal(prStatus(p), 'Review');
 });
 
 test('re-requesting review from the reviewer who asked for changes moves it to Needs review', () => {
@@ -184,12 +203,12 @@ test('a draft PR with no reviews stays In Progress', () => {
   assert.equal(prStatus(pr({ isDraft: true })), 'In Progress');
 });
 
-test('re-requesting only some blocking reviewers keeps In Progress', () => {
+test('re-requesting only some blocking reviewers keeps Changes requested', () => {
   const p = pr({
     verdicts: { nodes: [verdict(user('bob'), 'CHANGES_REQUESTED'), verdict(user('cat'), 'CHANGES_REQUESTED')] },
     reviewRequests: { nodes: [request('bob')] },
   });
-  assert.equal(prStatus(p), 'In Progress');
+  assert.equal(prStatus(p), 'Changes requested');
 });
 
 test('a stale changes-requested verdict is not lost behind many later comments', () => {
@@ -197,7 +216,7 @@ test('a stale changes-requested verdict is not lost behind many later comments',
     verdicts: { nodes: [verdict(user('bob'), 'CHANGES_REQUESTED')] },
     reviews: { nodes: Array.from({ length: 30 }, () => review(user('bob'), 'COMMENTED')) },
   });
-  assert.equal(prStatus(p), 'In Progress');
+  assert.equal(prStatus(p), 'Changes requested');
 });
 
 test('a PR whose only review was dismissed counts as reviewed', () => {
@@ -242,6 +261,17 @@ test('an issue takes the furthest of its linked PRs', () => {
   const reviewed = pr({ id: 'PR_2', verdicts: { nodes: [verdict(user('bob'), 'APPROVED')] } });
   const i = issue({ linked: { totalCount: 2, nodes: [pr(), reviewed] } });
   assert.equal(issueStatus(i), 'Review');
+});
+
+test('issue follows its trusted linked PR into Changes requested', () => {
+  const blocked = pr({ verdicts: { nodes: [verdict(user('bob'), 'CHANGES_REQUESTED')] } });
+  assert.equal(issueStatus(issue({ assignees: { totalCount: 1 }, linked: linked(blocked) })), 'Changes requested');
+});
+
+test('an issue with one PR waiting on a reviewer and one on its author shows Needs review', () => {
+  const blocked = pr({ id: 'PR_2', verdicts: { nodes: [verdict(user('bob'), 'CHANGES_REQUESTED')] } });
+  const i = issue({ linked: { totalCount: 2, nodes: [blocked, pr()] } });
+  assert.equal(issueStatus(i), 'Needs review');
 });
 
 test('a merged or closed linked PR is ignored', () => {
@@ -359,6 +389,7 @@ test('the public log names no issue, PR, status or draft; the private card has t
     item(pr({ number: 501, verdicts: { nodes: [verdict(user('bob'), 'APPROVED')] } }), 'Todo'),
     item(issue({ number: 602, assignees: { totalCount: 1 } }), 'Todo'),
     item(pr({ number: 703 }), 'Todo'),
+    item(pr({ number: 804, verdicts: { nodes: [verdict(user('bob'), 'CHANGES_REQUESTED')] } }), 'Todo'),
     item({ __typename: 'DraftIssue', id: 'D1', title: 'Secret launch plan' }, 'Todo'),
     item(null, 'Todo'),
   ];
@@ -369,11 +400,11 @@ test('the public log names no issue, PR, status or draft; the private card has t
   });
   const { core } = await run(gh);
   const publicLog = [...core.info, ...core.warning, ...core.failed].join('\n');
-  for (const leak of ['#501', '#602', '#703', 'Todo', 'In Progress', 'Needs review', 'Review', 'review', 'draft', 'Secret', 'linked to issue', 'inaccessible', 'boom']) {
+  for (const leak of ['#501', '#602', '#703', '#804', 'Todo', 'In Progress', 'Changes requested', 'Needs review', 'Review', 'review', 'draft', 'Secret', 'linked to issue', 'inaccessible', 'boom']) {
     assert.ok(!publicLog.includes(leak), `public log leaked "${leak}": ${publicLog}`);
   }
   const card = gh.writes.find((w) => w.kind === 'heartbeat-add');
-  for (const detail of ['PR #501', 'issue #602', 'PR #703: Todo -> Needs review', 'Pull request linked to issue', 'draft item 1', 'boom']) {
+  for (const detail of ['PR #501', 'issue #602', 'PR #703: Todo -> Needs review', 'PR #804: Todo -> Changes requested', 'Pull request linked to issue', 'draft item 1', 'boom']) {
     assert.ok(card.body.includes(detail), `card is missing "${detail}"`);
   }
 });
@@ -416,6 +447,28 @@ test('a renamed status option is reported, not fatal', async () => {
   assert.ok(result.problems.some((m) => m.includes('no "Review" status option')));
   assert.equal(gh.writes.filter((w) => w.kind === 'status').length, 1);
   assert.equal(core.failed.length, 0);
+});
+
+test('before the Changes requested column exists, those cards stay put and the run is degraded', async () => {
+  const field = { id: 'F', options: OPTIONS.filter((o) => o.name !== 'Changes requested') };
+  const blocked = pr({ number: 5, verdicts: { nodes: [verdict(user('bob'), 'CHANGES_REQUESTED')] } });
+  const gh = fakeGithub({ pages: [boardPage([item(blocked, 'In Progress'), item(pr({ number: 6 }), 'Todo')], { field })] });
+  const { result, core } = await run(gh);
+  assert.equal(result.outcome, 'degraded');
+  assert.ok(result.problems.some((m) => m.includes('PR #5') && m.includes('no "Changes requested" status option')));
+  assert.deepEqual(gh.writes.filter((w) => w.kind === 'status').map((w) => w.item), ['ITEM_6']);
+  assert.equal(core.failed.length, 0);
+});
+
+test('a card already in Changes requested is managed, and moves on once review is re-requested', async () => {
+  const back = pr({
+    number: 5,
+    verdicts: { nodes: [verdict(user('bob'), 'CHANGES_REQUESTED')] },
+    reviewRequests: { nodes: [request('bob')] },
+  });
+  const gh = fakeGithub({ pages: [boardPage([item(back, 'Changes requested')])] });
+  const { result } = await run(gh);
+  assert.deepEqual(result.changes.map((c) => [c.label, c.from, c.to]), [['PR #5', 'Changes requested', 'Needs review']]);
 });
 
 test('a missing Status field changes nothing and is reported', async () => {
