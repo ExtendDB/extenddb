@@ -667,8 +667,15 @@ on it returns the held item (`7cc900a`, round-5 branch `[ref-repo]`). Tess-2 to
 Tess-6 are runs of `tests/test_fault_hooks.py` on a `fault-hooks` build on the
 single-node demo stack (`PutItem` only), one run each; the held-write test
 passed on every one, on the earlier form of the test in Tess-2 to Tess-5 and on
-the rewritten form in Tess-6 `[ref-repo]`. Negative control, a build with both
-drain waits removed: `<<NEGCTL: shown | not shown>>` that the test fails. The
+the rewritten form in Tess-6 `[ref-repo]`. Negative control (Tess-7, same stack and
+build, `[ref-repo]`): with the early return added to the one function both drain
+waits share, so that neither the fenced pass nor the worker's pass waits, the
+rewritten test failed at "index left CREATING while a write was held: ACTIVE" in
+two of three runs, and failed once with a client read timeout that has no
+explanation yet; no patched run passed. The unpatched build passed the same test
+once, in 8.5 s. That shows a fence with no drain fails this test. It does not
+show that a short or partial drain, or a fault in only one of the two passes, is
+caught (both were removed together), nor the multi-server case. The
 guard before the view read, the transaction guard, the reconciler change, the
 worker's drain wait and the background `committing` takeover are built and
 unit-tested only (the takeover is not exercised), with no dedicated test; the
