@@ -1,0 +1,137 @@
+name: diag-secmem-verify2
+
+on:
+  push:
+    branches: [diag/secmem-verify2]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [extenddb_ubuntu-2404_4-core]
+        n: [1, 2, 3]
+        include:
+          - { runner: ubuntu-24.04, n: 1 }
+          - { runner: ubuntu-24.04-arm, n: 1 }
+          - { runner: ubuntu-22.04, n: 1 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: diag
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: src
+          ref: f9e5e3b71d0f7163e8b755c2f8df37c4caddaf03
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Host
+        run: |
+          echo "runner=${{ matrix.runner }} image=${ImageVersion:-unset} kernel=$(uname -r) arch=$(uname -m)"
+          echo "memlock=$(ulimit -l)"
+          git -C src log -1 --format='source=%H tree=%T %s'
+      - name: Store under several memlock limits
+        run: |
+          mkdir -p src/crates/auth/examples
+          cp diag/crates/auth/examples/secmem_diag.rs src/crates/auth/examples/
+          cd src && cargo run -q -p extenddb-auth --example secmem_diag
+      - name: secmem unit tests
+        if: always()
+        run: cd src && cargo test -q -p extenddb-auth --lib secmem -- --nocapture --test-threads=1
+
+  serve:
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [fix, main]
+        runner: [extenddb_ubuntu-2404_4-core, ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ matrix.variant == 'fix' && 'f9e5e3b71d0f7163e8b755c2f8df37c4caddaf03' || '1369bbdbee0e4d52ef9e46b0057d250d6708eed4' }}
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Host
+        run: |
+          echo "variant=${{ matrix.variant }} runner=${{ matrix.runner }} image=${ImageVersion:-unset} kernel=$(uname -r) arch=$(uname -m)"
+          echo "memlock=$(ulimit -l)"
+          git log -1 --format='source=%H tree=%T %s'
+      - name: Build
+        run: cargo build -q -p extenddb --no-default-features --features sqlite
+      - name: Serve under memlock limits
+        run: |
+          set -u
+          bin="$PWD/target/debug/extenddb"
+          crashed=0
+
+          start() {
+            mkdir -p "$1"
+            if ! (cd "$1" && "$bin" init --backend sqlite --config extenddb.toml > init.log 2>&1); then
+              cat "$1/init.log"
+              exit 1
+            fi
+            if [ "$3" = default ]; then
+              (cd "$1" && EXTENDDB__SERVER__PORT="$2" exec "$bin" serve --config extenddb.toml --foreground > serve.log 2>&1) &
+            else
+              (cd "$1" && EXTENDDB__SERVER__PORT="$2" exec prlimit --memlock="$3:$3" "$bin" serve --config extenddb.toml --foreground > serve.log 2>&1) &
+            fi
+            echo $! > "$1/pid"
+          }
+
+          check() {
+            pid=$(cat "$1/pid")
+            outcome=timeout
+            for i in $(seq 1 120); do
+              if ! kill -0 "$pid" 2>/dev/null; then
+                status=0
+                wait "$pid" || status=$?
+                outcome="exited status=$status"
+                if [ "$status" -ge 128 ]; then crashed=1; fi
+                break
+              fi
+              if curl -sk "https://127.0.0.1:$2/health" | grep -q healthy; then
+                outcome=healthy
+                break
+              fi
+              sleep 1
+            done
+            echo "RESULT $1 limit=$3 $outcome $(grep -o 'key_store=.*' "$1/serve.log" | head -1)"
+            grep -i 'cannot lock\|key store' "$1/serve.log" | head -5 || true
+            echo "--- $1/serve.log (last 15 lines)"
+            tail -n 15 "$1/serve.log"
+          }
+
+          stop() {
+            pid=$(cat "$1/pid")
+            if kill -0 "$pid" 2>/dev/null; then
+              kill "$pid" || true
+              wait "$pid" || true
+            fi
+          }
+
+          echo "== low: one server under a 64 KiB limit"
+          start low 18443 65536
+          check low 18443 65536
+          stop low
+
+          echo "== shared: a second server under a 1 MiB limit while the first holds its store"
+          start first 18443 default
+          check first 18443 default
+          start second 18444 1048576
+          check second 18444 1048576
+          stop second
+          stop first
+
+          if [ "${{ matrix.variant }}" = fix ] && [ "$crashed" = 1 ]; then
+            echo "a server died from a signal"
+            exit 1
+          fi
