@@ -388,6 +388,12 @@ Catalog upgrades change the schema; behavior changes alter how the running serve
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
 
+### v1.1.0: an expression name that starts with `_` is refused
+
+**What changed.** An attribute name that starts with `_`, written in an expression without an `ExpressionAttributeNames` placeholder, now gets `ValidationException` with the service's syntax error. For example, `attribute_exists(_x)` in a Scan filter gets "Invalid FilterExpression: Syntax error; token: \"_\", near: \"(_x\"". This holds in condition, filter, key condition, projection and update expressions. 1.0.0 served such a name. A `_` after the first character of a name stays part of the name, and a `#name` placeholder can still stand for a name that starts with `_`. On Query, a key condition that the tokenizer refuses now gets that answer when the table does not exist. A key condition over the expression size limit gets the size error there. 1.0.0 answered `ResourceNotFoundException` to both.
+
+**Who is affected.** A client that writes such a name in an expression gets the error after the upgrade. Write the name through `ExpressionAttributeNames`. No catalog migration or configuration change is required.
+
 ### v1.1.0: latency `segments` are summed into time buckets
 
 **What changed** (#398). The latency `segments` that `/metrics` and the console's `/console/metrics-data` return come from time buckets per account and operation. 1.0.0 kept one record per request for 24 hours. Each operation's count and means are still exact over the requests that the window covers. Four things change:

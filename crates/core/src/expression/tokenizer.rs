@@ -358,8 +358,12 @@ fn push_token(
     Ok(())
 }
 
+/// A name written in an expression starts with a letter. Amazon `DynamoDB`
+/// refuses a name that starts with `_` as a syntax error at the `_`, and
+/// takes `_` after the first character and in a `#name` or `:value`
+/// (measured 2026-11-14 and 2026-11-18).
 fn is_ident_start(c: u8) -> bool {
-    c.is_ascii_alphabetic() || c == b'_'
+    c.is_ascii_alphabetic()
 }
 
 fn is_ident_char(c: u8) -> bool {

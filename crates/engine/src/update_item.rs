@@ -184,7 +184,8 @@ pub(crate) async fn handle_update_item_with(
     // No UpdateExpression and no AttributeUpdates: no-op upsert.
     // Some("") still errors via parse_update_expr.
     let actions = if let Some(update_expr) = effective_update_expr.as_deref() {
-        crate::expression_helpers::parse_update_expr(update_expr, &ctx.limits)?
+        crate::expression_helpers::parse_update_expr(update_expr, &ctx.limits)
+            .map_err(crate::expression_helpers::count_leading_underscore_refusal)?
     } else {
         Vec::new()
     };

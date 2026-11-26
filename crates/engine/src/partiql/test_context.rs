@@ -30,7 +30,7 @@ pub(super) fn block_on<F: Future>(future: F) -> F::Output {
 }
 
 /// A context whose item authorizer is `authorizer`.
-pub(super) async fn context(authorizer: Option<Arc<dyn ItemAuthorizer>>) -> OperationContext {
+pub(crate) async fn context(authorizer: Option<Arc<dyn ItemAuthorizer>>) -> OperationContext {
     let storage = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
         .await
         .expect("an in-memory database opens");

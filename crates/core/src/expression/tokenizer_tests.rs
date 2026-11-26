@@ -161,16 +161,52 @@ fn tokenize_function_call() {
 }
 
 #[test]
-fn tokenize_underscore_ident() {
-    let tokens = tokenize("_my_attr = :v").unwrap();
-    assert_eq!(
-        tokens,
-        vec![
-            Token::Ident("_my_attr".into()),
-            Token::Eq,
-            Token::Placeholder("v".into()),
-        ]
-    );
+fn a_name_that_starts_with_an_underscore_is_refused_at_the_underscore() {
+    // Amazon DynamoDB's answers, measured 2026-11-14 and 2026-11-18. The
+    // condition tokenizer (`None`) leaves the `Invalid <member>:` label
+    // to its caller, and `tokenize_for` writes it.
+    use super::super::ExpressionKind::{KeyCondition, Projection, Update};
+    for (input, kind, near) in [
+        ("attribute_exists(_x)", None, "(_x"),
+        ("attribute_not_exists(_x)", None, "(_x"),
+        ("_x = :v", None, "_x"),
+        ("a._b = :v", None, "._b"),
+        ("a[0]._b = :v", None, "._b"),
+        ("attribute_not_exists(_)", None, "(_)"),
+        ("attribute_not_exists(__x)", None, "(__"),
+        ("attribute_not_exists(_1)", None, "(_1"),
+        ("pk, _x", Some(Projection), ", _x"),
+        ("_x", Some(Projection), "_x"),
+        ("a._b", Some(Projection), "._b"),
+        ("_pk = :v", Some(KeyCondition), "_pk"),
+        (
+            "pk = :v AND begins_with(_sk, :p)",
+            Some(KeyCondition),
+            "(_sk",
+        ),
+        ("SET _x = :v", Some(Update), "SET _x"),
+        ("SET a._b = :v", Some(Update), "._b"),
+        ("REMOVE _x", Some(Update), "REMOVE _x"),
+    ] {
+        let (err, label) = match kind {
+            None => (tokenize(input).unwrap_err(), String::new()),
+            Some(kind) => (
+                tokenize_for(input, 4096, kind).unwrap_err(),
+                format!("Invalid {kind}: "),
+            ),
+        };
+        let expected = format!("{label}Syntax error; token: \"_\", near: \"{near}\"");
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(m) if *m == expected),
+            "{input}: {err:?}"
+        );
+    }
+    // An underscore after the first character, and in a placeholder or a
+    // value reference, is part of the name (served, same dates).
+    let tokens = tokenize("attribute_not_exists(a_b) AND #_x = :_v").unwrap();
+    assert_eq!(tokens[2], Token::Ident("a_b".into()));
+    assert_eq!(tokens[5], Token::NameRef("_x".into()));
+    assert_eq!(tokens[7], Token::Placeholder("_v".into()));
 }
 
 #[test]
@@ -290,6 +326,10 @@ const UNKNOWN_CHARACTER_ROWS: &[(&str, &str, &str)] = &[
     ("#v = é\tabc", "é", "= é\tabc"),
     ("#v = é\n:v", "é", "= é\n:v"),
     ("#v = é\r:v", "é", "= é\r:v"),
+    // A `_` cannot start a name, so the next token is the `_` alone
+    // (measured 2026-11-18).
+    ("#v = é _abc", "é", "= é _"),
+    ("#v = é __x", "é", "= é _"),
     // No token after the character: the window runs to the end of the
     // expression, trailing whitespace kept (measured 2026-11-24).
     ("#v = é   ", "é", "= é   "),

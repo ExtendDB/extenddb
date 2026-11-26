@@ -68,6 +68,22 @@ fn a_deep_write_condition_is_written_for_the_classic_parser() {
     );
 }
 
+/// The classic tokenizer refuses a name that starts with `_` written in an
+/// expression. A `PartiQL` statement keeps its answer: its names reach the
+/// classic parser as `#name` placeholders.
+#[test]
+fn a_partiql_name_that_starts_with_an_underscore_is_written_as_a_placeholder() {
+    let sql = "UPDATE \"t\" SET q = 1 WHERE _x = 1 AND a._b = 2";
+    let condition = match extenddb_core::partiql::parse(sql).unwrap() {
+        Statement::Update(update) => update.where_clause.unwrap(),
+        other => panic!("expected an UPDATE, got {other:?}"),
+    };
+    let text = ExprBuilder::default().condition(&condition, &[]).unwrap();
+    assert!(!text.contains('_'), "{text}");
+    let limits = extenddb_core::limits::LimitsConfig::default();
+    assert!(crate::expression_helpers::parse_condition_expr(&text, &limits).is_ok());
+}
+
 #[test]
 fn update_paths_that_overlap_are_refused_naming_the_later_one_first() {
     for (assignments, one, two) in [
