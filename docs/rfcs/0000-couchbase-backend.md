@@ -1,6 +1,6 @@
 # RFC-0000: Couchbase Storage Backend
 
-- Status: Draft (revision 5, 2026-11-25: the engineering items of revision 3 are implemented and merged in the reference repository, which no reviewer can read yet, so rows 2.4, 3.5, 4.1, 4.3, 5.2 and 6.2 of the acceptance table stay OPEN; engineering items 13 and 15 are open too, see "Engineering items of revision 3")
+- Status: Draft (revision 5, 2026-11-25: most engineering items of revision 3 are implemented in the reference repository `[ref-repo]`, which no reviewer can read yet, so rows 2.4, 3.5, 4.1, 4.3, 5.2 and 6.2 of the acceptance table stay OPEN. Open parts remain in engineering items 1, 2, 5 and 8, plain-lease loop timing is open (item 10 below), item 13 is blocked on the pin, and item 15 is a design gap (Gaps A and B) with no code; see "Engineering items of revision 3")
 - Author: @suravarjjala
 - Created: 2026-11-04
 - FCP ends: —
@@ -87,14 +87,14 @@ backend build that produced it:
   transactional read, the descending twins, the budgets, the backfill fence,
   the scoped `destroy`, and the smaller ones) are merged on the reference
   repository's `main` as commits `b0c272f`, `5e8462b` and `f4f293d`
-  (2026-11-25 UTC) `[ref-repo]`, each run against the demo stack and checked
-  against the upstream files at the pin; the three-node harness
+  (2026-11-25 UTC) `[ref-repo]`, run against the demo stack where a test
+  exists (each item's row says which). The three-node harness
   (`scripts/query-txn-multinode-test.sh` `[ref-repo]`, three Couchbase nodes each
-  running data, index and query, durability `majority`) passed 19 of 19 when
-  those commits merged, including the new commit-point hold `[ref-repo]` (see
-  "Transactions" and "DynamoDB Streams"). Round 4 changed the lease and the
-  fence afterwards; that work is on a branch not yet pushed, and the 19 of 19
-  does not cover it.
+  running data, index and query, durability `majority`) ran when those commits
+  merged; its commit-point hold `[ref-repo]` (see "Transactions" and "DynamoDB
+  Streams") is NOT RUN on this revision, and the figures once quoted for it
+  are withdrawn as untraceable. Round 4 changed the lease and the fence
+  afterwards; that work is on a branch not yet pushed.
 - QE `[ref-repo]`: a 343-case Couchbase-specific test plan (`docs/qe/testcases.md`) run
   against a real multi-node cluster; every failure traced to code and fixed or
   filed (`docs/qe/qe-report.md`). No acknowledged write was lost in any
@@ -576,7 +576,7 @@ the catalog row with the index `CREATING`, and returns. A detached task on that
 server then runs the fenced second pass: it sleeps the catalog freshness window
 (`EXTENDDB_CATALOG_FRESHNESS_MS`, default 2 s, plus 0.5 s), waits up to 30 s for
 every write on this server that was already in flight, backfills again, and
-flips the index `ACTIVE`. The leader's GSI worker repeats the backfill and the
+flips the index `ACTIVE`. The server's GSI worker repeats the backfill and the
 flip 75 s after the publish, which covers a task lost to a restart and any pass
 that left the index `CREATING`.
 
@@ -609,14 +609,14 @@ ordinary writers against the create and finds every item in the `ACTIVE` index,
 but it holds nothing, so a fence that waited for nothing could pass it. The held
 write test, in which a `PutItem` whose key info was resolved before the publish
 is parked until after the publish and must then land with the index column,
-passed once on a `fault-hooks` build on the single-node demo stack (`PutItem`
+passed on three `fault-hooks` runs (Tess-2, Tess-3, Tess-4) on a `fault-hooks` build on the single-node demo stack (`PutItem`
 only) `[ref-repo]`. The guard before the view read, the transaction guard, the
 reconciler change and the `committing` skip are built and unit-tested only, with
 no dedicated test; the reconciler held-write test is a skipped stub (**OPEN**).
 
 `index_num_replicas` sets `num_replica` on every index the backend creates,
 failing closed when the cluster has too few index nodes. Multi-part RANGE keys
-are supported on every part: the backend derives one column per part
+are implemented on every part and not yet exercised (engineering item 13): the backend derives one column per part
 (`_g<slot>sk`, `_g<slot>sk1`, ...) and builds per-part predicates with tuple
 pagination. The engine classifies the conditions: `resolve_multipart_with`
 (upstream commit `f49c5f82`, #429, 31 October) is what hands the backend a
@@ -648,9 +648,9 @@ the condition holds, as `tests/test_conditional_atomicity.py` expects.
 documentation says a non-transactional write must not touch a document while a
 transaction that involves it is in progress, calls the outcome undefined when
 one does, and says a non-transactional actor cannot see a transaction's staged
-insert of a key that does not exist yet. The backend therefore never lets the
-two meet at the document: on every table, **plain writes and transactions
-exclude each other through one lease document per item**, and nothing depends on
+insert of a key that does not exist yet. The backend therefore does not let its
+own writers meet at the document: on every table, **ExtendDB's plain writes and
+transactions exclude each other through one lease document per item**, and nothing depends on
 how Couchbase stages a mutation. There is no per-table switch: the first
 transaction on a table needs no state change, and no plain write can have read a
 stale "no transactions here" view.
@@ -738,11 +738,11 @@ The outcomes for one key, both orders:
 | `PutItem` holds the lease | `TransactWriteItems` on the item | the transaction retries its lease for up to 2 s (the plain write holds it for milliseconds), then stages against the new image |
 | `PutItem` commits | `TransactWriteItems` on the item | the transaction reads the new image, evaluates its conditions against it, commits |
 | `TransactWriteItems` holds the lease | a second `TransactWriteItems` on it | the second fails to take the lease within 2 s and answers `TransactionCanceledException` with `TransactionConflict` on that item |
-| `TransactWriteItems` creates a key that does not exist | a `PutItem` of that key | the key's lease was taken before the insert was staged, so the `PutItem` answers `TransactionConflictException`; the staged insert's invisibility to plain actors never matters because no plain actor writes without the lease |
+| `TransactWriteItems` creates a key that does not exist | a `PutItem` of that key | the key's lease was taken before the insert was staged, so the `PutItem` answers `TransactionConflictException`; the staged insert's invisibility to plain actors never matters because no ExtendDB writer writes without the lease (a write from the Couchbase side, through SQL++, Eventing, Mobile or XDCR, takes no lease; a plain write stalled past its lease is the bound described above) |
 
 **TransactGetItems.** SQL++ transactions run at read committed with a monotonic
 atomic view, which does not by itself make a multi-item read serializable. The
-backend does not read inside a query transaction. It takes a `transact_get`
+backend does not read inside a query transaction, except for a key still `committing` at the bound (see below). It takes a `transact_get`
 lease on every key it reads, present or absent, in sorted order, then reads each
 key by KV and releases the leases. An absent key is protected by its lease alone:
 no plain write creates it while the lease is held, and a `TransactWriteItems`
@@ -771,9 +771,13 @@ backend's `txn_timeout`) and the node's `memory-quota`, which bounds a
 transaction's delta table and defaults to 0, no quota. A transaction that runs
 past `txtimeout` before its commit point is rolled back by the query service
 and answers 503 `ServiceUnavailable` with nothing written. One whose `COMMIT
-WORK` was sent and whose outcome is unknown (the statement timed out, the node
-went away, or the query service answered with an error the backend does not
-recognise) is never run again. The backend reads the request's idempotency
+WORK` was sent and whose outcome is unknown (no answer reached the backend, the
+node went away, error 17004, or an error the backend does not recognise) is
+never run again. The rule, from the code: an error 17010 at `COMMIT WORK` with
+no `raise` is Expired, which is retryable, and the stream writes a skip marker
+only when the answer says nothing committed; `raise` is checked before the code
+(conn.rs:177-181, 220; engine.rs:2006); 17004 and unrecognised `COMMIT WORK`
+errors are Ambiguous `[ref-repo]`. The backend reads the request's idempotency
 token, which is written inside the same transaction, by a KV read; a committed
 transaction's token stays staged until Couchbase unstages it, so a KV read can
 miss the token of a transaction that did commit, and reading it inside a
@@ -808,7 +812,7 @@ stream-enabled table with `NEW_AND_OLD_IMAGES` committed in 0.67 s
 service raise "Transaction memory (N) exceeded quota (M)" (code 17016): at a
 statement the backend answers 503 with that error logged and nothing written,
 as observed with a 1 MB quota `[ref-repo]`; at `COMMIT WORK` it is an unknown
-outcome, as above (unit-tested only). Never a silent partial commit.
+outcome, as above (unit-tested only). No partial commit was observed at a statement.
 
 `ClientRequestToken` idempotency is a document in `data.idempotency` with a
 600 s retention; a replay with a matching fingerprint returns the original
@@ -879,16 +883,20 @@ the shard (`AT_TIMESTAMP` is a DynamoDB Streams iterator type that `main`
 supports from #468, `6aef346f`, and the pinned engine does not have; for it
 this is the in-tree design, engineering item 2). Implemented in
 `resolve_aged_gaps` and `txn_peek` (at most 64 probes per `GetRecords` call),
-with `contiguous_prefix` as the fast path for a gapless prefix. Tested by the
-three-node harness's commit-point hold `[ref-repo]`: the harness watches the
+with `contiguous_prefix` as the fast path for a gapless prefix. The test is the
+three-node harness's commit-point hold `[ref-repo]` (NOT RUN on this revision): the harness watches the
 backend log for the `COMMIT WORK` of a 20-document filler transaction, freezes
 the query engine that received it (`SIGSTOP`) half a second later, once the
 commit point is written and the unstaging is under way, and holds it 60 s,
 longer than the gap grace, under three transaction writers, two plain writers
 and a stream reader on one table. A run fails unless the backend logged at
 least one stream record resolved by a transactional read after the freeze
-began, which is a record that a plain read did not find and the transactional
-read did, so it was committed and not yet unstaged, and the reader, against
+began, which is a number that the walk's `request_plus` read did not return and a
+transactional read by key did. The log line (engine.rs:8772) fires on any
+transactional-read hit and does no check that the KV read missed, so it does
+not show that the record was still staged at the instant of the read, because
+it could have unstaged between the two reads. The gate checks that the
+transactional read resolved at least one number after the freeze began, and the reader, against
 the final shard content, never passed a number whose record appeared later
 (`scripts/query-txn-multinode-test.sh` step 7,
 `scripts/txn-commitpoint-test.py`). The harness prints the count of records so
@@ -1060,7 +1068,7 @@ service's system keyspaces (`system:scopes`, `system:keyspaces`,
 `system:indexes`) over every bucket the backend's user can see, under the
 backend's own create lock: an in-process mutex of one server, taken by
 `CreateTable`, `UpdateTable` and the TTL index creation before the check and
-held until the request has created its indexes. It does not coordinate two
+held until the request has created its indexes (not the rebuild of an out-of-date TTL index, which runs outside the create lock, engine.rs:12505-12519 and is not under the budget: **OPEN**). It does not coordinate two
 servers; the one-server-per-catalog rule does that. An index the catalog lists
 as `CREATING` is already in `system:indexes`, because `UpdateTable` creates and
 builds the index on the request path before it publishes the row, so it is
@@ -1110,8 +1118,8 @@ the implementation PR.
   bucket with three replicas (Couchbase supports durable writes for up to two),
   bucket or collection `maxTTL`, and eviction on ephemeral buckets. Single-node
   demos set `durability = "none"` explicitly.
-- **Query service**: `memory-quota` at 0 (the default, no quota) or at least
-  the value the 100-action transaction measurement sets.
+- **Query service**: `memory-quota` at 0 (the default, no quota) or at a
+  value large enough for the request. The 100-action measurement ran at 0; at a 1 MB quota the query service raised 17016, the backend answered 503 and nothing was written (single-node demo stack `[ref-repo]`).
 - **Strict startup**: unknown or misspelled `[storage.couchbase]` keys are
   refused by name.
 
@@ -1175,9 +1183,9 @@ definitions), `crates/auth/`, or `crates/core/`.
 | Conditional writes | CAS read-evaluate-replace, 64 attempts / 10 s, then 503 | DynamoDB atomicity without a transaction; exhaustion is retried by the SDKs, as on MongoDB |
 | GSIs/LSIs | Derived keys inside the item + one `_xdb.tid`-scoped Couchbase GSI per index | No secondary write to keep in sync; deferred build + single `BUILD INDEX` |
 | Transactions | Query-service `BEGIN WORK`/`COMMIT` pinned to one node, in process | The Rust SDK has no KV transactions; no sidecar, no extra credentials, survives node failover |
-| Plain write vs transaction | One lease document per item, taken by every plain write and every transaction on every table | Mutual exclusion through KV insert's fail-if-exists, a documented operation; DynamoDB's priority for the transaction; no per-table switch; nothing depends on how Couchbase stages a mutation |
+| Plain write vs transaction | One lease document per item, taken by every plain write and every transaction on every table | Mutual exclusion through KV insert's fail-if-exists, a documented operation; no per-table switch; nothing depends on how Couchbase stages a mutation |
 | TransactGetItems | Leases on every read key, present or absent, then plain KV reads | SQL++ transactions are read committed; the lease excludes plain creates of absent keys and writers of present ones, and no document is rewritten |
-| Streams | Explicit records, four shards per stream, number taken before commit, reader stops at an unresolved number and resolves it by a transactional read | DynamoDB contract (monotonic sequence, images, 24 h retention); no reader passes a number that may still commit, with no reliance on a cleanup bound |
+| Streams | Explicit records, four shards per stream, number taken before commit, reader stops at an unresolved number and resolves it by a transactional read | DynamoDB contract (monotonic sequence, images, 24 h retention); designed so that no reader passes a number that may still commit, with no reliance on a cleanup bound; the hold that tests it has not been re-run since its gate changed |
 | Descending queries | A descending twin of the base index and of every secondary index | Couchbase does not scan an index in reverse; the twins are counted in the budget |
 | TTL | Sweeper through the delete path, never native expiry | Native expiry would break the `REMOVE` stream record contract |
 | Isolation | Shared collection by default, collection/scope tiers opt-in | Physical isolation and RBAC when a tenant needs it; limits counted cluster-wide |
@@ -1221,7 +1229,7 @@ definitions), `crates/auth/`, or `crates/core/`.
 
 | Layer | What | Where |
 |---|---|---|
-| Unit | number encoding, item round-trip, sidecar, key forging, policy hardening | `cargo test --lib`: 262 passed, 0 failed, 0 ignored (offline run, 2026-11-09) `[ref-repo]` |
+| Unit | number encoding, item round-trip, sidecar, key forging, policy hardening | `cargo test --lib`: 267 passed, 0 failed (271 with the `fault-hooks` feature) on the round-4 branch `[ref-repo]` |
 | Storage-invariant lint | stale top-level `_pk`/`_sk` reads, hand-built keys, unescaped `LIKE` | `scripts/lint-storage-invariants.sh` `[ref-repo]`, per PR |
 | Conformance | upstream `tests/test_*.py` 912 + 1 xfail, `tests/python/` 331, web console 30 | `CONFORMANCE.md` `[ref-repo]`; the Jenkins nightly's sweep `[ref-repo]` |
 | Backend tests | transaction rollback (7), DynamoDB head-to-head parity, encoding edges | `tests/` `[ref-repo]` |
@@ -1239,10 +1247,11 @@ the ExtendDB conformance suite (`upstream/tests/`); QE ids are cases in
 `docs/qe/testcases.md` `[ref-repo]`; `tests/` and `scripts/` are the reference
 repository's own `[ref-repo]`. Six criteria (2.4, 3.5, 4.1, 4.3, 5.2 and 6.2)
 are marked OPEN: their evidence is in the reference repository, which no
-reviewer can read yet, and they close when a reviewer has read it. No other
-criterion is open as of revision 5; the items revision 3 listed and their state
-are under "Engineering items of revision 3" below, where item 13 is blocked on
-the pin.
+reviewer can read yet, and they close when a reviewer has read it. Open
+engineering parts: items 1, 2, 5 and 8 (their OPEN parts), item 13 (blocked on
+the pin), item 15 (a design gap, Gaps A and B, no code), and the plain-lease
+loop timing; the items and their state are under "Engineering items of
+revision 3" below.
 
 ### 1. Item identity
 
@@ -1260,10 +1269,11 @@ the pin.
 | 2.1 | Duplicate index keys | There is no separate index entry: the derived keys live in the item document and the Couchbase GSI indexes the document itself, so identity is the base document key | IX-04, upstream `test_put_item_create_race.py` (GSI and LSI tables) |
 | 2.2 | Stale entry prevention | Every write path rebuilds `_xdb` through `item_to_document`; the sub-document fast path is refused for any key or index attribute | IX-09, upstream `test_query_scan.py` GSI cases, stress "GSI query after updating a key attribute" |
 | 2.3 | Sparse semantics and type validation | The shared validators in `crates/core/src/validation` reject a wrong-type or empty index key with `ValidationException`; a missing attribute yields no derived key and the GSI `WHERE` excludes it | IX-03, DT-20, upstream `test_gsi_attribute_definitions.py` |
-| 2.4 | Backfill on UpdateTable | `UpdateTable` creates and builds the index and backfills once, then writes the catalog row `CREATING`; a fenced second pass on the same server waits for the catalog freshness window and for the writes then in flight on that server, backfills again and flips `ACTIVE`; the leader's GSI worker repeats it 75 s after the publish (for other servers' writes) and flips a still-`CREATING` index (implemented in `f4f293d` `[ref-repo]`, fence hardened on the round-4 branch; see "Global and Local Secondary Indexes") | **OPEN** until a reviewer reads the reference repository. IX-07 `[ref-repo]`, `tests/test_gsi_fence.py` `[ref-repo]` (racing writers; the upstream `gsi_async*` files spawn their own server and are outside the endpoint sweep, so IX-07 is the gate), and the held-write test in `tests/test_fault_hooks.py` `[ref-repo]` (`PutItem` only, on a `fault-hooks` build; engineering item 5 says what has no test) |
+| 2.4 | Backfill on UpdateTable | `UpdateTable` creates and builds the index and backfills once, then writes the catalog row `CREATING`; a fenced second pass on the same server waits for the catalog freshness window and for the writes then in flight on that server, backfills again and flips `ACTIVE`; the server's GSI worker repeats it 75 s after the publish and flips a still-`CREATING` index (implemented in `f4f293d` `[ref-repo]`, fence hardened on the round-4 branch; see "Global and Local Secondary Indexes") | **OPEN** until a reviewer reads the reference repository. IX-07 `[ref-repo]`, `tests/test_gsi_fence.py` `[ref-repo]` (racing writers; the upstream `gsi_async*` files spawn their own server and are outside the endpoint sweep, so IX-07 is the gate), and the held-write test in `tests/test_fault_hooks.py` `[ref-repo]` (`PutItem` only, on a `fault-hooks` build; engineering item 5 says what has no test) |
 | 2.5 | Transactional index maintenance | Transactional writes rewrite the whole document, derived keys included, inside the query-service transaction | TX-01, TX-13, upstream `test_transaction_operations.py` |
 | 2.6 | Index query pagination | `LastEvaluatedKey` carries index and base keys; the resume bound is merged with, not substituted for, the key condition | IX-06, QS-07, upstream `test_read_paging.py` |
 | 2.7 | ConsistentRead on GSI | Rejected by the engine with `ValidationException`; the backend exposes no strong-read option for index reads (see "Reads") | IX-10, QS-20 |
+| 2.8 | Multi-part RANGE key queries | Per-part columns and predicates are implemented; the engine at the pin `7b828b0` refuses a multi-condition Query before the backend sees it. Shipping behaviour in both states: until the engine pin moves to or past `f49c5f82`, `couchbase` is listed in `FIRST_RANGE_ONLY_BACKENDS`, in `docs/differences-from-dynamodb.md` and in the README row `[ref-repo]`; after, per-part predicates ship with `tests/test_gsi_multi_range_query.py` at '60 passed, 0 skipped' | **OPEN**, blocked on the pin (engineering item 13); `tests/test_gsi_multi_range_query.py` NOT RUN |
 
 ### 3. Transactions
 
@@ -1279,7 +1289,7 @@ the pin.
 
 | # | Criterion | How the backend meets it | Evidence |
 |---|---|---|---|
-| 4.1 | Unconditional writes never fail under contention | A bare unconditional `PutItem` with no `ReturnValues` takes the item's lease (a KV insert), makes one KV write and removes the lease (a read and a CAS remove): there is no CAS on the item and no retry of the write itself, and the last writer wins. A plain write that meets another plain write's lease retries with jittered backoff and answers 503 at the end of a 10 s bound; the lease is held for the length of one KV write, so in practice two racing calls both succeed, and one fails only if the other holds the item for more than 10 s. What a plain write answers when it meets a transaction's lease is under "Transactions". With `ALL_OLD` it is a CAS loop of 64 attempts / 10 s that answers 503 at exhaustion, as MongoDB does; no CAS detail is client-visible (`cas_contended`); the differences-document rows come with the implementation PR | **OPEN** until a reviewer reads the reference repository. Upstream `test_put_item_create_race.py::test_racing_puts_with_all_old_all_succeed`, `::test_racing_puts_on_a_stream_table_all_succeed`, `test_concurrency.py::test_parallel_inserts`; run against the demo stack on 2026-11-25 (upstream tests at the pin `7b828b0`): `test_put_item_create_race.py` 9 passed and `test_concurrency.py::TestAtomicCounter::test_atomic_counter` passed. No test drives two plain writers into the 10 s bound. CR-03 `[ref-repo]` |
+| 4.1 | Unconditional writes never fail under contention | A bare unconditional `PutItem` with no `ReturnValues` takes the item's lease (a KV insert), makes one KV write and removes the lease (a read and a CAS remove): there is no CAS on the item and no retry of the write itself, and the last writer wins. A plain write that meets another plain write's lease retries with jittered backoff and answers 503 at the end of a 10 s bound; the lease is held for the length of one KV write, so in practice two racing calls both succeed, and one fails only if the other holds the item for more than 10 s. What a plain write answers when it meets a transaction's lease is under "Transactions". With `ALL_OLD` it is a CAS loop of 64 attempts / 10 s that answers 503 at exhaustion, as MongoDB does; no CAS detail is client-visible (`cas_contended`); the differences-document rows come with the implementation PR | **OPEN** until a reviewer reads the reference repository. Upstream `test_put_item_create_race.py::test_racing_puts_with_all_old_all_succeed`, `::test_racing_puts_on_a_stream_table_all_succeed`, `test_concurrency.py::test_parallel_inserts`; run against the demo stack on 2026-11-25 (upstream tests at the pin `7b828b0`): `test_put_item_create_race.py` 9 passed and `test_concurrency.py::TestAtomicCounter::test_atomic_counter` passed `[ref-repo]`. No test drives two plain writers into the 10 s bound. CR-03 `[ref-repo]` |
 | 4.2 | Conditional writes: correct error on race | The CAS loop re-evaluates the condition against the winner's image and returns `ConditionalCheckFailedException` | CC-01, upstream `test_put_item_create_race.py::test_racing_puts_check_their_condition_against_the_winner`, `::test_racing_conditional_creates_have_one_winner` |
 | 4.3 | Transaction conflict mapping | A plain write meeting a `transact_write` lease returns `TransactionConflictException`; a transaction that cannot take its leases in 2 s returns `TransactionCanceledException` with `TransactionConflict`; a plain write meeting a `transact_get` or `plain` lease retries and answers 503 at its 10 s bound; plain-writer contention never surfaces as a transaction conflict (implemented `[ref-repo]`; see "Transactions") | **OPEN** until a reviewer reads the reference repository. TX-08 `[ref-repo]`, CC-09 `[ref-repo]`, upstream `test_transact_write_conflict.py`, `scripts/write-race-test.py` `[ref-repo]`, `tests/test_txn_lease.py` `[ref-repo]`, the three-node harness's commit-point hold `[ref-repo]` |
 | 4.4 | UpdateItem serializes | CAS read-modify-write with jittered backoff; arithmetic and `ADD` never take the sub-document path; on a stream-enabled table each write is a transaction, two on one key conflict at the document and the later retries within the same budget, and both succeed | CC-02, CC-03, `scripts/concurrency-property-test.py` (`prop_add_counter`, `prop_optlock_counter`), upstream `test_concurrency.py::test_atomic_counter` |
@@ -1290,7 +1300,7 @@ the pin.
 | # | Criterion | How the backend meets it | Evidence |
 |---|---|---|---|
 | 5.1 | Atomicity with data writes | Records are written in the data transaction | ST-04, upstream `test_streams.py` |
-| 5.2 | Per-shard ordering | Numbers are taken before commit; `GetRecords` walks the shard in sequence order and stops at an unresolved number, which only a skip marker written after a definite failure, or a transactional read of the record after the age, resolves (see "DynamoDB Streams"), so no reader passes a number whose record may still appear (implemented; see "DynamoDB Streams") | **OPEN** until a reviewer reads the reference repository. ST-03, DC-07 `[ref-repo]`, upstream `test_streams.py`; RFC-0003's stress scenario "consumer reading during concurrent writes" (RFC-0003:160, not a test in `upstream/tests/`) is covered only for gaps, by the stream reader of `scripts/txn-commitpoint-test.py` `[ref-repo]` (the three-node harness's commit-point hold: a query engine frozen 60 s, longer than the age); event types and cross-table leakage under concurrent writes are not yet tested |
+| 5.2 | Per-shard ordering | Numbers are taken before commit; `GetRecords` walks the shard in sequence order and stops at an unresolved number, which only a skip marker written after a definite failure, or a transactional read of the record after the age, resolves (see "DynamoDB Streams"), designed so that no reader passes a number whose record may still appear (implemented; the hold that tests it has not been re-run since its gate changed; see "DynamoDB Streams") | **OPEN** until a reviewer reads the reference repository. ST-03, DC-07 `[ref-repo]`, upstream `test_streams.py`; RFC-0003's stress scenario "consumer reading during concurrent writes" (RFC-0003:160, not a test in `upstream/tests/`) is covered only for gaps, by the stream reader of `scripts/txn-commitpoint-test.py` `[ref-repo]` (the three-node harness's commit-point hold: a query engine frozen 60 s, longer than the age); event types and cross-table leakage under concurrent writes are not yet tested |
 | 5.3 | Account and table isolation | Shard id embeds the table id; records carry the table id and every read is scoped by it | upstream `test_cross_account_isolation.py` (one case in this file failed in the nightly baseline for a test-suite-skew reason, see 6.3; it passes against the pinned suite), `test_stream_table_reuse.py` |
 | 5.4 | Correct event types | `INSERT` / `MODIFY` / `REMOVE` with images per view type; an unchanged item emits no record | ST-01, ST-05, upstream `test_streams.py` |
 | 5.5 | Retention and cleanup | `idx_stream_ts` plus a delete at 24 h on every TTL sweep cycle | ST-06, ST-07 |
@@ -1302,7 +1312,7 @@ the pin.
 |---|---|---|---|
 | 6.1 | Evaluation semantics | Delegates to `extenddb_core::expression::evaluate_condition` on the read image; no native pushdown | CR-10 to CR-13, upstream `test_conditional_writes.py`, `test_conditional_operator.py` |
 | 6.2 | No hidden unused code | The crate-level `#![allow(unused_variables, unused_imports, clippy::too_many_arguments)]` of `engine.rs` and `catalog.rs` is gone, with the 3 unused imports and the 5 dead items it hid (measured 2026-11-05, removed 2026-11-24, commit `b0c272f`; `[ref-repo]`). One targeted, commented `#[allow(dead_code)]` remains, on the sidecar-format detector the proposed v3.1 → map-form data migration will call | **OPEN** until a reviewer reads the reference repository. `cargo rustc --lib -- --force-warn unused_imports --force-warn unused_variables --force-warn dead_code`: that one item |
-| 6.3 | Documentation describes the system as built | Every mechanism described in this RFC is implemented and on the live code path, or is marked OPEN: rows 2.4, 3.5, 4.1, 4.3, 5.2 and 6.2 are OPEN until a reviewer reads the reference repository, and item 13 of "Engineering items of revision 3" is blocked on the pin; Capella is stated as unvalidated, the failover-sweep claim cites a specific nightly run, every conformance figure names its suite revision, and the scaling figures cite measured runs. Also recorded here for honesty: nightlies #46 through #58 `[ref-repo]` reported a **baseline** sweep of 908 of 913 with the same 5 non-passes every run (`test_abac.py` ×3, `test_auth_permissions.py::test_explicit_deny_all_service_operations`, `test_cross_account_isolation.py::TestStreamAccountScoping::test_shard_iterator_only_returns_owning_account_records`). Triaged 2026-11-09 as test-suite skew: the nightly's heavy lane skipped the "clone upstream at the pinned rev" stage, so the sweep ran the stale `e41f370` test checkout (913 collected) against the auth-cluster build. What the pinned `7b828b0` run of 2026-11-24 (under "Evidence") shows: the `test_auth_permissions.py` and `test_cross_account_isolation.py` cases pass, and three `test_abac.py` cases fail, all three `aws:SourceIp` loopback cases, behind Docker Desktop's bridge on the machine that ran it. Whether the nightly's three `test_abac.py` non-passes were those cases, and whether they pass on the Linux agent, is settled by the first nightly after couchbaselabs/extenddb-couchbase#237 `[ref-repo]` (merged 2026-11-24: the clone stage runs in both lanes and `scripts/sweep-under-failover.sh` refuses a checkout that does not match the Cargo pin); until then the skew triage covers two of the five, not all five | Jenkins `extenddb-couchbase-nightly` #51 console `[ref-repo]`; #237 `[ref-repo]`; the pinned run under "Evidence" |
+| 6.3 | Documentation describes the system as built | Every mechanism described in this RFC is implemented and on the live code path, or is marked OPEN: rows 2.4, 3.5, 4.1, 4.3, 5.2 and 6.2 are OPEN until a reviewer reads the reference repository, and, in "Engineering items of revision 3", items 1, 2, 5 and 8 have OPEN parts, item 13 is blocked on the pin and item 15 is a design gap (Gaps A and B) with no code; Capella is stated as unvalidated, the failover-sweep claim cites a specific nightly run, every conformance figure names its suite revision, and the scaling figures cite measured runs. Also recorded here for honesty: nightlies #46 through #58 `[ref-repo]` reported a **baseline** sweep of 908 of 913 with the same 5 non-passes every run (`test_abac.py` ×3, `test_auth_permissions.py::test_explicit_deny_all_service_operations`, `test_cross_account_isolation.py::TestStreamAccountScoping::test_shard_iterator_only_returns_owning_account_records`). Triaged 2026-11-09 as test-suite skew: the nightly's heavy lane skipped the "clone upstream at the pinned rev" stage, so the sweep ran the stale `e41f370` test checkout (913 collected) against the auth-cluster build. What the pinned `7b828b0` run of 2026-11-24 (under "Evidence") shows: the `test_auth_permissions.py` and `test_cross_account_isolation.py` cases pass, and three `test_abac.py` cases fail, all three `aws:SourceIp` loopback cases, behind Docker Desktop's bridge on the machine that ran it. Whether the nightly's three `test_abac.py` non-passes were those cases, and whether they pass on the Linux agent, is settled by the first nightly after couchbaselabs/extenddb-couchbase#237 `[ref-repo]` (merged 2026-11-24: the clone stage runs in both lanes and `scripts/sweep-under-failover.sh` refuses a checkout that does not match the Cargo pin); until then the skew triage covers two of the five, not all five | Jenkins `extenddb-couchbase-nightly` #51 console `[ref-repo]`; #237 `[ref-repo]`; the pinned run under "Evidence" |
 
 ### 7. Query and Scan
 
@@ -1360,11 +1370,11 @@ without a commit id, and each row says what ran and what did not):
 
 | # | Item | State |
 |---|---|---|
-| 1 | The lease on every plain write path, the `committing` state, the transactional escalation, the pre-commit lease check with rollback | Implemented: the first form, with a per-table `transactional` flag, in `5e8462b` `[ref-repo]`; the lease on every table, without the flag and held until the commit is visible, in `bb94b2c` `[ref-repo]`. `tests/test_txn_lease.py` `[ref-repo]` (8 tests; passed 8 of 8 on the demo stack on 2026-11-25, round-4 branch): plain updates racing transfers (balance conserved, no acknowledged update lost, transactions keep committing), the create race on a key a transaction creates, `TransactGetItems` never torn across an absent key, `PutItem`s against a read lease all acknowledged. These check answers and invariants; they do not show that a plain write inserts its lease, because a write that only read the lease would pass whenever the race is not hit. The test that would, holding a `PutItem` after its lease insert while a transaction commits on the key, is not written: the `fault-hooks` build (`tests/test_fault_hooks.py` `[ref-repo]`, hooks compiled out of release builds) holds a write after its catalog-view read, not after its lease insert. **OPEN** for that test. Three-node harness commit-point hold `[ref-repo]`: a query engine frozen 60 s under the load; no commit count is quoted (revision 4's could not be traced to a run), and the hold has not been re-run since its gate was changed |
+| 1 | The lease on every plain write path, the `committing` state, the transactional escalation, the pre-commit lease check with rollback | Implemented: the first form, with a per-table `transactional` flag, in `5e8462b` `[ref-repo]`; the lease on every table, without the flag and held until the commit is visible (for CAS-pinned actions only: item 15 is OPEN), in `bb94b2c` `[ref-repo]`. `tests/test_txn_lease.py` `[ref-repo]` (8 tests; passed 8 of 8 on the demo stack on 2026-11-25, round-4 branch): plain updates racing transfers (balance conserved, no acknowledged update lost, transactions keep committing), the create race on a key a transaction creates, `TransactGetItems` never torn across an absent key, `PutItem`s against a read lease all acknowledged. These check answers and invariants; they do not show that a plain write inserts its lease, because a write that only read the lease would pass whenever the race is not hit. The test that would, holding a `PutItem` after its lease insert while a transaction commits on the key, is not written: the `fault-hooks` build (`tests/test_fault_hooks.py` `[ref-repo]`, hooks compiled out of release builds) holds a write after its catalog-view read, not after its lease insert. **OPEN** for that test. Three-node harness commit-point hold `[ref-repo]`: a query engine frozen 60 s under the load; no commit count is quoted (revision 4's could not be traced to a run), and the hold has not been re-run since its gate was changed. **OPEN**, plain-lease loop: some retry branches skip the deadline check (engine.rs:5750, 5756, 5760), so the plain-write bound is about 10 s, not strict |
 | 2 | The transactional read that resolves an aged stream number; `LATEST` and `AT_TIMESTAMP` no later than the first unresolved number | The read is implemented (`5e8462b` `[ref-repo]`) and exercised by the commit-point hold (see "DynamoDB Streams"; no result is quoted, because the hold has not been re-run since its gate was changed). The narrower skip-marker rule (an answer to `COMMIT WORK` that is not recognised is an unknown outcome and writes no marker) is built and unit-tested only, with no dedicated test. **OPEN** for `AT_TIMESTAMP`: it is a DynamoDB Streams iterator type that `main` supports from #468 (`6aef346f`) and the pinned engine (`7b828b0`) does not have. In-tree, `first_sequence_number_at_or_after` returns the first unresolved number when one precedes the first record at or after the timestamp, because a record that commits late may carry a timestamp at or after it; that is in-tree design with no code at the pin, and its acceptance is `tests/test_streams_at_timestamp.py` on `main` once the pin moves |
 | 3 | The `UpdateItem` fast path falls back above 16 sub-document operations | Implemented (`b0c272f` `[ref-repo]`), unit-tested at 8, 9 and 8 + `REMOVE` |
 | 4 | `TransactGetItems` leases on every read key, absent or present, read by KV, with a 5 s deadline | Implemented (`5e8462b`, reworked in `bb94b2c`) `[ref-repo]`, `tests/test_txn_lease.py` `[ref-repo]` (passed, see item 1), including a `PutItem` that creates an absent key during `TransactGetItems` on a plain and on a stream-enabled table |
-| 5 | The GSI backfill fence | Implemented (`f4f293d` `[ref-repo]`, then hardened on the round-4 branch): the first backfill on the request path, `CREATING`, the fenced second pass (the freshness window, then this server's in-flight writes, counted per generation: single-item writes before their catalog-view read, `TransactWriteItems`, and the reindex reconciler's rewrites; a drain timeout leaves the index `CREATING`), the worker's pass at 75 s, `ACTIVE`. An item under a `committing` lease fails the pass and the index stays `CREATING` until the item can be backfilled. Tests: `tests/test_gsi_fence.py` `[ref-repo]` (racing writers; passed 1 of 1); the held-write test, which holds a `PutItem` after its catalog-view read until the index is published and then requires the item to carry the index column (`tests/test_fault_hooks.py` `[ref-repo]`, on a `fault-hooks` build, `PutItem` only), passed; the reconciler held-write test is a skipped stub. The `TransactWriteItems` guard (C2), the reconciler's per-document key-info read (C3) and the `committing` skip are built and unit-tested only, with no dedicated test. **OPEN** for those three |
+| 5 | The GSI backfill fence | Implemented (`f4f293d` `[ref-repo]`, then hardened on the round-4 branch): the first backfill on the request path, `CREATING`, the fenced second pass (the freshness window, then this server's in-flight writes, counted per generation: single-item writes before their catalog-view read, `TransactWriteItems`, and the reindex reconciler's rewrites; a drain timeout leaves the index `CREATING`), the worker's pass at 75 s, `ACTIVE`. An item under a `committing` lease fails the pass and the index stays `CREATING` until the item can be backfilled. Tests: `tests/test_gsi_fence.py` `[ref-repo]` (racing writers; passed 1 of 1); the held-write test, which holds a `PutItem` after its catalog-view read until the index is published and then requires the item to carry the index column (`tests/test_fault_hooks.py` `[ref-repo]`, on a `fault-hooks` build, `PutItem` only), passed on three `fault-hooks` runs (Tess-2, Tess-3, Tess-4); the reconciler held-write test is a skipped stub. The `TransactWriteItems` guard (C2), the reconciler's per-document key-info read (C3) and the `committing` skip are built and unit-tested only, with no dedicated test. **OPEN** for those three |
 | 6 | The 100-action, 4 MB `TransactWriteItems` on `NEW_AND_OLD_IMAGES`; the answer below the query service's `memory-quota`; the unknown-outcome answers | Implemented. On the one-node demo stack at the default `memory-quota` (0) and `EXTENDDB_DURABILITY=none` (a one-node bucket cannot run a higher level), a 100-action request of about 4 MB (100 `Put`s of about 40 KB) on a stream-enabled table with `NEW_AND_OLD_IMAGES` committed in 0.67 s; at a `memory-quota` of 1 MB the query service raised "Transaction memory (N) exceeded quota (M)" (code 17016), the backend answered 503 `ServiceUnavailable` and nothing was written (observed on the round-4 branch, 2026-11-25) `[ref-repo]`. The same error at `COMMIT WORK` is classed an unknown outcome: unit-tested only. An ambiguous `COMMIT WORK` with a token resolved to success and applied the writes once, and a same-token retry did not apply them again: passed on a `fault-hooks` build (`tests/test_fault_hooks.py` `[ref-repo]`). The `txtimeout` answer (503, nothing written) has unit tests of its mapping and a script that does not assert the 503 or that nothing was written; no live test asserts both |
 | 7 | The descending twin indexes, counted in the budget, descending paging in the tests | Implemented (`f4f293d` `[ref-repo]`); `tests/test_desc_paging.py` `[ref-repo]`; `EXPLAIN` confirms the twin serves a descending Query without a sort |
 | 8 | Cluster-wide scope, collection and index counting under the create lock, twins and replicas included, and the TTL index; `LimitExceededException` | Implemented (`f4f293d` `[ref-repo]`). The TTL index takes the same lock and budget at a cost of `1 + index_num_replicas` (round-4 branch; built and unit-tested, the cost arithmetic only). Whether `system:indexes` lists a replica as a row of its own is not checked on a cluster with replicas, so the used count may be of definitions where the limit is of instances (**OPEN**). The measured shared-tier bound is still to be published (unresolved question 1) |
