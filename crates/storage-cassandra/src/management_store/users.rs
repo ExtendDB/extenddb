@@ -30,19 +30,9 @@ impl CassandraCatalogStore {
         let password_hash = password_hash.map(std::borrow::ToOwned::to_owned);
 
         // Seed self-service policy document
-        let self_service_policy = serde_json::json!({
-            "Version": "2012-10-17",
-            "Statement": [{
-                "Effect": "Allow",
-                "Action": [
-                    "iam:CreateAccessKey",
-                    "iam:DeleteAccessKey",
-                    "iam:ListAccessKeys",
-                    "iam:ChangePassword"
-                ],
-                "Resource": format!("arn:aws:iam::{account_id}:user/{user_name}")
-            }]
-        });
+        let self_service_policy = extenddb_storage::management_store::self_service_policy(
+            &format!("arn:aws:iam::{account_id}:user/{user_name}"),
+        );
 
         // Use LWT to atomically create the user, preventing duplicate names.
         let user_query = format!(

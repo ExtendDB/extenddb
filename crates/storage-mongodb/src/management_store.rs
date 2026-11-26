@@ -612,19 +612,9 @@ impl ManagementStore for MongoCatalogStore {
                 .await?;
 
             // Seed default self-service policy.
-            let self_service_policy = serde_json::json!({
-                "Version": "2012-10-17",
-                "Statement": [{
-                    "Effect": "Allow",
-                    "Action": [
-                        "iam:CreateAccessKey",
-                        "iam:DeleteAccessKey",
-                        "iam:ListAccessKeys",
-                        "iam:ChangePassword"
-                    ],
-                    "Resource": format!("arn:aws:iam::{}:user/{}", account_id, user_name)
-                }]
-            });
+            let self_service_policy = extenddb_storage::management_store::self_service_policy(
+                &format!("arn:aws:iam::{account_id}:user/{user_name}"),
+            );
 
             let policies_coll = self.catalog_db().collection::<Document>("iam_policies");
             let policy_doc = doc! {
@@ -2773,23 +2763,7 @@ impl extenddb_storage::management_store::AdminStore for MongoCatalogStore {
 
 // ── Crypto helpers ──────────────────────────────────────────────────────
 
-fn generate_access_key_id() -> String {
-    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let mut rng = rand::rng();
-    let suffix: String = (0..8)
-        .map(|_| CHARSET[rand::Rng::random_range(&mut rng, 0..CHARSET.len())] as char)
-        .collect();
-    format!("AKIAEXTENDDB{suffix}")
-}
-
-fn generate_secret_key() -> String {
-    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut rng = rand::rng();
-    let suffix: String = (0..32)
-        .map(|_| CHARSET[rand::Rng::random_range(&mut rng, 0..CHARSET.len())] as char)
-        .collect();
-    format!("extenddb{suffix}")
-}
+use extenddb_storage::management_store::{generate_access_key_id, generate_secret_key};
 
 /// A stored policy or boundary as the resource-tag migration reads it: its
 /// `policy_document` as JSON, or why that cannot be read. `list_policies`

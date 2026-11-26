@@ -18,7 +18,7 @@ with DynamoDB works with ExtendDB, unchanged.
 
 ## Scope
 
-ExtendDB is a server that implements the Amazon DynamoDB API on a database that you provide: PostgreSQL, SQLite, MongoDB or Cassandra. An application connects to it through the endpoint setting of an AWS SDK or the AWS CLI. The application signs each request with an access key stored in ExtendDB.
+ExtendDB is a server that implements the Amazon DynamoDB API on a database that you provide: PostgreSQL, SQLite, MongoDB, Cassandra or Google Cloud Bigtable. An application connects to it through the endpoint setting of an AWS SDK or the AWS CLI. The application signs each request with an access key stored in ExtendDB.
 
 ExtendDB 1.0 is for:
 
@@ -36,7 +36,7 @@ ExtendDB 1.0 is not:
 ## Features
 
 - Full DynamoDB wire protocol: CRUD, Query, Scan, Batch, Transactions, Streams, TTL, Import/Export
-- Pluggable storage: PostgreSQL (default), SQLite, MongoDB, and Cassandra
+- Pluggable storage: PostgreSQL (default), SQLite, MongoDB, Cassandra, and Google Cloud Bigtable (experimental)
 - SigV4 authentication with IAM compatibility: users, groups, roles, policies, permissions boundaries
 - Web management console for account and credential administration
 - TLS with automatic self-signed certificate generation (replaceable with CA-signed certs)
@@ -60,6 +60,7 @@ A backend moves up one tier in a minor release. Before that release, the maintai
 | SQLite | Stable (single node) | SQLite runs in the server process. A lock file allows one server for each database file. There is no production image, so build from source. | As PostgreSQL. `migrate --yes` copies the database file before its first change. | The operations in Supported Operations. | `integration`, required | One write transaction at a time. TTL as PostgreSQL. |
 | MongoDB | Beta | MongoDB 7.0 or later, as a replica set, also for one node. | As PostgreSQL. | No vector search. On a global secondary index (GSI) with more than one RANGE attribute, `Query` takes a key condition on the first one only. | `mongodb-integration`, required, on MongoDB 7 | A number in a key attribute has at most 34 significant digits. The database names are fixed, so one replica set holds one catalog. TTL as PostgreSQL. |
 | Cassandra | Experimental | Cassandra 4.1 or later, with `PasswordAuthenticator`. Each table takes its writes in one datacenter. | `migrate --yes` migrates the catalog. No rollback procedure is tested. | No vector search. CreateBackup keeps each backup in the catalog, with or without a backup store. The `Query` limit of MongoDB on a GSI with more than one RANGE attribute. | `cassandra-integration`, required, on Cassandra 4.1 | Some management operations are not atomic. A few known race conditions are open. TTL removes about 1,000 expired items per table per minute. See [Known Limitations](docs/cassandra-setup.md#known-limitations). |
+| Google Cloud Bigtable | Experimental | Cloud Bigtable instance (or local `cbtemulator`), with a single-cluster routing app profile that enables single-row transactions. | `migrate --yes` migrates the catalog and data ledgers. No rollback procedure is tested. | No vector search. No `CreateBackup` (use Cloud Bigtable's own backups; `ListBackups` returns empty and `DescribeBackup`, `DeleteBackup`, and `RestoreTableFromBackup` return `BackupNotFoundException`). | `bigtable-integration`, on `cbtemulator` | The system table names are fixed, so one Bigtable instance (or catalog/data instance pair) holds one catalog. `DescribeTable` reports `ItemCount` 0 and `TableSizeBytes` 0. Multi-RANGE GSI shadow keys exceeding Bigtable's 4 KiB row-key limit are refused. TTL sweeps up to 1,600 expired items per cycle across 16 shards. See [Bigtable Setup](docs/bigtable-setup.md). |
 
 On every backend, run one ExtendDB server for each catalog. Only SQLite enforces this. [Differences from DynamoDB](docs/differences-from-dynamodb.md) lists the differences of each backend from the service.
 
@@ -120,6 +121,7 @@ scripts/install-macos.sh   # macOS
   - SQLite (embedded)
   - MongoDB 7+ (see `docs/local-mongodb-setup.md`)
   - Cassandra 4.1+ (see `docs/cassandra-setup.md`)
+  - Google Cloud Bigtable (experimental; see `docs/bigtable-setup.md`)
 
 ### Python Environment
 
@@ -212,7 +214,7 @@ unreachable at startup does stop the server from listening. There is no separate
 Run one `extenddb serve` per catalog. On SQLite this is enforced: the server takes an exclusive lock on `<database>.lock`
 next to the database file and a second server on the same file will refuse to start (`init`, `migrate --yes`,
 `migrate --forget` and `destroy` take the same lock while they run; the `migrate` preview and `verify` take none). On
-PostgreSQL, MongoDB and Cassandra nothing prevents a second ExtendDB instance from running, but running more than one
+PostgreSQL, MongoDB, Cassandra and Google Cloud Bigtable nothing prevents a second ExtendDB instance from running, but running more than one
 against the same catalog is not supported in this release: every instance runs every background worker, credential and
 policy caches are per instance with no cross-instance invalidation (a revoked key stays valid on the other instance for
 up to the cache TTL), and `/health` does not check the database.
@@ -714,6 +716,7 @@ crates/
   engine/             — operation handlers
   server/             — HTTP server, management API, web console
   storage/            — storage trait definitions
+  storage-bigtable/   — Google Cloud Bigtable backend (experimental)
   storage-cassandra/  — Cassandra backend (experimental)
   storage-mongodb/    — MongoDB backend
   storage-postgres/   — PostgreSQL backend (default/reference)

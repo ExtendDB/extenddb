@@ -267,6 +267,12 @@ pub fn in_catalog_create_only(backend: &str) -> Option<&'static str> {
     }
 }
 
+/// Whether `CreateBackup` is unsupported on `backend`.
+#[must_use]
+pub fn create_backup_unsupported(backend: &str) -> bool {
+    backend == "bigtable"
+}
+
 /// Build the backup runtime for this process: the job slots and, when the
 /// configuration and the backend select one, the store with its health
 /// ([`configure_described`] without the reason for an absent store).
@@ -319,6 +325,7 @@ pub async fn configure_described<C: BackupCatalog + ?Sized>(
     caller: Caller,
 ) -> anyhow::Result<StoreSetup> {
     let in_catalog_only = in_catalog_create_only(backend);
+    let create_unsupported = create_backup_unsupported(backend);
     if let Some(why) = in_catalog_only {
         tracing::info!(
             "CreateBackup on this server writes the in-catalog format whatever [backup.store] \
@@ -327,24 +334,39 @@ pub async fn configure_described<C: BackupCatalog + ?Sized>(
     }
     let runtime = BackupRuntime::new(backup.max_concurrent_jobs)
         .with_legacy_create_only(in_catalog_only.is_some())
+        .with_create_unsupported(create_unsupported)
         .with_job_settings(job_settings(backup));
     let resolved = backup
         .resolve_store(database_file)
         .map_err(|e| anyhow::anyhow!("[backup] configuration: {e}"))?;
     let (config, defaulted) = match resolved.store {
         EffectiveStore::Unconfigured(Unconfigured::Absent) => {
-            tracing::info!(
-                "backup store: none configured ([backup.store] is absent and this backend has \
-                 no default root); CreateBackup writes in-catalog backups, with a deprecation \
-                 warning on each call"
-            );
+            if create_unsupported {
+                tracing::info!(
+                    "backup store: none configured ([backup.store] is absent); CreateBackup is \
+                     not supported by this storage backend"
+                );
+            } else {
+                tracing::info!(
+                    "backup store: none configured ([backup.store] is absent and this backend has \
+                     no default root); CreateBackup writes in-catalog backups, with a deprecation \
+                     warning on each call"
+                );
+            }
             return Ok(StoreSetup::without_store(runtime, NotConfigured::Absent));
         }
         EffectiveStore::Unconfigured(Unconfigured::Disabled) => {
-            tracing::info!(
-                "backup store: disabled ([backup.store] kind = \"disabled\"); CreateBackup \
-                 writes in-catalog backups, with a deprecation warning on each call"
-            );
+            if create_unsupported {
+                tracing::info!(
+                    "backup store: disabled ([backup.store] kind = \"disabled\"); CreateBackup is \
+                     not supported by this storage backend"
+                );
+            } else {
+                tracing::info!(
+                    "backup store: disabled ([backup.store] kind = \"disabled\"); CreateBackup \
+                     writes in-catalog backups, with a deprecation warning on each call"
+                );
+            }
             return Ok(StoreSetup::without_store(runtime, NotConfigured::Disabled));
         }
         EffectiveStore::Configured { config, defaulted } => (config, defaulted),
@@ -477,11 +499,19 @@ pub async fn configure_described<C: BackupCatalog + ?Sized>(
     }
     if kind == StoreKind::S3 {
         if caller == Caller::Server {
-            tracing::info!(
-                "backup store: {kind} {}{spool_line}; its validation and identity check run \
-                 after the listener is up, and CreateBackup writes to it once a check passes",
-                opened.root
-            );
+            if create_unsupported {
+                tracing::info!(
+                    "backup store: {kind} {}{spool_line}; CreateBackup is not supported by this \
+                     storage backend",
+                    opened.root
+                );
+            } else {
+                tracing::info!(
+                    "backup store: {kind} {}{spool_line}; its validation and identity check run \
+                     after the listener is up, and CreateBackup writes to it once a check passes",
+                    opened.root
+                );
+            }
         }
         let configured = configured(ConfiguredStore::checking(
             kind,
@@ -550,6 +580,11 @@ pub async fn configure_described<C: BackupCatalog + ?Sized>(
         }
     };
     match &outcome {
+        Ok(_) if create_unsupported => tracing::info!(
+            "backup store: {kind} {}{spool_line}; CreateBackup is not supported by this storage \
+             backend",
+            opened.root
+        ),
         Ok(identity) => tracing::info!(
             "backup store: {kind} {} (store id {}){spool_line}; CreateBackup writes to it, and \
              it serves restores and deletes of the backups it holds",
@@ -731,6 +766,18 @@ fn warn_default_root_unusable(root: &str, problem: &str) {
 /// spelling beside it only where the two differ.
 #[must_use]
 pub fn banner_line(backup: &BackupConfig, database_file: Option<&Path>) -> String {
+    banner_line_for_backend(backup, database_file, "")
+}
+
+/// [`banner_line`] for `backend`, reporting when `CreateBackup` is not
+/// supported on the compiled storage backend rather than claiming it writes
+/// in-catalog backups.
+#[must_use]
+pub fn banner_line_for_backend(
+    backup: &BackupConfig,
+    database_file: Option<&Path>,
+    backend: &str,
+) -> String {
     let resolved = match backup.resolve_store(database_file) {
         Ok(resolved) => resolved,
         Err(e) => return format!("backup store: configuration error ({e})"),
@@ -740,7 +787,17 @@ pub fn banner_line(backup: &BackupConfig, database_file: Option<&Path>) -> Strin
         .as_ref()
         .map(|p| format!(", spool {}", p.display()))
         .unwrap_or_default();
+    let unsupported = create_backup_unsupported(backend);
     match resolved.store {
+        EffectiveStore::Unconfigured(Unconfigured::Absent) if unsupported => {
+            "backup store: none ([backup.store] is absent); CreateBackup is not supported by \
+             this storage backend"
+                .to_owned()
+        }
+        EffectiveStore::Unconfigured(Unconfigured::Disabled) if unsupported => {
+            "backup store: disabled; CreateBackup is not supported by this storage backend"
+                .to_owned()
+        }
         EffectiveStore::Unconfigured(Unconfigured::Absent) => {
             "backup store: none ([backup.store] is absent); CreateBackup writes in-catalog \
              backups"
@@ -749,6 +806,15 @@ pub fn banner_line(backup: &BackupConfig, database_file: Option<&Path>) -> Strin
         EffectiveStore::Unconfigured(Unconfigured::Disabled) => {
             "backup store: disabled; CreateBackup writes in-catalog backups".to_owned()
         }
+        EffectiveStore::Configured { config, defaulted } if unsupported => format!(
+            "backup store: {}{}{spool}; CreateBackup is not supported by this storage backend",
+            banner_target(&config),
+            if defaulted {
+                " (the default beside the database file)"
+            } else {
+                ""
+            }
+        ),
         EffectiveStore::Configured { config, defaulted } => format!(
             "backup store: {}{}{spool}",
             banner_target(&config),
@@ -2037,6 +2103,48 @@ mod tests {
         assert_eq!(
             lookup(found(&base.join("elsewhere")), f.join("x/backups")).await,
             None
+        );
+    }
+
+    #[test]
+    fn banner_line_reports_create_backup_unsupported_for_bigtable() {
+        let absent = BackupConfig::default();
+        assert_eq!(
+            banner_line_for_backend(&absent, None, "bigtable"),
+            "backup store: none ([backup.store] is absent); CreateBackup is not supported by this storage backend"
+        );
+        assert_eq!(
+            banner_line_for_backend(&absent, None, "postgres"),
+            "backup store: none ([backup.store] is absent); CreateBackup writes in-catalog backups"
+        );
+        let disabled = BackupConfig {
+            store: Some(extenddb_backup_store::BackupStoreConfig {
+                kind: BackupStoreKind::Disabled,
+                filesystem: None,
+                s3: None,
+            }),
+            ..BackupConfig::default()
+        };
+        assert_eq!(
+            banner_line_for_backend(&disabled, None, "bigtable"),
+            "backup store: disabled; CreateBackup is not supported by this storage backend"
+        );
+        let missing = format!("/nonexistent-{}/backups", uuid::Uuid::new_v4().simple());
+        let configured_fs = BackupConfig {
+            store: Some(extenddb_backup_store::BackupStoreConfig {
+                kind: BackupStoreKind::Filesystem,
+                filesystem: Some(extenddb_backup_store::FilesystemStoreConfig {
+                    path: std::path::PathBuf::from(&missing),
+                }),
+                s3: None,
+            }),
+            ..BackupConfig::default()
+        };
+        assert_eq!(
+            banner_line_for_backend(&configured_fs, None, "bigtable"),
+            format!(
+                "backup store: filesystem {missing}; CreateBackup is not supported by this storage backend"
+            )
         );
     }
 }

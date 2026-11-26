@@ -1,0 +1,213 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+name: Bigtable Integration Tests
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Supersede an in-flight run of the SAME pull request when a new push arrives,
+# so repeated pushes do not stack up on a capped pool. Non-PR runs get a group
+# unique to the run (run_id): merge-group runs reuse a ref across re-queues,
+# and GitHub concurrency replaces a PENDING run in a group even with
+# cancel-in-progress false, so keying them by ref would let one merge-group
+# run cancel another and evict its queue entry.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# `devtools/run-bigtable-tests` starts a disposable local `cbtemulator` (using a
+# host binary when installed or `gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators`
+# in Docker), runs `extenddb init` + `extenddb serve`, and delegates conformance
+# suites to `devtools/run-tests --extenddb --backend bigtable`, tearing everything
+# down on exit so CI executes the exact path developers run locally.
+
+jobs:
+  bigtable-storage:
+    # Dedicated ExtendDB runner group (Ubuntu 24.04, 4 vCPU / 16 GB, capped at
+    # 20 concurrent); see integration.yml.
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-on-failure: true
+          # Only pushes to main save, so other runs restore main's cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Start Cloud Bigtable emulator
+        run: devtools/run-bigtable-tests --emulator-only --emulator-port 8086 --output "$RUNNER_TEMP/cbt-emulator"
+      - name: Unit tests
+        run: |
+          cargo test -p extenddb-storage-bigtable --lib
+          cargo test -p extenddb --no-default-features --features bigtable --bins
+      - name: Direct storage-trait emulator integration tests (production feature set)
+        if: ${{ !cancelled() }}
+        env:
+          BIGTABLE_EMULATOR_HOST: 127.0.0.1:8086
+          EXTENDDB_TEST_BIGTABLE_REQUIRED: "1"
+        run: cargo test -p extenddb-storage-bigtable --test emulator_integration -- --nocapture
+      - name: Direct storage-trait emulator integration tests (with test-hooks)
+        if: ${{ !cancelled() }}
+        env:
+          BIGTABLE_EMULATOR_HOST: 127.0.0.1:8086
+          EXTENDDB_TEST_BIGTABLE_REQUIRED: "1"
+        run: cargo test -p extenddb-storage-bigtable --features test-hooks --test emulator_integration -- --nocapture
+      - name: Stop Cloud Bigtable emulator
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/cbt-emulator/cbtemulator.pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/cbt-emulator/cbtemulator.pid")" 2>/dev/null || true
+          fi
+          docker rm -f extenddb-runtests-cbt-8086 2>/dev/null || true
+
+  # One release build shared by the jobs that test it; see integration.yml.
+  build-bigtable:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-on-failure: true
+          # Only pushes to main save, so other runs restore main's cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build release (bigtable backend)
+        run: cargo build --release -p extenddb --no-default-features --features bigtable
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: extenddb-bigtable
+          path: target/release/extenddb
+          if-no-files-found: error
+          retention-days: 1
+          # A re-run of a failed job uploads the same name again.
+          overwrite: true
+
+  bigtable-pytest:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 60
+    needs: build-bigtable
+    # Three shards by test file; bigtable-integration checks that together
+    # they collected every test of the whole suite.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    env:
+      EXTENDDB_TEST_SHARD: ${{ matrix.shard }}/3
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: extenddb-bigtable
+          path: target/release
+      # Artifacts do not keep file modes.
+      - run: chmod +x target/release/extenddb
+      - name: Install Terraform (pinned version, checksum asserted)
+        run: echo "TERRAFORM=$(tests/terraform/install-terraform.sh "$RUNNER_TEMP/terraform")" >> "$GITHUB_ENV"
+      - name: Run Bigtable pytest suite
+        env:
+          EXTENDDB_TEST_BACKUP_STORE: none
+        run: devtools/run-bigtable-tests -- --pytest --comprehensive --terraform --parallel
+      # bigtable-integration checks these lists.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: shards-bigtable-pytest-${{ matrix.shard }}
+          path: discussions/shards/
+          if-no-files-found: warn
+          retention-days: 1
+          # A re-run of a failed job uploads the same name again.
+          overwrite: true
+
+  bigtable-rust:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 55
+    needs: build-bigtable
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-on-failure: true
+          # Only pushes to main save, so other runs restore main's cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+      # After the cache restore, so a cached target/ cannot replace it.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: extenddb-bigtable
+          path: target/release
+      # Artifacts do not keep file modes.
+      - run: chmod +x target/release/extenddb
+      - name: Run Bigtable rust integration suite
+        env:
+          EXTENDDB_TEST_BACKUP_STORE: none
+        run: devtools/run-bigtable-tests -- --rust-integration
+      - name: Check Bigtable catalog lock and serving registration
+        run: python3 devtools/check-bigtable-catalog-lock target/release/extenddb 18086 18460
+
+  bigtable-production-build:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-on-failure: true
+          # Only pushes to main save, so other runs restore main's cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Check production Bigtable feature graph
+        run: cargo check --release --no-default-features --features bigtable
+
+  bigtable-integration:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 40
+    needs:
+      - bigtable-storage
+      - bigtable-pytest
+      - bigtable-rust
+      - bigtable-production-build
+    if: always()
+    steps:
+      - run: |
+          if [ "${{ needs.bigtable-storage.result }}" != "success" ] || \
+             [ "${{ needs.bigtable-pytest.result }}" != "success" ] || \
+             [ "${{ needs.bigtable-rust.result }}" != "success" ] || \
+             [ "${{ needs.bigtable-production-build.result }}" != "success" ]; then
+            exit 1
+          fi
+      # Fails unless the shards together collected every test of the whole
+      # suite exactly once, so a bad split cannot pass.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: shards-bigtable-pytest-*
+          path: shards/bigtable-pytest
+      - name: Check the shards ran every test
+        run: python3 devtools/test-shards check shards/bigtable-pytest

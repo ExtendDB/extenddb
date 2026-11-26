@@ -23,20 +23,8 @@ impl SqliteCatalogStore {
         // Seed a default self-service policy so the user can manage its own
         // access keys and password without an administrator attaching one
         // (parity with the PostgreSQL backend).
-        let self_service_policy = serde_json::json!({
-            "Version": "2012-10-17",
-            "Statement": [{
-                "Effect": "Allow",
-                "Action": [
-                    "iam:CreateAccessKey",
-                    "iam:DeleteAccessKey",
-                    "iam:ListAccessKeys",
-                    "iam:ChangePassword"
-                ],
-                "Resource": &user_arn,
-            }]
-        })
-        .to_string();
+        let self_service_policy =
+            extenddb_storage::management_store::self_service_policy(&user_arn).to_string();
 
         // D1: every writer holds the write lock, acquired before the
         // transaction begins so the lock never waits on a pool connection.

@@ -428,22 +428,4 @@ impl CassandraCatalogStore {
     }
 }
 
-// ── Crypto helpers (duplicated from server::crypto to avoid circular dep) ──
-// TODO - These should be lifted to extenddb-storage or extenddb-auth
-fn generate_access_key_id() -> String {
-    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let mut rng = rand::rng();
-    let suffix: String = (0..8)
-        .map(|_| CHARSET[rand::Rng::random_range(&mut rng, 0..CHARSET.len())] as char)
-        .collect();
-    format!("AKIAEXTENDDB{suffix}")
-}
-
-fn generate_secret_key() -> String {
-    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut rng = rand::rng();
-    let suffix: String = (0..32)
-        .map(|_| CHARSET[rand::Rng::random_range(&mut rng, 0..CHARSET.len())] as char)
-        .collect();
-    format!("extenddb{suffix}")
-}
+use extenddb_storage::management_store::{generate_access_key_id, generate_secret_key};

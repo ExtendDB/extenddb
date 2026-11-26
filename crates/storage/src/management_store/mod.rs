@@ -662,3 +662,122 @@ pub trait ManagementStore: Send + Sync {
         Box::pin(async { Ok(()) })
     }
 }
+
+// ── Shared IAM & credential helpers ────────────────────────────────────
+
+/// Catalog setting key holding the deployment's default 12-digit account ID.
+pub const DEFAULT_ACCOUNT_SETTING: &str = "default_account_id";
+
+/// Default inline IAM self-service policy attached to newly created IAM users
+/// so each user can manage its own access keys and password.
+#[must_use]
+pub fn self_service_policy(user_arn: &str) -> serde_json::Value {
+    serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": [
+                "iam:CreateAccessKey",
+                "iam:DeleteAccessKey",
+                "iam:ListAccessKeys",
+                "iam:ChangePassword"
+            ],
+            "Resource": user_arn
+        }]
+    })
+}
+
+/// Generate a 20-character long-term access key ID branded with the
+/// `AKIAEXTENDDB` prefix (`AKIAEXTENDDB` + 8 uppercase alphanumeric chars).
+#[must_use]
+pub fn generate_access_key_id() -> String {
+    use rand::Rng;
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut rng = rand::rng();
+    let suffix: String = (0..8)
+        .map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char)
+        .collect();
+    format!("AKIAEXTENDDB{suffix}")
+}
+
+/// Generate a 40-character secret access key branded with the `extenddb`
+/// prefix (`extenddb` + 32 random base64-alphabet chars).
+#[must_use]
+pub fn generate_secret_key() -> String {
+    use rand::Rng;
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut rng = rand::rng();
+    let suffix: String = (0..32)
+        .map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char)
+        .collect();
+    format!("extenddb{suffix}")
+}
+
+/// Generate a 20-character temporary session access key ID branded with the
+/// `ASIAEXTENDDB` prefix (`ASIAEXTENDDB` + 8 uppercase alphanumeric chars).
+#[must_use]
+pub fn generate_session_key_id() -> String {
+    use rand::Rng;
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut rng = rand::rng();
+    let suffix: String = (0..8)
+        .map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char)
+        .collect();
+    format!("ASIAEXTENDDB{suffix}")
+}
+
+/// Generate a 64-character random session token for `AssumeRole`.
+#[must_use]
+pub fn generate_session_token() -> String {
+    use rand::Rng;
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut rng = rand::rng();
+    (0..64)
+        .map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_key_generators_match_documented_prefixes_and_lengths() {
+        let ak = generate_access_key_id();
+        assert!(ak.starts_with("AKIAEXTENDDB"), "got {ak}");
+        assert_eq!(ak.len(), 20);
+        assert!(
+            ak.chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        );
+
+        let sk = generate_secret_key();
+        assert!(sk.starts_with("extenddb"), "got {sk}");
+        assert_eq!(sk.len(), 40);
+
+        let sk_id = generate_session_key_id();
+        assert!(sk_id.starts_with("ASIAEXTENDDB"), "got {sk_id}");
+        assert_eq!(sk_id.len(), 20);
+
+        let tok = generate_session_token();
+        assert_eq!(tok.len(), 64);
+    }
+
+    #[test]
+    fn self_service_policy_grants_expected_iam_actions_on_user_arn() {
+        let arn = "arn:aws:iam::123456789012:user/alice";
+        let doc = self_service_policy(arn);
+        assert_eq!(doc["Version"], "2012-10-17");
+        assert_eq!(doc["Statement"][0]["Effect"], "Allow");
+        assert_eq!(doc["Statement"][0]["Resource"], arn);
+        assert_eq!(
+            doc["Statement"][0]["Action"],
+            serde_json::json!([
+                "iam:CreateAccessKey",
+                "iam:DeleteAccessKey",
+                "iam:ListAccessKeys",
+                "iam:ChangePassword"
+            ])
+        );
+    }
+}

@@ -176,9 +176,10 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     );
     let banner_line3 = format!(
         "  {}",
-        extenddb_server::backup_store::banner_line(
+        extenddb_server::backup_store::banner_line_for_backend(
             &app_config.backup,
             app_config.storage.database_file().as_deref(),
+            backend,
         )
     );
     let mut warnings = app_config.storage.startup_warnings();
