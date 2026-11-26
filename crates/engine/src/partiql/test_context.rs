@@ -1,11 +1,12 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! An [`OperationContext`] for the unit tests that need one, and item
-//! authorizers that answer every access the same way. The context's catalog
-//! is an empty in-memory database, and its snapshot holds the table "t" as
-//! missing, so that nothing the PartiQL layer does for "t" reads the
-//! catalog.
+//! The [`OperationContext`]s of the unit tests that need one, and item
+//! authorizers that answer every access the same way. The catalog of
+//! [`context`] is an empty in-memory database, and its snapshot holds the
+//! table "t" as missing, so that nothing the PartiQL layer does for "t"
+//! reads the catalog. [`catalog_context`] has a catalog that tables are
+//! created in.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -13,7 +14,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::limits::LimitsConfig;
-use extenddb_storage_sqlite::SqliteEngine;
+use extenddb_storage::server_components::ServerComponentsOptions;
+use extenddb_storage_sqlite::{SqliteConfig, SqliteEngine};
 
 use crate::{
     AuthorizedKeyInfo, BackupRuntime, ItemAccess, ItemAuthorization, ItemAuthorizer,
@@ -48,6 +50,40 @@ pub(super) async fn context(authorizer: Option<Arc<dyn ItemAuthorizer>>) -> Oper
         auth_cache: extenddb_auth::AuthCacheRegistry::default(),
         table_key_info_lookup: None,
         item_authorizer: authorizer,
+    }
+}
+
+/// A context whose catalog is an in-memory database that holds the account
+/// the backend bootstraps, in which a table is ACTIVE once it is created,
+/// and whose item authorizer allows every access.
+pub(super) async fn catalog_context() -> OperationContext {
+    let config = SqliteConfig {
+        path: ":memory:".to_owned(),
+        pool_size: 1,
+    };
+    let mut options = ServerComponentsOptions::default();
+    options.release = "test";
+    options.startup_recovery = false;
+    let components =
+        (extenddb_storage_sqlite::backend().server_components)(&config, "us-east-1", options)
+            .await
+            .unwrap_or_else(|e| panic!("server components: {e:?}"));
+    let catalog = &components.catalog_store;
+    let account_id = catalog
+        .default_account_id()
+        .await
+        .unwrap()
+        .expect("the bootstrapped account");
+    catalog
+        .set_setting("control_plane_delay_seconds", "0")
+        .await
+        .unwrap();
+    let allowing: Arc<dyn ItemAuthorizer> = Fixed::allowing();
+    OperationContext {
+        storage: components.engine,
+        account_id: Arc::from(account_id),
+        authorized_key_info: AuthorizedKeyInfo::new(),
+        ..context(Some(allowing)).await
     }
 }
 
