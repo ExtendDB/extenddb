@@ -1,12 +1,36 @@
 # RFC-0000: Couchbase Storage Backend
 
-- Status: Draft (revision 6, 2026-11-26: most engineering items of revision 3 are implemented in the reference repository `[ref-repo]`, which no reviewer can read yet, so rows 2.4, 3.5, 4.1, 4.3, 5.2 and 6.2 of the acceptance table stay OPEN. Open parts remain in engineering items 1, 2, 5 and 8, item 13 is blocked on the pin, and item 15 is two OPEN gaps, Gap A (visibility after a commit, no code) and Gap B (the idempotency-token read after an unknown outcome, fixed in the unknown-outcome arm only); see "Engineering items of revision 3")
+- Status: Draft (revision 6, 2026-11-26: most engineering items of revision 3
+  are implemented in the reference repository `[ref-repo]`, which no reviewer
+  can read yet, so rows 2.4, 3.5, 4.1, 4.3, 5.2 and 6.2 of the acceptance table
+  stay OPEN. Open parts remain in engineering items 1, 2, 5 and 8, item 13 is
+  blocked on the pin, and item 15 is two OPEN gaps, Gap A (visibility after a
+  commit, no code) and Gap B (the idempotency-token read after an unknown
+  outcome, fixed in the unknown-outcome arm only); see "Engineering items of
+  revision 3")
 - Author: @suravarjjala
 - Created: 2026-11-04
 - FCP ends: —
 - Tracking issue: ExtendDB/extenddb#1183
 - Acceptance rubric: RFC-0003 "Backend Acceptance Criteria"; every criterion is mapped in "RFC-0003 acceptance criteria" below
-- Reference implementation: https://github.com/couchbaselabs/extenddb-couchbase. Read access is granted to any reviewer who asks: the invitation to the first reviewer was sent on 2026-11-24 at 19:15 UTC and is pending at https://github.com/couchbaselabs/extenddb-couchbase/invitations (GitHub answers 404 until it is accepted). The repository goes public before the Final Comment Period, once Couchbase's open-source release approval completes. Until a reviewer has read it, every `docs/`, `scripts/`, `tests/` path, QE id, commit id, pull-request number, Jenkins build number, pass count and timing in this document that comes from that repository, its demo stack or its Jenkins jobs is a claim that only that repository can show. Each such item is followed by `[ref-repo]` wherever it appears in a table or a list of results; upstream test files (`upstream/tests/`, the `test_*.py` names) are not so marked. Dates of commits are UTC: the three commits of 2026-11-25 carry the author time 2026-11-24 17:25 to 17:31 in UTC-8. Figures from Couchbase's performance CI (multi-node YCSB runs, 2026-10-22 to 2026-11-01) come from that CI, not from this repository, and no reviewer can repeat them from here; each is followed by `[perf-ci]`, and until a reviewer is given access to those runs they are claims that only Couchbase can show.
+- Reference implementation: https://github.com/couchbaselabs/extenddb-couchbase.
+  Read access is granted to any reviewer who asks: the invitation to the first
+  reviewer was sent on 2026-11-24 at 19:15 UTC and is pending at
+  https://github.com/couchbaselabs/extenddb-couchbase/invitations (GitHub
+  answers 404 until it is accepted). The repository goes public before the Final
+  Comment Period, once Couchbase's open-source release approval completes. Until
+  a reviewer has read it, every `docs/`, `scripts/`, `tests/` path, QE id,
+  commit id, pull-request number, Jenkins build number, pass count and timing in
+  this document that comes from that repository, its demo stack or its Jenkins
+  jobs is a claim that only that repository can show. Each such item is followed
+  by `[ref-repo]` wherever it appears in a table or a list of results; upstream
+  test files (`upstream/tests/`, the `test_*.py` names) are not so marked. Dates
+  of commits are UTC: the three commits of 2026-11-25 carry the author time
+  2026-11-24 17:25 to 17:31 in UTC-8. Figures from Couchbase's performance CI
+  (multi-node YCSB runs, 2026-10-22 to 2026-11-01) come from that CI, not from
+  this repository, and no reviewer can repeat them from here; each is followed
+  by `[perf-ci]`, and until a reviewer is given access to those runs they are
+  claims that only Couchbase can show.
 - Tier at entry: Experimental, per `README.md` "Storage backends"
 
 ## Summary
@@ -92,15 +116,20 @@ backend build that produced it:
   (`scripts/query-txn-multinode-test.sh` `[ref-repo]`, three Couchbase nodes each
   running data, index and query, durability `majority`) ran when those commits
   merged; its commit-point hold `[ref-repo]` (see "Transactions" and "DynamoDB
-  Streams") was run twice on the round-4 branch and its gate failed both times (see "DynamoDB Streams"); the figures once quoted for it are withdrawn as untraceable. Round 4 changed the lease and the fence
-  afterwards; that work is on a branch of the reference repository that is pushed to the private repository and not merged `[ref-repo]`.
+  Streams") was run twice on the round-4 branch and its gate failed both times
+  (see "DynamoDB Streams"); the figures once quoted for it are withdrawn as
+  untraceable. Round 4 changed the lease and the fence
+  afterwards; that work is on a branch of the reference repository that is
+  pushed to the private repository and not merged `[ref-repo]`.
 - QE `[ref-repo]`: a 343-case Couchbase-specific test plan (`docs/qe/testcases.md`) run
   against a real multi-node cluster; every failure traced to code and fixed or
   filed (`docs/qe/qe-report.md`). No acknowledged write was lost in any
   rebalance, failover, node kill, churn, or API-restart test.
 - Performance: YCSB through the same binding measures workload A at 2,822 ops/s
   on the 5K-record baseline and 2,096 ops/s at 1M records, with bulk load at
-  ~7,400 inserts/s on the 1M-record run (`docs/ycsb-benchmark.md` `[ref-repo]`). Couchbase's performance CI `[perf-ci]` (multi-node YCSB runs, 2026-10-22 to 2026-11-01) shows the
+  ~7,400 inserts/s on the 1M-record run (`docs/ycsb-benchmark.md` `[ref-repo]`).
+  Couchbase's performance CI `[perf-ci]` (multi-node YCSB runs, 2026-10-22 to
+  2026-11-01) shows the
   read-heavy workload B scaling near-linearly from 3 to 18 nodes (34K to 164K
   ops/s) with flat read latency, and workload A at 5.7 ms update p99 and 3.0 ms
   read p99 at 5,000 ops/s (see "Performance characteristics"). Those runs used
@@ -575,7 +604,15 @@ server then runs the fenced second pass: it sleeps the catalog freshness window
 (`EXTENDDB_CATALOG_FRESHNESS_MS`, default 2 s, plus 0.5 s), waits up to 30 s for
 every write on this server that was already in flight, backfills again, and
 flips the index `ACTIVE`. The server's GSI worker repeats the backfill and the
-flip 75 s after the publish, which covers a task lost to a restart and any pass that left the index `CREATING`. Before its backfill the worker waits, with the same drain helper and the same 30 s cap as the fenced pass, for the writes counted before it to finish; on a timeout it warns, leaves the mark and the index `CREATING`, backfills nothing, and retries at the next interval (`38eeab5` `[ref-repo]`, round-5 branch). The 75 s is not what makes this safe: no longest in-flight time is claimed, and the wait is what a worker pass after a drain timeout depends on. No unit test covers the wait (the helper needs a running engine).
+flip 75 s after the publish, which covers a task lost to a restart and any pass
+that left the index `CREATING`. Before its backfill the worker waits, with the
+same drain helper and the same 30 s cap as the fenced pass, for the writes
+counted before it to finish; on a timeout it warns, leaves the mark and the
+index `CREATING`, backfills nothing, and retries at the next interval (`38eeab5`
+`[ref-repo]`, round-5 branch). The 75 s is not what makes this safe: no longest
+in-flight time is claimed, and the wait is what a worker pass after a drain
+timeout depends on. No unit test covers the wait (the helper needs a running
+engine).
 
 The fence between the backfill and in-flight writes: `main`'s
 `CachedTableKeyInfoStore` is stale-while-revalidate and `UpdateTable`
@@ -591,14 +628,51 @@ takes the counter before it reads its catalog view. `TransactWriteItems` (one
 guard per table) and the reindex reconciler take it too; the reconciler reads
 the catalog row for every document it rewrites, one KV get per document, rather
 than reusing key info cached earlier in its drain. A drain that times out leaves
-the index `CREATING` for the worker's pass instead of flipping it. Each backfilled item, and each document the reindex reconciler rewrites, is rewritten under the item's `plain` lease, like any plain write, and what the rewrite does depends on the lease it finds (`e7f94b0`, `84c30aa` `[ref-repo]`, round-5 branch): on a `transact_write` lease it skips the item at once (the reconciler leaves it queued and logs it; the backfill counts it skipped); on a `transact_get` or `plain` lease it waits up to 10 s and then skips; on a `committing` lease (a committed transaction not yet visible to KV reads, or one whose outcome was unknown) it takes the lease over by CAS and rewrites in a query-service transaction, with one `replace-expect` carrying the CAS it read, which is the path of an escalated plain write, so a `committing` lease does not hold an index `CREATING`. A skipped item makes the fenced pass leave the index `CREATING`, and the worker retries every 30 s, so an item skipped on a `transact_write` lease, or on a `plain` or `transact_get` lease still held after 10 s, keeps the index `CREATING` until a pass finds it free (the first backfill on the request path ignores that count, so `UpdateTable` does not fail on it). The takeover of a `committing` lease by a background rewrite was not exercised (it needs a harness that holds a commit between its commit point and its unstaging) and has no unit test; the unit tests cover the lease arithmetic only. The counter is
+the index `CREATING` for the worker's pass instead of flipping it. Each
+backfilled item, and each document the reindex reconciler rewrites, is rewritten
+under the item's `plain` lease, like any plain write, and what the rewrite does
+depends on the lease it finds (`e7f94b0`, `84c30aa` `[ref-repo]`, round-5
+branch): on a `transact_write` lease it skips the item at once (the reconciler
+leaves it queued and logs it; the backfill counts it skipped); on a
+`transact_get` or `plain` lease it waits up to 10 s and then skips; on a
+`committing` lease (a committed transaction not yet visible to KV reads, or one
+whose outcome was unknown) it takes the lease over by CAS and rewrites in a
+query-service transaction, with one `replace-expect` carrying the CAS it read,
+which is the path of an escalated plain write, so a `committing` lease does not
+hold an index `CREATING`. A skipped item makes the fenced pass leave the index
+`CREATING`, and the worker retries every 30 s, so an item skipped on a
+`transact_write` lease, or on a `plain` or `transact_get` lease still held after
+10 s, keeps the index `CREATING` until a pass finds it free (the first backfill
+on the request path ignores that count, so `UpdateTable` does not fail on it).
+The takeover of a `committing` lease by a background rewrite was not exercised
+(it needs a harness that holds a commit between its commit point and its
+unstaging) and has no unit test; the unit tests cover the lease arithmetic only.
+The counter is
 per server process; with one server per catalog it covers every writer. The
 sub-document fast path reads the same key info and refuses any attribute an
 index names, so it is covered by the same fence.
 
 What tests the fence, honestly. `tests/test_gsi_fence.py` `[ref-repo]` races four
 ordinary writers against the create and finds every item in the `ACTIVE` index,
-but it holds nothing, so a fence that waited for nothing could pass it. The held write test (`tests/test_fault_hooks.py` `[ref-repo]`) has one hold point, after the catalog-view read. A `PutItem` whose key info was resolved before the publish is parked there, and the test holds it for the catalog freshness window (`EXTENDDB_CATALOG_FRESHNESS_MS`, default 2000 ms) plus 0.5 s plus 3 s, which is past the point where a pass that waited for nothing would have run its second backfill and flipped the index. While the write is held the test asserts that the index is still `CREATING`; it then releases the write and requires that the write lands with the index column, that the index goes `ACTIVE` and that a query on it returns the held item (`7cc900a`, round-5 branch `[ref-repo]`). Tess-2 to Tess-6 are runs of `tests/test_fault_hooks.py` on a `fault-hooks` build on the single-node demo stack (`PutItem` only), one run each; the held-write test passed on every one, on the earlier form of the test in Tess-2 to Tess-5 and on the rewritten form in Tess-6 `[ref-repo]`. Negative control, a build with both drain waits removed: `<<NEGCTL: shown | not shown>>` that the test fails. The guard before the view read, the transaction guard, the reconciler change, the worker's drain wait and the background `committing` takeover are built and unit-tested only (the takeover is not exercised), with no dedicated test; the reconciler held-write test is a skipped stub (**OPEN**).
+but it holds nothing, so a fence that waited for nothing could pass it. The held
+write test (`tests/test_fault_hooks.py` `[ref-repo]`) has one hold point, after
+the catalog-view read. A `PutItem` whose key info was resolved before the
+publish is parked there, and the test holds it for the catalog freshness window
+(`EXTENDDB_CATALOG_FRESHNESS_MS`, default 2000 ms) plus 0.5 s plus 3 s, which is
+past the point where a pass that waited for nothing would have run its second
+backfill and flipped the index. While the write is held the test asserts that
+the index is still `CREATING`; it then releases the write and requires that the
+write lands with the index column, that the index goes `ACTIVE` and that a query
+on it returns the held item (`7cc900a`, round-5 branch `[ref-repo]`). Tess-2 to
+Tess-6 are runs of `tests/test_fault_hooks.py` on a `fault-hooks` build on the
+single-node demo stack (`PutItem` only), one run each; the held-write test
+passed on every one, on the earlier form of the test in Tess-2 to Tess-5 and on
+the rewritten form in Tess-6 `[ref-repo]`. Negative control, a build with both
+drain waits removed: `<<NEGCTL: shown | not shown>>` that the test fails. The
+guard before the view read, the transaction guard, the reconciler change, the
+worker's drain wait and the background `committing` takeover are built and
+unit-tested only (the takeover is not exercised), with no dedicated test; the
+reconciler held-write test is a skipped stub (**OPEN**).
 
 `index_num_replicas` sets `num_replica` on every index the backend creates,
 failing closed when the cluster has too few index nodes. Multi-part RANGE keys
@@ -675,7 +749,9 @@ stale "no transactions here" view.
   action that does not pin a document by CAS (an unconditional `Put`, a `Put`
   that only requires the key to be absent, an unconditional `Delete`, a
   `ConditionCheck`) gets no such wait, so a transaction made only of those
-  deletes its leases when `COMMIT WORK` returns: that gap is Gap A, **OPEN** (engineering item 15). Every lease delete is a CAS remove that checks the owner id first.
+  deletes its leases when `COMMIT WORK` returns: that gap is Gap A, **OPEN**
+  (engineering item 15). Every lease delete is a CAS remove that checks the
+  owner id first.
 - A **plain write** (`PutItem`, `UpdateItem`, `DeleteItem`, `BatchWriteItem`)
   takes the same lease with `op = "plain"` before it writes and deletes it
   after; a bare `PutItem` becomes lease insert, KV write, lease get, lease
@@ -684,7 +760,14 @@ stale "no transactions here" view.
   transaction holds the item; a `transact_get` or `plain` lease is retried with
   jittered backoff until the 10 s deadline (there is no attempt count on the
   lease wait; the 64 attempts belong to the CAS loops), and the write answers 503
-  at its end; a `committing` lease (a committed transaction not yet visible to KV reads, or one whose outcome was unknown) is taken over by CAS, and the write runs as a query-service transaction, which Couchbase orders after the committed one, holding the lease across it. That escalated write, and every single-item write on a stream-enabled table, commits through `COMMIT WORK` and deletes its lease when it returns, with no wait for the commit to be visible to KV reads: that is Gap A (engineering item 15, **OPEN**), so the next plain write is an ordinary one only once that commit is visible.
+  at its end; a `committing` lease (a committed transaction not yet visible to
+  KV reads, or one whose outcome was unknown) is taken over by CAS, and the
+  write runs as a query-service transaction, which Couchbase orders after the
+  committed one, holding the lease across it. That escalated write, and every
+  single-item write on a stream-enabled table, commits through `COMMIT WORK` and
+  deletes its lease when it returns, with no wait for the commit to be visible
+  to KV reads: that is Gap A (engineering item 15, **OPEN**), so the next plain
+  write is an ordinary one only once that commit is visible.
 - A **transaction** that meets a `committing` lease does not cancel: a
   `TransactWriteItems` takes the lease over by CAS; a `TransactGetItems` waits on
   it for its 5 s, then reads that key inside a throwaway query transaction,
@@ -692,7 +775,16 @@ stale "no transactions here" view.
   agree (see "TransactGetItems").
 - **A lease is a bound, not a fence.** A plain write finishes well inside its
   lease in normal operation, and a transaction checks its own leases by CAS
-  before it commits, but nothing re-checks a plain write's lease between taking it and its KV write, and a bare `PutItem` is one unfenced KV write. A process stalled for longer than the lease (30 s for a KV write) can still land a write after the lease lapsed, and nothing bounds how late that write lands: the lease length bounds how long contending writers wait and how long a crashed holder blocks its key, and the transaction's pre-commit CAS check covers the transaction's own leases, not a stale plain write that lands later. The durability level makes each write durable; it does not bound when a stalled write lands. The design accepts that, as any lease without a fencing token does.
+  before it commits, but nothing re-checks a plain write's lease between taking
+  it and its KV write, and a bare `PutItem` is one unfenced KV write. A process
+  stalled for longer than the lease (30 s for a KV write) can still land a write
+  after the lease lapsed, and nothing bounds how late that write lands: the
+  lease length bounds how long contending writers wait and how long a crashed
+  holder blocks its key, and the transaction's pre-commit CAS check covers the
+  transaction's own leases, not a stale plain write that lands later. The
+  durability level makes each write durable; it does not bound when a stalled
+  write lands. The design accepts that, as any lease without a fencing token
+  does.
 - **Every ending path deletes the leases, except the ones that must keep them.**
   A `TransactWriteItems` that cannot take its leases, whose condition fails,
   that rolls back, whose lease is lost, or whose `txtimeout` expires before the
@@ -730,7 +822,23 @@ to 0) `[ref-repo]`. No document is rewritten, so the read changes no CAS and
 writes no stream record. A plain writer that meets the read's lease retries
 until its 10 s deadline and answers 503 at its end (DynamoDB fails the read
 instead; the difference is that the plain write here waits milliseconds rather
-than failing, and goes in the differences document). The read has one deadline of 5 s, taken before its first lease, for acquiring the leases and for the agreement passes together, plus an allowance of 3 s for one pass already running (an estimate, not measured), so the read ends within 8 s of its first lease, 2 s inside the 10 s lease; the leases are not renewed. Within the deadline it waits on a `transact_write` lease, and then answers `TransactionCanceledException` with `TransactionConflict`, as DynamoDB cancels a read that meets an ongoing transaction. It waits on a `committing` lease for the same deadline; a key still under one then is read inside a throwaway query transaction, which sees the committed version, and the whole set is read again until two passes agree; the deadline is checked before each pass, and once it has passed the read is cancelled the same way. Every cancelled or failed read deletes its leases, and the section that holds them runs detached, so a client that drops the request still releases them (`3ffb3df` `[ref-repo]`; a compile-time check and two unit tests cover the arithmetic, and the release on cancel is not unit-tested). On a very slow cluster a pass over 100 keys could still outlast the 3 s allowance and the lease; that is not measured. A `ConditionCheck`
+than failing, and goes in the differences document). The read has one deadline
+of 5 s, taken before its first lease, for acquiring the leases and for the
+agreement passes together, plus an allowance of 3 s for one pass already running
+(an estimate, not measured), so the read ends within 8 s of its first lease, 2 s
+inside the 10 s lease; the leases are not renewed. Within the deadline it waits
+on a `transact_write` lease, and then answers `TransactionCanceledException`
+with `TransactionConflict`, as DynamoDB cancels a read that meets an ongoing
+transaction. It waits on a `committing` lease for the same deadline; a key still
+under one then is read inside a throwaway query transaction, which sees the
+committed version, and the whole set is read again until two passes agree; the
+deadline is checked before each pass, and once it has passed the read is
+cancelled the same way. Every cancelled or failed read deletes its leases, and
+the section that holds them runs detached, so a client that drops the request
+still releases them (`3ffb3df` `[ref-repo]`; a compile-time check and two unit
+tests cover the arithmetic, and the release on cancel is not unit-tested). On a
+very slow cluster a pass over 100 keys could still outlast the 3 s allowance and
+the lease; that is not measured. A `ConditionCheck`
 item in `TransactWriteItems` is leased like every other target, so a plain write
 to it between the check and the commit meets the lease and is refused.
 
@@ -746,7 +854,22 @@ never run again. The rule, from the code: an error 17010 at `COMMIT WORK` with
 no `raise` is Expired, which is retryable, and the stream writes a skip marker
 only when the answer says nothing committed; `raise` is checked before the code
 (conn.rs:177-181, 220; engine.rs:2006); 17004 and unrecognised `COMMIT WORK`
-errors are Ambiguous `[ref-repo]`. After an unknown outcome the backend reads the request's idempotency token, which is written inside the same transaction, with `txn_peek`, a read by key inside a throwaway query transaction (`3231463` `[ref-repo]`): a token with the request's fingerprint means the transaction committed, an absent token or another fingerprint is taken as not committed, and a failed read is an unknown outcome that keeps the leases. This replaces a KV read, which can miss the token of a transaction that did commit when Couchbase has not unstaged it yet (Gap B, engineering item 15). The decision is unit-tested; a committed token that is still staged, and a failed `txn_peek`, are not tested end to end, because the test hook cannot make a committed token invisible to a KV read. The other token reads, the pre-check before the writes and the `Exists` arm of the retry path, are still KV reads (Gap B, **OPEN**). If the token is there with the request's fingerprint, the backend waits for the written documents to be visible to KV reads, but only for the CAS-pinned actions (Gap A: the other actions get no wait; see "Plain writes and transactions on one document"), and answers success; otherwise it answers 500
+errors are Ambiguous `[ref-repo]`. After an unknown outcome the backend reads
+the request's idempotency token, which is written inside the same transaction,
+with `txn_peek`, a read by key inside a throwaway query transaction (`3231463`
+`[ref-repo]`): a token with the request's fingerprint means the transaction
+committed, an absent token or another fingerprint is taken as not committed, and
+a failed read is an unknown outcome that keeps the leases. This replaces a KV
+read, which can miss the token of a transaction that did commit when Couchbase
+has not unstaged it yet (Gap B, engineering item 15). The decision is
+unit-tested; a committed token that is still staged, and a failed `txn_peek`,
+are not tested end to end, because the test hook cannot make a committed token
+invisible to a KV read. The other token reads, the pre-check before the writes
+and the `Exists` arm of the retry path, are still KV reads (Gap B, **OPEN**). If
+the token is there with the request's fingerprint, the backend waits for the
+written documents to be visible to KV reads, but only for the CAS-pinned actions
+(Gap A: the other actions get no wait; see "Plain writes and transactions on one
+document"), and answers success; otherwise it answers 500
 `InternalServerError` ("commit outcome unknown, not retried") with the query
 service's error in the server log and leaves the leases `committing`, so the
 next writer orders itself after the transaction if it did commit. A client
@@ -845,16 +968,65 @@ the shard (`AT_TIMESTAMP` is a DynamoDB Streams iterator type that `main`
 supports from #468, `6aef346f`, and the pinned engine does not have; for it
 this is the in-tree design, engineering item 2). Implemented in
 `resolve_aged_gaps` and `txn_peek` (at most 64 probes per `GetRecords` call),
-with `contiguous_prefix` as the fast path for a gapless prefix. The test is the three-node harness's commit-point hold `[ref-repo]`: the harness watches the backend log for the `COMMIT WORK` of a 20-document filler transaction, freezes the query engine that received it (`SIGSTOP`) half a second later, once the commit point is written and the unstaging is under way, and holds it 60 s, longer than the gap grace, under three transaction writers, two plain writers and a stream reader on one table. Its gate fails a run unless the backend logged at least one stream record resolved by a transactional read after the freeze began, which is a number that the walk's `request_plus` read did not return and a transactional read by key did, and the reader, against the final shard content, never passed a number whose record appeared later (`scripts/query-txn-multinode-test.sh` step 7, `scripts/txn-commitpoint-test.py`). The log line (engine.rs:8772) fires on any transactional-read hit, carries no transaction id (a stream record has none) and does not check that the KV read missed, so even a nonzero count would not show that the record was still staged at the instant of the read.
+with `contiguous_prefix` as the fast path for a gapless prefix. The test is the
+three-node harness's commit-point hold `[ref-repo]`: the harness watches the
+backend log for the `COMMIT WORK` of a 20-document filler transaction, freezes
+the query engine that received it (`SIGSTOP`) half a second later, once the
+commit point is written and the unstaging is under way, and holds it 60 s,
+longer than the gap grace, under three transaction writers, two plain writers
+and a stream reader on one table. Its gate fails a run unless the backend logged
+at least one stream record resolved by a transactional read after the freeze
+began, which is a number that the walk's `request_plus` read did not return and
+a transactional read by key did, and the reader, against the final shard
+content, never passed a number whose record appeared later
+(`scripts/query-txn-multinode-test.sh` step 7,
+`scripts/txn-commitpoint-test.py`). The log line (engine.rs:8772) fires on any
+transactional-read hit, carries no transaction id (a stream record has none) and
+does not check that the KV read missed, so even a nonzero count would not show
+that the record was still staged at the instant of the read.
 
-Result. The hold was run twice on the round-4 branch (a worktree at `60192cd`, three query nodes; that the image was built from that commit is inferred from timestamps, not proven) `[ref-repo]`. The safety invariants passed both times: the driver's 10 invariants held (no lost or overwritten plain write, every acknowledged transaction applied, the live reader monotonic and never past a later record), and the 31 transaction conformance tests, 10 concurrency rounds, the cross-collection rollback and a failover (6 of 6 committed) passed. Run 1: transactions ok 1421, cancelled 114, unknown 0, timeout 0; filler ok 6, unknown 1; plain writes ok 200, conflicts 2987, 503 0; stream records live 2965, final 3164. Run 2: transactions ok 1271, cancelled 120, unknown 0; filler ok 8, unknown 0; plain ok 315, conflicts 2542, 503 0; stream live 2877, final 3019. **The gate failed both times**, in all six attempts: 0 stream records were resolved by a transactional read after the freeze (the `txn_peek` count is 0, and neither run's backend log holds that line at all), although each freeze landed on the node named in the `ops=41` commit line about 0.5 s after the send. The run therefore shows the safety invariants under a freeze; it does not show that any record was committed and unstaged during the hold, or that the gap reader's transactional path ran. This is **OPEN** and is not a pass.
+Result. The hold was run twice on the round-4 branch (a worktree at `60192cd`,
+three query nodes; that the image was built from that commit is inferred from
+timestamps, not proven) `[ref-repo]`. The safety invariants passed both times:
+the driver's 10 invariants held (no lost or overwritten plain write, every
+acknowledged transaction applied, the live reader monotonic and never past a
+later record), and the 31 transaction conformance tests, 10 concurrency rounds,
+the cross-collection rollback and a failover (6 of 6 committed) passed. Run 1:
+transactions ok 1421, cancelled 114, unknown 0, timeout 0; filler ok 6, unknown
+1; plain writes ok 200, conflicts 2987, 503 0; stream records live 2965,
+final 3164. Run 2: transactions ok 1271, cancelled 120, unknown 0; filler ok 8,
+unknown 0; plain ok 315, conflicts 2542, 503 0; stream live 2877, final 3019.
+**The gate failed both times**, in all six attempts: 0 stream records were
+resolved by a transactional read after the freeze (the `txn_peek` count is 0,
+and neither run's backend log holds that line at all), although each freeze
+landed on the node named in the `ops=41` commit line about 0.5 s after the send.
+The run therefore shows the safety invariants under a freeze; it does not show
+that any record was committed and unstaged during the hold, or that the gap
+reader's transactional path ran. This is **OPEN** and is not a pass.
 
-The reviewer asked for a gate on a state seen after the freeze begins: a KV get misses a filler record that a transactional read by key returns. That condition cannot be met on the version tested as probed: on Couchbase 8.0.4, single node, two probes (Pip, Quin) found no staged state observable from outside a transaction `[ref-repo]` (see engineering item 15), so no KV-miss, transactional-hit state has been seen to gate on. A harness that lands the freeze between the commit point and unstaging is still owed. The record counts quoted in revision 4 could not be traced to a run and are withdrawn.
+The reviewer asked for a gate on a state seen after the freeze begins: a KV get
+misses a filler record that a transactional read by key returns. That condition
+cannot be met on the version tested as probed: on Couchbase 8.0.4, single node,
+two probes (Pip, Quin) found no staged state observable from outside a
+transaction `[ref-repo]` (see engineering item 15), so no KV-miss,
+transactional-hit state has been seen to gate on. A harness that lands the
+freeze between the commit point and unstaging is still owed. The record counts
+quoted in revision 4 could not be traced to a run and are withdrawn.
 
 **Single-item writes on a stream-enabled table** take the item's lease like a
 write on any table (see "Plain writes and transactions on one document") and
 then run as a query-service transaction, so the lease's expiry is `txtimeout`
-plus the HTTP slack plus 5 s rather than the 30 s of a single KV write. Two that meet on one key do not meet at the document: the second waits on the first's lease, retrying within the 10 s bound, and writes after the first has released it, so both succeed, which is what `test_racing_puts_on_a_stream_table_all_succeed` expects, and at the end of the bound the write answers 503. The paths that can still conflict at the document are a writer that takes no lease (a write from the Couchbase side), a holder stalled past its lease (the bound described above), and a second write that starts after the first's `COMMIT WORK` returned and before its commit is visible (Gap A, **OPEN**); between ExtendDB's own lease-holding writers no other is known. `TransactionConflictException` is answered only
+plus the HTTP slack plus 5 s rather than the 30 s of a single KV write. Two that
+meet on one key do not meet at the document: the second waits on the first's
+lease, retrying within the 10 s bound, and writes after the first has released
+it, so both succeed, which is what
+`test_racing_puts_on_a_stream_table_all_succeed` expects, and at the end of the
+bound the write answers 503. The paths that can still conflict at the document
+are a writer that takes no lease (a write from the Couchbase side), a holder
+stalled past its lease (the bound described above), and a second write that
+starts after the first's `COMMIT WORK` returned and before its commit is visible
+(Gap A, **OPEN**); between ExtendDB's own lease-holding writers no other is
+known. `TransactionConflictException` is answered only
 when the lease says `transact_write`, which is how a write tells a transaction
 from another single-item write. The shard counter is a plain atomic
 increment, so writers of different keys do not contend on it.
@@ -1190,7 +1362,10 @@ repository's own `[ref-repo]`. Six criteria (2.4, 3.5, 4.1, 4.3, 5.2 and 6.2)
 are marked OPEN: their evidence is in the reference repository, which no
 reviewer can read yet, and they close when a reviewer has read it. Open
 engineering parts: items 1, 2, 5 and 8 (their OPEN parts), item 13 (blocked on
-the pin), item 15 (Gap A, visibility after a commit, no code; Gap B, the token read after an unknown outcome, fixed in the unknown-outcome arm only). Gap A leaves an OPEN part in rows 4.4 and 4.5 and Gap B in row 3.3; the items and their state are under "Engineering items of
+the pin), item 15 (Gap A, visibility after a commit, no code; Gap B, the token
+read after an unknown outcome, fixed in the unknown-outcome arm only). Gap A
+leaves an OPEN part in rows 4.4 and 4.5 and Gap B in row 3.3; the items and
+their state are under "Engineering items of
 revision 3" below.
 
 ### 1. Item identity
@@ -1305,7 +1480,10 @@ Jenkins nightly.
 
 The items revision 3 listed as open, with their state in the reference
 repository (commits on its `main`, dated 2026-11-25 UTC, are marked
-`[ref-repo]`; work on the round-4 branch, which is pushed to the private repository and not merged, keeps its commit ids and the same `[ref-repo]` mark, round-5 work is on the branch `fix/round5` `[ref-repo]`, and each row says what ran and what did not):
+`[ref-repo]`; work on the round-4 branch, which is pushed to the private
+repository and not merged, keeps its commit ids and the same `[ref-repo]` mark,
+round-5 work is on the branch `fix/round5` `[ref-repo]`, and each row says what
+ran and what did not):
 
 | # | Item | State |
 |---|---|---|
@@ -1345,8 +1523,17 @@ propagates to another's manifest, a pre-existing multi-node race.
   bounded by the cluster index limit.
 - **Reserved key and sidecar.** `_xdb` is visible to Couchbase-side consumers,
   and sets, binary, and wide numbers are only faithful through the sidecar.
-  External writes that drop `_xdb` leave indexes stale until the reconciler adopts them; native expiry bypasses streams. Both footguns are documented.
-- **A Couchbase-side write during a transaction.** ExtendDB's own writers exclude each other through the lease, but a write from the Couchbase side (SQL++, Eventing, Mobile, XDCR) takes no lease. Couchbase's transactions documentation says a non-transactional write to a document while a transaction that involves it is in progress can interfere with the transaction's updates, and calls the outcome undefined: the write can be overwritten by the transaction's commit, or the transaction's update can be disturbed. An operator who writes from both sides to the same items should know that such a write can be lost.
+  External writes that drop `_xdb` leave indexes stale until the reconciler
+  adopts them; native expiry bypasses streams. Both footguns are documented.
+- **A Couchbase-side write during a transaction.** ExtendDB's own writers
+  exclude each other through the lease, but a write from the Couchbase side
+  (SQL++, Eventing, Mobile, XDCR) takes no lease. Couchbase's transactions
+  documentation says a non-transactional write to a document while a transaction
+  that involves it is in progress can interfere with the transaction's updates,
+  and calls the outcome undefined: the write can be overwritten by the
+  transaction's commit, or the transaction's update can be disturbed. An
+  operator who writes from both sides to the same items should know that such a
+  write can be lost.
 - **A real port, not a copy.** The backend is validated against `v0.1.x`;
   adopting the migrations framework, the key ring, stream lineage and the
   engine-owned backup path is new code whose correctness is re-proven in-tree.
