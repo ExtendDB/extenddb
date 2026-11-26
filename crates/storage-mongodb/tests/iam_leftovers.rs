@@ -8,7 +8,7 @@
 //! with no ExtendDB server in between, as the Cassandra crate's
 //! `tests/direct_integration.rs` does against a live node. Without the URI
 //! they skip, unless `EXTENDDB_TEST_MONGODB_REQUIRED` is `1`, which
-//! `devtools/run-mongodb-tests --rust-live` sets.
+//! `devtools/run-mongodb-tests` sets for `--rust` and `--rust-integration`.
 //!
 //! Each test works in a deployment of its own, created with every migration
 //! as `init` creates it, and drops it at the end.
