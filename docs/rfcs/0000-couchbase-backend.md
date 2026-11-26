@@ -860,9 +860,12 @@ the detached section skips the release and the leases lapse at their 10 s expiry
 (`3ffb3df` `[ref-repo]`, and the committing cut in the round-5 branch
 `[ref-repo]`). A compile-time check and unit tests cover the arithmetic of the
 deadline and of the cut. The release on cancel and the panic path are not
-unit-tested, and the committing path's fault-hooks test (an ambiguous `COMMIT
+unit-tested, and the committing path has a fault-hooks test (an ambiguous `COMMIT
 WORK` without a token, then a `TransactGetItems` that must return the committed
-value) is not yet run. On a very slow cluster a pass over 100 keys could still
+value): it passed on a `fault-hooks` build on the single-node demo stack in
+2.03 s (the whole test, against a 4 s bound), and with the cut reverted to the
+deadline it failed in both runs after about 5.3 s with `TransactionConflict`,
+the old behaviour (Tess-8, `[ref-repo]`). On a very slow cluster a pass over 100 keys could still
 outlast the 3 s allowance and the lease; that is not measured. A `ConditionCheck`
 item in `TransactWriteItems` is leased like every other target, so a plain write
 to it between the check and the commit meets the lease and is refused.
