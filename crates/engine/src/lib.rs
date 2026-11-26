@@ -48,6 +48,7 @@ mod int32_member;
 mod item_authorizer;
 mod legacy_filter;
 mod list_tables;
+mod nested_enums;
 #[cfg(feature = "partiql")]
 mod partiql;
 mod pre_dispatch;
@@ -308,9 +309,8 @@ pub(crate) fn validate_enum_fields(
         {
             errors.push(match field.clause {
                 EnumClause::Named(api_name) => format!(
-                    "Value '{s}' at '{api_name}' failed to satisfy constraint: \
-                         Member must satisfy enum value set: [{}]",
-                    field.valid.join(", ")
+                    "Value '{s}' at '{api_name}' failed to satisfy constraint: {}",
+                    enum_constraint(field.valid)
                 ),
                 EnumClause::Bare(clause) => clause.to_owned(),
             });
@@ -322,6 +322,12 @@ pub(crate) fn validate_enum_fields(
     Err(DynamoDbError::ValidationException(
         extenddb_core::error::validation_errors_detected(&errors),
     ))
+}
+
+/// The constraint a value outside the enum `valid` fails, as the service
+/// words it.
+pub(crate) fn enum_constraint(valid: &[&str]) -> String {
+    format!("Member must satisfy enum value set: [{}]", valid.join(", "))
 }
 
 /// Validate the `ReturnValues` field for `PutItem` / `DeleteItem`, which accept

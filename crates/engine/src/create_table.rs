@@ -10,7 +10,7 @@ use crate::OperationContext;
 use crate::serialize_output;
 
 pub async fn handle_create_table(
-    body: Value,
+    mut body: Value,
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
     crate::validate_enum_fields(
@@ -30,6 +30,7 @@ pub async fn handle_create_table(
     )?;
 
     crate::require_stream_enabled_member(&body)?;
+    let enum_faults = crate::nested_enums::EnumFaults::create_table(&mut body);
     let mut input: CreateTableInput = serde_json::from_value(body).map_err(|e| {
         let msg = e.to_string();
         if msg.contains("validation error detected")
@@ -49,6 +50,7 @@ pub async fn handle_create_table(
             ))
         }
     })?;
+    enum_faults.check()?;
     input.resolve_table_throughput_mode();
 
     validate_create_table(&input, &ctx.limits)?;
