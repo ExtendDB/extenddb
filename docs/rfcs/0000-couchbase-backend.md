@@ -795,7 +795,10 @@ commit that may have happened, and it never runs the writes again itself. A
 client that retries the same request without a token runs it a second time, and
 applies it again if the first commit succeeded; boto3 fills a token in by
 default (checked on botocore 1.43.86), so this path is for a caller that
-bypasses it. This no-token behaviour is <<TESS4-NOTOKEN: tested | open>>.
+bypasses it. This no-token behaviour is tested on a `fault-hooks` build of the reference
+repository's backend on a single-node demo stack [ref-repo]: an injected ambiguous
+`COMMIT WORK` with no token answered 500 and was not retried, and the same
+fault with a token resolved to success with the counter at 1.
 
 The operational requirement is `memory-quota` at 0 (the default, no quota). On
 the one-node demo stack, at that default and at `EXTENDDB_DURABILITY=none`
