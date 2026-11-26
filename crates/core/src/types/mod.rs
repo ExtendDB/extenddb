@@ -33,10 +33,10 @@ pub use import_export::{
     ImportTableInput, ImportTableOutput, InputFormat, InputFormatOptions, TableCreationParameters,
 };
 pub use item::{
-    AttributeValueUpdate, ConditionalOperator, DeleteItemInput, DeleteItemOutput,
-    ExpectedAttributeValue, GetItemInput, GetItemOutput, Item, PutItemInput, PutItemOutput,
-    ReturnValues, UpdateItemInput, UpdateItemOutput, attribute_value_size, extract_key,
-    item_size_bytes,
+    AttributeValueUpdate, CONDITIONAL_OPERATOR_REFUSAL_END, ConditionalOperator, DeleteItemInput,
+    DeleteItemOutput, ExpectedAttributeValue, GetItemInput, GetItemOutput, Item, PutItemInput,
+    PutItemOutput, ReturnValues, UpdateItemInput, UpdateItemOutput, attribute_value_size,
+    extract_key, item_size_bytes,
 };
 pub use key_schema::{
     AttributeDefinition, IndexInfo, IndexType, KeySchemaElement, KeyType, PartitionedIndexes,

@@ -27,6 +27,8 @@ pub use backup_requests::refuse_point_in_time_recovery;
 mod batch_get_item;
 mod batch_write_item;
 pub mod capacity_helpers;
+#[cfg(all(test, feature = "partiql"))]
+mod conditional_operator_tests;
 mod create_table;
 mod decimal_digits;
 mod delete_item;
@@ -251,6 +253,29 @@ pub(crate) fn deserialize_error(e: serde_json::Error) -> DynamoDbError {
             "Start of structure or map found where not expected: {e}"
         ))
     }
+}
+
+/// [`deserialize_error`] for Query and Scan, which send a refused
+/// `ConditionalOperator` as the enum clause alone, also ahead of the operand
+/// count of a `BETWEEN` with one value. PutItem, UpdateItem and DeleteItem
+/// keep the "1 validation error detected: " envelope the type's `Deserialize`
+/// impl writes (measured 2026-11-13, 2026-11-14 and 2026-11-24, us-east-1).
+/// Beside some other faults, such as an empty AttributeValue or a null
+/// `ComparisonOperator` in the legacy filter, the service sends the clause
+/// inside a "1 validation error detected: " or "2 validation errors
+/// detected: " envelope with the set as `[OR, AND]`. serde stops at the first
+/// error, so this path does not send that form (#978).
+pub(crate) fn query_scan_deserialize_error(e: serde_json::Error) -> DynamoDbError {
+    use extenddb_core::types::CONDITIONAL_OPERATOR_REFUSAL_END;
+    let error = deserialize_error(e);
+    if let DynamoDbError::ValidationException(msg) = &error
+        && let Some(clause) = msg.strip_prefix("1 validation error detected: ")
+        && clause.starts_with("Value '")
+        && clause.ends_with(CONDITIONAL_OPERATOR_REFUSAL_END)
+    {
+        return DynamoDbError::ValidationException(clause.to_owned());
+    }
+    error
 }
 
 /// One enum field for [`validate_enum_fields`]: where to find it in the JSON

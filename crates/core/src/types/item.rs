@@ -94,6 +94,11 @@ pub enum ConditionalOperator {
     Or,
 }
 
+/// The text after the refused value in ExtendDB's refusal of a
+/// `ConditionalOperator` outside `[AND, OR]`.
+pub const CONDITIONAL_OPERATOR_REFUSAL_END: &str = "' at 'conditionalOperator' failed to satisfy \
+     constraint: Member must satisfy enum value set: [AND, OR]";
+
 impl<'de> Deserialize<'de> for ConditionalOperator {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
@@ -101,8 +106,7 @@ impl<'de> Deserialize<'de> for ConditionalOperator {
             "AND" => Ok(Self::And),
             "OR" => Ok(Self::Or),
             other => Err(serde::de::Error::custom(format!(
-                "1 validation error detected: Value '{other}' at 'conditionalOperator' \
-                 failed to satisfy constraint: Member must satisfy enum value set: [AND, OR]"
+                "1 validation error detected: Value '{other}{CONDITIONAL_OPERATOR_REFUSAL_END}"
             ))),
         }
     }

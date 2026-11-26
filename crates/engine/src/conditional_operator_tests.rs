@@ -1,0 +1,139 @@
+// Copyright 2026 ExtendDB contributors
+// SPDX-License-Identifier: Apache-2.0
+
+//! The text of a refused `ConditionalOperator` on the five operations that
+//! take one. Query and Scan send the enum clause alone, ahead of the operand
+//! count of a legacy filter condition. PutItem, UpdateItem and DeleteItem
+//! send it inside the "1 validation error detected" envelope. Measured
+//! 2026-11-13, 2026-11-14 and 2026-11-24 (us-east-1). Beside some other
+//! faults, such as an empty AttributeValue or a null `ComparisonOperator` in
+//! the filter, Query and Scan send the clause inside a counted envelope with
+//! the set as `[OR, AND]`, which ExtendDB does not (#978).
+
+use extenddb_core::error::DynamoDbError;
+use serde_json::{Value, json};
+
+use crate::dispatch;
+use crate::partiql::test_context::context;
+
+const ENVELOPE: &str = "1 validation error detected: ";
+
+/// The operations that take a `ConditionalOperator`, with the envelope the
+/// service puts around the enum clause on each.
+const OPERATIONS: [(&str, &str); 5] = [
+    ("Query", ""),
+    ("Scan", ""),
+    ("PutItem", ENVELOPE),
+    ("UpdateItem", ENVELOPE),
+    ("DeleteItem", ENVELOPE),
+];
+
+/// The refused values of the measured requests.
+const VALUES: [&str; 5] = ["XOR", "and", "", "ALL_OLD", "ALL"];
+
+fn condition(operator: &str, values: &[&str]) -> Value {
+    let values: Vec<Value> = values.iter().map(|v| json!({"S": v})).collect();
+    json!({"ComparisonOperator": operator, "AttributeValueList": values})
+}
+
+/// One row per measured request: the operation, its `ConditionalOperator`,
+/// the first of its two legacy conditions, and the envelope of the answer.
+/// The last two rows hold a `BETWEEN` with one value.
+fn rows() -> Vec<(&'static str, &'static str, Value, &'static str)> {
+    let mut rows = Vec::new();
+    for (operation, envelope) in OPERATIONS {
+        for value in VALUES {
+            rows.push((operation, value, condition("EQ", &["x"]), envelope));
+        }
+    }
+    for operation in ["Query", "Scan"] {
+        rows.push((operation, "XOR", condition("BETWEEN", &["x"]), ""));
+    }
+    rows
+}
+
+/// `operation`'s request with `op` as its `ConditionalOperator`, and `first`
+/// and an `EQ` as the two entries of its `QueryFilter`, `ScanFilter` or
+/// `Expected`.
+fn request(operation: &str, op: &str, first: Value) -> Value {
+    let two = json!({"a": first, "b": condition("EQ", &["y"])});
+    let key = json!({"pk": {"S": "k"}, "sk": {"S": "s"}});
+    let mut body = match operation {
+        "Query" => json!({"KeyConditions": {"pk": condition("EQ", &["k"])}, "QueryFilter": two}),
+        "Scan" => json!({"ScanFilter": two}),
+        "PutItem" => json!({"Item": key, "Expected": two}),
+        "UpdateItem" => json!({
+            "Key": key,
+            "Expected": two,
+            "AttributeUpdates": {"c": {"Value": {"S": "v"}}},
+        }),
+        "DeleteItem" => json!({"Key": key, "Expected": two}),
+        other => panic!("no request shape for {other}"),
+    };
+    body["TableName"] = json!("tbl");
+    body["ConditionalOperator"] = json!(op);
+    body
+}
+
+#[tokio::test]
+async fn refused_conditional_operator_text() {
+    let ctx = context(None).await;
+    for (operation, value, first, envelope) in rows() {
+        let body = request(operation, value, first);
+        let shown = body.to_string();
+        let expected = format!(
+            "{envelope}Value '{value}' at 'conditionalOperator' failed to satisfy \
+             constraint: Member must satisfy enum value set: [AND, OR]"
+        );
+        match dispatch(operation, body, &ctx, "").await {
+            Err(DynamoDbError::ValidationException(msg)) => {
+                assert_eq!(msg, expected, "{operation} {shown}");
+            }
+            Err(other) => panic!("{operation} answered {other:?} to {shown}"),
+            Ok(_) => panic!("{operation} accepted {shown}"),
+        }
+    }
+}
+
+/// The Query and Scan mapping keeps the envelope of a refusal whose echoed
+/// value names `conditionalOperator`. `refused_conditional_operator_text`
+/// checks the clause that loses it.
+#[test]
+fn query_scan_mapping_keeps_an_echo_of_conditional_operator() {
+    let select = "1 validation error detected: Value 'x at 'conditionalOperator'' at 'select' \
+                  failed to satisfy constraint: Member must satisfy enum value set: \
+                  [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]";
+    let error = <serde_json::Error as serde::de::Error>::custom(select);
+    match crate::query_scan_deserialize_error(error) {
+        DynamoDbError::ValidationException(msg) => assert_eq!(msg, select),
+        other => panic!("{select} gave {other:?}"),
+    }
+}
+
+/// A string where the `AttributesToGet` list goes, written ahead of an
+/// invalid `ConditionalOperator`, answers `SerializationException`, the
+/// exception DynamoDB sends (measured 2026-11-17 and 2026-11-24, us-east-1).
+/// The test checks that the Query and Scan mapping keeps the exception a
+/// `SerializationException`. `refused_conditional_operator_text` checks the
+/// text of the refusal.
+#[tokio::test]
+async fn unreadable_attributes_to_get_answers_before_conditional_operator() {
+    let ctx = context(None).await;
+    for operation in ["Query", "Scan"] {
+        let mut body = request(operation, "XOR", condition("EQ", &["x"]));
+        // A build with serde_json's preserve_order reads members in the order
+        // written; bson turns it on, so the MongoDB build and a `--workspace`
+        // build have it, and the SQLite build does not. ConditionalOperator
+        // goes last, so both builds read AttributesToGet first. Written first,
+        // the preserve_order build answers the ConditionalOperator refusal
+        // where DynamoDB answers SerializationException (#723).
+        body.as_object_mut().unwrap().remove("ConditionalOperator");
+        body["AttributesToGet"] = json!("x");
+        body["ConditionalOperator"] = json!("XOR");
+        match dispatch(operation, body.clone(), &ctx, "").await {
+            Err(DynamoDbError::SerializationException(_)) => {}
+            Err(other) => panic!("{operation} answered {other:?} to {body}"),
+            Ok(_) => panic!("{operation} accepted {body}"),
+        }
+    }
+}
