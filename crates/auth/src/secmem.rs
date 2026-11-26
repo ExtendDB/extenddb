@@ -384,20 +384,21 @@ mod tests {
         }
     }
 
-    /// The store the host gives: `memfd_secret` on a kernel that has it,
-    /// locked pages otherwise, and locked pages when `memfd_secret` is
-    /// switched off.
+    /// The store the host gives: `memfd_secret` where the `memfd_secret`
+    /// call succeeds, locked pages otherwise, and locked pages when
+    /// `memfd_secret` is switched off. One page fits the default memlock
+    /// limit, so a one-page store in locked pages on a host where the call
+    /// succeeds means the store lost `memfd_secret`.
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_locks_with_memfd_secret_or_falls_back() {
+        let expected = if platform::secret_fd(platform::page_size()).is_ok() {
+            Protection::MemfdSecret
+        } else {
+            Protection::LockedPages
+        };
         let (region, protection) = platform::lock(platform::page_size()).unwrap();
-        assert!(
-            matches!(
-                protection,
-                Protection::MemfdSecret | Protection::LockedPages
-            ),
-            "{protection}"
-        );
+        assert_eq!(protection, expected);
         assert_eq!(region.len(), platform::page_size());
         let (_, fallback) = platform::lock_with(platform::page_size(), false).unwrap();
         assert_eq!(fallback, Protection::LockedPages);

@@ -102,6 +102,9 @@ pub(super) fn lock_with(
         match memfd_secret(len) {
             Ok(region) => return Ok((region, Protection::MemfdSecret)),
             Err(e) if matches!(e.errno, libc::ENOSYS | libc::EPERM | libc::EAGAIN) => {}
+            // The pre-fault failed and the secret pages are unmapped.
+            // Under a low memlock limit the mlock path gives the refusal.
+            Err(e) if matches!(e.call, "read" | "open") => {}
             Err(e) => return Err(e),
         }
     }
@@ -164,6 +167,8 @@ pub(super) const SECRET_FD_FLAGS: libc::c_int = libc::O_CLOEXEC;
 
 #[cfg(target_os = "linux")]
 fn memfd_secret(len: usize) -> Result<Region, LockError> {
+    use std::os::fd::AsRawFd;
+
     let fail = |call: &'static str| LockError {
         bytes: len,
         call,
@@ -201,10 +206,38 @@ fn memfd_secret(len: usize) -> Result<Region, LockError> {
         kind: Kind::Mapped,
     };
     fd.close().map_err(|_| fail("close"))?;
-    // SAFETY: the mapping is `len` writable bytes. Writing it faults
-    // every page in now, so a later key write cannot hit a page the
-    // kernel refuses to allocate.
-    unsafe { std::ptr::write_bytes(region.ptr(), 0, len) };
+    // Fault every page in now, so a later key write cannot hit a page the
+    // kernel refuses to allocate. A read from /dev/zero makes the kernel
+    // write the zeros and take the page faults. On kernels that charge
+    // secret pages to the memlock limit at fault time, a refused page ends
+    // the kernel's copy with EFAULT, where a write from this process would
+    // raise SIGBUS. On an error `region` drops and unmaps the pages.
+    // MADV_POPULATE_WRITE does not work here, because get_user_pages
+    // refuses memfd_secret mappings.
+    let zero = std::fs::File::open("/dev/zero").map_err(|e| LockError {
+        bytes: len,
+        call: "open",
+        errno: e.raw_os_error().unwrap_or(0),
+    })?;
+    let mut done = 0;
+    while done < len {
+        // SAFETY: `done < len`, so the `len - done` bytes at `ptr + done`
+        // are inside the mapping above.
+        let n = unsafe { libc::read(zero.as_raw_fd(), region.ptr().add(done).cast(), len - done) };
+        match usize::try_from(n) {
+            Ok(n) if n > 0 => done += n,
+            Err(_) if last_errno() == libc::EINTR => {}
+            // A read of 0 bytes sets no errno.
+            Ok(_) => {
+                return Err(LockError {
+                    bytes: len,
+                    call: "read",
+                    errno: 0,
+                });
+            }
+            Err(_) => return Err(fail("read")),
+        }
+    }
     Ok(region)
 }
 
