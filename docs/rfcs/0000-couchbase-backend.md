@@ -1,12 +1,12 @@
 # RFC-0000: Couchbase Storage Backend
 
-- Status: Draft (revision 4, 2026-11-25: the engineering items of revision 3 are implemented and merged in the reference repository, see "Engineering items of revision 3")
+- Status: Draft (revision 5, 2026-11-25: the engineering items of revision 3 are implemented and merged in the reference repository, which no reviewer can read yet, so rows 2.4, 3.5, 4.1, 4.3, 5.2 and 6.2 of the acceptance table stay OPEN; engineering items 13 and 15 are open too, see "Engineering items of revision 3")
 - Author: @suravarjjala
 - Created: 2026-11-04
 - FCP ends: —
 - Tracking issue: ExtendDB/extenddb#1183
 - Acceptance rubric: RFC-0003 "Backend Acceptance Criteria"; every criterion is mapped in "RFC-0003 acceptance criteria" below
-- Reference implementation: https://github.com/couchbaselabs/extenddb-couchbase. Read access is granted to any reviewer who asks: the invitation to the first reviewer was sent on 2026-11-24 at 19:15 UTC and is pending at https://github.com/couchbaselabs/extenddb-couchbase/invitations (GitHub answers 404 until it is accepted). The repository goes public before the Final Comment Period, once Couchbase's open-source release approval completes. Until a reviewer has read it, every `docs/`, `scripts/`, `tests/` path and QE id in this document is a claim that only that repository can show.
+- Reference implementation: https://github.com/couchbaselabs/extenddb-couchbase. Read access is granted to any reviewer who asks: the invitation to the first reviewer was sent on 2026-11-24 at 19:15 UTC and is pending at https://github.com/couchbaselabs/extenddb-couchbase/invitations (GitHub answers 404 until it is accepted). The repository goes public before the Final Comment Period, once Couchbase's open-source release approval completes. Until a reviewer has read it, every `docs/`, `scripts/`, `tests/` path, QE id, commit id, pull-request number, Jenkins build number, pass count and timing in this document that comes from that repository, its demo stack or its Jenkins jobs is a claim that only that repository can show. Each such item is followed by `[ref-repo]` wherever it appears in a table or a list of results; upstream test files (`upstream/tests/`, the `test_*.py` names) are not so marked. Dates of commits are UTC: the three commits of 2026-11-25 carry the author time 2026-11-24 17:25 to 17:31 in UTC-8.
 - Tier at entry: Experimental, per `README.md` "Storage backends"
 
 ## Summary
@@ -51,7 +51,7 @@ choice. The replication, rebalance, auto-failover, backup, and multi-dimensional
 scaling (KV, index, query, and search on separate nodes) that such deployments
 need come from Couchbase, not from the API tier. Couchbase cross-datacenter
 replication (XDCR, Enterprise Edition only) can copy the native documents to
-another cluster; `docs/couchbase-side-operations.md` covers it, including its
+another cluster; `docs/couchbase-side-operations.md` `[ref-repo]` covers it, including its
 limits with transactions: XDCR replicates documents, not transactions, so a
 dropped connection can deliver part of a transaction's writes, and Couchbase
 advises against active-active replication of transactional data. XDCR is an
@@ -68,12 +68,12 @@ backend build that produced it:
   (upstream's own expected-fail marking; 913 collected after excluding the
   files that run ExtendDB-internal infrastructure: dev mode, host CLI, web
   console, SQLite, the self-spawning `gsi_async` queue) and `tests/python/`
-  **331 / 331** (`CONFORMANCE.md`). The pinned suite the backend builds against
+  **331 / 331** (`CONFORMANCE.md` `[ref-repo]`). The pinned suite the backend builds against
   is `7b828b0` on the `couchbaselabs/extenddb` fork (the pin plus six fork-only
   commits; see "Alignment with upstream `main`"). Its full run on 2026-11-24
-  against backend `201f03f` (the demo stack, same file exclusions): top-level
+  against backend `201f03f` `[ref-repo]` (the demo stack, same file exclusions): top-level
   **1,211 passed, 6 failed, 16 skipped, 1 xfail** of 1,234 collected, and
-  `tests/python/` **331 / 331**. The six: four `aws:SourceIp` loopback cases
+  `tests/python/` **331 / 331** `[ref-repo]`. The six: four `aws:SourceIp` loopback cases
   (`test_abac.py` ×3, `test_auth_integration.py` ×1) that require the server to
   see the client on 127.0.0.1, which a server behind Docker Desktop's bridge
   on the machine that ran it does not (an environment limit of that run; the
@@ -82,23 +82,26 @@ backend build that produced it:
   changes fail today and stream lineage closes (row 5.6). The nightly that
   runs this suite is `extenddb-couchbase-nightly`; the clone stage that kept
   it on the stale `e41f370` checkout was fixed in
-  couchbaselabs/extenddb-couchbase#237, merged 2026-11-24.
+  couchbaselabs/extenddb-couchbase#237 `[ref-repo]`, merged 2026-11-24.
 - The engineering items of revision 3 (the lease, the stream reader's
   transactional read, the descending twins, the budgets, the backfill fence,
   the scoped `destroy`, and the smaller ones) are merged on the reference
   repository's `main` as commits `b0c272f`, `5e8462b` and `f4f293d`
-  (2026-11-25), each verified against the demo stack and the upstream files
-  at the pin; the three-node harness (`scripts/query-txn-multinode-test.sh`,
-  three Couchbase nodes each running data, index and query, durability
-  `majority`) passes 19 of 19, including the new commit-point hold (see
-  "Transactions" and "DynamoDB Streams").
-- QE: a 343-case Couchbase-specific test plan (`docs/qe/testcases.md`) run
+  (2026-11-25 UTC) `[ref-repo]`, each run against the demo stack and checked
+  against the upstream files at the pin; the three-node harness
+  (`scripts/query-txn-multinode-test.sh` `[ref-repo]`, three Couchbase nodes each
+  running data, index and query, durability `majority`) passed 19 of 19 when
+  those commits merged, including the new commit-point hold `[ref-repo]` (see
+  "Transactions" and "DynamoDB Streams"). Round 4 changed the lease and the
+  fence afterwards; that work is on a branch not yet pushed, and the 19 of 19
+  does not cover it.
+- QE `[ref-repo]`: a 343-case Couchbase-specific test plan (`docs/qe/testcases.md`) run
   against a real multi-node cluster; every failure traced to code and fixed or
   filed (`docs/qe/qe-report.md`). No acknowledged write was lost in any
   rebalance, failover, node kill, churn, or API-restart test.
 - Performance: YCSB through the same binding measures workload A at 2,822 ops/s
   on the 5K-record baseline and 2,096 ops/s at 1M records, with bulk load at
-  ~7,400 inserts/s on the 1M-record run (`docs/ycsb-benchmark.md`). Couchbase's
+  ~7,400 inserts/s on the 1M-record run (`docs/ycsb-benchmark.md` `[ref-repo]`). Couchbase's
   performance CI (multi-node YCSB runs, 2026-10-22 to 2026-11-01) shows the
   read-heavy workload B scaling near-linearly from 3 to 18 nodes (34K to 164K
   ops/s) with flat read latency, and workload A at 5.7 ms update p99 and 3.0 ms
@@ -219,9 +222,10 @@ One Couchbase bucket holds one ExtendDB deployment, split into two scopes.
 
 **`catalog` scope** — control-plane state: `tables`, `accounts`, `users`,
 `access_keys`, `policies`, `roles`, `groups`, `sessions`, `admins`,
-`login_attempts`, `settings` (the migration lock and the catalog version row
-among them), `account_metrics`, `backups`, `extenddb_servers`,
-`extenddb_migrations`.
+`login_attempts`, `settings` (the catalog version row among them),
+`account_metrics`, `backups`, `extenddb_servers`, `extenddb_migrations`. The
+migration lock is not in this scope: it is the `extenddb_migration_lock`
+document in `_default._default` (see "Catalog and data migrations").
 
 **`data` scope** — user data and data-plane state:
 
@@ -232,20 +236,25 @@ among them), `account_metrics`, `backups`, `extenddb_servers`,
 | `stream_records`, `stream_seq` | DynamoDB Streams records (and skip markers) and the per-shard sequence counters |
 | `idempotency` | `TransactWriteItems` client request tokens (10-minute retention) |
 | `txn_atr` | query-service transaction records (created on first use) |
-| `txn_leases` | the per-item leases that transactions and, on tables a transaction has touched, plain writes take before writing (see "Transactions") |
+| `txn_leases` | the per-item leases that transactions and plain writes take before writing (see "Transactions") |
 | `extenddb_migrations` | the data store's migration ledger |
 
 `init` creates nothing by hand: the scopes, collections and indexes are created
-by the migration bodies below. The foreign-store check follows `main`: it runs
-only when the status is `Uninitialized` (no ledger), and then reads the
-contents. A `catalog` scope that holds the out-of-tree `catalog_version`
-document is an older deployment of this backend, reported as
-`WrittenByOlderRelease`, and `migrate --yes` adopts it (the baseline body
-reads that document); a `catalog` or `data` scope with neither a ledger nor
-that document holds someone else's data and `init` refuses the bucket by
-name. `verify` is the readiness probe. `destroy` drops exactly the scopes,
-collections and indexes that the catalog and the ledgers record, by name from
-those records, never by pattern, and leaves anything else in the bucket alone.
+by the migration bodies below. The status follows `main`'s runner. A bucket
+whose `catalog` scope has neither a ledger row nor the out-of-tree
+`catalog_version` document is `Uninitialized`; only then does `init` read the
+contents, and a `catalog` or `data` scope that holds something else is someone
+else's data, which `init` refuses by name. A `catalog` scope that holds
+`catalog_version` but no `extenddb_migrations` ledger is an older deployment of
+this backend, from before the ledger. It is not `Uninitialized` and not
+`WrittenByOlderRelease`: it is `Behind` at migration 1 with no version (exit 3),
+and `migrate --yes` adopts it (the baseline body reads that document).
+`WrittenByOlderRelease` is the later state, a ledger row for migration 1
+followed by a write of a release that predates the ledger, and needs `migrate
+--yes --reconverge`. `verify` is the readiness probe. `destroy` drops exactly
+the scopes, collections and indexes that the catalog and the ledgers record, by
+name from those records, never by pattern, and leaves anything else in the
+bucket alone.
 
 ### Catalog and data migrations
 
@@ -263,8 +272,8 @@ backend adopts it as follows, mirroring `crates/storage-mongodb/src/migrations/`
   and read by the shared status check, as ADR-0023 requires; it is the same
   `settings` document the out-of-tree backend wrote, so an out-of-tree
   deployment's version is readable by the in-tree binary. Nothing deletes it.
-  The out-of-tree `resource_tag_migration` marker is deleted by the baseline
-  body once it has recorded migration 2 from it, as ADR-0023 decision 4 does.
+  The out-of-tree `resource_tag_migration` marker is deleted by migration 1's
+  body, as ADR-0023 decision 4 does; migration 1 records nothing for migration 2.
 - **Table.** `migration()` is the exhaustive `match` from every `MigrationId`
   to a `Migration` for each store, with no wildcard arm, so the crate fails to
   compile when the registry gains an id this backend has no entry for.
@@ -436,8 +445,8 @@ need no terminator because there a prefix sorts before its extensions
 **The document key.** Each encoded component is escaped before it is joined:
 `\` becomes `\\` first and then `|` becomes `\|`, so the escape is reversible
 and the separator cannot occur unescaped inside a component. The raw key is
-then `<table_id>#<pk_esc>|<sk_esc>` (`<table_id>#<pk_esc>` on a table without
-a sort key). The reviewer's example, pk `x` with sk `y|S#z` and pk `x|S#y` with
+then `<table_id>#<pk_esc>|<sk_esc>` (`<table_id>#<pk_enc>`, the partition key's type-tagged encoding unescaped, on a table without
+a sort key, where nothing follows it to confuse). The reviewer's example, pk `x` with sk `y|S#z` and pk `x|S#y` with
 sk `z`, gives `S#x|S#y\|S#z` and `S#x\|S#y|S#z`, which differ;
 `tests/test_encoding_edges.py::test_separator_in_string_key_does_not_collide`
 is that case, and a partition key containing `|S#` is added to it. Main's
@@ -447,7 +456,7 @@ deployment is already written with it, a document key cannot be rewritten in
 place, and the escape is unambiguous (a `\` is always followed by `\` or `|`).
 
 Couchbase allows a key of 246 bytes in a named collection, and every item
-lives in a named collection, so a raw key over **240 bytes** is replaced by
+lives in a named collection, so a document key over **240 bytes**, table id included, is replaced by
 `<table_id>#H#<hex SHA-256 of pk_esc|sk_esc>`, which is 3 + 64 bytes past the
 table id; the escaped composite is hashed, so the pairs that differ raw differ
 hashed. The two forms cannot collide: the segment after `<table_id>#` begins
@@ -523,12 +532,13 @@ unconditional `PutItem` with `ReturnValues=ALL_OLD` takes the same loop, since
 the old image must be the one the write replaced; at exhaustion it has written
 nothing and answers 503. A bare unconditional `PutItem` or `DeleteItem` with no
 `ReturnValues` is one KV write with no CAS and no retry, so two racing calls
-both succeed. On a table a transaction has touched, every plain write also
-takes the item's lease first (see "Transactions"); on a stream-enabled table
-every write is a query-service transaction, and two single-item writes that
-meet on one key both succeed, the later one retrying within the same 64-attempt,
-10 s budget and answering 503 at its end. These rows go into
-`docs/differences-from-dynamodb.md` with the implementation PR.
+both succeed. Every plain write also takes the item's lease first and releases
+it after, on every table (see "Transactions"); on a stream-enabled table every
+write is a query-service transaction, and two single-item writes that meet on
+one key both succeed, the later one retrying until the same 10 s deadline and
+answering 503 at its end. The lease wait has no attempt count, only the
+deadline. These rows go into `docs/differences-from-dynamodb.md` with the
+implementation PR.
 
 **UpdateItem** has a sub-document fast path, taken only for the narrow,
 provably-correct case: `ReturnValues NONE`, no condition, no stream, every action
@@ -558,34 +568,63 @@ real defect, fixed; it is now the storage-invariant lint's job to keep it fixed)
 There is no secondary write to keep in sync.
 
 `CreateTable` with many indexes issues deferred `CREATE INDEX` statements and a
-single `BUILD INDEX`, cutting a 20-GSI create from 97 s to 26 s. `UpdateTable`
-GSI creation writes the catalog row as `CREATING` and lets the index reconciler
-backfill `_xdb._g<slot>` for existing items and flip the row to `ACTIVE`; index
-DDL never runs on the request path. The fence between the backfill and
-in-flight writes: `main`'s `CachedTableKeyInfoStore` is stale-while-revalidate
-and `UpdateTable` invalidates it after the catalog mutation succeeds, so a
-request that started before that invalidation may carry the old index list.
-The server keeps an in-flight counter per table (incremented when a write's
-key info is fixed, decremented when the write finishes). `UpdateTable` creates
-and builds the index, backfills once, publishes the catalog row with the
-index `CREATING`, and returns; the fenced second pass then waits for the
-catalog freshness window (after which every write that resolves its key info
-carries the index), then for every write in flight on this server to finish,
-backfills again, and flips the index `ACTIVE`; the GSI worker's later pass
-flips a still-`CREATING` index too. In-tree the first wait is the cache
-invalidation `UpdateTable` performs; out of tree it is the freshness window.
-`tests/test_gsi_fence.py` races four writers against the create and finds
-every item in the `ACTIVE` index. The sub-document fast path reads the same
-key info and refuses any attribute an index names, so it is covered by the
-same fence. `index_num_replicas` sets `num_replica` on every index the backend
-creates, failing closed when the cluster has too few index nodes. Multi-part
-RANGE keys are supported on every part: the backend derives one column per
-part (`_g<slot>sk`, `_g<slot>sk1`, ...) and builds per-part predicates with
-tuple pagination, verified against the engine's `resolve_multipart_with` (the
-fix #381 that landed on 31 October), so the in-tree crate runs the upstream
-multi-part tests rather than `refuse_conditions_beyond_first_range`; if any
-case fails there, the shared helper and the MongoDB README wording are the
-fallback.
+single `BUILD INDEX`, cutting a 20-GSI create from 97 s to 26 s `[ref-repo]`.
+`UpdateTable` GSI creation runs in two parts. On the request path, under the
+server's create lock, it creates the Couchbase index and its descending twin,
+builds them, backfills `_xdb._g<slot>` for the existing items once, publishes
+the catalog row with the index `CREATING`, and returns. A detached task on that
+server then runs the fenced second pass: it sleeps the catalog freshness window
+(`EXTENDDB_CATALOG_FRESHNESS_MS`, default 2 s, plus 0.5 s), waits up to 30 s for
+every write on this server that was already in flight, backfills again, and
+flips the index `ACTIVE`. The leader's GSI worker repeats the backfill and the
+flip 75 s after the publish, which covers a task lost to a restart and any pass
+that left the index `CREATING`.
+
+The fence between the backfill and in-flight writes: `main`'s
+`CachedTableKeyInfoStore` is stale-while-revalidate and `UpdateTable`
+invalidates it only after the backend returns, which the backend cannot observe,
+so the fence does not wait for that invalidation. Instead every single-item
+write checks the key info it arrived with against the backend's own catalog
+view, never older than the freshness window, and takes the index list from the
+view, so a write that starts after the publish plus the window carries the
+index. The in-flight counter covers the writes that started earlier. It is kept
+per table and per generation: the fenced pass starts a new generation and waits
+only for the writes counted before it, so a busy table does not hold it. A write
+takes the counter before it reads its catalog view. `TransactWriteItems` (one
+guard per table) and the reindex reconciler take it too; the reconciler reads
+the catalog row for every document it rewrites, one KV get per document, rather
+than reusing key info cached earlier in its drain. A drain that times out leaves
+the index `CREATING` for the worker's pass instead of flipping it. Each
+backfilled item is rewritten under the item's `plain` lease, like any plain
+write; an item that a committed transaction still holds `committing` is not
+backfilled, the fenced pass then leaves the index `CREATING`, and the worker
+retries every 30 s until the lease clears (the first backfill on the request
+path ignores that count, so `UpdateTable` does not fail on it). The counter is
+per server process; with one server per catalog it covers every writer. The
+sub-document fast path reads the same key info and refuses any attribute an
+index names, so it is covered by the same fence.
+
+What tests the fence, honestly. `tests/test_gsi_fence.py` `[ref-repo]` races four
+ordinary writers against the create and finds every item in the `ACTIVE` index,
+but it holds nothing, so a fence that waited for nothing could pass it. The held
+write test, in which a `PutItem` whose key info was resolved before the publish
+is parked until after the publish and must then land with the index column,
+passed once on a `fault-hooks` build on the single-node demo stack (`PutItem`
+only) `[ref-repo]`. The guard before the view read, the transaction guard, the
+reconciler change and the `committing` skip are built and unit-tested only, with
+no dedicated test; the reconciler held-write test is a skipped stub (**OPEN**).
+
+`index_num_replicas` sets `num_replica` on every index the backend creates,
+failing closed when the cluster has too few index nodes. Multi-part RANGE keys
+are supported on every part: the backend derives one column per part
+(`_g<slot>sk`, `_g<slot>sk1`, ...) and builds per-part predicates with tuple
+pagination. The engine classifies the conditions: `resolve_multipart_with`
+(upstream commit `f49c5f82`, #429, 31 October) is what hands the backend a
+per-attribute condition set. At the pinned engine revision `7b828b0` that
+function does not exist and the engine refuses a multi-condition Query on such
+an index before the backend sees it, so the per-part predicates are implemented
+but not yet exercised by the upstream multi-part tests (engineering item 13).
+The pin moves to a revision containing `f49c5f82` before that item can pass.
 
 ### Transactions
 
@@ -610,89 +649,121 @@ documentation says a non-transactional write must not touch a document while a
 transaction that involves it is in progress, calls the outcome undefined when
 one does, and says a non-transactional actor cannot see a transaction's staged
 insert of a key that does not exist yet. The backend therefore never lets the
-two meet at the document: on any table a transaction has touched, **plain
-writes and transactions exclude each other through one lease document per
-item**, and nothing depends on how Couchbase stages a mutation.
+two meet at the document: on every table, **plain writes and transactions
+exclude each other through one lease document per item**, and nothing depends on
+how Couchbase stages a mutation. There is no per-table switch: the first
+transaction on a table needs no state change, and no plain write can have read a
+stale "no transactions here" view.
 
-- The **lease** is a document `<table_id>#<item key>` in `data.txn_leases`,
-  taken with a KV insert (fail-if-exists, which is the whole mechanism) under
-  a 10 s native expiry, with the fields `owner` (a per-request id), `op`
-  (`transact_write`, `transact_get`, `plain`, or `committing`) and `exp`.
-- A **`TransactWriteItems`** sets the table's `transactional` flag (below)
-  before anything else, takes a lease on every target item, including
-  `ConditionCheck` items and keys that do not exist yet, within 2 s (past it
-  the transaction answers `TransactionCanceledException` with
-  `TransactionConflict` on the items it could not lease), stages its writes,
-  and renews every lease every 3.3 s by a CAS replace from its own task. Before
+- The **lease** is a document in `data.txn_leases`. Its key is the lower-case
+  hex SHA-256 of the item's scope, collection and document key, so it is always
+  64 bytes, under Couchbase's 246-byte key limit whatever the item key. It is
+  taken with a KV insert (fail-if-exists, which is the whole mechanism) and
+  carries `id` (a per-request id), `op` (`transact_write`, `transact_get`,
+  `plain`, or `committing`) and `exp` (wall-clock milliseconds, compared on
+  every server that reads it; the native expiry is the backstop). A lease is
+  three KV operations around a write: the insert, a get that reads it back with
+  its CAS, and a remove by that CAS, which checks the owner `id` first. Every
+  lease insert, replace and remove carries the backend's `durability`
+  (`majority` by default), so a lease is not lost in a failover unless the
+  operator turned durability off. The native expiry is 10 s for a transaction's
+  lease (renewed), 30 s for a plain KV write's, `txtimeout` plus 20 s for a
+  plain write that runs as a query-service transaction, and 24 h for
+  `committing`.
+- A **`TransactWriteItems`** takes a lease on every target item, including
+  `ConditionCheck` items and keys that do not exist yet, in sorted order, within
+  2 s (past it the transaction answers `TransactionCanceledException` with
+  `TransactionConflict` on the items it could not lease), stages its writes, and
+  renews every lease every 3.3 s by a CAS replace from its own task. Before
   `COMMIT WORK` it verifies by CAS that it still owns every lease; a lease it
   lost (a renewal failed, or expired) makes it `ROLLBACK WORK` and answer the
-  same cancellation, so nothing it staged reaches a document while anything
-  else may be writing. Then it rewrites its leases to `op = "committing"` with
-  a 24 h expiry, sends `COMMIT WORK`, and deletes them when the commit has
-  returned and Couchbase has unstaged every document. If the query node fails
-  between the commit point and the unstaging, the `committing` leases stay
-  until the cleanup has run, and the next transactional write to the item
-  (below) ends them.
+  same cancellation, so nothing it staged reaches a document while anything else
+  may be writing. Then it rewrites its leases to `op = "committing"` by CAS and
+  sends `COMMIT WORK`. Couchbase's commit is eventually consistent for KV
+  readers: `COMMIT WORK` can return before every document is unstaged. For every
+  CAS-pinned action (a replace or delete that carries the CAS it read) the
+  backend deletes the `committing` leases, and answers success, only after a KV
+  read of the written document shows the committed body, or its absence for a
+  delete, within 15 s `[ref-repo]`. Past 15 s the success is still answered and
+  the leases stay `committing` until the next writer ends them (below). An
+  action that does not pin a document by CAS (an unconditional `Put`, a `Put`
+  that only requires the key to be absent, an unconditional `Delete`, a
+  `ConditionCheck`) gets no such wait, so a transaction made only of those
+  deletes its leases when `COMMIT WORK` returns: that gap is **OPEN** (engineering
+  item 15). Every lease delete is a CAS remove that checks the owner id first.
 - A **plain write** (`PutItem`, `UpdateItem`, `DeleteItem`, `BatchWriteItem`)
-  on a table whose `transactional` flag is set takes the same lease with
-  `op = "plain"` before it writes and deletes it after; a bare `PutItem`
-  becomes lease insert, KV write, lease delete, so the lease is the only cost
-  and the document-level write is unchanged. When the insert fails: a lease
-  held by a `transact_write` answers `TransactionConflictException` at once,
-  which is DynamoDB's answer while a transaction holds the item; a lease held
-  by a `transact_get` or another `plain` write is retried with jittered
-  backoff within the 64-attempt, 10 s budget, and the write answers 503 at its
-  end; a `committing` lease (a committed transaction whose node died before it
-  unstaged) makes the plain write run as a query-service transaction instead,
-  which the protocol orders after the committed one (a transaction reads the
-  committed version as soon as the transaction record says committed, and
-  waits for or conflicts with a staged document until cleanup unstages it),
-  retried within the same budget and answering 503 at its end; a successful
-  transactional write deletes the `committing` lease. On a table whose flag is
-  not set, a plain write is what it was: no lease, one KV operation.
-- The **`transactional` flag** is a field of the table's catalog document, set
-  once by the first `TransactWriteItems` or `TransactGetItems` that names the
-  table (written with majority durability before the transaction takes any
-  lease) and never cleared, and mirrored in the server's key info; with one
-  server per catalog there is no other process whose view could be stale. The
-  cost of the flag on a workload is measured before FCP (see "Performance
-  characteristics").
+  takes the same lease with `op = "plain"` before it writes and deletes it
+  after; a bare `PutItem` becomes lease insert, KV write, lease get, lease
+  remove. When the insert fails: a `transact_write` lease answers
+  `TransactionConflictException` at once, which is DynamoDB's answer while a
+  transaction holds the item; a `transact_get` or `plain` lease is retried with
+  jittered backoff until the 10 s deadline (there is no attempt count on the
+  lease wait; the 64 attempts belong to the CAS loops), and the write answers 503
+  at its end; a `committing` lease (a committed transaction not yet visible to
+  KV reads, or one whose outcome was unknown) is taken over by CAS, and the write
+  runs as a query-service transaction, which Couchbase orders after the committed
+  one, holding the lease across it and deleting it after, so the next plain
+  write is an ordinary one.
+- A **transaction** that meets a `committing` lease does not cancel: a
+  `TransactWriteItems` takes the lease over by CAS; a `TransactGetItems` waits on
+  it for its 5 s, then reads that key inside a throwaway query transaction,
+  which sees the committed version, and repeats the whole read until two passes
+  agree (see "TransactGetItems").
+- **A lease is a bound, not a fence.** A plain write finishes well inside its
+  lease in normal operation, and a transaction checks its own leases by CAS
+  before it commits, but nothing re-checks a plain write's lease between taking
+  it and its KV write. A process stalled for longer than the lease (30 s for a
+  KV write) can still land a write after the lease lapsed. The design accepts
+  that, as any lease without a fencing token does, and the durability level and
+  the lease length are what bound it.
+- **Every ending path deletes the leases, except the ones that must keep them.**
+  A `TransactWriteItems` that cannot take its leases, whose condition fails,
+  that rolls back, whose lease is lost, or whose `txtimeout` expires before the
+  commit point deletes the leases it holds before it answers, so a plain write
+  after it is not refused until the 10 s expiry. A commit that is not yet visible
+  to KV reads, and a commit whose outcome is unknown, deliberately keep their
+  `committing` leases, so the next writer orders itself after a transaction that
+  may have applied. A request abandoned by its client mid-transaction is not
+  covered by a release; the native expiry (10 s, or 24 h for `committing`) is the
+  backstop, and whether the server detaches the request from the connection is
+  not checked.
 
 The outcomes for one key, both orders:
 
 | First | Second | Outcome |
 |---|---|---|
 | `TransactWriteItems` holds the lease | `PutItem`, `UpdateItem`, `DeleteItem`, `BatchWriteItem` on it | the plain write answers `TransactionConflictException`; the transaction commits |
-| `TransactWriteItems` is committed but not unstaged (node failure) | a plain write on it | the plain write finds the `committing` lease, runs as a transaction ordered after the committed one, and succeeds |
-| `PutItem` holds the lease (flagged table) | `TransactWriteItems` on the item | the transaction retries its lease for up to 2 s (the plain write holds it for milliseconds), then stages against the new image |
+| `TransactWriteItems` is committed but not yet visible to KV readers (or its node failed before it unstaged) | a plain write on it | the plain write finds the `committing` lease, takes it over by CAS, runs as a transaction ordered after the committed one, and succeeds |
+| `TransactWriteItems` is committed but not yet visible to KV readers | a second `TransactWriteItems` on the item | the second takes the `committing` lease over by CAS and stages against the committed image |
+| `PutItem` holds the lease | `TransactWriteItems` on the item | the transaction retries its lease for up to 2 s (the plain write holds it for milliseconds), then stages against the new image |
 | `PutItem` commits | `TransactWriteItems` on the item | the transaction reads the new image, evaluates its conditions against it, commits |
 | `TransactWriteItems` holds the lease | a second `TransactWriteItems` on it | the second fails to take the lease within 2 s and answers `TransactionCanceledException` with `TransactionConflict` on that item |
 | `TransactWriteItems` creates a key that does not exist | a `PutItem` of that key | the key's lease was taken before the insert was staged, so the `PutItem` answers `TransactionConflictException`; the staged insert's invisibility to plain actors never matters because no plain actor writes without the lease |
 
 **TransactGetItems.** SQL++ transactions run at read committed with a monotonic
 atomic view, which does not by itself make a multi-item read serializable. The
-backend sets the tables' `transactional` flags, takes a `transact_get` lease on
-every key it reads, present or absent, and then reads inside one query-service
-transaction, taking each present document's write lock by deleting and
-re-inserting it with the identical body so that another transaction's write
-conflicts. An absent key is protected by its lease alone: no plain write
-creates it while the lease is held, and a `TransactWriteItems` that would
-create it must take the same lease first, so the read returns it absent and
-every other value as of one instant, which is the snapshot RFC-0003 3.5 asks
-for. This closed the torn-read defect QE found (14 of 150 torn pairs → 0). The
-side effects: a plain writer that meets the read's lease retries within its
-budget and answers 503 at its end (DynamoDB fails the read instead; the
-difference is that the plain write here waits milliseconds rather than
-failing, and goes in the differences document); the re-insert changes the
-document's CAS, so a CAS loop on the item retries once; no stream record is
-written, since the body is unchanged and stream records are explicit. A
-`TransactGetItems` that cannot take a lease, or whose locking read collides
-with another transaction's staged mutation, loses that round and retries the
-snapshot, up to 10 attempts and 5 s, then answers `TransactionCanceledException`
-with `TransactionConflict`. A `ConditionCheck` item in `TransactWriteItems` is
-leased like every other target and takes the same lock on a present document,
-so a plain write to it between the check and the commit meets the lease and is
-refused.
+backend does not read inside a query transaction. It takes a `transact_get`
+lease on every key it reads, present or absent, in sorted order, then reads each
+key by KV and releases the leases. An absent key is protected by its lease alone:
+no plain write creates it while the lease is held, and a `TransactWriteItems`
+that would create it must take the same lease first, so the read returns it
+absent and every other value as of one instant, which is the snapshot RFC-0003
+3.5 asks for. This closed the torn-read defect QE found (14 of 150 torn pairs
+to 0) `[ref-repo]`. No document is rewritten, so the read changes no CAS and
+writes no stream record. A plain writer that meets the read's lease retries
+until its 10 s deadline and answers 503 at its end (DynamoDB fails the read
+instead; the difference is that the plain write here waits milliseconds rather
+than failing, and goes in the differences document). The read waits on a
+`transact_write` lease for up to 5 s and then answers
+`TransactionCanceledException` with `TransactionConflict`, as DynamoDB cancels a
+read that meets an ongoing transaction. It waits on a `committing` lease for the
+same 5 s; a key still under one at the bound is read inside a throwaway query
+transaction, which sees the committed version, and the whole set is read again
+until two passes agree or the 5 s pass, then the read is cancelled the same way.
+The read's leases last 10 s and are not renewed, so the bound on acquisition
+plus the agreement passes is what keeps the read inside them. A `ConditionCheck`
+item in `TransactWriteItems` is leased like every other target, so a plain write
+to it between the check and the commit meets the lease and is refused.
 
 **Limits.** A `TransactWriteItems` of 100 actions and 4 MB runs as one SQL++
 transaction, and two query-service settings bound it: `txtimeout` (the
