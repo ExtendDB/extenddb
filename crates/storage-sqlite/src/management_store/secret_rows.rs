@@ -184,7 +184,7 @@ impl SqliteCatalogStore {
             .await
             .map_err(failed)?;
         for &(bytes, key) in rows {
-            let statement = sqlx::query(sql);
+            let statement = sqlx::query(sqlx::AssertSqlSafe(sql));
             let statement = match bytes {
                 Some(bytes) => statement.bind(bytes),
                 None => statement,

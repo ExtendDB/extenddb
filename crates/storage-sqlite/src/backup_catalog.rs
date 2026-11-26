@@ -244,10 +244,10 @@ impl SqliteJobClaim {
     async fn beat_under_the_lock(&self) -> Result<Heartbeat, StorageError> {
         let affected = match &self.record {
             JobRecord::Backup(key) => {
-                sqlx::query(&format!(
+                sqlx::query(sqlx::AssertSqlSafe(format!(
                     "UPDATE backup_index SET heartbeat_at = {NOW} \
                      WHERE account_id = ? AND backup_id = ? AND owner_generation = ?"
-                ))
+                )))
                 .bind(&key.account_id)
                 .bind(&key.backup_id)
                 .bind(generation_column(self.generation))
@@ -255,10 +255,10 @@ impl SqliteJobClaim {
                 .await
             }
             JobRecord::Restore { table_id } => {
-                sqlx::query(&format!(
+                sqlx::query(sqlx::AssertSqlSafe(format!(
                     "UPDATE table_restores SET heartbeat_at = {NOW} \
                      WHERE table_id = ? AND status = 'RUNNING' AND owner_generation = ?"
-                ))
+                )))
                 .bind(table_id)
                 .bind(generation_column(self.generation))
                 .execute(&self.engine.pool)
@@ -337,7 +337,7 @@ impl JobClaim for SqliteJobClaim {
                         .map_err(|e| {
                             StorageError::Internal(format!("source table details: {e}"))
                         })?;
-                    sqlx::query(&format!(
+                    sqlx::query(sqlx::AssertSqlSafe(format!(
                         "UPDATE backup_index SET status = ?, \
                          size_bytes = COALESCE(?, size_bytes), \
                          item_count = COALESCE(?, item_count), \
@@ -346,7 +346,7 @@ impl JobClaim for SqliteJobClaim {
                          completed_at = CASE WHEN ? THEN {NOW} ELSE completed_at END \
                          WHERE account_id = ? AND backup_id = ? AND owner_generation = ? \
                          AND status = ?"
-                    ))
+                    )))
                     .bind(to.as_str())
                     .bind(fields.size_bytes)
                     .bind(fields.item_count)
@@ -363,12 +363,12 @@ impl JobClaim for SqliteJobClaim {
                 JobRecord::Restore { table_id } => {
                     // The record's progress (`file_index`, `items_applied`)
                     // is `bulk_load`'s write; a status write leaves it.
-                    sqlx::query(&format!(
+                    sqlx::query(sqlx::AssertSqlSafe(format!(
                         "UPDATE table_restores SET status = ?, \
                          failure_reason = COALESCE(?, failure_reason), \
                          completed_at = CASE WHEN ? THEN {NOW} ELSE completed_at END \
                          WHERE table_id = ? AND owner_generation = ? AND status = ?"
-                    ))
+                    )))
                     .bind(to.as_str())
                     .bind(fields.failure_reason.as_deref())
                     .bind(fields.completed)
@@ -468,14 +468,14 @@ pub(crate) async fn insert_unowned_row(
     // `ON CONFLICT DO NOTHING` covers the primary key (`account_id`,
     // `backup_id`) and the unique `backup_id`, and no other constraint: a
     // NOT NULL or CHECK violation is an error.
-    let inserted = sqlx::query(&format!(
+    let inserted = sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO backup_index (backup_id, account_id, table_name, \
          backup_arn, backup_name, status, store_kind, store_root, store_id, size_bytes, \
          item_count, created_at, completed_at, failure_reason, \
          source_table_details_json, owner_generation, heartbeat_at) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {NOW}, ?, ?, ?, {NOW}) \
          ON CONFLICT DO NOTHING"
-    ))
+    )))
     .bind(&row.backup_id)
     .bind(&row.account_id)
     .bind(&row.table_name)
@@ -877,13 +877,13 @@ impl BackupCatalog for SqliteEngine {
                 .await
                 .map_err(db_err)?;
             // OR IGNORE: typed values fail no NOT NULL or CHECK, so only a key conflict is ignored.
-            let inserted = sqlx::query(&format!(
+            let inserted = sqlx::query(sqlx::AssertSqlSafe(format!(
                 "INSERT OR IGNORE INTO backup_index (backup_id, account_id, table_name, \
                  backup_arn, backup_name, status, store_kind, store_root, store_id, size_bytes, \
                  item_count, created_at, source_table_details_json, owner_generation, \
                  heartbeat_at) \
                  VALUES (?, ?, ?, ?, ?, 'CREATING', ?, ?, ?, ?, ?, ?, ?, ?, {NOW})"
-            ))
+            )))
             .bind(&row.backup_id)
             .bind(&row.account_id)
             .bind(&row.table_name)
@@ -945,11 +945,11 @@ impl BackupCatalog for SqliteEngine {
         store: &'a StoreIdentity,
     ) -> BoxStream<'a, Result<BackupRow, StorageError>> {
         rows_stream(async move {
-            sqlx::query_as(&format!(
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT {ROW_COLUMNS} FROM backup_index \
                  WHERE store_kind = ?1 AND store_root = ?2 AND store_id = ?3 \
                  AND (?4 IS NULL OR status = ?4) ORDER BY created_at, backup_arn"
-            ))
+            )))
             .bind(store.store_kind.as_str())
             .bind(&store.store_root)
             .bind(&store.store_id)
@@ -969,11 +969,11 @@ impl BackupCatalog for SqliteEngine {
         // `=` on TEXT compares bytes (the BINARY collation the columns
         // carry), so a root matches as stored.
         rows_stream(async move {
-            sqlx::query_as(&format!(
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT {ROW_COLUMNS} FROM backup_index \
                  WHERE store_kind = ?1 AND store_root = ?2 \
                  AND (?3 IS NULL OR status = ?3) ORDER BY created_at, backup_arn"
-            ))
+            )))
             .bind(store_kind.as_str())
             .bind(store_root)
             .bind(status.map(BackupStatus::as_str))
@@ -988,11 +988,11 @@ impl BackupCatalog for SqliteEngine {
         store: &'a StoreIdentity,
     ) -> BoxFuture<'a, Result<Option<BackupRow>, StorageError>> {
         Box::pin(async move {
-            let row: Option<RowTuple> = sqlx::query_as(&format!(
+            let row: Option<RowTuple> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT {ROW_COLUMNS} FROM backup_index \
                  WHERE store_kind = ? AND store_root = ? AND store_id = ? \
                  AND status = 'AVAILABLE' ORDER BY created_at DESC, backup_arn DESC LIMIT 1"
-            ))
+            )))
             .bind(store.store_kind.as_str())
             .bind(&store.store_root)
             .bind(&store.store_id)
@@ -1012,13 +1012,13 @@ impl BackupCatalog for SqliteEngine {
         rows_stream(async move {
             // `created_at` is written by `format_epoch_seconds`, fixed width,
             // so the bounds compare as text in time order.
-            sqlx::query_as(&format!(
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT {ROW_COLUMNS} FROM backup_index WHERE account_id = ?1 \
                  AND (?2 IS NULL OR table_name = ?2) \
                  AND (?3 IS NULL OR created_at >= ?3) \
                  AND (?4 IS NULL OR created_at < ?4) \
                  ORDER BY created_at, backup_arn"
-            ))
+            )))
             .bind(account_id)
             .bind(table_name)
             .bind(bounds.lower.map(format_epoch_seconds))
@@ -1034,10 +1034,10 @@ impl BackupCatalog for SqliteEngine {
         arn: &'a BackupArn,
     ) -> BoxFuture<'a, Result<Option<BackupRow>, StorageError>> {
         Box::pin(async move {
-            let row: Option<RowTuple> = sqlx::query_as(&format!(
+            let row: Option<RowTuple> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT {ROW_COLUMNS} FROM backup_index WHERE account_id = ? AND backup_id = ? \
                  AND table_name = ? AND backup_arn = ?"
-            ))
+            )))
             .bind(arn.account_id())
             .bind(arn.backup_id())
             .bind(arn.table_name())
@@ -1054,9 +1054,9 @@ impl BackupCatalog for SqliteEngine {
         backup_id: &'a str,
     ) -> BoxFuture<'a, Result<Option<BackupRow>, StorageError>> {
         Box::pin(async move {
-            let row: Option<RowTuple> = sqlx::query_as(&format!(
+            let row: Option<RowTuple> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT {ROW_COLUMNS} FROM backup_index WHERE backup_id = ?"
-            ))
+            )))
             .bind(backup_id)
             .fetch_optional(&self.pool)
             .await
@@ -1133,10 +1133,10 @@ impl BackupCatalog for SqliteEngine {
     ) -> BoxFuture<'a, Result<bool, StorageError>> {
         Box::pin(async move {
             let _writer = self.write_lock.lock().await;
-            let affected = sqlx::query(&format!(
+            let affected = sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE backup_index SET status = 'DELETED', completed_at = {NOW} \
                  WHERE account_id = ? AND backup_id = ? AND status = 'DELETING'"
-            ))
+            )))
             .bind(&key.account_id)
             .bind(&key.backup_id)
             .execute(&self.pool)
@@ -1182,12 +1182,12 @@ impl BackupCatalog for SqliteEngine {
             // the caller holds the serve lock and every owner is dead,
             // whatever the heartbeat says, a heartbeat ahead of the clock
             // (a backward clock step) included.
-            let affected = sqlx::query(&format!(
+            let affected = sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM backup_index WHERE account_id = ? AND backup_id = ? \
                  AND status = 'CREATING' \
                  AND {}",
                 zero_window_clause(stale_after, "heartbeat_at")
-            ))
+            )))
             .bind(&key.account_id)
             .bind(&key.backup_id)
             .bind(stale_after.as_secs_f64())
@@ -1264,13 +1264,13 @@ impl BackupCatalog for SqliteEngine {
             // measures; `julianday(NULL)` is NULL, so a row with
             // `completed_at` unset is never older than any age on that clock.
             // A zero window selects by status alone (`zero_window_clause`).
-            sqlx::query_as(&format!(
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT {ROW_COLUMNS} FROM backup_index \
                  WHERE store_kind = ? AND store_root = ? AND store_id = ? AND status = ? \
                  AND {} \
                  ORDER BY created_at, backup_arn",
                 zero_window_clause(age, column)
-            ))
+            )))
             .bind(store.store_kind.as_str())
             .bind(&store.store_root)
             .bind(&store.store_id)
@@ -1336,7 +1336,7 @@ impl BackupCatalog for SqliteEngine {
             // a task still on its own failure path to finish it. Both ages
             // are measured on the database's clock (`julianday('now')`); a
             // zero window selects by status alone (`zero_window_clause`).
-            let rows: Vec<RestoreJobTuple> = sqlx::query_as(&format!(
+            let rows: Vec<RestoreJobTuple> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT {RESTORE_ROW_COLUMNS} \
                  FROM table_restores r JOIN tables t ON t.table_id = r.table_id \
                  WHERE (r.status = 'RUNNING' AND {}) \
@@ -1345,7 +1345,7 @@ impl BackupCatalog for SqliteEngine {
                  ORDER BY t.account_id, t.table_name",
                 zero_window_clause(stale_after, "r.heartbeat_at"),
                 zero_window_clause(stale_after, "COALESCE(r.completed_at, r.heartbeat_at)"),
-            ))
+            )))
             .bind(stale_after.as_secs_f64())
             .bind(stale_after.as_secs_f64())
             .fetch_all(&self.pool)
@@ -1391,11 +1391,11 @@ impl BackupCatalog for SqliteEngine {
         Box::pin(async move {
             // By status alone: a record stamped in this statement's instant,
             // or ahead of the database's clock, is RUNNING too.
-            let rows: Vec<RestoreJobTuple> = sqlx::query_as(&format!(
+            let rows: Vec<RestoreJobTuple> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT {RESTORE_ROW_COLUMNS} \
                  FROM table_restores r JOIN tables t ON t.table_id = r.table_id \
                  WHERE r.status = 'RUNNING' ORDER BY t.account_id, t.table_name"
-            ))
+            )))
             .fetch_all(&self.pool)
             .await
             .map_err(db_err)?;
@@ -1483,13 +1483,13 @@ impl BackupCatalog for SqliteEngine {
             // second taker of this process, and the beat keeps the record
             // out of the reconciler's dead listing). A legacy record is
             // never taken over: the reconciler fails and removes it.
-            let taken = sqlx::query(&format!(
+            let taken = sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE table_restores SET owner_generation = ?, spool_host = ?, \
                  heartbeat_at = {NOW} \
                  WHERE table_id = ? AND status = 'RUNNING' AND kind = 'manifest' \
                  AND EXISTS(SELECT 1 FROM tables t WHERE t.table_id = table_restores.table_id \
                  AND t.account_id = ? AND t.table_name = ?)"
-            ))
+            )))
             .bind(generation_column(generation))
             .bind(spool_host)
             .bind(&key.table_id)
@@ -1518,11 +1518,11 @@ impl BackupCatalog for SqliteEngine {
         key: &'a RestoreTargetKey,
     ) -> BoxFuture<'a, Result<Option<RestoreJobRow>, StorageError>> {
         Box::pin(async move {
-            let row: Option<RestoreJobTuple> = sqlx::query_as(&format!(
+            let row: Option<RestoreJobTuple> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT {RESTORE_ROW_COLUMNS} \
                  FROM table_restores r JOIN tables t ON t.table_id = r.table_id \
                  WHERE r.table_id = ? AND t.account_id = ? AND t.table_name = ?"
-            ))
+            )))
             .bind(&key.table_id)
             .bind(&key.account_id)
             .bind(&key.table_name)
@@ -1538,12 +1538,12 @@ impl BackupCatalog for SqliteEngine {
         status: Option<JobStatus>,
     ) -> BoxFuture<'a, Result<Vec<RestoreJobRow>, StorageError>> {
         Box::pin(async move {
-            let rows: Vec<RestoreJobTuple> = sqlx::query_as(&format!(
+            let rows: Vec<RestoreJobTuple> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT {RESTORE_ROW_COLUMNS} \
                  FROM table_restores r JOIN tables t ON t.table_id = r.table_id \
                  WHERE (?1 IS NULL OR r.status = ?1) \
                  ORDER BY t.account_id, t.table_name"
-            ))
+            )))
             .bind(status.map(JobStatus::as_str))
             .fetch_all(&self.pool)
             .await
@@ -1569,14 +1569,14 @@ impl BackupCatalog for SqliteEngine {
             #[allow(clippy::cast_possible_truncation)] // epoch millis fit i64
             let listed_heartbeat =
                 crate::sqlite_util::format_epoch_millis((heartbeat_at * 1000.0).round() as i64);
-            let affected = sqlx::query(&format!(
+            let affected = sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE table_restores SET status = 'FAILED', failure_reason = ?, \
                  completed_at = {NOW}, owner_generation = ? \
                  WHERE table_id = ? AND status = 'RUNNING' AND owner_generation = ? \
                  AND julianday(heartbeat_at) = julianday(?) AND EXISTS(\
                  SELECT 1 FROM tables t WHERE t.table_id = table_restores.table_id \
                  AND t.account_id = ? AND t.table_name = ?)"
-            ))
+            )))
             .bind(reason)
             .bind(generation_column(new_generation()))
             .bind(&key.table_id)
@@ -1663,11 +1663,11 @@ impl BackupCatalog for SqliteEngine {
                 )));
             }
             let generation = new_generation();
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "INSERT OR REPLACE INTO backup_maintenance \
                  (singleton, holder, owner_generation, claimed_at, heartbeat_at) \
                  VALUES (1, ?, ?, {NOW}, {NOW})"
-            ))
+            )))
             .bind(holder)
             .bind(generation_column(generation))
             .execute(&self.pool)
@@ -1706,9 +1706,9 @@ struct SqliteMaintenanceClaim {
 impl SqliteMaintenanceClaim {
     /// The heartbeat's `UPDATE`, with the engine write lock held.
     async fn beat_under_the_lock(&self) -> Result<Heartbeat, StorageError> {
-        let affected = sqlx::query(&format!(
+        let affected = sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE backup_maintenance SET heartbeat_at = {NOW} WHERE owner_generation = ?"
-        ))
+        )))
         .bind(generation_column(self.generation))
         .execute(&self.engine.pool)
         .await

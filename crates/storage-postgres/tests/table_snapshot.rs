@@ -102,10 +102,11 @@ impl Drop for Scratch {
                         return;
                     };
                     for name in &names {
-                        if let Err(e) =
-                            sqlx::query(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
-                                .execute(&mut conn)
-                                .await
+                        if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(format!(
+                            "DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"
+                        )))
+                        .execute(&mut conn)
+                        .await
                         {
                             eprintln!("scratch cleanup: drop {name}: {e}");
                         }
@@ -248,7 +249,7 @@ async fn create_databases(base: &str, names: &[String; 2], pgvector: bool) -> bo
         }
     }
     for name in names {
-        sqlx::query(&format!("CREATE DATABASE \"{name}\""))
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{name}\"")))
             .execute(&admin)
             .await
             .expect("create scratch database");
@@ -481,9 +482,9 @@ async fn legacy_collation_table_streams_unordered_and_complete(shared: bool) {
     // collation. One table per column the check reads.
     for (table, column) in [("legacy_pk", "pk"), ("legacy_sk", "sk_s")] {
         let relation = data_table_name(&key_info(&s, table).await.table_id);
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE {relation} ALTER COLUMN {column} TYPE TEXT COLLATE \"default\""
-        ))
+        )))
         .execute(&data)
         .await
         .expect("recollate");
@@ -629,10 +630,12 @@ async fn delete_with_relation_locked(s: &Scratch, table: &str, locked: &str, rel
         .execute(&mut holder)
         .await
         .expect("begin");
-    sqlx::query(&format!("LOCK TABLE {locked} IN ACCESS SHARE MODE"))
-        .execute(&mut holder)
-        .await
-        .expect("lock the relation");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "LOCK TABLE {locked} IN ACCESS SHARE MODE"
+    )))
+    .execute(&mut holder)
+    .await
+    .expect("lock the relation");
     let deleted = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         s.engine.delete_table(
@@ -789,10 +792,10 @@ async fn an_unparseable_row_ends_the_stream_and_frees_its_permit(shared: bool) {
     // Valid JSON that is not an item, keyed between p005 and p006: the
     // seventh row, on the second (full) page of five, so the error is not
     // also the end of the table.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {} (pk, sk_n, item_data) VALUES ('p005a', 1, '{{\"pk\": 5}}')",
         data_table_name(&table_id)
-    ))
+    )))
     .execute(&data)
     .await
     .expect("insert an unparseable row");
@@ -881,10 +884,13 @@ async fn gsi_without_a_data_table_is_left_out_with_its_attributes(shared: bool) 
     .expect("gi2 row");
     let data = s.data_pool().await;
     // An index the snapshot cannot see whole: drop its data table.
-    sqlx::query(&format!("DROP TABLE {}", index_table_name(&index_id)))
-        .execute(&data)
-        .await
-        .expect("drop the GSI data table");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP TABLE {}",
+        index_table_name(&index_id)
+    )))
+    .execute(&data)
+    .await
+    .expect("drop the GSI data table");
     data.close().await;
 
     let snapshot = s
@@ -1017,9 +1023,9 @@ async fn sqlstate_mapping_is_pinned() {
     }
     let s = scratch().await;
     for (code, expired) in [("40001", true), ("72000", true), ("57014", false)] {
-        let err = sqlx::query(&format!(
+        let err = sqlx::query(sqlx::AssertSqlSafe(format!(
             "DO $$ BEGIN RAISE EXCEPTION 'probe' USING ERRCODE = '{code}'; END $$"
-        ))
+        )))
         .execute(&s.catalog)
         .await
         .expect_err("raised");
@@ -1203,7 +1209,8 @@ async fn explain_page(
     let sql =
         extenddb_storage_postgres::page_sql_for(desc, &desc.table_id, collate_c, after.is_some());
     let explain_sql = format!("EXPLAIN (FORMAT JSON) {sql}");
-    let mut explain = sqlx::query_scalar::<_, serde_json::Value>(&explain_sql);
+    let mut explain =
+        sqlx::query_scalar::<_, serde_json::Value>(sqlx::AssertSqlSafe(explain_sql.as_str()));
     let seek = after.is_some();
     for value in after.into_iter().flatten() {
         explain = match value {
@@ -1412,22 +1419,22 @@ async fn the_page_query_is_an_index_scan_on_every_key_shape(shared: bool) {
             .expect("describe");
         let ddb_table = data_table_name(&desc.table_id);
         let data = s.data_pool().await;
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO {ddb_table} ({}) {}",
             shape.columns, shape.rows
-        ))
+        )))
         .execute(&data)
         .await
         .unwrap_or_else(|e| panic!("{}: fill the table: {e}", shape.label));
         if shape.label.starts_with("legacy") {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "ALTER TABLE {ddb_table} ALTER COLUMN pk TYPE TEXT COLLATE \"default\""
-            ))
+            )))
             .execute(&data)
             .await
             .expect("recollate");
         }
-        sqlx::query(&format!("ANALYZE {ddb_table}"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("ANALYZE {ddb_table}")))
             .execute(&data)
             .await
             .expect("analyze");
@@ -1643,13 +1650,13 @@ async fn filled_table(
         .expect("describe");
     let ddb_table = data_table_name(&desc.table_id);
     let data = s.data_pool().await;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO {ddb_table} (pk, sk_n, item_data) {rows}"
-    ))
+    )))
     .execute(&data)
     .await
     .expect("fill the table");
-    sqlx::query(&format!("ANALYZE {ddb_table}"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("ANALYZE {ddb_table}")))
         .execute(&data)
         .await
         .expect("analyze");
@@ -1726,14 +1733,15 @@ async fn the_last_page_sorts_the_rows_after_the_seek(shared: bool) {
     );
     // The sorted page's rows: the 57 after the seek, in key order.
     let sql = extenddb_storage_postgres::page_sql_for(&desc, &desc.table_id, true, true);
-    let rows: Vec<(String, String)> = sqlx::query_as(&format!("SELECT c0, c1 FROM ({sql}) q"))
-        .bind("zz002")
-        .bind("2")
-        .bind(810_i64)
-        .bind(i64::try_from(extenddb_storage::snapshot::paging::SNAPSHOT_FETCH_BYTES).unwrap())
-        .fetch_all(&data)
-        .await
-        .expect("the last page");
+    let rows: Vec<(String, String)> =
+        sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT c0, c1 FROM ({sql}) q")))
+            .bind("zz002")
+            .bind("2")
+            .bind(810_i64)
+            .bind(i64::try_from(extenddb_storage::snapshot::paging::SNAPSHOT_FETCH_BYTES).unwrap())
+            .fetch_all(&data)
+            .await
+            .expect("the last page");
     let expected: Vec<(String, String)> = (3..60)
         .map(|i| (format!("zz{i:03}"), i.to_string()))
         .collect();
@@ -2155,10 +2163,12 @@ async fn a_plain_reader_past_the_active_window_delays_the_drop_only_until_it_rel
         .execute(&mut holder)
         .await
         .expect("begin");
-    sqlx::query(&format!("LOCK TABLE {relation} IN ACCESS SHARE MODE"))
-        .execute(&mut holder)
-        .await
-        .expect("hold the data table as a plain reader");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "LOCK TABLE {relation} IN ACCESS SHARE MODE"
+    )))
+    .execute(&mut holder)
+    .await
+    .expect("hold the data table as a plain reader");
 
     let deleted = delete_within_5s(&s, "read").await.expect("delete");
     assert_eq!(
@@ -2666,10 +2676,13 @@ async fn a_reader_after_the_probe_sends_delete_table_down_the_async_path(how: La
                 .execute(&mut conn)
                 .await
                 .expect("begin");
-            sqlx::query(&format!("LOCK TABLE {} IN ACCESS SHARE MODE", relations[1]))
-                .execute(&mut conn)
-                .await
-                .expect("lock the GSI data table");
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "LOCK TABLE {} IN ACCESS SHARE MODE",
+                relations[1]
+            )))
+            .execute(&mut conn)
+            .await
+            .expect("lock the GSI data table");
             session = Some(conn);
         }
     }
@@ -2755,10 +2768,12 @@ async fn hold_relation(s: &Scratch, relation: &str) -> PgConnection {
         .execute(&mut holder)
         .await
         .expect("begin");
-    sqlx::query(&format!("LOCK TABLE {relation} IN ACCESS SHARE MODE"))
-        .execute(&mut holder)
-        .await
-        .expect("hold the relation");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "LOCK TABLE {relation} IN ACCESS SHARE MODE"
+    )))
+    .execute(&mut holder)
+    .await
+    .expect("hold the relation");
     holder
 }
 
@@ -2855,9 +2870,9 @@ async fn a_drop_that_keeps_failing_does_not_keep_the_poller_active(shared: bool)
     create_active(&s, plain_input("viewed")).await;
     let relation = data_table_name(&key_info(&s, "viewed").await.table_id);
     let data = s.data_pool().await;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE VIEW viewed_dependent AS SELECT * FROM {relation}"
-    ))
+    )))
     .execute(&data)
     .await
     .expect("a view on the data table");
@@ -3025,10 +3040,12 @@ async fn hold_relation_in(s: &Scratch, relation: &str, mode: &str) -> PgConnecti
         .execute(&mut holder)
         .await
         .expect("begin");
-    sqlx::query(&format!("LOCK TABLE {relation} IN {mode} MODE"))
-        .execute(&mut holder)
-        .await
-        .unwrap_or_else(|e| panic!("hold {relation} in {mode} mode: {e}"));
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "LOCK TABLE {relation} IN {mode} MODE"
+    )))
+    .execute(&mut holder)
+    .await
+    .unwrap_or_else(|e| panic!("hold {relation} in {mode} mode: {e}"));
     holder
 }
 
@@ -3218,10 +3235,10 @@ async fn terminate_held_data_backend(s: &Scratch) {
 /// even the superuser the engine connects as (a connection limit does not).
 async fn set_data_allow_connections(s: &Scratch, allow: bool) {
     let admin = data_admin_pool(s).await;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER DATABASE \"{}\" WITH ALLOW_CONNECTIONS {allow}",
         s.data_name()
-    ))
+    )))
     .execute(&admin)
     .await
     .expect("set the data database's allow_connections");
@@ -4184,10 +4201,10 @@ async fn alter_data_database(s: &Scratch, setting: &str, value: &str) {
     let mut admin = PgConnection::connect(&format!("{}/postgres", s.base))
         .await
         .expect("admin");
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER DATABASE \"{}\" SET {setting} = '{value}'",
         s.data_name()
-    ))
+    )))
     .execute(&mut admin)
     .await
     .expect("alter database");
@@ -4246,7 +4263,7 @@ async fn a_deadlock_victim_delete_table_takes_the_async_path(shared: bool) {
         "BEGIN".to_owned(),
         format!("LOCK TABLE {relation} IN ROW EXCLUSIVE MODE"),
     ] {
-        sqlx::query(&statement)
+        sqlx::query(sqlx::AssertSqlSafe(statement.as_str()))
             .execute(&mut holder)
             .await
             .expect("holder");
@@ -4364,10 +4381,10 @@ async fn a_claimed_queue_row_holds_delete_table_until_it_ends(shared: bool) {
         .fetch_one(&mut claim)
         .await
         .expect("a pending row to claim");
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT 1 FROM {} WHERE pk = 'p000' FOR SHARE",
         relations[0]
-    ))
+    )))
     .fetch_one(&mut claim)
     .await
     .expect("share-lock the base row");
@@ -4452,10 +4469,10 @@ async fn a_write_in_progress_finishes_before_delete_table_drops(shared: bool) {
         watcher.close().await.expect("close watcher");
         assert_eq!(waiting, 1, "precondition: a drop waits on the writer");
         let started = std::time::Instant::now();
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "LOCK TABLE {} IN ROW EXCLUSIVE MODE",
             relations[1]
-        ))
+        )))
         .execute(&mut writer)
         .await
         .expect("the writer's index write");

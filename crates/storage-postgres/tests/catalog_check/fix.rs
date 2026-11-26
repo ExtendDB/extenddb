@@ -11,7 +11,9 @@ use extenddb_storage::server_components::KeySource;
 use extenddb_storage_postgres::PostgresCatalogStore;
 use sqlx::{Connection, PgPool};
 
-use crate::support::{ACCOUNT, Deployment, TABLE, base_conn, hold, hold_relation, skip};
+use crate::support::{
+    ACCOUNT, Deployment, TABLE, base_conn, hold, hold_relation, skip, without_server_line,
+};
 
 /// Wait until a session of the catalog database waits for `SHARE` on
 /// `indexes`, and return the catalog tables among `tables` and
@@ -335,7 +337,7 @@ async fn a_held_orphan_fails_within_its_lock_timeout_and_catalog_writes_go_on() 
     assert_eq!(outcomes.len(), 1, "{outcomes:?}");
     match &outcomes[0] {
         (name, OrphanDrop::Failed(reason)) if *name == orphan => assert_eq!(
-            reason,
+            without_server_line(reason),
             "another session held a lock on it for more than 1000 ms, so it was kept; run the \
              command again: error returned from database: canceling statement due to lock \
              timeout"
@@ -415,7 +417,7 @@ async fn an_index_write_open_past_the_budget_stops_the_check_and_the_drop() {
     ] {
         match result {
             Err(DiagError::QueryFailed(msg)) => assert_eq!(
-                msg,
+                without_server_line(&msg),
                 format!(
                     "index changes in progress kept the index catalog locked for more than 2 \
                      seconds, so {outcome}; run the command again: error returned from \

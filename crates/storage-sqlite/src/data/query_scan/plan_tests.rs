@@ -142,7 +142,7 @@ fn s_key(pairs: &[(&str, &str)]) -> Item {
 /// `EXPLAIN QUERY PLAN` detail lines for a statement and its binds.
 async fn plan(engine: &SqliteEngine, sql: &str, binds: Vec<BoundValue>) -> Vec<String> {
     let explain = format!("EXPLAIN QUERY PLAN {sql}");
-    let mut query = sqlx::query_as::<_, (i64, i64, i64, String)>(&explain);
+    let mut query = sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(explain));
     for bound in binds {
         query = crate::data::bind_bound!(query, bound);
     }

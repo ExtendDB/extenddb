@@ -389,7 +389,7 @@ impl extenddb_storage::management_store::MetricsStore for PostgresCatalogStore {
             sql.push_str(" ORDER BY bucket");
 
             // Build the query with dynamic binds.
-            let mut query = sqlx::query_as::<_, DbMetricsRow>(&sql)
+            let mut query = sqlx::query_as::<_, DbMetricsRow>(sqlx::AssertSqlSafe(sql))
                 .bind(start)
                 .bind(end);
             for (_, value) in &filters {

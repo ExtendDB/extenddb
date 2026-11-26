@@ -89,10 +89,12 @@ async fn a_cancelled_concurrent_build_is_not_recorded_and_the_rerun_rebuilds_it(
     // An open transaction that wrote the index table: the concurrent build
     // waits for it to end.
     let mut blocker = data.begin().await.unwrap();
-    sqlx::query(&format!("LOCK TABLE \"{table}\" IN ROW EXCLUSIVE MODE"))
-        .execute(&mut *blocker)
-        .await
-        .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "LOCK TABLE \"{table}\" IN ROW EXCLUSIVE MODE"
+    )))
+    .execute(&mut *blocker)
+    .await
+    .unwrap();
     let run = spawn_run(s.target());
     let pid = waiting_runner(&admin, &s.data_name, "CREATE INDEX CONCURRENTLY").await;
     sqlx::query("SELECT pg_cancel_backend($1)")
@@ -167,7 +169,7 @@ async fn killed_inside(
     };
     let rows_before = ledger(target_pool).await;
     let mut blocker = target_pool.begin().await.unwrap();
-    sqlx::query(&lock_sql.replace("{table}", &table))
+    sqlx::query(sqlx::AssertSqlSafe(lock_sql.replace("{table}", &table)))
         .execute(&mut *blocker)
         .await
         .unwrap();
@@ -271,15 +273,15 @@ async fn the_key_transactions_outlast_the_roles_timeouts_at_the_production_inter
     let lock_database = format!("{}2", s.catalog_name);
     let role = format!("{}_short", s.catalog_name);
     let admin = pool(&format!("{base}/postgres"), 1).await;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE ROLE \"{role}\" LOGIN PASSWORD 'short-timeouts'"
-    ))
+    )))
     .execute(&admin)
     .await
     .unwrap();
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER ROLE \"{role}\" SET idle_in_transaction_session_timeout = '5s'"
-    ))
+    )))
     .execute(&admin)
     .await
     .unwrap();
@@ -288,9 +290,9 @@ async fn the_key_transactions_outlast_the_roles_timeouts_at_the_production_inter
         .await
         .unwrap();
     if version >= 170_000 {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER ROLE \"{role}\" SET transaction_timeout = '20s'"
-        ))
+        )))
         .execute(&admin)
         .await
         .unwrap();
@@ -337,9 +339,11 @@ async fn the_key_transactions_outlast_the_roles_timeouts_at_the_production_inter
     serving.release().await;
     lock.release().await;
     drop(s);
-    let _ = sqlx::query(&format!("DROP ROLE IF EXISTS \"{role}\""))
-        .execute(&admin)
-        .await;
+    let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP ROLE IF EXISTS \"{role}\""
+    )))
+    .execute(&admin)
+    .await;
     admin.close().await;
 }
 

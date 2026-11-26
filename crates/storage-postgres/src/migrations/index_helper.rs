@@ -131,7 +131,7 @@ impl<'a> IndexHelper<'a> {
     /// a lock; `attempt` counts from 1, for the line that says so.
     async fn run(&self, sql: &str, attempt: u32) -> Result<Ran, MigrationError> {
         self.stores.check_lock().await?;
-        let statement = sqlx::query(sql).execute(self.pool);
+        let statement = sqlx::query(sqlx::AssertSqlSafe(sql)).execute(self.pool);
         tokio::pin!(statement);
         let mut waited = Duration::ZERO;
         let mut announced = false;

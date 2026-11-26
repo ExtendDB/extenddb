@@ -162,9 +162,9 @@ async fn rewrite(pool: &PgPool, documents: &[(&str, &[&str])]) -> Result<Vec<Str
             .collect::<Vec<_>>()
             .join(" OR ");
         let selected = columns.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT ctid::text AS row_ctid, {selected} FROM \"{table}\" WHERE {found} FOR UPDATE"
-        ))
+        )))
         .fetch_all(pool)
         .await
         .map_err(|e| sql_error(&format!("find the documents to rewrite in {table}"), &e))?;
@@ -200,7 +200,7 @@ async fn rewrite(pool: &PgPool, documents: &[(&str, &[&str])]) -> Result<Vec<Str
             if !changed {
                 continue;
             }
-            let mut query = sqlx::query(&update);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(update.as_str()));
             for value in values {
                 query = query.bind(value);
             }

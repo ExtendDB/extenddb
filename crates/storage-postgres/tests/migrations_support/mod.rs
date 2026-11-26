@@ -146,10 +146,11 @@ impl Drop for Guard {
                     .await
                 {
                     for n in &names {
-                        let _ =
-                            sqlx::query(&format!("DROP DATABASE IF EXISTS \"{n}\" WITH (FORCE)"))
-                                .execute(&admin)
-                                .await;
+                        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+                            "DROP DATABASE IF EXISTS \"{n}\" WITH (FORCE)"
+                        )))
+                        .execute(&admin)
+                        .await;
                     }
                     admin.close().await;
                 }
@@ -184,7 +185,7 @@ impl Scratch {
         names.extend(others.iter().map(|suffix| format!("{stem}{suffix}")));
         let admin = pool(&format!("{base}/postgres"), 1).await;
         for n in &names {
-            sqlx::query(&format!("CREATE DATABASE \"{n}\""))
+            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{n}\"")))
                 .execute(&admin)
                 .await
                 .expect("create a scratch database");
@@ -240,7 +241,7 @@ impl Scratch {
             let sql = std::fs::read_to_string(dir.join(file))
                 .unwrap_or_else(|e| panic!("{state}/{file}: {e}"));
             let p = pool(&url, 1).await;
-            sqlx::raw_sql(&sql)
+            sqlx::raw_sql(sqlx::AssertSqlSafe(sql.as_str()))
                 .execute(&p)
                 .await
                 .unwrap_or_else(|e| panic!("load {state}/{file}: {e}"));
@@ -537,7 +538,7 @@ pub async fn legacy_rows(p: &PgPool) -> Vec<String> {
 }
 
 pub async fn count(p: &PgPool, sql: &str) -> i64 {
-    sqlx::query_scalar(sql)
+    sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
         .fetch_one(p)
         .await
         .unwrap_or_else(|e| panic!("{sql}: {e}"))

@@ -291,10 +291,10 @@ impl RestoreEngine for PostgresEngine {
             // checked against the catalog so a bare id reads no other
             // account's table.
             self.restore_target_shape(key).await?;
-            let count: i64 = sqlx::query_scalar(&format!(
+            let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT count(*) FROM {}",
                 data_table_name(&key.table_id)
-            ))
+            )))
             .fetch_one(&self.data_pool)
             .await
             .map_err(db_err)?;

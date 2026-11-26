@@ -140,7 +140,7 @@ fn shown_secs(wait: Duration) -> u128 {
 }
 
 async fn try_key(conn: &mut PgConnection, function: &str, key: i32) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(&format!("SELECT {function}($1, $2)"))
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT {function}($1, $2)")))
         .bind(NAMESPACE)
         .bind(key)
         .fetch_one(&mut *conn)

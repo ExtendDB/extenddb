@@ -57,9 +57,9 @@ impl Scratch {
         } = self;
         drop(engine);
         db.close().await;
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
-        ))
+        )))
         .execute(&admin)
         .await
         .expect("drop the scratch database");
@@ -120,10 +120,12 @@ async fn scratch() -> Scratch {
         .connect(&format!("{base}/postgres"))
         .await
         .expect("connect to the postgres maintenance database");
-    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
-        .execute(&admin)
-        .await
-        .expect("create the scratch database");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE \"{db_name}\""
+    )))
+    .execute(&admin)
+    .await
+    .expect("create the scratch database");
     let url = format!("{base}/{db_name}");
     let db = PgPoolOptions::new()
         .max_connections(2)
@@ -134,7 +136,7 @@ async fn scratch() -> Scratch {
     // database, so every shipped migration file from both directories is
     // applied to it, in filename order.
     for sql in shipped_migrations() {
-        sqlx::raw_sql(&sql)
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
             .execute(&db)
             .await
             .expect("apply a shipped migration");
@@ -254,7 +256,7 @@ async fn create_in_flight(
     } else {
         format!("INSERT INTO {table} (pk, item_data) VALUES ('c', $1)")
     };
-    sqlx::query(&sql)
+    sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(data)
         .execute(&mut *creator)
         .await
@@ -318,9 +320,9 @@ async fn put_after_winner(
 
 async fn stored_v(s: &Scratch) -> String {
     let table = data_table(&s.db).await;
-    sqlx::query_scalar(&format!(
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT item_data->'v'->>'S' FROM {table} WHERE pk = 'c'"
-    ))
+    )))
     .fetch_one(&s.db)
     .await
     .expect("read the stored item")
@@ -435,7 +437,7 @@ async fn connect(s: &Scratch) -> (PgConnection, i32) {
 /// sets `test.bypass_gate`. Passing takes the gate shared and releases it, so
 /// an insert parks while a session holds the gate exclusively.
 async fn install_gate(s: &Scratch, table: &str) {
-    sqlx::raw_sql(&format!(
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "CREATE FUNCTION pass_gate() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
            IF current_setting('test.bypass_gate', true) = 'on' THEN RETURN NEW; END IF; \
            PERFORM pg_advisory_lock_shared({GATE}); \
@@ -444,7 +446,7 @@ async fn install_gate(s: &Scratch, table: &str) {
          END $$; \
          CREATE TRIGGER pass_gate BEFORE INSERT ON {table} \
            FOR EACH ROW EXECUTE FUNCTION pass_gate();"
-    ))
+    )))
     .execute(&s.db)
     .await
     .expect("install the gate trigger");
@@ -462,7 +464,7 @@ async fn commit_winner(s: &Scratch, table: &str, range: bool, v: &str) {
     } else {
         format!("INSERT INTO {table} (pk, item_data) VALUES ('c', $1)")
     };
-    sqlx::query(&sql)
+    sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(serde_json::to_value(item(range, v)).expect("serialize the winner"))
         .execute(&mut *tx)
         .await
@@ -487,9 +489,9 @@ async fn lose_to_a_vanishing_winner(
         .execute(&mut locker)
         .await
         .expect("begin the locker");
-    let locked: Option<(serde_json::Value,)> = sqlx::query_as(&format!(
+    let locked: Option<(serde_json::Value,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT item_data FROM {table} WHERE pk = 'c' FOR UPDATE"
-    ))
+    )))
     .fetch_optional(&mut locker)
     .await
     .expect("lock the winner");
@@ -508,10 +510,12 @@ async fn lose_to_a_vanishing_winner(
             .expect("close the gate again");
     }
     wait_until_blocked_by(&s.db, locker_pid, "transactionid").await?;
-    sqlx::query(&format!("DELETE FROM {table} WHERE pk = 'c'"))
-        .execute(&mut locker)
-        .await
-        .expect("delete the winner");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DELETE FROM {table} WHERE pk = 'c'"
+    )))
+    .execute(&mut locker)
+    .await
+    .expect("delete the winner");
     sqlx::query("COMMIT")
         .execute(&mut locker)
         .await
@@ -759,10 +763,12 @@ async fn a_lost_create_race_gives_the_lsi_and_the_stream_the_winner() {
         .fetch_one(&mut *holder)
         .await
         .expect("read the backend pid");
-    sqlx::query(&format!("SELECT 1 FROM {table} WHERE pk = 'd' FOR UPDATE"))
-        .execute(&mut *holder)
-        .await
-        .expect("lock d");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT 1 FROM {table} WHERE pk = 'd' FOR UPDATE"
+    )))
+    .execute(&mut *holder)
+    .await
+    .expect("lock d");
 
     let capture = StreamCapture {
         view_type: StreamViewType::NewAndOldImages,
@@ -832,16 +838,16 @@ async fn a_lost_create_race_gives_the_lsi_and_the_stream_the_winner() {
         "ALL_OLD returns the winner"
     );
 
-    let lsks: Vec<String> = sqlx::query_scalar(&format!(
+    let lsks: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT item_data->'lsk'->>'S' FROM {lsi} WHERE pk = 'c'"
-    ))
+    )))
     .fetch_all(&s.db)
     .await
     .expect("read the LSI rows");
     assert_eq!(lsks, ["l-loser"], "only the put's LSI row is left");
-    let v: String = sqlx::query_scalar(&format!(
+    let v: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT item_data->'v'->>'S' FROM {table} WHERE pk = 'c'"
-    ))
+    )))
     .fetch_one(&s.db)
     .await
     .expect("read c");

@@ -171,12 +171,16 @@ impl SqliteEngine {
             let sk = extenddb_storage::util::parse_sk(sk_value, sk_type)?;
             let sk_col = sk_column(sk_type);
             let sql = format!("SELECT item_data FROM {ddb_table} WHERE pk = ? AND {sk_col} = ?");
-            let row: Option<(serde_json::Value,)> =
-                bind_sk_fetch_optional!(&sql, pk_text.as_ref(), &sk, &self.pool)?;
+            let row: Option<(serde_json::Value,)> = bind_sk_fetch_optional!(
+                sqlx::AssertSqlSafe(sql),
+                pk_text.as_ref(),
+                &sk,
+                &self.pool
+            )?;
             row.map(|(v,)| v)
         } else {
             let sql = format!("SELECT item_data FROM {ddb_table} WHERE pk = ?");
-            let row: Option<(serde_json::Value,)> = sqlx::query_as(&sql)
+            let row: Option<(serde_json::Value,)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(pk_text.as_ref())
                 .fetch_optional(&self.pool)
                 .await
