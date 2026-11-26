@@ -367,6 +367,8 @@ Import/export file paths are validated:
 - DynamoDB-fidelity error messages reproduce real DynamoDB exactly (no additional information)
 - Internal errors (database connection failures, SQL errors, I/O errors) are logged server-side but return generic messages to clients
 - Stack traces, file paths, and SQL text are never exposed to clients
+- Backend-chosen text reaches a client in two ways. A backend may return `StorageError::Service(DynamoDbError)` when it has classified its own failure into a service error class, and the engine returns that error with its message unchanged. The engine also passes on, as the backend wrote them, the message of `Validation`, `NoOpUpdate`, `Unsupported`, `IndexesInUse`, `LimitExceeded`, `BackupInUse` and `TransactionConflict`, the message of `TableNotFound` in the backup and streams mappings and of `TableAlreadyExists` and `TableNotActive` in the backup mapping, and the cancellation reasons of `TransactionCanceled`. That text is client-facing text the backend author owns; it must not contain driver output, SQL text, paths or connection details, and it is reviewed as client-visible wording under the same rule as the engine's own messages
+- The server reads a table's key schema before the IAM decision, which needs it for `dynamodb:LeadingKeys`. A `StorageError::Service` carrying `ResourceNotFoundException` from that read is a missing table, as `StorageError::TableNotFound` is: a caller the IAM decision refuses gets the refusal, not the backend's not-found
 
 ## Operational Security
 

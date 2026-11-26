@@ -219,7 +219,7 @@ fn validate_ttl_attribute_name(name: &str) -> Result<(), DynamoDbError> {
     Ok(())
 }
 
-fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
+pub(crate) fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
     match e {
         // A backend's refusal of the request (the Cassandra backend refuses
         // TTL on a table with an asynchronously propagated GSI): a client
@@ -231,6 +231,7 @@ fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
         StorageError::TableNotActive(name) => {
             DynamoDbError::ResourceInUseException(format!("Table {name} is not in ACTIVE state"))
         }
+        StorageError::Service(e) => crate::create_table::service_err_to_dynamo(e),
         other => {
             tracing::error!(internal_error = %other, "storage internal error");
             DynamoDbError::InternalServerError("Internal server error".to_owned())

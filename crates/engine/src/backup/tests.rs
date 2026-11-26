@@ -13137,48 +13137,11 @@ async fn a_second_create_over_the_job_bound_is_limit_exceeded() {
 #[derive(Clone, Default)]
 struct LogLines(Arc<Mutex<Vec<(tracing::Level, String)>>>);
 
-/// The process's global `tracing` subscriber while these tests run:
-/// interested in every callsite and enabled for none. `tracing` caches each
-/// callsite's interest the first time any thread reaches it; while exactly
-/// one scoped subscriber is registered in the process, that cache is
-/// computed from the default of the thread that got there first. A test
-/// without a subscriber running beside a `LogLines` test on another thread
-/// would so cache the job's log callsites as "never", and the `LogLines`
-/// test would then see no line from them (tokio-rs/tracing#2743). With this
-/// global default the cache reads "sometimes" instead, and each event asks
-/// the thread's own default, the `LogLines` where one is set.
-struct InterestedInEveryCallsite;
-
-impl tracing::Subscriber for InterestedInEveryCallsite {
-    fn register_callsite(
-        &self,
-        _: &'static tracing::Metadata<'static>,
-    ) -> tracing::subscriber::Interest {
-        tracing::subscriber::Interest::sometimes()
-    }
-    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-        false
-    }
-    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(1)
-    }
-    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-    fn event(&self, _: &tracing::Event<'_>) {}
-    fn enter(&self, _: &tracing::span::Id) {}
-    fn exit(&self, _: &tracing::span::Id) {}
-}
-
 impl LogLines {
     /// A fresh `LogLines` set as this thread's `tracing` default until the
     /// guard drops, with the process's global default installed once.
     fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
-        static GLOBAL: std::sync::Once = std::sync::Once::new();
-        GLOBAL.call_once(|| {
-            // Another global may already be set by a test outside this
-            // module; then its interest rule applies and this one is moot.
-            let _ = tracing::subscriber::set_global_default(InterestedInEveryCallsite);
-        });
+        crate::test_tracing::interest_in_every_callsite();
         let lines = Self::default();
         let guard = tracing::subscriber::set_default(lines.clone());
         (lines, guard)
@@ -13211,9 +13174,9 @@ struct MessageVisitor<'a>(&'a mut String);
 
 /// A callsite met first by a thread without a scoped subscriber is still
 /// seen by a `LogLines` on another thread (the global default's interest
-/// rule; the doc of `InterestedInEveryCallsite`). Without that default the
-/// callsite's interest is cached as "never" whenever this is the only
-/// `LogLines` alive in the process, and nothing is captured.
+/// rule; the doc of `test_tracing::InterestedInEveryCallsite`). Without that
+/// default the callsite's interest is cached as "never" whenever this is the
+/// only `LogLines` alive in the process, and nothing is captured.
 #[test]
 fn a_callsite_first_met_on_another_thread_still_reaches_the_lines() {
     fn shared_callsite(n: u32) {

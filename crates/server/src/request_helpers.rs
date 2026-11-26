@@ -140,12 +140,24 @@ pub(crate) fn metric_table_name(
 /// `StorageError::TableNotFound` and every other fault as a distinct error, so
 /// the two are told apart here rather than collapsed to `None`. Every fault
 /// class fails closed: none authorizes the request.
+///
+/// A backend-classified `ResourceNotFoundException` (`StorageError::Service`)
+/// is the backend's own not-found answer, so it is a missing table here as
+/// well. This read comes before the IAM decision, which needs the key schema
+/// for `dynamodb:LeadingKeys`, so its answer reaches callers the IAM decision
+/// would refuse. A missing table gives those callers the refusal; passed
+/// through, the backend's not-found would tell them that the table does not
+/// exist. Every other `Service` error fails closed with its own class, for
+/// the reason the transient and connection faults do.
 fn key_info_for_authz(
     result: Result<extenddb_core::types::TableKeyInfo, StorageError>,
 ) -> Result<Option<extenddb_core::types::TableKeyInfo>, DynamoDbError> {
     match result {
         Ok(info) => Ok(Some(info)),
-        Err(StorageError::TableNotFound(_)) => Ok(None),
+        Err(
+            StorageError::TableNotFound(_)
+            | StorageError::Service(DynamoDbError::ResourceNotFoundException(_)),
+        ) => Ok(None),
         Err(e) => Err(extenddb_engine::storage_err_to_dynamo(e)),
     }
 }
@@ -563,12 +575,22 @@ mod tests {
 
     #[test]
     fn key_info_for_authz_missing_table_returns_none() {
-        let out = key_info_for_authz(Err(StorageError::TableNotFound("t".to_owned())))
-            .expect("a missing table is not a lookup failure");
-        assert!(
-            out.is_none(),
-            "a missing table must leave the leading key absent so the engine returns not-found"
-        );
+        // The backend's own not-found answer is a missing table too, so a
+        // caller the IAM decision refuses gets that refusal and does not learn
+        // from the backend that the table is missing.
+        for missing in [
+            StorageError::TableNotFound("t".to_owned()),
+            StorageError::Service(DynamoDbError::ResourceNotFoundException(
+                "Requested resource not found: Table: t not found".to_owned(),
+            )),
+        ] {
+            let out = key_info_for_authz(Err(missing.clone()))
+                .unwrap_or_else(|e| panic!("{missing:?} is not a lookup failure, got {e:?}"));
+            assert!(
+                out.is_none(),
+                "{missing:?} must leave the leading key absent so the engine returns not-found"
+            );
+        }
     }
 
     #[test]
@@ -612,6 +634,18 @@ mod tests {
         assert!(
             matches!(engine, DynamoDbError::ResourceInUseException(_)),
             "the engine maps TableNotActive to ResourceInUseException, got: {engine:?}"
+        );
+
+        // Any other backend-classified error fails closed with its own class
+        // and message.
+        let unavailable = DynamoDbError::ServiceUnavailable(
+            "The database is temporarily unavailable, retry shortly.".to_owned(),
+        );
+        let err = key_info_for_authz(Err(StorageError::Service(unavailable.clone())))
+            .expect_err("a backend-classified fault must fail closed");
+        assert_eq!(
+            extenddb_core::error::error_document(&err),
+            extenddb_core::error::error_document(&unavailable)
         );
     }
 
