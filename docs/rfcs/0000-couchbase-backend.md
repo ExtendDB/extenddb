@@ -1381,7 +1381,7 @@ definitions), `crates/auth/`, or `crates/core/`.
 
 | Layer | What | Where |
 |---|---|---|
-| Unit | number encoding, item round-trip, sidecar, key forging, policy hardening | `cargo test --lib`: 272 passed, 0 failed (276 with the `fault-hooks` feature) on the round-5 branch after its last item, 269 and 273 on the round-4 branch `[ref-repo]` |
+| Unit | number encoding, item round-trip, sidecar, key forging, policy hardening | `cargo test --lib`: 274 passed, 0 failed (278 with the `fault-hooks` feature) on the round-5 branch after its last item, 269 and 273 on the round-4 branch `[ref-repo]` |
 | Storage-invariant lint | stale top-level `_pk`/`_sk` reads, hand-built keys, unescaped `LIKE` | `scripts/lint-storage-invariants.sh` `[ref-repo]`, per PR |
 | Conformance | upstream `tests/test_*.py` 912 + 1 xfail, `tests/python/` 331, web console 30 | `CONFORMANCE.md` `[ref-repo]`; the Jenkins nightly's sweep `[ref-repo]` |
 | Backend tests | transaction rollback (7), DynamoDB head-to-head parity, encoding edges | `tests/` `[ref-repo]` |
