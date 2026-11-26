@@ -59,7 +59,7 @@ fn a_deep_write_condition_is_written_for_the_classic_parser() {
         .unwrap();
     let wrapped = format!("attribute_exists(#pk) AND ({text})");
     let limits = extenddb_core::limits::LimitsConfig::default();
-    assert!(crate::expression_helpers::parse_condition_expr(&wrapped, &limits).is_ok());
+    assert!(crate::expression_helpers::parse_condition_expr_with(&wrapped, &limits, true).is_ok());
     // An OR at the top is left for the caller to put in parentheses.
     let or = condition_of("UPDATE \"t\" SET q = 1 WHERE a = 1 OR NOT (b = 1 OR c = 2)");
     assert_eq!(

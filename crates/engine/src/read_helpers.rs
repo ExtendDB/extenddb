@@ -463,7 +463,8 @@ mod tests {
     fn a_page_whose_items_all_fail_the_filter_ends_at_the_budget_with_a_key() {
         let s = store(1_000, 4_000);
         let filter =
-            parse_optional_filter(Some("payload = :nomatch"), &LimitsConfig::default()).unwrap();
+            parse_optional_filter(Some("payload = :nomatch"), &LimitsConfig::default(), true)
+                .unwrap();
         let mut values = HashMap::new();
         values.insert(":nomatch".to_owned(), AttributeValue::S("never".to_owned()));
         let maps = crate::expression_helpers::build_expression_maps(None, Some(&values));

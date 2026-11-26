@@ -211,7 +211,7 @@ fn a_deep_condition_within_the_operator_limit_passes_the_classic_parser() {
         let text = ExprBridge::new(&[])
             .render_condition(&where_of(&sql))
             .unwrap();
-        let parsed = crate::expression_helpers::parse_optional_filter(Some(&text), &limits);
+        let parsed = crate::expression_helpers::parse_optional_filter(Some(&text), &limits, true);
         assert!(parsed.is_ok(), "{condition}: {parsed:?}");
     }
 }
@@ -258,11 +258,12 @@ fn nested_text(expr: &WhereExpr, bridge: &mut ExprBridge<'_>) -> String {
 
 #[test]
 fn the_condition_text_means_what_the_condition_says() {
+    use crate::expression_helpers::parse_optional_filter;
     use extenddb_core::expression::evaluate_condition;
     let limits = extenddb_core::limits::LimitsConfig::default();
     let evaluate =
         |text: &str, bridge: &ExprBridge<'_>, item: &BTreeMap<String, AttributeValue>| {
-            let filter = crate::expression_helpers::parse_optional_filter(Some(text), &limits)
+            let filter = parse_optional_filter(Some(text), &limits, true)
                 .unwrap()
                 .unwrap();
             let maps = crate::expression_helpers::build_expression_maps(
