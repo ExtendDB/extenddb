@@ -19,7 +19,9 @@
 //!   later page that reaches it;
 //! * a Query the page stops inside stays in the list, and goes on from
 //!   where it stopped when a later page reaches it, which need not be
-//!   first.
+//!   first. A Query that stops at the limit before an item of its
+//!   partition that it does not match is read to its end instead, and
+//!   leaves the list (see `Reader::next_item_unmatched`).
 //!
 //! When the list is empty there is no NextToken. A request whose page
 //! visits only disjuncts held back gets their refusal instead of a page,

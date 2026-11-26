@@ -32,7 +32,9 @@ const PAGE_BYTES: u64 = crate::read_helpers::PAGE_BYTE_BUDGET as u64;
 ///   item exists or not (`pk IN ['a', 'zz']` with `Limit` 1 gives [a] and a
 ///   NextToken, then an empty page with none);
 /// * any other disjunct is a Query with the units left; a Query that stops
-///   at the limit ends the page, and a later page goes on inside it; a
+///   at the limit ends the page, and a later page goes on inside it unless
+///   the next item of its partition is one the Query does not match (see
+///   [`Reader::next_item_unmatched`]); a
 ///   Query that runs out leaves the units it did not evaluate to the next
 ///   disjunct in the same page (`(pk = 'b' AND sk = 'x') OR (pk = 'a' AND
 ///   sk > 'a')` with `Limit` 1 gives [a/x], [a/y], then [b/x]);
@@ -242,7 +244,11 @@ impl Reader<'_> {
                 let limited = units.is_some_and(|u| evaluated >= u);
                 match page.add(result, read).0 {
                     None => Ok(QueryEnd::Ran(evaluated)),
-                    Some(key) if limited => Ok(QueryEnd::AtLimit(key)),
+                    Some(key) if limited => Ok(if self.next_item_unmatched(read, &key).await? {
+                        QueryEnd::Ran(evaluated)
+                    } else {
+                        QueryEnd::AtLimit(key)
+                    }),
                     Some(key) => {
                         // The Query ended its own page at 1 MB, before the
                         // item that takes this page past it: the page keeps
@@ -265,6 +271,39 @@ impl Reader<'_> {
                 None => QueryEnd::RanPastBudget,
             }),
         }
+    }
+
+    /// Whether the Query of `read` that stopped at the limit on `key`
+    /// matches no item after it while its partition holds one. The service
+    /// reads such a disjunct to its end (measured 2026-11-14 to 2026-11-19:
+    /// with r1 at a and r2 at b, `lsiSk = 'a' OR lsiSk = 'z'` with `Limit` 1
+    /// gives [r1] and a NextToken, then an empty page of 0.5, as the table
+    /// read `pk = 'lk' AND (sk < 'r2' OR sk = 'r9')` does on 2026-11-19).
+    /// At a partition's end the Query keeps `key` as before, so a later page
+    /// reads the disjunct again and charges that read. A later page skips
+    /// that read only when another item follows `key` in its partition.
+    /// Neither read made here is charged.
+    async fn next_item_unmatched(
+        &self,
+        read: &KeyRead<'_>,
+        key: &Value,
+    ) -> Result<bool, DynamoDbError> {
+        if read.sort.is_none() {
+            return Ok(false);
+        }
+        let next = Paging {
+            start: Some(key),
+            limit: Some(1),
+            ..Paging::default()
+        };
+        if scanned_count(&self.query(read, next, false).await?) > 0 {
+            return Ok(false);
+        }
+        let partition = KeyRead {
+            sort: None,
+            ..read.clone()
+        };
+        Ok(scanned_count(&self.query(&partition, next, false).await?) > 0)
     }
 
     /// Dispatch the Query of one disjunct, with its filter when `filtered`
@@ -478,3 +517,6 @@ fn add_numbers(sum: &mut Value, more: Value) {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod index_tests;
