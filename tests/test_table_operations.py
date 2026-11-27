@@ -197,10 +197,7 @@ class TestDeleteTable:
             second = dynamodb_client.delete_table(TableName=unique_table_name)
             assert second["TableDescription"]["TableStatus"] == "DELETING"
             return
-        backend = configured_backend() or (
-            "postgres" if config_value("storage.postgres", "connection_string") else None
-        )
-        print(f"backend under test: {backend}")
+        backend = _catalog_backend()
         if backend not in ("postgres", "sqlite"):
             pytest.skip(f"backend {backend!r} never leaves a table DELETING")
         with _catalog_connection(backend) as catalog:
@@ -221,6 +218,73 @@ class TestDeleteTable:
             finally:
                 # Back to ACTIVE, so the fixture's DeleteTable removes it.
                 _set_status(catalog, backend, unique_table_name, "ACTIVE")
+
+    @pytest.mark.parametrize("protected", [False, True], ids=["plain", "protected"])
+    def test_delete_of_a_creating_table_is_refused(
+        self, create_and_cleanup_table, dynamodb_client, unique_table_name, protected
+    ):
+        """DeleteTable of a table that CreateTable is still creating is
+        ResourceInUseException with the service's text, before deletion
+        protection is checked, and leaves the table CREATING (measured on
+        DynamoDB on 2026-11-21, twice for each row).
+
+        On ExtendDB the CREATING state is written into the catalog with its
+        transition an hour away, on PostgreSQL and SQLite, as the DELETING test
+        above does. MongoDB and Cassandra are not covered here.
+        """
+        real = _is_real_dynamodb()
+        create_and_cleanup_table(
+            unique_table_name, wait=not real, DeletionProtectionEnabled=protected
+        )
+        try:
+            with contextlib.nullcontext() if real else _held_creating(unique_table_name):
+                with pytest.raises(ClientError) as exc_info:
+                    dynamodb_client.delete_table(TableName=unique_table_name)
+                status = dynamodb_client.describe_table(TableName=unique_table_name)
+        finally:
+            if protected:
+                # So the fixture's DeleteTable removes it.
+                wait_for_active(dynamodb_client, unique_table_name)
+                dynamodb_client.update_table(
+                    TableName=unique_table_name, DeletionProtectionEnabled=False
+                )
+        answer = exc_info.value.response
+        assert (
+            answer["ResponseMetadata"]["HTTPStatusCode"],
+            answer["Error"]["Code"],
+            answer["Error"]["Message"],
+        ) == (
+            400,
+            "ResourceInUseException",
+            "Attempt to change a resource which is still in use: Table is being created: "
+            + unique_table_name,
+        ), f"protected={protected}"
+        assert status["Table"]["TableStatus"] == "CREATING", f"protected={protected}"
+
+
+def _catalog_backend() -> str | None:
+    """The backend of the running server, from its config."""
+    backend = configured_backend() or (
+        "postgres" if config_value("storage.postgres", "connection_string") else None
+    )
+    print(f"backend under test: {backend}")
+    return backend
+
+
+@contextlib.contextmanager
+def _held_creating(table_name: str):
+    """Hold the table CREATING in the catalog, on PostgreSQL and SQLite, and
+    set it back to ACTIVE afterwards if it still exists."""
+    backend = _catalog_backend()
+    if backend not in ("postgres", "sqlite"):
+        pytest.skip(f"backend {backend!r}: the test cannot set a table CREATING")
+    with _catalog_connection(backend) as catalog:
+        _set_status(catalog, backend, table_name, "CREATING")
+        try:
+            yield
+        finally:
+            if _status_row(catalog, backend, table_name):
+                _set_status(catalog, backend, table_name, "ACTIVE")
 
 
 @contextlib.contextmanager
@@ -252,10 +316,11 @@ def _placeholder(backend: str) -> str:
 
 
 def _set_status(conn, backend: str, table_name: str, status: str) -> None:
-    """Set the table's catalog status: DELETING with a removal an hour away, or
-    back to ACTIVE with none scheduled."""
+    """Set the table's catalog status: CREATING or DELETING with its transition
+    an hour away, as CreateTable and DeleteTable schedule one, or back to
+    ACTIVE with none scheduled."""
     p = _placeholder(backend)
-    if status == "DELETING":
+    if status in ("CREATING", "DELETING"):
         when = (
             "NOW() + INTERVAL '1 hour'"
             if backend == "postgres"

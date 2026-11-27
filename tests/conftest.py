@@ -161,7 +161,7 @@ def create_and_cleanup_table(dynamodb_client, unique_table_name):
     """Create a table and ensure it's deleted after the test (REQ-TEST-005)."""
     created_tables: list[str] = []
 
-    def _create(table_name: str | None = None, **kwargs) -> dict:
+    def _create(table_name: str | None = None, wait: bool = True, **kwargs) -> dict:
         name = table_name or unique_table_name
         defaults = {
             "TableName": name,
@@ -176,8 +176,10 @@ def create_and_cleanup_table(dynamodb_client, unique_table_name):
         defaults.update(kwargs)
         result = dynamodb_client.create_table(**defaults)
         created_tables.append(name)
-        # D-2: Always wait for ACTIVE — matches real DynamoDB behavior.
-        wait_for_active(dynamodb_client, name)
+        # D-2: wait for ACTIVE, as a DynamoDB client must, unless the test
+        # needs the table while it is CREATING.
+        if wait:
+            wait_for_active(dynamodb_client, name)
         return result
 
     yield _create

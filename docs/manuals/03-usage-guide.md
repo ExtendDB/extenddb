@@ -108,7 +108,7 @@ aws dynamodb create-table \
     }]'
 ```
 
-Tables transition through `CREATING` → `ACTIVE` status. The transition delay is configurable via the `control_plane_delay_seconds` runtime setting (default: 5 seconds). Poll with DescribeTable until `TableStatus` is `ACTIVE` before performing operations on the table.
+Tables transition through `CREATING` → `ACTIVE` status. The transition delay is configurable via the `control_plane_delay_seconds` runtime setting (default: 0.25 seconds). Poll with DescribeTable until `TableStatus` is `ACTIVE` before performing operations on the table.
 
 ### DeleteTable
 
@@ -116,7 +116,7 @@ Tables transition through `CREATING` → `ACTIVE` status. The transition delay i
 aws dynamodb delete-table --table-name Orders
 ```
 
-Tables transition through `DELETING` before removal.
+Tables transition through `DELETING` before removal. DeleteTable on a table that is still `CREATING` answers `ResourceInUseException`, as on DynamoDB: wait until DescribeTable reports `ACTIVE` first.
 
 ### DescribeTable
 

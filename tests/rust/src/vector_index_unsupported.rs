@@ -24,6 +24,7 @@ use aws_smithy_runtime_api::client::identity::Identity;
 use std::time::SystemTime;
 
 use crate::test_base::is_real_dynamodb;
+use crate::vector_index_search::wait_for_active;
 
 fn endpoint() -> String {
     std::env::var("EXTENDDB_TEST_ENDPOINT")
@@ -177,6 +178,7 @@ async fn backend_supports_vectors() -> bool {
     );
     let (status, text) = call("CreateTable", &body).await;
     if status == 200 {
+        wait_for_active(&name).await;
         let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
         return true;
     }
@@ -318,6 +320,7 @@ async fn create_table_without_vector_indexes_still_succeeds() {
     let (status, text) = call("CreateTable", &body).await;
     assert_eq!(status, 200, "control table must be created, body: {text}");
 
+    wait_for_active(&name).await;
     let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
 }
 
@@ -358,6 +361,7 @@ async fn update_table_creating_a_vector_index_is_refused() {
     let (status, text) = call("UpdateTable", &body).await;
     assert_validation_exception(status, &text, NOT_SUPPORTED_INDEXES);
 
+    wait_for_active(&name).await;
     let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
 }
 
@@ -390,6 +394,7 @@ async fn update_table_deleting_a_vector_index_is_refused() {
     let (status, text) = call("UpdateTable", &body).await;
     assert_validation_exception(status, &text, NOT_SUPPORTED_INDEXES);
 
+    wait_for_active(&name).await;
     let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
 }
 
@@ -426,6 +431,7 @@ async fn update_table_with_an_empty_vector_list_is_not_a_vector_request() {
         "an empty list is no change, so the nothing-specified error is expected: {text}"
     );
 
+    wait_for_active(&name).await;
     let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
 }
 
@@ -459,6 +465,7 @@ async fn search_vectors_is_refused() {
     let (status, text) = call("SearchVectors", &body).await;
     assert_validation_exception(status, &text, NOT_SUPPORTED_SEARCH);
 
+    wait_for_active(&name).await;
     let _ = call("DeleteTable", &format!(r#"{{"TableName": "{name}"}}"#)).await;
 }
 
