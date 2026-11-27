@@ -428,6 +428,7 @@ Expression parsing lives in `crates/core/src/expression/`. This is pure sync Rus
 | Cassandra Setup | `docs/cassandra-setup.md`                         | Cassandra install, config, and deployment (experimental) |
 | Testing Design | `docs/design/09-testing.md`                       | Test strategy and infrastructure       |
 | Extending Storage | `docs/manuals/12-extending-extenddb-storage.md` | Guide to implementing storage backends |
+| Experimental: WebAssembly Build | `docs/webassembly.md` | What the browser build does, refuses and skips; how to build it |
 
 Build PDFs:
 

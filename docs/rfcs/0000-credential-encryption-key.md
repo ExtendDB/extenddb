@@ -31,7 +31,7 @@ A production deployment must not let a holder of a catalog dump hold both the en
 - The credential cache keeps up to 10,000 plaintext secrets and session tokens (section 1). A heap leak, a core dump or swap gives the secret of every active key.
 - The only rotation is the manual procedure at `docs/manuals/10-security-model.md:66-70`. The operator replaces the row, restarts every server, then deletes and re-creates every access key. The comment on #707 describes the result as an outage for every signed request until each client has new credentials.
 
-On #228 (2026-08-05), a code owner wrote that the current handling "is probably not sufficient for many production uses". The same review asked for other mechanisms, such as a hardware security module (HSM) or a passcode. ExtendDB runs with no internet connection (`README.md:17`, `docs/manuals/11-deployment-guide.md:148-154`), so no key source may depend on a network key service.
+On #228 (2026-08-05), a code owner wrote that the current handling "is probably not sufficient for many production uses". The same review asked for other mechanisms, such as a hardware security module (HSM) or a passcode. ExtendDB runs with no internet connection (the paragraph of `README.md` after its trademark notice, `docs/manuals/11-deployment-guide.md:148-154`), so no key source may depend on a network key service.
 
 ## Detailed design
 
@@ -402,7 +402,7 @@ PostgreSQL only. The command takes a connection string on standard input, encryp
 
 ### 9. Several servers
 
-In 1.0, ExtendDB supports one server per catalog (`README.md:32`). Only SQLite enforces the limit (`docs/manuals/11-deployment-guide.md:302`). The offline commands assume that one server. They run while no server is registered, and the one server loads the new key at its next start. 1.0 does not support more than one server on a catalog. The commands add nothing for it: no reload signal and no poll of the catalog. `rewrap` and `set-data-connection` run beside the running server, because the server reads the ring and the connection string row only at startup.
+In 1.0, ExtendDB supports one server per catalog (`README.md`, "What ExtendDB is not"). Only SQLite enforces the limit (`docs/manuals/11-deployment-guide.md`, "Multi-Instance Considerations"). The offline commands assume that one server. They run while no server is registered, and the one server loads the new key at its next start. 1.0 does not support more than one server on a catalog. The commands add nothing for it: no reload signal and no poll of the catalog. `rewrap` and `set-data-connection` run beside the running server, because the server reads the ring and the connection string row only at startup.
 
 ### 10. Upgrade and rollback
 

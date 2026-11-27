@@ -349,7 +349,7 @@ python3 docs/build-docs.py --list
 python3 docs/build-docs.py --doc 4
 ```
 
-If you haven't set up the virtual environment yet, see the [Python Environment Setup](../../README.md#python-environment-setup) section in the README.
+If you haven't set up the virtual environment yet, see [Python Environment Setup](#python-environment-setup) above.
 
 Output goes to `pdfs/` (gitignored).
 

@@ -191,9 +191,10 @@ mod imp {
     }
 
     pub(super) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-        // HMAC accepts a key of any length, so this never errors. The README
-        // at the root of the repository this crate's manifest names, in its
-        // section "What it does not do", says what this leaves on the stack.
+        // HMAC accepts a key of any length, so this never errors.
+        // `docs/webassembly.md` in the repository this crate's manifest
+        // names, in its section "What it does not do", says what this leaves
+        // on the stack.
         let mut mac =
             <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
         mac.update(data);
@@ -214,7 +215,7 @@ mod imp {
         plaintext: &[u8],
         aad: &[u8],
     ) -> Result<Vec<u8>, String> {
-        // The README at the root of the repository this crate's manifest
+        // `docs/webassembly.md` in the repository this crate's manifest
         // names, in its section "What it does not do", says what this leaves
         // on the stack.
         let cipher = Aes256Gcm::new_from_slice(key)
@@ -243,7 +244,7 @@ mod imp {
         sealed: &[u8],
         aad: &[u8],
     ) -> Result<Zeroizing<Vec<u8>>, String> {
-        // The README at the root of the repository this crate's manifest
+        // `docs/webassembly.md` in the repository this crate's manifest
         // names, in its section "What it does not do", says what this leaves
         // on the stack.
         let (nonce, rest) = split_or_refuse(sealed)?;

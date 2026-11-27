@@ -24,7 +24,7 @@ use zeroize::Zeroizing;
 ///   each step, and the tag its backend computes, on the stack;
 /// - copies of the key-derived state that the HMAC of each step can leave on
 ///   the stack, with either backend, and on `wasm32` copies of its key as well
-///   (the README at the root of the repository this crate's manifest names,
+///   (`docs/webassembly.md` in the repository this crate's manifest names,
 ///   in its section "What it does not do", says what the `wasm32` backend can
 ///   leave).
 ///

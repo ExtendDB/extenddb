@@ -175,8 +175,8 @@ Thin binary that wires everything together:
 
 Experimental WebAssembly build of the engine (`publish = false`). It compiles the engine, `storage-sqlite` over an
 in-memory database, and the crates they depend on to `wasm32-unknown-unknown`, and exposes a `wasm-bindgen` surface
-that answers a DynamoDB request by calling `engine`'s `dispatch` in process, with no server. The README section
-"Experimental: WebAssembly build" lists what it does not do and what it refuses.
+that answers a DynamoDB request by calling `engine`'s `dispatch` in process, with no server. The page
+[Experimental: WebAssembly build](../webassembly.md) lists what it does not do and what it refuses.
 
 ## Request Lifecycle
 
