@@ -942,6 +942,12 @@ account in DynamoDB, so the same token value from two accounts never collides.
 If a request arrives with the same `(account_id, token)` but a different
 fingerprint, return `IdempotentParameterMismatchException`.
 
+The `token` the engine gives a backend (`IdempotencyKey::token`) is the
+stored form of the `ClientRequestToken`: each `\` doubled and each U+0000
+written `\0`, because a PostgreSQL `text` column holds no U+0000. Two tokens
+never share a stored form, and a token of `[a-zA-Z0-9-]` is stored as sent.
+The fingerprint uses the token as sent.
+
 The fingerprint (`compute_fingerprint` in
 `crates/engine/src/transact_write_helpers.rs`) is an HMAC-SHA256 keyed by the
 token. It hashes the request's `TransactItems` JSON, then its

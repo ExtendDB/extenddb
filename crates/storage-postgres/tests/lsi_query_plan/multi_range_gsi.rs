@@ -113,7 +113,7 @@ async fn multi_range_table(s: &Scratch) -> (TableKeyInfo, String, String) {
         .expect("read the index info");
     let bare_table = format!("_ddb_{}", index.index_id);
     let sql_table = format!("\"{bare_table}\"");
-    sqlx::query(&format!("ANALYZE {sql_table}"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("ANALYZE {sql_table}")))
         .execute(&s.db)
         .await
         .expect("analyze the index table");

@@ -19,9 +19,9 @@
 //! excluded there (see the `#[cfg(target_arch = "wasm32")]` on its
 //! declaration).
 //!
-//! # What follows `sqlx-sqlite` 0.8.6
+//! # What follows `sqlx-sqlite` 0.9.1
 //!
-//! The rules below are taken from `sqlx-sqlite` 0.8.6 and `sqlx-core` 0.8.6.
+//! The rules below are taken from `sqlx-sqlite` 0.9.1 and `sqlx-core` 0.9.1.
 //! The crate's `tests/wasm_shim.rs` holds a row per rule and runs on both
 //! targets: natively against `sqlx` over the C SQLite, on wasm32 against this
 //! module. A row expects the same outcome from both, except its rows named
@@ -57,9 +57,10 @@
 //!   query built with `query`, `query_as` or `query_scalar` carries arguments
 //!   even when none is bound, and binds as above.
 //! * **Running SQL.** The SQL is trimmed and every statement in it runs in
-//!   turn. `rows_affected` adds up `sqlite3_changes` after each statement (so a
-//!   `SELECT` counts the changes of the last write before it, as SQLite reports
-//!   them); SQL with no statement reports 0. `fetch_optional` and `fetch_one`
+//!   turn. `rows_affected` adds up `sqlite3_changes` after each statement
+//!   that `sqlite3_stmt_readonly` does not mark read-only; a read-only
+//!   statement (a `SELECT`, a plain `BEGIN` or a `COMMIT`) adds 0. SQL with no
+//!   statement reports 0. `fetch_optional` and `fetch_one`
 //!   stop at the first row: later rows and statements do not run and their
 //!   errors are not seen. `fetch` yields each row in order, a row that fails to
 //!   decode as an error in its place, and stops after a database error.
@@ -68,17 +69,18 @@
 //!   and `begin_with` fail with [`Error::PoolTimedOut`]; after
 //!   [`SqlitePool::close`] they fail with [`Error::PoolClosed`]. A `begin_with`
 //!   statement that leaves the connection in autocommit mode fails with
-//!   [`Error::BeginFailed`].
+//!   [`Error::BeginFailed`] and opens no transaction, so a later `begin_with`
+//!   runs.
 //! * **Connection settings.** A connection opens with a 5 s busy timeout and
 //!   with foreign keys enforced (`PRAGMA foreign_keys = ON`), as
 //!   `sqlx-sqlite`'s default connect options set them on every connection it
 //!   opens.
 //!
-//! # Documented differences from `sqlx-sqlite` 0.8.6
+//! # Documented differences from `sqlx-sqlite` 0.9.1
 //!
 //! The table in `tests/wasm_shim.rs` has a `difference: ...` row for each of
-//! **One location**, **One connection** and **After a failed `begin_with`**,
-//! and one per terminal (`fetch_one`, `fetch_optional`, `execute`) for
+//! **One location** and **One connection**, and one per terminal
+//! (`fetch_one`, `fetch_optional`, `execute`) for
 //! **`$0`**; its `DIFFERENCE_ROWS` counts them. The other entries have no
 //! `difference: ...` row.
 //!
@@ -110,14 +112,9 @@
 //!   in-memory pool with `max_connections(2)` runs a statement while a
 //!   transaction holds the first connection; here it fails with
 //!   [`Error::PoolTimedOut`].
-//! * **After a failed `begin_with`.** `sqlx` counts the transaction a
-//!   `begin_with` statement was meant to open even when it fails with
-//!   [`Error::BeginFailed`], so its next `begin_with` on that connection fails
-//!   with `InvalidSavePointStatement`; here the connection is left as it was
-//!   and the next `begin_with` runs.
 //! * **`$0`.** A `$0` placeholder in a query built with `query`, `query_as`
 //!   or `query_scalar` is [`Error::Protocol`] from every terminal.
-//!   Under `sqlx` the argument lookup for it (`arguments.rs:116`, the index
+//!   Under `sqlx` the argument lookup for it (`arguments.rs:110`, the index
 //!   `n - 1` with `n = 0`) panics the connection's worker thread while it
 //!   binds, before the statement runs, and the call returns as if the
 //!   statement had produced no row: `execute` returns `Ok` with 0 rows
@@ -127,10 +124,10 @@
 //!   first row, so dropping the stream early does not stop later statements
 //!   from running.
 //! * **SQLite build.** The bundled SQLite (3.54.1, built with
-//!   `sqlite-wasm-rs`'s compile flags) is a different build from the one
-//!   `libsqlite3-sys` links on other targets (3.46.0), so the query planner may
-//!   order rows that are not constrained by an `ORDER BY` differently. Callers
-//!   that compare unordered result sets sort them first.
+//!   `sqlite-wasm-rs`'s compile flags) is built with other flags than the one
+//!   `libsqlite3-sys` links on other targets (also 3.54.1), so the query planner
+//!   may order rows that are not constrained by an `ORDER BY` differently.
+//!   Callers that compare unordered result sets sort them first.
 //!
 //! # Concurrency
 //!
@@ -411,14 +408,15 @@ pub trait Executor {
     /// `conn.execute("PRAGMA ...")`.
     fn execute<'a>(
         self,
-        sql: &'a str,
+        sql: impl Into<String>,
     ) -> Pin<Box<dyn Future<Output = Result<QueryResult, Error>> + 'a>>
     where
         Self: Sized + 'a,
     {
+        let sql = sql.into();
         Box::pin(async move {
             self.ensure_available()?;
-            run_exec(&self.handle(), sql)
+            run_exec(&self.handle(), &sql)
         })
     }
 }
@@ -509,9 +507,12 @@ impl SqlitePool {
     }
 
     /// Begin a transaction with an explicit statement, e.g. `BEGIN IMMEDIATE`.
-    pub async fn begin_with(&self, stmt: &str) -> Result<Transaction<'static, Sqlite>, Error> {
+    pub async fn begin_with(
+        &self,
+        stmt: impl Into<String>,
+    ) -> Result<Transaction<'static, Sqlite>, Error> {
         let PoolConnection { conn, checkout, .. } = self.acquire().await?;
-        Transaction::start(conn, checkout, Some(stmt))
+        Transaction::start(conn, checkout, Some(&stmt.into()))
     }
 
     /// Check the connection out of the pool until the returned value drops.
@@ -1084,11 +1085,9 @@ impl Decode for serde_json::Value {
         matches!(value.0, ColVal::Text(_))
     }
     fn decode(value: SqliteValueRef<'_>) -> Result<Self, BoxDynError> {
-        // Read as a string, then parse: a NULL is the empty string, which is
-        // not JSON.
-        Ok(serde_json::from_str(std::str::from_utf8(value_bytes(
-            value,
-        )?)?)?)
+        // Parse the bytes, as `sqlx-sqlite` does, so serde_json checks the
+        // UTF-8: a NULL is no bytes, which is not JSON.
+        Ok(serde_json::from_slice(value_bytes(value)?)?)
     }
 }
 impl<T: Decode> Decode for Option<T> {
@@ -1174,7 +1173,7 @@ fn leading_number(digits: &str) -> Option<usize> {
 /// arguments earlier statements of the same SQL used, and return how many
 /// arguments this statement used.
 ///
-/// This follows `SqliteArguments::bind` of `sqlx-sqlite` 0.8.6: placeholders
+/// This follows `SqliteArguments::bind` of `sqlx-sqlite` 0.9.1: placeholders
 /// `1..=sqlite3_bind_parameter_count` are visited in order; `?NNN` and `$NNN`
 /// take argument NNN and a nameless `?` the next one; any other name is
 /// refused; binding stops at the first placeholder with no argument, which
@@ -1214,12 +1213,12 @@ fn bind_all(
                     leading_number(digits).ok_or_else(|| {
                         Error::Protocol(format!(
                             "parameters with non-integer names are not currently supported: \
-                             {digits} (sqlx_sqlite::arguments:93)"
+                             {digits} (sqlx_sqlite::arguments:87)"
                         ))
                     })?
                 } else {
                     return Err(Error::Protocol(format!(
-                        "unsupported SQL parameter format: {name} (sqlx_sqlite::arguments:99)"
+                        "unsupported SQL parameter format: {name} (sqlx_sqlite::arguments:93)"
                     )));
                 }
             }
@@ -1360,7 +1359,8 @@ pub struct QueryResult {
 }
 
 impl QueryResult {
-    /// `sqlite3_changes` added up over the statements that ran.
+    /// `sqlite3_changes` added up over the statements that ran and are not
+    /// read-only.
     pub fn rows_affected(&self) -> u64 {
         self.rows_affected
     }
@@ -1397,11 +1397,11 @@ impl Run {
 }
 
 /// Prepare, bind and step each statement of `sql` in turn, the way
-/// `sqlx-sqlite` 0.8.6 runs a query: the SQL is trimmed, each statement binds
+/// `sqlx-sqlite` 0.9.1 runs a query: the SQL is trimmed, each statement binds
 /// its own placeholders with the argument offset carried over (see
-/// [`bind_all`]), `sqlite3_changes` is added up after each statement, and the
-/// first error stops the run. SQL with no statement runs nothing and reports
-/// zero.
+/// [`bind_all`]), `sqlite3_changes` is added up after each statement that is
+/// not read-only, and the first error stops the run. SQL with no statement
+/// runs nothing and reports zero.
 ///
 /// `params` is `None` for a call that carries no arguments, `raw_sql` and
 /// `Executor::execute` on a `&str`; `sqlx-sqlite` binds nothing for such a
@@ -1481,8 +1481,17 @@ fn run_statements(
                 _ => return Err(db_error(db)),
             }
         }
-        // SAFETY: `db` is live; the counter is a simple read.
-        let changes = unsafe { ffi::sqlite3_changes(db) };
+        // A read-only statement adds 0, as in `sqlx-sqlite`: after it,
+        // `sqlite3_changes` still holds the count of the last write.
+        // SAFETY: `stmt` is a live prepared statement and `db` is live; both
+        // calls are simple reads.
+        let changes = unsafe {
+            if ffi::sqlite3_stmt_readonly(stmt) != 0 {
+                0
+            } else {
+                ffi::sqlite3_changes(db)
+            }
+        };
         run.result.rows_affected += u64::try_from(changes).unwrap_or(0);
         drop(statement);
     }
@@ -1520,6 +1529,20 @@ fn execute<E: Executor>(ex: &E, sql: &str, params: Option<&[Param]>) -> Result<Q
 
 // ─────────────────────────── query builders ────────────────────────────
 
+/// SQL text its caller has checked for injection, mirroring
+/// `sqlx::AssertSqlSafe`. The builders, `Executor::execute` and `begin_with`
+/// take `impl Into<String>`, so a `&'static str` and this wrapper both pass.
+/// The native build, which the backend is defined against, refuses other
+/// text in code that both targets compile. Code that only wasm32 compiles is
+/// not checked.
+pub struct AssertSqlSafe<T>(pub T);
+
+impl<T: Into<String>> From<AssertSqlSafe<T>> for String {
+    fn from(sql: AssertSqlSafe<T>) -> String {
+        sql.0.into()
+    }
+}
+
 /// A positional-parameter SQL query, mirroring `sqlx::query`.
 pub struct Query<DB = Sqlite> {
     sql: String,
@@ -1528,9 +1551,9 @@ pub struct Query<DB = Sqlite> {
 }
 
 /// Build a query from SQL text.
-pub fn query<DB>(sql: &str) -> Query<DB> {
+pub fn query<DB>(sql: impl Into<String>) -> Query<DB> {
     Query {
-        sql: sql.to_owned(),
+        sql: sql.into(),
         params: Vec::new(),
         _db: PhantomData,
     }
@@ -1559,9 +1582,9 @@ pub struct QueryAs<O, DB = Sqlite> {
 
 /// Build a typed query. The first type parameter is the database marker (so
 /// `query_as::<_, O>(...)` resolves), the second is the row type.
-pub fn query_as<DB, O: FromRow>(sql: &str) -> QueryAs<O, DB> {
+pub fn query_as<DB, O: FromRow>(sql: impl Into<String>) -> QueryAs<O, DB> {
     QueryAs {
-        sql: sql.to_owned(),
+        sql: sql.into(),
         params: Vec::new(),
         _db: PhantomData,
         _o: PhantomData,
@@ -1638,9 +1661,9 @@ pub struct QueryScalar<O, DB = Sqlite> {
 
 /// Build a scalar query. The first type parameter is the database marker (so
 /// `query_scalar::<_, O>(...)` resolves), the second is the scalar type.
-pub fn query_scalar<DB, O: Decode>(sql: &str) -> QueryScalar<O, DB> {
+pub fn query_scalar<DB, O: Decode>(sql: impl Into<String>) -> QueryScalar<O, DB> {
     QueryScalar {
-        sql: sql.to_owned(),
+        sql: sql.into(),
         params: Vec::new(),
         _db: PhantomData,
         _o: PhantomData,
@@ -1686,10 +1709,8 @@ pub struct RawSql {
 }
 
 /// Build a raw multi-statement script (used for migrations DDL).
-pub fn raw_sql(sql: &str) -> RawSql {
-    RawSql {
-        sql: sql.to_owned(),
-    }
+pub fn raw_sql(sql: impl Into<String>) -> RawSql {
+    RawSql { sql: sql.into() }
 }
 
 impl RawSql {

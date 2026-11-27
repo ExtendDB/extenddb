@@ -238,7 +238,7 @@ async fn named_relations(
 /// A catalog transaction at READ COMMITTED whose lock waits are bounded by
 /// `lock_timeout`.
 ///
-/// Both settings are made before any statement that takes a snapshot, so
+/// The isolation level is set before any statement that takes a snapshot, so
 /// every later statement reads the data committed when it starts, whatever
 /// `default_transaction_isolation` the database, the role or the connection
 /// sets. Under REPEATABLE READ a snapshot taken before the lock wait would
@@ -251,11 +251,7 @@ async fn begin_read_committed(
     sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
         .execute(&mut *tx)
         .await?;
-    // A number of milliseconds, at least 1 (0 would disable the timeout).
-    let ms = lock_timeout.as_millis().max(1);
-    sqlx::query(&format!("SET LOCAL lock_timeout = '{ms}ms'"))
-        .execute(&mut *tx)
-        .await?;
+    super::ddl::set_lock_timeout(&mut tx, lock_timeout).await?;
     Ok(tx)
 }
 
@@ -406,12 +402,9 @@ pub(crate) async fn drop_orphaned(
 async fn drop_relation(data: &PgPool, relation: &str) -> OrphanDrop {
     let dropped = async {
         let mut tx = data.begin().await?;
-        let ms = DROP_LOCK_TIMEOUT.as_millis();
-        sqlx::query(&format!("SET LOCAL lock_timeout = '{ms}ms'"))
-            .execute(&mut *tx)
-            .await?;
+        super::ddl::set_lock_timeout(&mut tx, DROP_LOCK_TIMEOUT).await?;
         let quoted = format!("\"{}\"", relation.replace('"', "\"\""));
-        sqlx::query(&format!("DROP TABLE {quoted}"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE {quoted}")))
             .execute(&mut *tx)
             .await?;
         tx.commit().await

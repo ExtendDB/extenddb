@@ -10,9 +10,10 @@
 //! masks them: `extenddb_config::should_redact` picks the keys and
 //! `extenddb_config::MASK` is the text printed; `get --show-secret` prints the
 //! stored value. A key the catalog has no row for prints the storage
-//! engine's default (`extenddb_storage::operations::setting_default`), as the
-//! console does, so a fresh install, which seeds no settings rows, lists the
-//! values the engine uses.
+//! engine's default (`extenddb_storage::operations::setting_default`), or for
+//! a key the server reads, the server's (`server_setting_default`), as the
+//! console does. So a fresh install, which seeds no settings rows, lists the
+//! values the server uses.
 
 use clap::{Args, Subcommand};
 
@@ -21,7 +22,9 @@ use extenddb_storage::management_store::SettingsStore;
 use extenddb_config::{self as config, MASK};
 
 // Re-use validation constants from the ops layer.
-use extenddb_server::management::ops_settings::{KNOWN_KEYS, READONLY_KEYS};
+use extenddb_server::management::ops_settings::{
+    KNOWN_KEYS, READONLY_KEYS, server_setting_default,
+};
 
 #[derive(Args)]
 pub struct SettingsArgs {
@@ -143,12 +146,18 @@ async fn stored_or_default(
     Ok(default(current))
 }
 
+/// The value the server uses for `key` when the catalog has no row for it:
+/// the storage engine's default, else the server's.
+fn default_of(key: &str) -> Option<String> {
+    extenddb_storage::operations::setting_default(key).or_else(|| server_setting_default(key))
+}
+
 async fn list(store: &dyn SettingsStore) -> anyhow::Result<()> {
     let rows = store
         .list_settings()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to list settings: {e:?}"))?;
-    let rows = with_defaults(rows, extenddb_storage::operations::setting_default);
+    let rows = with_defaults(rows, default_of);
 
     if rows.is_empty() {
         println!("No settings found.");
@@ -159,8 +168,7 @@ async fn list(store: &dyn SettingsStore) -> anyhow::Result<()> {
 }
 
 async fn get(store: &dyn SettingsStore, key: &str, show_secret: bool) -> anyhow::Result<()> {
-    let value =
-        stored_or_default(store, key, extenddb_storage::operations::setting_default).await?;
+    let value = stored_or_default(store, key, default_of).await?;
 
     if let Some(v) = value {
         println!("{}", display_value(key, &v, show_secret));
@@ -366,6 +374,37 @@ mod tests {
                 .expect("get");
             assert_eq!(value.as_deref(), Some("7"), "{key}");
         }
+    }
+
+    /// With no row, `search_inequality_filters` lists and gets the server's
+    /// default, and a stored row wins over it.
+    #[cfg(feature = "search-inequality-filters")]
+    #[tokio::test]
+    async fn the_search_filter_setting_shows_the_server_default() {
+        // Another test of this binary may install a storage backend, whose
+        // defaults `default_of` adds too; no backend reads this key.
+        let key = "search_inequality_filters";
+        let listed = with_defaults(rows(&[("log_level", "debug")]), default_of);
+        assert!(
+            listed.contains(&(key.to_owned(), "all".to_owned())),
+            "{listed:?}"
+        );
+        assert!(listed.contains(&("log_level".to_owned(), "debug".to_owned())));
+        let listed = with_defaults(rows(&[(key, "off")]), default_of);
+        assert!(
+            listed.contains(&(key.to_owned(), "off".to_owned())),
+            "{listed:?}"
+        );
+        assert!(
+            !listed.contains(&(key.to_owned(), "all".to_owned())),
+            "{listed:?}"
+        );
+        let fresh = Rows(Vec::new());
+        let value = stored_or_default(&fresh, key, default_of).await.unwrap();
+        assert_eq!(value.as_deref(), Some("all"));
+        let set = Rows(rows(&[(key, "off")]));
+        let value = stored_or_default(&set, key, default_of).await.unwrap();
+        assert_eq!(value.as_deref(), Some("off"));
     }
 
     /// `list` adds a row for each writable key with an engine default and

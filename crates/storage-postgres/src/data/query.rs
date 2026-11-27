@@ -192,7 +192,7 @@ pub(crate) async fn execute_query_sql(
     pagination_binds: &PaginationBinds,
     pool: &sqlx::PgPool,
 ) -> Result<Vec<serde_json::Value>, StorageError> {
-    let mut query = sqlx::query_as::<_, (serde_json::Value,)>(sql);
+    let mut query = sqlx::query_as::<_, (serde_json::Value,)>(sqlx::AssertSqlSafe(sql));
     query = query.bind(pk_text.to_owned());
 
     // Bind sort key condition values
@@ -342,7 +342,7 @@ pub(crate) async fn execute_scan_sql(
     base_pk_attr_name: Option<&str>,
     pool: &sqlx::PgPool,
 ) -> Result<Vec<serde_json::Value>, StorageError> {
-    let mut query = sqlx::query_as::<_, (serde_json::Value,)>(sql);
+    let mut query = sqlx::query_as::<_, (serde_json::Value,)>(sqlx::AssertSqlSafe(sql));
 
     if let Some(start_key) = exclusive_start_key {
         // Bind index/table PK

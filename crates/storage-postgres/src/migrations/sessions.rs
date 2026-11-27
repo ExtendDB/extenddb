@@ -46,9 +46,11 @@ pub(crate) const CONNECTION_CHECK: &str = "SET LOCAL client_connection_check_int
 /// Whether the server accepts [`CONNECTION_CHECK`]: PostgreSQL 14 and later,
 /// on a platform that can watch a socket for the peer closing it.
 pub(crate) async fn connection_check_supported(pool: &PgPool) -> bool {
-    let probe = sqlx::raw_sql(&format!("BEGIN; {CONNECTION_CHECK}; ROLLBACK"))
-        .execute(pool)
-        .await;
+    let probe = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "BEGIN; {CONNECTION_CHECK}; ROLLBACK"
+    )))
+    .execute(pool)
+    .await;
     if probe.is_err() {
         let _ = sqlx::raw_sql("ROLLBACK").execute(pool).await;
     }

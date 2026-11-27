@@ -494,17 +494,19 @@ fn bare_negated_op_absent_dynamodb_keys_do_not_match() {
     // IAM matches a bare negated operator on absent dynamodb:Attributes and
     // dynamodb:LeadingKeys too. ExtendDB leaves dynamodb:LeadingKeys absent on
     // query shapes it cannot pin to a partition value, where the service
-    // populates it. It leaves dynamodb:Attributes absent only on a
-    // SearchVectors with no ProjectionExpression (#729) and, on a table that
-    // does not exist, on a GetItem, transaction Get or BatchGetItem that names
-    // no attribute outside its keys, a Query whose key condition the key
-    // condition parser refuses and that names none elsewhere, and a Scan that
-    // names none. On the service the key holds the table's key attributes on
-    // every item request measured, a Scan that names no attribute included,
-    // and an Allow gated on a bare StringNotEquals over it grants no Scan
-    // (measured 2026-11-01). Matching on those absent keys could grant an
-    // Allow the service refuses, so for these two keys an absent key keeps the
-    // no-match rule (BR-7085).
+    // populates it. Outside SearchVectors it leaves dynamodb:Attributes absent
+    // only on a table that does not exist, on a GetItem, transaction Get or
+    // BatchGetItem that names no attribute outside its keys, a Query whose key
+    // condition the key condition parser refuses and that names none
+    // elsewhere, and a Scan that names none. On the service the key holds the
+    // table's key attributes on every item request measured, a Scan that
+    // names no attribute included, and an Allow gated on a bare
+    // StringNotEquals over it grants no Scan (measured 2026-11-01). Matching
+    // on those absent keys could grant an Allow the service refuses, so a
+    // context that does not report the service's absence keeps the no-match
+    // rule for these two keys. On a SearchVectors, where the service sets no
+    // dynamodb:Attributes value, the request context reports it and the
+    // operator matches (see evaluator/tests/absent_attributes.rs).
     let ctx = TestContext::new();
     for key in ["dynamodb:Attributes", "dynamodb:LeadingKeys"] {
         for op in [

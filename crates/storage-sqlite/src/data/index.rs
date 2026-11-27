@@ -436,7 +436,7 @@ pub(crate) async fn delete_index_row_multi(
         where_parts.join(" AND ")
     );
 
-    let mut query = sqlx::query(&sql).bind(base_pk_text);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(base_pk_text);
     for &(sk_name, sk_type) in base_sks {
         // Bind a value for every placeholder, mirroring insert_index_row_multi:
         // a missing sort-key attribute binds an empty string rather than
@@ -505,7 +505,7 @@ pub(crate) async fn insert_index_row_multi(
         cols.join(", ")
     );
 
-    let mut query = sqlx::query(&sql);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
     for v in values {
         query = super::bind_bound!(query, v);
     }

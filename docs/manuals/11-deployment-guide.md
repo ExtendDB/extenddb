@@ -74,7 +74,7 @@ Example Dockerfile:
 
 ```dockerfile
 # Match rust-version in Cargo.toml, and the Debian release of the runtime stage
-FROM rust:1.91.1-bookworm AS builder
+FROM rust:1.94.0-bookworm AS builder
 WORKDIR /src
 COPY . .
 RUN cargo build --release
@@ -274,6 +274,8 @@ RestartSec=5
 # keys needs about 640 KiB for the default [auth.cache] max_entries. Kernels
 # before 5.16 default the memlock limit to 64 KiB (the admin guide's Memory
 # locking section).
+# With upstream commit 97d34aa65c29, the memfd_secret pages of every process
+# that runs as the extenddb user count together against this limit.
 LimitMEMLOCK=16M
 # On a host that backs up tables of large items, one malloc arena keeps a
 # backup job's high-water mark at the pipeline's terms whatever the number of

@@ -553,9 +553,15 @@ fn is_principal_of(identity: &AuthIdentity, key: Key) -> bool {
                 account_id,
                 role_name,
                 session_name,
+                access_key_id,
             },
             Key::Session,
-        ) => account_id == ACCOUNT_ID && role_name == ROLE_NAME && session_name == SESSION_NAME,
+        ) => {
+            account_id == ACCOUNT_ID
+                && role_name == ROLE_NAME
+                && session_name == SESSION_NAME
+                && access_key_id == Key::Session.id()
+        }
         _ => false,
     }
 }

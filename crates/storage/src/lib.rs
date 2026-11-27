@@ -41,6 +41,9 @@ pub mod restore_engine;
 pub mod secret_cipher;
 pub mod secret_keys;
 pub mod server_components;
+#[doc(hidden)]
+#[cfg(feature = "test-util")]
+pub mod session_data_conformance;
 pub mod settings_store;
 pub mod snapshot;
 #[doc(hidden)]
@@ -52,6 +55,7 @@ pub mod stream_lineage;
 pub mod test_pause;
 pub mod transact;
 pub mod vector_catalog;
+pub mod vector_filter;
 pub mod vector_lifecycle;
 
 pub use backend::{Backend, BackendAlreadySet, backend_name, set_backend, try_backend};
@@ -65,6 +69,7 @@ pub use restore_engine::{BulkLoadFile, Finished, RestoreEngine};
 pub use snapshot::{SnapshotEngine, SnapshotInfo, TableSnapshot};
 
 pub use transact::{IdempotencyKey, TransactGetOp, TransactWriteOp};
+pub use vector_filter::VectorItemFilter;
 
 pub use server_components::{
     BackendError, KeySource, ServerComponents, ServerComponentsFactory, create_server_components,
@@ -185,15 +190,18 @@ pub struct VectorSearch<'a> {
     /// on every search against such an index. Backends may therefore treat
     /// `Some` as a mandatory predicate rather than a hint.
     pub hash_key: Option<(&'a str, &'a AttributeValue)>,
-    /// Equality filters over the index's inline-filter attributes, combined
-    /// with logical AND. Empty means no additional filtering.
+    /// Equalities on String and Binary values over the index's inline-filter
+    /// attributes, combined with logical AND, which the backend applies in
+    /// its own query. Empty means no additional filtering.
     ///
-    /// Equality only, deliberately. The wire surface accepts a filter
-    /// expression, which the engine parses and lowers to these pairs; that is
-    /// lossless today because only exact-match conditions are supported, and
-    /// range or function conditions are rejected before reaching a backend. If
-    /// the service ever admits range conditions this type must widen.
+    /// Every other condition of a search condition, a range, `IN`, `OR`,
+    /// `NOT`, a function or a Number equality, arrives as `item_filter`.
     pub filters: &'a [(&'a str, &'a AttributeValue)],
+    /// A condition each returned item must satisfy, for a search condition
+    /// that `filters` cannot express; the `top_k` cut applies to the items
+    /// that satisfy it. `None` means no
+    /// condition beyond `hash_key` and `filters`. See [`VectorItemFilter`].
+    pub item_filter: Option<std::sync::Arc<dyn VectorItemFilter>>,
 }
 /// TTL table info: `(account_id, table_name, ttl_attribute)`.
 pub type TtlTableInfo = (String, String, String);
@@ -983,6 +991,7 @@ mod vector_opt_out_tests {
                 top_k: 10,
                 hash_key: None,
                 filters: &[],
+                item_filter: None,
             })
             .await
             .expect("a participating backend answers a search");

@@ -146,11 +146,11 @@ pub(crate) async fn activate_restore_target(
     table_size_bytes: i64,
     items_applied: Option<i64>,
 ) -> Result<Activated, StorageError> {
-    let record = sqlx::query(&format!(
+    let record = sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE table_restores SET status = 'DONE', \
          items_applied = COALESCE(?, items_applied), completed_at = {NOW} \
          WHERE table_id = ? AND status = 'RUNNING' AND owner_generation = ?"
-    ))
+    )))
     .bind(items_applied)
     .bind(table_id)
     .bind(generation_column(generation))
@@ -320,7 +320,7 @@ impl SqliteEngine {
                 values.push(sk_bound(&parse_sk(value, sk_type)?));
             }
             values.push(BoundValue::Text(item_json));
-            let mut q = sqlx::query(&plan.insert_sql);
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(plan.insert_sql.as_str()));
             for v in values {
                 q = crate::data::bind_bound!(q, v);
             }
@@ -525,10 +525,10 @@ impl RestoreEngine for SqliteEngine {
             // checked against the catalog so a bare id reads no other
             // account's table.
             self.restore_target_shape(key).await?;
-            let count: i64 = sqlx::query_scalar(&format!(
+            let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT COUNT(*) FROM {}",
                 data_table_name(&key.table_id)
-            ))
+            )))
             .fetch_one(&self.pool)
             .await
             .map_err(db_err)?;

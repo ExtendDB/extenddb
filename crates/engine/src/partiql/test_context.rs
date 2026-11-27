@@ -12,13 +12,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::limits::LimitsConfig;
-use extenddb_storage_sqlite::SqliteEngine;
 
-use crate::{
-    AuthorizedKeyInfo, BackupRuntime, ItemAccess, ItemAuthorization, ItemAuthorizer,
-    OperationContext,
-};
+use crate::{ItemAccess, ItemAuthorization, ItemAuthorizer, OperationContext};
 
 /// Run `future` to completion on a runtime of its own.
 pub(super) fn block_on<F: Future>(future: F) -> F::Output {
@@ -31,24 +26,11 @@ pub(super) fn block_on<F: Future>(future: F) -> F::Output {
 
 /// A context whose item authorizer is `authorizer`.
 pub(super) async fn context(authorizer: Option<Arc<dyn ItemAuthorizer>>) -> OperationContext {
-    let storage = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
-        .await
-        .expect("an in-memory database opens");
-    let mut authorized_key_info = AuthorizedKeyInfo::new();
-    authorized_key_info.insert("t".to_owned(), None);
-    OperationContext {
-        storage: Arc::new(storage),
-        backup: Arc::new(BackupRuntime::new(1)),
-        limits: Arc::new(LimitsConfig::default()),
-        region: Arc::from("us-east-1"),
-        account_id: Arc::from("000000000000"),
-        import_paths: Arc::from(Vec::new()),
-        export_paths: Arc::from(Vec::new()),
-        authorized_key_info,
-        auth_cache: extenddb_auth::AuthCacheRegistry::default(),
-        table_key_info_lookup: None,
-        item_authorizer: authorizer,
-    }
+    let mut ctx =
+        crate::test_context::context_on(crate::test_context::memory_engine().await, "000000000000");
+    ctx.authorized_key_info.insert("t".to_owned(), None);
+    ctx.item_authorizer = authorizer;
+    ctx
 }
 
 /// Gives every access the same answer, and counts the accesses it is asked

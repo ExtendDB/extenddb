@@ -18,6 +18,7 @@ use serde_json::Value;
 use sha2::Sha256;
 
 use crate::capacity_helpers;
+use crate::request_limits::{MAX_CLIENT_REQUEST_TOKEN, length_constraint};
 
 /// Pre-processed write operation with parsed expressions and resolved table info.
 pub(crate) enum PreparedOp {
@@ -236,28 +237,27 @@ impl PreparedOp {
     }
 }
 
-/// Validate `ClientRequestToken` format.
-///
-/// Real `DynamoDB` requires 1–36 characters, alphanumeric plus hyphens.
+/// Check a `ClientRequestToken`: 1 to 36 characters of any kind, counted as
+/// the PartiQL request checks count them. Measured on 2026-11-23: 36 `é`
+/// (72 bytes) pass and 37 do not, and `_`, a space, a tab, U+0001 and
+/// U+0000 pass.
 pub(crate) fn validate_client_request_token(token: &str) -> Result<(), DynamoDbError> {
-    if token.is_empty() || token.len() > 36 {
-        return Err(DynamoDbError::ValidationException(
-            "1 validation error detected: Value at 'clientRequestToken' failed to satisfy \
-             constraint: Member must have length less than or equal to 36"
-                .to_owned(),
-        ));
+    match length_constraint(token, MAX_CLIENT_REQUEST_TOKEN) {
+        None => Ok(()),
+        Some(constraint) => Err(DynamoDbError::ValidationException(format!(
+            "1 validation error detected: Value at 'ClientRequestToken' failed to satisfy \
+             constraint: {constraint}"
+        ))),
     }
-    if !token
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    {
-        return Err(DynamoDbError::ValidationException(
-            "1 validation error detected: Value at 'clientRequestToken' failed to satisfy \
-             constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9-]+"
-                .to_owned(),
-        ));
-    }
-    Ok(())
+}
+
+/// The form a `ClientRequestToken` is stored in: each `\` doubled and each
+/// U+0000 written `\0`, since PostgreSQL's `text` holds no U+0000. Two
+/// tokens never share a stored form. A token of `[a-zA-Z0-9-]`, the only
+/// kind an earlier build accepted, is stored as sent, so the tokens such a
+/// build stored still match.
+pub(crate) fn stored_token(token: &str) -> String {
+    token.replace('\\', "\\\\").replace('\0', "\\0")
 }
 
 /// The message of the `IdempotentParameterMismatchException` that a request
@@ -374,21 +374,45 @@ mod tests {
         assert!(validate_client_request_token(&"a".repeat(36)).is_ok());
     }
 
+    /// The rows measured on DynamoDB on 2026-11-23 (T0 to T12, a `\` and a
+    /// `\` before `0`): each token, the constraint its refusal names (`None`
+    /// when it passes) and its stored form when that differs.
     #[test]
-    fn validate_token_empty() {
-        assert!(validate_client_request_token("").is_err());
-    }
-
-    #[test]
-    fn validate_token_too_long() {
-        assert!(validate_client_request_token(&"a".repeat(37)).is_err());
-    }
-
-    #[test]
-    fn validate_token_bad_chars() {
-        assert!(validate_client_request_token("abc_123").is_err());
-        assert!(validate_client_request_token("abc 123").is_err());
-        assert!(validate_client_request_token("abc!").is_err());
+    fn client_request_tokens() {
+        let short = Some("Member must have length greater than or equal to 1");
+        let long = Some("Member must have length less than or equal to 36");
+        let rows = [
+            ("T0", "a".repeat(36), None, None),
+            ("T1", "a".repeat(37), long, None),
+            ("T2", "abc_def".to_owned(), None, None),
+            ("T3", "abc def".to_owned(), None, None),
+            ("T4", String::new(), short, None),
+            ("T5", "_".repeat(37), long, None),
+            ("T6", "a".repeat(36) + "_", long, None),
+            ("T7", "\u{e9}".repeat(36), None, None),
+            ("T8", "\u{e9}".repeat(37), long, None),
+            ("T9", "abc\u{1}def".to_owned(), None, None),
+            ("T10", "abc\tdef".to_owned(), None, None),
+            ("T11", "abc\0def".to_owned(), None, Some("abc\\0def")),
+            ("T12", "\0".to_owned(), None, Some("\\0")),
+            ("backslash", "\\".to_owned(), None, Some("\\\\")),
+            ("backslash 0", "\\0".to_owned(), None, Some("\\\\0")),
+        ];
+        for (id, token, constraint, stored) in rows {
+            let answer = match validate_client_request_token(&token) {
+                Ok(()) => None,
+                Err(DynamoDbError::ValidationException(m)) => Some(m),
+                Err(e) => panic!("{id}: {e:?}"),
+            };
+            let want = constraint.map(|c| {
+                format!(
+                    "1 validation error detected: Value at 'ClientRequestToken' failed to \
+                     satisfy constraint: {c}"
+                )
+            });
+            assert_eq!(answer, want, "{id}");
+            assert_eq!(stored_token(&token), stored.unwrap_or(&token), "{id}");
+        }
     }
 
     const NO_RCC: ReturnConsumedCapacity = ReturnConsumedCapacity::None;

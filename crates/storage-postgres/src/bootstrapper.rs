@@ -153,7 +153,7 @@ impl Bootstrapper for PostgresBootstrapper {
             ));
         }
         let sql = format!("CREATE USER \"{user}\" WITH PASSWORD '{password}'");
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql))
             .execute(admin)
             .await
             .map_err(|e| OpError::Internal(format!("Create user: {e}")))?;
@@ -170,12 +170,15 @@ impl Bootstrapper for PostgresBootstrapper {
             "GRANT \"{}\" TO \"{}\"",
             self.config.app_user, self.config.admin_user
         );
-        sqlx::query(&grant_sql).execute(admin).await.map_err(|e| {
-            OpError::Internal(format!(
-                "Cannot grant {} to {}: {e}",
-                self.config.app_user, self.config.admin_user
-            ))
-        })?;
+        sqlx::query(sqlx::AssertSqlSafe(grant_sql))
+            .execute(admin)
+            .await
+            .map_err(|e| {
+                OpError::Internal(format!(
+                    "Cannot grant {} to {}: {e}",
+                    self.config.app_user, self.config.admin_user
+                ))
+            })?;
         Ok(())
     }
 
@@ -385,7 +388,7 @@ impl Bootstrapper for PostgresBootstrapper {
         if !data_db.is_empty() {
             println!("--- Dropping data database '{data_db}'...");
             let sql = format!("DROP DATABASE IF EXISTS \"{data_db}\"");
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(sql))
                 .execute(admin)
                 .await
                 .map_err(|e| OpError::Internal(format!("Drop data database: {e}")))?;
@@ -394,7 +397,7 @@ impl Bootstrapper for PostgresBootstrapper {
         let catalog = &self.config.catalog_db;
         println!("--- Dropping catalog database '{catalog}'...");
         let sql = format!("DROP DATABASE IF EXISTS \"{catalog}\"");
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql))
             .execute(admin)
             .await
             .map_err(|e| OpError::Internal(format!("Drop catalog database: {e}")))?;
@@ -461,7 +464,7 @@ async fn create_database(pool: &PgPool, name: &str, owner: &str) -> OpResult<()>
 
     // CREATE DATABASE doesn't support parameterized names.
     let sql = format!("CREATE DATABASE \"{name}\" OWNER \"{owner}\"");
-    sqlx::query(&sql)
+    sqlx::query(sqlx::AssertSqlSafe(sql))
         .execute(pool)
         .await
         .map_err(|e| OpError::Internal(format!("Create database '{name}': {e}")))?;

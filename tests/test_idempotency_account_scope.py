@@ -75,40 +75,6 @@ def _count(client, table_name: str, key: str = "k") -> int:
     return int(item["count"]["N"]) if item and "count" in item else 0
 
 
-def test_replay_same_token_same_payload_is_idempotent(dynamodb_client, unique_table_name):
-    """Same token + identical request applies exactly once (no double count)."""
-    _simple_table(dynamodb_client, unique_table_name)
-    try:
-        token = f"tok-{uuid.uuid4().hex[:12]}"
-        _add_one(dynamodb_client, unique_table_name, token)
-        assert _count(dynamodb_client, unique_table_name) == 1
-        # Replaying the exact same request is a no-op that returns success.
-        _add_one(dynamodb_client, unique_table_name, token)
-        assert _count(dynamodb_client, unique_table_name) == 1
-    finally:
-        dynamodb_client.delete_table(TableName=unique_table_name)
-        wait_for_deleted(dynamodb_client, unique_table_name)
-
-
-def test_same_token_different_payload_is_rejected(dynamodb_client, unique_table_name):
-    """Reusing a token with a different request is rejected as a mismatch."""
-    _simple_table(dynamodb_client, unique_table_name)
-    try:
-        token = f"tok-{uuid.uuid4().hex[:12]}"
-        _add_one(dynamodb_client, unique_table_name, token, amount=1)
-        with pytest.raises(ClientError) as exc:
-            _add_one(dynamodb_client, unique_table_name, token, amount=5)
-        assert (
-            exc.value.response["Error"]["Code"]
-            == "IdempotentParameterMismatchException"
-        )
-        # The rejected transaction must not have applied.
-        assert _count(dynamodb_client, unique_table_name) == 1
-    finally:
-        dynamodb_client.delete_table(TableName=unique_table_name)
-        wait_for_deleted(dynamodb_client, unique_table_name)
-
-
 def test_different_token_writes_independently(dynamodb_client, unique_table_name):
     """A distinct token applies its own transaction (token-scoped dedup)."""
     _simple_table(dynamodb_client, unique_table_name)
@@ -116,6 +82,60 @@ def test_different_token_writes_independently(dynamodb_client, unique_table_name
         _add_one(dynamodb_client, unique_table_name, f"tok-{uuid.uuid4().hex[:12]}")
         _add_one(dynamodb_client, unique_table_name, f"tok-{uuid.uuid4().hex[:12]}")
         assert _count(dynamodb_client, unique_table_name) == 2
+    finally:
+        dynamodb_client.delete_table(TableName=unique_table_name)
+        wait_for_deleted(dynamodb_client, unique_table_name)
+
+
+# The first token is plain. The others hold characters that the stored form
+# changes: U+0000, which a PostgreSQL text column refuses, and the backslash,
+# the stored form's escape character. DynamoDB accepts each of them (U+0000 and
+# the backslash measured 2026-11-23, the astral run 2026-11-25). Each ends in a
+# part unique to the run, so a rerun inside the 10-minute window does not meet
+# the token of an earlier run.
+TOKENS = [
+    ("plain", lambda u: f"tok-{u}"),
+    ("nul-run", lambda u: "\0" * 28 + u),
+    ("astral-and-nul", lambda u: "\U0001F600" * 14 + "\0" * 14 + u),
+    ("backslash-run", lambda u: "\\" * 20 + u),
+    ("nul-inside", lambda u: f"x\0y-{u}"),
+]
+
+
+@pytest.mark.parametrize(("name", "make"), TOKENS, ids=[r[0] for r in TOKENS])
+def test_a_token_replays_and_refuses_a_change(dynamodb_client, unique_table_name, name, make):
+    """A token applies once, replays with no second write, and refuses a change."""
+    _simple_table(dynamodb_client, unique_table_name)
+    try:
+        token = make(uuid.uuid4().hex[:8])
+        _add_one(dynamodb_client, unique_table_name, token)
+        assert _count(dynamodb_client, unique_table_name) == 1
+        _add_one(dynamodb_client, unique_table_name, token)
+        assert _count(dynamodb_client, unique_table_name) == 1
+        with pytest.raises(ClientError) as exc:
+            _add_one(dynamodb_client, unique_table_name, token, amount=5)
+        assert (
+            exc.value.response["Error"]["Code"]
+            == "IdempotentParameterMismatchException"
+        )
+        assert _count(dynamodb_client, unique_table_name) == 1
+    finally:
+        dynamodb_client.delete_table(TableName=unique_table_name)
+        wait_for_deleted(dynamodb_client, unique_table_name)
+
+
+def test_nul_and_backslash_zero_are_two_tokens(dynamodb_client, unique_table_name):
+    """`x` U+0000 `y` and `x` `\\` `0` `y` are two tokens: neither replays the other."""
+    _simple_table(dynamodb_client, unique_table_name)
+    try:
+        suffix = uuid.uuid4().hex[:12]
+        nul, backslash_zero = f"x\0y-{suffix}", f"x\\0y-{suffix}"
+        _add_one(dynamodb_client, unique_table_name, nul, key="nul")
+        _add_one(dynamodb_client, unique_table_name, backslash_zero, key="backslash")
+        _add_one(dynamodb_client, unique_table_name, nul, key="nul")
+        _add_one(dynamodb_client, unique_table_name, backslash_zero, key="backslash")
+        assert _count(dynamodb_client, unique_table_name, key="nul") == 1
+        assert _count(dynamodb_client, unique_table_name, key="backslash") == 1
     finally:
         dynamodb_client.delete_table(TableName=unique_table_name)
         wait_for_deleted(dynamodb_client, unique_table_name)

@@ -89,10 +89,10 @@ use futures::StreamExt;
 /// The number of rows `cases()` returns, written here by hand rather than
 /// counted from `cases()`, so that a row deleted from or filtered out of
 /// `cases()` fails the test. Adding or removing a row changes this number.
-const ROWS: usize = 102;
+const ROWS: usize = 103;
 
 /// The number of rows named `difference: ...`.
-const DIFFERENCE_ROWS: usize = 6;
+const DIFFERENCE_ROWS: usize = 5;
 
 /// A row's rendered outcome, or the error of a setup step that failed.
 type R = Result<String, sqlx::Error>;
@@ -278,8 +278,11 @@ fn mismatch(column: &str, rust: &str, as_sql: &str, found: &str) -> String {
 
 /// `rows_affected` of `sql`, run after `setup`.
 async fn rows_affected(pool: &sqlx::SqlitePool, setup: &str, sql: &str) -> R {
-    sqlx::raw_sql(setup).execute(pool).await?;
-    Ok(match sqlx::query(sql).execute(pool).await {
+    sqlx::raw_sql(sqlx::AssertSqlSafe(setup))
+        .execute(pool)
+        .await?;
+    let run = sqlx::query(sqlx::AssertSqlSafe(sql)).execute(pool).await;
+    Ok(match run {
         Ok(r) => format!("rows_affected={}", r.rows_affected()),
         Err(e) => render::<()>(Err(e)),
     })
@@ -323,7 +326,7 @@ fn refused_location(url: &str) -> String {
 
 /// The items of a `fetch` stream of one-column rows, rendered.
 async fn stream(pool: &sqlx::SqlitePool, sql: &str) -> String {
-    let items: Vec<String> = sqlx::query_as::<_, (i64,)>(sql)
+    let items: Vec<String> = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(sql))
         .fetch(pool)
         .map(render)
         .collect()
@@ -415,6 +418,11 @@ fn cases() -> Vec<Case> {
             "CAST(x'fffe' AS TEXT)",
             String,
             format!("{DECODE} 0: invalid utf-8 sequence of 1 bytes from index 0")
+        ),
+        decode!(
+            "CAST(x'fffe' AS TEXT)",
+            serde_json::Value,
+            format!("{DECODE} 0: expected value at line 1 column 1")
         ),
         decode!("CAST(x'fffe' AS TEXT)", Vec<u8>, "Ok([255, 254])"),
         // ── decoding: NULL into a non-Option type ──
@@ -649,7 +657,7 @@ fn cases() -> Vec<Case> {
         row!(
             "a :name placeholder is refused",
             "Err[Protocol] encountered unexpected or invalid data: unsupported SQL parameter \
-             format: :x (sqlx_sqlite::arguments:99)",
+             format: :x (sqlx_sqlite::arguments:93)",
             |pool| render(
                 sqlx::query_scalar::<_, i64>("SELECT :x")
                     .bind(7_i64)
@@ -660,7 +668,7 @@ fn cases() -> Vec<Case> {
         row!(
             "an @name placeholder is refused",
             "Err[Protocol] encountered unexpected or invalid data: unsupported SQL parameter \
-             format: @x (sqlx_sqlite::arguments:99)",
+             format: @x (sqlx_sqlite::arguments:93)",
             |pool| render(
                 sqlx::query_scalar::<_, i64>("SELECT @x")
                     .bind(7_i64)
@@ -671,7 +679,7 @@ fn cases() -> Vec<Case> {
         row!(
             "a $name placeholder is refused",
             "Err[Protocol] encountered unexpected or invalid data: parameters with non-integer \
-             names are not currently supported: abc (sqlx_sqlite::arguments:93)",
+             names are not currently supported: abc (sqlx_sqlite::arguments:87)",
             |pool| render(
                 sqlx::query_scalar::<_, i64>("SELECT $abc")
                     .bind(7_i64)
@@ -718,7 +726,7 @@ fn cases() -> Vec<Case> {
         row!(
             "query with no arguments refuses a :name placeholder",
             "Err[Protocol] encountered unexpected or invalid data: unsupported SQL parameter \
-             format: :x (sqlx_sqlite::arguments:99)",
+             format: :x (sqlx_sqlite::arguments:93)",
             |pool| render(
                 sqlx::query("SELECT :x")
                     .execute(&pool)
@@ -729,7 +737,7 @@ fn cases() -> Vec<Case> {
         row!(
             "query_as with no arguments refuses an @name placeholder",
             "Err[Protocol] encountered unexpected or invalid data: unsupported SQL parameter \
-             format: @x (sqlx_sqlite::arguments:99)",
+             format: @x (sqlx_sqlite::arguments:93)",
             |pool| render(
                 sqlx::query_as::<_, (i64,)>("SELECT @x")
                     .fetch_all(&pool)
@@ -739,7 +747,7 @@ fn cases() -> Vec<Case> {
         row!(
             "query_scalar with no arguments refuses a $name placeholder",
             "Err[Protocol] encountered unexpected or invalid data: parameters with non-integer \
-             names are not currently supported: abc (sqlx_sqlite::arguments:93)",
+             names are not currently supported: abc (sqlx_sqlite::arguments:87)",
             |pool| render(
                 sqlx::query_scalar::<_, i64>("SELECT $abc")
                     .fetch_optional(&pool)
@@ -749,7 +757,7 @@ fn cases() -> Vec<Case> {
         row!(
             "fetch with no arguments refuses a :name placeholder",
             "[Err[Protocol] encountered unexpected or invalid data: unsupported SQL parameter \
-             format: :x (sqlx_sqlite::arguments:99)]",
+             format: :x (sqlx_sqlite::arguments:93)]",
             |pool| stream(&pool, "SELECT :x").await
         ),
         difference!(
@@ -844,8 +852,8 @@ fn cases() -> Vec<Case> {
             .await?
         ),
         row!(
-            "a SELECT after a write reports the write's sqlite3_changes",
-            "rows_affected=2",
+            "a SELECT after a write reports 0",
+            "rows_affected=0",
             |pool| rows_affected(
                 &pool,
                 "CREATE TABLE t (id); INSERT INTO t VALUES (1), (2)",
@@ -1006,11 +1014,9 @@ fn cases() -> Vec<Case> {
              transaction",
             |pool| render(pool.begin_with("SELECT 1").await.map(drop))
         ),
-        difference!(
-            "difference: begin_with after a failed begin_with",
-            native: "Err[InvalidSavePointStatement] attempted to call begin_with at non-zero \
-                     transaction depth",
-            wasm: "Ok(())",
+        row!(
+            "begin_with after a failed begin_with runs",
+            "Ok(())",
             |pool| {
                 let failed = pool.begin_with("SELECT 1").await.map(drop);
                 assert!(failed.is_err(), "SELECT 1 opens no transaction");

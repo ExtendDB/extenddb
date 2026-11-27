@@ -103,10 +103,12 @@ async fn row_counts(s: &Scratch) -> BTreeMap<String, i64> {
 }
 
 async fn count_rows(p: &PgPool, table: &str) -> i64 {
-    sqlx::query_scalar(&format!("SELECT count(*) FROM \"{table}\""))
-        .fetch_one(p)
-        .await
-        .unwrap_or(-1)
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM \"{table}\""
+    )))
+    .fetch_one(p)
+    .await
+    .unwrap_or(-1)
 }
 
 async fn upgrade_and_compare(state: &State) {

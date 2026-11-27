@@ -265,6 +265,7 @@ pub(crate) fn principal_arn(identity: &AuthIdentity) -> String {
             account_id,
             role_name,
             session_name,
+            ..
         } => format!("arn:aws:sts::{account_id}:assumed-role/{role_name}/{session_name}"),
     }
 }

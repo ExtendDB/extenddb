@@ -148,7 +148,7 @@ async fn lsi_table(s: &Scratch) -> (TableKeyInfo, String) {
         .await
         .expect("read the index info");
     let sql_table = format!("\"_ddb_{}\"", index.index_id);
-    sqlx::query(&format!("ANALYZE {sql_table}"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("ANALYZE {sql_table}")))
         .execute(&s.db)
         .await
         .expect("analyze the index table");
@@ -196,7 +196,7 @@ async fn last_statement(db: &PgPool, sql_table: &str) -> String {
 /// statement's `$n` placeholders parameters of the `EXPLAIN` itself.
 async fn generic_plan(db: &PgPool, statement: &str) -> Vec<String> {
     let sql = format!("EXPLAIN (GENERIC_PLAN, COSTS OFF) {statement}");
-    sqlx::raw_sql(&sql)
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql.as_str()))
         .fetch_all(db)
         .await
         .unwrap_or_else(|e| panic!("{sql}: {e}"))
@@ -219,7 +219,7 @@ async fn custom_plan(db: &PgPool, statement: &str, values: &[&str]) -> Vec<Strin
          EXPLAIN (COSTS OFF) EXECUTE lsi_page({args}); \
          DEALLOCATE lsi_page"
     );
-    sqlx::raw_sql(&sql)
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql.as_str()))
         .fetch_all(&mut *conn)
         .await
         .unwrap_or_else(|e| panic!("{sql}: {e}"))

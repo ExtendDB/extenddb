@@ -87,11 +87,14 @@ pub async fn handle_transact_write_items(
         }
     }
 
-    // The client request token's length and pattern are checked ahead of the
-    // actions (measured 2026-10-27: a 37-character token is reported ahead of
-    // a missing table, a condition syntax error and a malformed key number;
-    // measured 2026-11-11: ahead of an attribute name over the size limit and
-    // a number the service cannot read).
+    // The client request token's length is checked after the item count,
+    // the one-operation check above and the enum members read during
+    // deserialization, and ahead of each item's own checks (measured
+    // 2026-10-27: a 37-character token is reported ahead of a missing table,
+    // a condition syntax error and a malformed key number; measured
+    // 2026-11-11: ahead of an attribute name over the size limit and a
+    // number the service cannot read). DynamoDB checks it ahead of all three,
+    // and lists it with a count fault in one message (measured 2026-11-24).
     if let Some(ref token) = input.client_request_token {
         validate_client_request_token(token)?;
     }
@@ -189,15 +192,15 @@ pub async fn handle_transact_write_items(
     // The token is passed to the storage layer and checked atomically within
     // the write transaction, guaranteeing that token storage and data writes
     // commit together.
-    let idempotency =
-        input
-            .client_request_token
-            .as_deref()
-            .map(|t| extenddb_storage::IdempotencyKey {
-                account_id: ctx.account_id.as_ref(),
-                token: t,
-                fingerprint: fingerprint.as_str(),
-            });
+    let token = input
+        .client_request_token
+        .as_deref()
+        .map(super::transact_write_helpers::stored_token);
+    let idempotency = token.as_deref().map(|t| extenddb_storage::IdempotencyKey {
+        account_id: ctx.account_id.as_ref(),
+        token: t,
+        fingerprint: fingerprint.as_str(),
+    });
 
     match ctx.storage.transact_write_items(&ops, idempotency).await {
         Ok(()) => {}
