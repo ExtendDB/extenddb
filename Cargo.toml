@@ -29,7 +29,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 rust-version = "1.94.0"
 license = "Apache-2.0"
@@ -46,9 +46,9 @@ homepage = "https://extenddb.org/"
 # pin that is not exact.
 # Internal dev-dependencies are declared by path in each crate instead, with
 # no version, so that cargo drops them from the published manifests.
-extenddb-core = { path = "crates/core", version = "=1.0.0" }
-extenddb-cache = { path = "crates/cache", version = "=1.0.0" }
-extenddb-backup-store = { path = "crates/backup-store", version = "=1.0.0" }
+extenddb-core = { path = "crates/core", version = "=1.1.0" }
+extenddb-cache = { path = "crates/cache", version = "=1.1.0" }
+extenddb-backup-store = { path = "crates/backup-store", version = "=1.1.0" }
 # The engine entry turns default features off so that a member can choose
 # them: `server` asks for `default`, the WebAssembly adapter asks for none.
 # Cargo unifies features over everything one command builds, so a member
@@ -57,16 +57,16 @@ extenddb-backup-store = { path = "crates/backup-store", version = "=1.0.0" }
 # `-p <member> -p extenddb-server`, or when the member depends on `server`.
 # Built with nothing that asks for them, the engine answers the PartiQL
 # operations with UnknownOperationException.
-extenddb-engine = { path = "crates/engine", version = "=1.0.0", default-features = false }
-extenddb-storage = { path = "crates/storage", version = "=1.0.0" }
-extenddb-config = { path = "crates/config", version = "=1.0.0" }
-extenddb-storage-cassandra = { path = "crates/storage-cassandra", version = "=1.0.0" }
-extenddb-storage-mongodb = { path = "crates/storage-mongodb", version = "=1.0.0" }
-extenddb-storage-postgres = { path = "crates/storage-postgres", version = "=1.0.0" }
-extenddb-storage-sqlite = { path = "crates/storage-sqlite", version = "=1.0.0" }
-extenddb-auth = { path = "crates/auth", version = "=1.0.0" }
-extenddb-server = { path = "crates/server", version = "=1.0.0", default-features = false }
-extenddb-app = { path = "crates/app", version = "=1.0.0" }
+extenddb-engine = { path = "crates/engine", version = "=1.1.0", default-features = false }
+extenddb-storage = { path = "crates/storage", version = "=1.1.0" }
+extenddb-config = { path = "crates/config", version = "=1.1.0" }
+extenddb-storage-cassandra = { path = "crates/storage-cassandra", version = "=1.1.0" }
+extenddb-storage-mongodb = { path = "crates/storage-mongodb", version = "=1.1.0" }
+extenddb-storage-postgres = { path = "crates/storage-postgres", version = "=1.1.0" }
+extenddb-storage-sqlite = { path = "crates/storage-sqlite", version = "=1.1.0" }
+extenddb-auth = { path = "crates/auth", version = "=1.1.0" }
+extenddb-server = { path = "crates/server", version = "=1.1.0", default-features = false }
+extenddb-app = { path = "crates/app", version = "=1.1.0" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

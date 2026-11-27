@@ -423,8 +423,7 @@ it can be the sort key. It never drops a bucket. Resident memory then grows
 with the number of distinct values those requests carry.
 
 Every release through 1.0.0 kept one latency segment record per request that
-reaches dispatch in memory for 24 hours. So does any later release before the
-one that carries this change. The upgrade manual's
+reaches dispatch in memory for 24 hours. The upgrade manual's
 [v1.1.0 entry](07-upgrade-manual.md#v110-latency-segments-are-summed-into-time-buckets)
 lists what the change does to the `segments` that `/metrics` returns. A record
 takes about 190 bytes through 0.1.14, and about
