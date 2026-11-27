@@ -66,9 +66,9 @@ impl Scratch {
         } = self;
         drop(engine);
         db.close().await;
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
-        ))
+        )))
         .execute(&admin)
         .await
         .expect("drop the scratch database");
@@ -234,10 +234,12 @@ async fn scratch(default_isolation: Option<&str>, pool_size: u32) -> Scratch {
         .connect(&format!("{base}/postgres"))
         .await
         .expect("connect to the postgres maintenance database");
-    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
-        .execute(&admin)
-        .await
-        .expect("create the scratch database");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE \"{db_name}\""
+    )))
+    .execute(&admin)
+    .await
+    .expect("create the scratch database");
     let url = format!("{base}/{db_name}");
     let db = PgPoolOptions::new()
         .max_connections(4)
@@ -248,7 +250,7 @@ async fn scratch(default_isolation: Option<&str>, pool_size: u32) -> Scratch {
     // database, so every shipped migration file from both directories is
     // applied to it, in filename order.
     for sql in shipped_migrations() {
-        sqlx::raw_sql(&sql)
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
             .execute(&db)
             .await
             .expect("apply a shipped migration");
@@ -275,9 +277,9 @@ async fn scratch(default_isolation: Option<&str>, pool_size: u32) -> Scratch {
         .expect("seed the account row");
     if let Some(level) = default_isolation {
         // Sessions opened from here on, the engine's among them, take it.
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER DATABASE \"{db_name}\" SET default_transaction_isolation = '{level}'"
-        ))
+        )))
         .execute(&admin)
         .await
         .expect("set the default isolation level");
@@ -356,14 +358,14 @@ async fn connect(s: &Scratch) -> (PgConnection, i32) {
 /// statement of the transaction, so the write has stored its stream record
 /// by then.
 async fn install_commit_gate(s: &Scratch, relation: &str, condition: &str) {
-    sqlx::raw_sql(&format!(
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "CREATE FUNCTION hold_at_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
            IF {condition} THEN PERFORM pg_advisory_xact_lock_shared({GATE}); END IF; \
            RETURN NULL; \
          END $$; \
          CREATE CONSTRAINT TRIGGER hold_at_commit AFTER INSERT OR UPDATE ON {relation} \
            DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION hold_at_commit();"
-    ))
+    )))
     .execute(&s.db)
     .await
     .expect("install the gate trigger");
@@ -578,10 +580,10 @@ async fn concurrent_writers_lose_no_record_and_keep_each_items_order() {
         last_image.insert(pk, new_image);
     }
     for pk in ITEMS {
-        let stored: serde_json::Value = sqlx::query_scalar(&format!(
+        let stored: serde_json::Value = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT item_data FROM {} WHERE pk = $1",
             data_table(&table_id)
-        ))
+        )))
         .bind(pk)
         .fetch_one(&s.db)
         .await

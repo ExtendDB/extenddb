@@ -97,8 +97,12 @@ impl PostgresEngine {
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-                let old: Option<(serde_json::Value,)> =
-                    bind_sk_fetch_optional!(&select_sql, pk_text.as_ref(), &sk, &mut *tx)?;
+                let old: Option<(serde_json::Value,)> = bind_sk_fetch_optional!(
+                    sqlx::AssertSqlSafe(select_sql),
+                    pk_text.as_ref(),
+                    &sk,
+                    &mut *tx
+                )?;
 
                 if let Some((ref old_json,)) = old {
                     let old_item: Item = json_to_item(old_json.clone())?;
@@ -126,21 +130,21 @@ impl PostgresEngine {
                 // Delete the row
                 match &sk {
                     SortKeyValue::S(s) => {
-                        sqlx::query(&delete_sql)
+                        sqlx::query(sqlx::AssertSqlSafe(delete_sql))
                             .bind(pk_text.as_ref())
                             .bind(s)
                             .execute(&mut *tx)
                             .await
                     }
                     SortKeyValue::N(n) => {
-                        sqlx::query(&delete_sql)
+                        sqlx::query(sqlx::AssertSqlSafe(delete_sql))
                             .bind(pk_text.as_ref())
                             .bind(n)
                             .execute(&mut *tx)
                             .await
                     }
                     SortKeyValue::B(b) => {
-                        sqlx::query(&delete_sql)
+                        sqlx::query(sqlx::AssertSqlSafe(delete_sql))
                             .bind(pk_text.as_ref())
                             .bind(b)
                             .execute(&mut *tx)
@@ -240,21 +244,21 @@ impl PostgresEngine {
                 super::gsi_build::pause_before_autocommit_statement().await;
                 match &sk {
                     SortKeyValue::S(s) => {
-                        sqlx::query(&delete_sql)
+                        sqlx::query(sqlx::AssertSqlSafe(delete_sql))
                             .bind(pk_text.as_ref())
                             .bind(s)
                             .execute(&self.data_pool)
                             .await
                     }
                     SortKeyValue::N(n) => {
-                        sqlx::query(&delete_sql)
+                        sqlx::query(sqlx::AssertSqlSafe(delete_sql))
                             .bind(pk_text.as_ref())
                             .bind(n)
                             .execute(&self.data_pool)
                             .await
                     }
                     SortKeyValue::B(b) => {
-                        sqlx::query(&delete_sql)
+                        sqlx::query(sqlx::AssertSqlSafe(delete_sql))
                             .bind(pk_text.as_ref())
                             .bind(b)
                             .execute(&self.data_pool)
@@ -278,11 +282,12 @@ impl PostgresEngine {
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-                let old: Option<(serde_json::Value,)> = sqlx::query_as(&select_sql)
-                    .bind(pk_text.as_ref())
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                let old: Option<(serde_json::Value,)> =
+                    sqlx::query_as(sqlx::AssertSqlSafe(select_sql))
+                        .bind(pk_text.as_ref())
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .map_err(|e| StorageError::Internal(e.to_string()))?;
 
                 if let Some((ref old_json,)) = old {
                     let old_item: Item = json_to_item(old_json.clone())?;
@@ -305,7 +310,7 @@ impl PostgresEngine {
                     return Ok(None);
                 }
 
-                sqlx::query(&delete_sql)
+                sqlx::query(sqlx::AssertSqlSafe(delete_sql))
                     .bind(pk_text.as_ref())
                     .execute(&mut *tx)
                     .await
@@ -400,7 +405,7 @@ impl PostgresEngine {
             } else {
                 let delete_sql = format!("DELETE FROM {ddb_table} WHERE pk = $1");
                 super::gsi_build::pause_before_autocommit_statement().await;
-                sqlx::query(&delete_sql)
+                sqlx::query(sqlx::AssertSqlSafe(delete_sql))
                     .bind(pk_text.as_ref())
                     .execute(&self.data_pool)
                     .await

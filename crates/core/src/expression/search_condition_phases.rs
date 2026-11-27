@@ -147,6 +147,23 @@ pub(super) fn each_comparison(
     Ok(conditions)
 }
 
+/// The `ExpressionAttributeNames` keys a search condition can resolve: for
+/// each `#alias` element of an operand, the key `#alias` and the key `alias`,
+/// the two keys [`resolve_name`] looks up.
+pub(super) fn name_refs(expr: &str) -> std::collections::BTreeSet<&str> {
+    let mut used = std::collections::BTreeSet::new();
+    for token in tokenize(expr) {
+        for element in token.split('.') {
+            let name = element.split('[').next().unwrap_or_default();
+            if let Some(alias) = name.strip_prefix('#') {
+                used.insert(name);
+                used.insert(alias);
+            }
+        }
+    }
+    used
+}
+
 /// Split an expression into operands, comparators and `AND`.
 ///
 /// Whitespace separates tokens. `=`, `<`, `>`, `<=`, `>=` and `<>` are tokens

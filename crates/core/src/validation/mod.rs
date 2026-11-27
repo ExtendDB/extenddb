@@ -1234,6 +1234,11 @@ pub enum AttributeNameRequestForm {
     /// A `PutRequest` of a `BatchWriteItem` request. It carries no
     /// expression maps.
     BatchRequest,
+    /// A `SearchVectors` request: `Attribute name is too large, must be less
+    /// than 65536 bytes for key #n`, without the `1 validation error
+    /// detected: ` prefix (measured on DynamoDB 2026-11-24). Its callers pass
+    /// no `ExpressionAttributeValues`.
+    SearchRequest,
 }
 
 /// Validate that no attribute name exceeds the maximum allowed size (REQ-LIM-004).
@@ -1283,7 +1288,10 @@ pub fn validate_expression_attribute_name_sizes(
     limits: &LimitsConfig,
     form: AttributeNameRequestForm,
 ) -> Result<(), DynamoDbError> {
-    if form == AttributeNameRequestForm::SingleItem {
+    if matches!(
+        form,
+        AttributeNameRequestForm::SingleItem | AttributeNameRequestForm::SearchRequest
+    ) {
         check_expression_attribute_names(names, limits, form)?;
         check_expression_attribute_values(values, limits, form)
     } else {
@@ -1379,9 +1387,9 @@ fn attribute_name_too_large(limits: &LimitsConfig, form: AttributeNameRequestFor
     );
     match form {
         AttributeNameRequestForm::SingleItem => format!("1 validation error detected: {sentence}"),
-        AttributeNameRequestForm::TransactionMember | AttributeNameRequestForm::BatchRequest => {
-            sentence
-        }
+        AttributeNameRequestForm::TransactionMember
+        | AttributeNameRequestForm::BatchRequest
+        | AttributeNameRequestForm::SearchRequest => sentence,
     }
 }
 
@@ -1396,7 +1404,9 @@ fn expression_attribute_name_too_large(
 ) -> String {
     let refusal = attribute_name_too_large(limits, form);
     match form {
-        AttributeNameRequestForm::SingleItem => format!("{refusal} for key {placeholder}"),
+        AttributeNameRequestForm::SingleItem | AttributeNameRequestForm::SearchRequest => {
+            format!("{refusal} for key {placeholder}")
+        }
         AttributeNameRequestForm::TransactionMember | AttributeNameRequestForm::BatchRequest => {
             format!("{map} contains invalid value: {refusal} for key {placeholder}")
         }

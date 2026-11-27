@@ -207,23 +207,15 @@ impl AuthorizationStore for MongoCatalogStore {
 
     fn fetch_session_data(
         &self,
-        account_id: &str,
-        role_name: &str,
-        session_name: &str,
+        access_key_id: &str,
     ) -> BoxFuture<'_, OpResult<Option<SessionData>>> {
-        let account_id = account_id.to_owned();
-        let role_name = role_name.to_owned();
-        let session_name = session_name.to_owned();
+        let access_key_id = access_key_id.to_owned();
         Box::pin(async move {
             let coll = self.catalog_db().collection::<Document>("iam_sessions");
-            let now_bson = mongodb::bson::DateTime::now();
+            // `access_key_id` has a unique index, so this reads one session's
+            // document.
             let doc = coll
-                .find_one(doc! {
-                    "account_id": &account_id,
-                    "role_name": &role_name,
-                    "session_name": &session_name,
-                    "expires_at": { "$gt": now_bson },
-                })
+                .find_one(doc! { "access_key_id": &access_key_id })
                 .await
                 .map_err(|e| {
                     tracing::error!("fetch_session_data: {e}");

@@ -50,9 +50,9 @@ impl Scratch {
         } = self;
         drop(engine);
         db.close().await;
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
-        ))
+        )))
         .execute(&admin)
         .await
         .expect("drop the scratch database");
@@ -107,10 +107,12 @@ async fn scratch() -> Scratch {
         .connect(&format!("{base}/postgres"))
         .await
         .expect("connect to the postgres maintenance database");
-    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
-        .execute(&admin)
-        .await
-        .expect("create the scratch database");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE \"{db_name}\""
+    )))
+    .execute(&admin)
+    .await
+    .expect("create the scratch database");
     let url = format!("{base}/{db_name}");
     let db = PgPoolOptions::new()
         .max_connections(2)
@@ -121,7 +123,7 @@ async fn scratch() -> Scratch {
     // database, so every shipped migration file from both directories is
     // applied to it, in filename order.
     for sql in shipped_migrations() {
-        sqlx::raw_sql(&sql)
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
             .execute(&db)
             .await
             .expect("apply a shipped migration");
@@ -297,7 +299,7 @@ async fn text_key_columns_are_declared_in_byte_order_collation() {
 
 /// The plan for a statement, as the text lines `EXPLAIN` prints.
 async fn explain(db: &PgPool, sql: &str) -> Vec<String> {
-    sqlx::query_scalar::<_, String>(&format!("EXPLAIN (COSTS OFF) {sql}"))
+    sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!("EXPLAIN (COSTS OFF) {sql}")))
         .fetch_all(db)
         .await
         .expect("explain the statement")
@@ -345,11 +347,11 @@ async fn resuming_inside_a_partition_seeks_on_the_sort_key() {
     }
     let tid = table_id(&s.db, "t_seek").await;
     let gid = index_id(&s.db, &tid, "gsi1").await;
-    sqlx::query(&format!("ANALYZE \"_ddb_{tid}\""))
+    sqlx::query(sqlx::AssertSqlSafe(format!("ANALYZE \"_ddb_{tid}\"")))
         .execute(&s.db)
         .await
         .expect("analyze the data table");
-    sqlx::query(&format!("ANALYZE \"_ddb_{gid}\""))
+    sqlx::query(sqlx::AssertSqlSafe(format!("ANALYZE \"_ddb_{gid}\"")))
         .execute(&s.db)
         .await
         .expect("analyze the index table");

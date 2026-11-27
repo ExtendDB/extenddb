@@ -362,9 +362,9 @@ async fn an_index_build_behind_a_held_lock_stops_naming_the_holder() {
             .await
             .unwrap();
     let mut blocker = data.begin().await.unwrap();
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "LOCK TABLE \"_ddb_{index_id}\" IN ROW EXCLUSIVE MODE"
-    ))
+    )))
     .execute(&mut *blocker)
     .await
     .unwrap();
@@ -414,16 +414,16 @@ async fn a_role_that_does_not_own_the_tables_is_told_what_to_run() {
     s.load("0.1.14").await;
     let role = format!("{}_app", s.catalog_name);
     let admin = pool(&format!("{base}/postgres"), 1).await;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE ROLE \"{role}\" LOGIN PASSWORD 'owner-test'"
-    ))
+    )))
     .execute(&admin)
     .await
     .unwrap();
     for database in [&s.catalog_name, &s.data_name] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "GRANT ALL ON DATABASE \"{database}\" TO \"{role}\""
-        ))
+        )))
         .execute(&admin)
         .await
         .unwrap();
@@ -433,7 +433,7 @@ async fn a_role_that_does_not_own_the_tables_is_told_what_to_run() {
             "GRANT ALL ON ALL TABLES IN SCHEMA public TO \"{role}\"",
             "GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO \"{role}\"",
         ] {
-            sqlx::query(&grant.replace("{role}", &role))
+            sqlx::query(sqlx::AssertSqlSafe(grant.replace("{role}", &role)))
                 .execute(&p)
                 .await
                 .unwrap();
@@ -540,7 +540,7 @@ async fn a_role_that_does_not_own_the_tables_is_told_what_to_run() {
         let p = pool(&format!("{base}/{database}"), 1).await;
         for (who, statement) in steps {
             assert_eq!(who, "a superuser", "{}", note.text);
-            sqlx::raw_sql(&statement)
+            sqlx::raw_sql(sqlx::AssertSqlSafe(statement.as_str()))
                 .execute(&p)
                 .await
                 .unwrap_or_else(|e| panic!("{statement}: {e}"));
@@ -553,14 +553,16 @@ async fn a_role_that_does_not_own_the_tables_is_told_what_to_run() {
         .expect("the role owns every object now");
     for database in [&s.catalog_name, &s.data_name] {
         let p = pool(&format!("{base}/{database}"), 1).await;
-        let _ = sqlx::query(&format!("DROP OWNED BY \"{role}\""))
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!("DROP OWNED BY \"{role}\"")))
             .execute(&p)
             .await;
         p.close().await;
     }
     drop(s);
-    let _ = sqlx::query(&format!("DROP ROLE IF EXISTS \"{role}\""))
-        .execute(&admin)
-        .await;
+    let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP ROLE IF EXISTS \"{role}\""
+    )))
+    .execute(&admin)
+    .await;
     admin.close().await;
 }

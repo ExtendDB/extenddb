@@ -424,7 +424,10 @@ mod init_tests {
             .connect(&crate::sqlite_util::sqlite_url(path))
             .await
             .expect("open");
-        let found: Vec<String> = sqlx::query_scalar(sql).fetch_all(&pool).await.expect(sql);
+        let found: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .fetch_all(&pool)
+            .await
+            .expect(sql);
         pool.close().await;
         found
     }

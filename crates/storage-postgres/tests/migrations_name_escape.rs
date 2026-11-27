@@ -212,7 +212,10 @@ async fn seed_raw_backup_index(catalog: &PgPool, backup_id: &str, arn: &str) {
 /// Each row's documents as `jsonb::text`, under a label, sorted by byte
 /// order.
 async fn dump_documents(pool: &PgPool, sql: &str, out: &mut String) {
-    let rows: Vec<(String, Vec<String>)> = sqlx::query_as(sql).fetch_all(pool).await.unwrap();
+    let rows: Vec<(String, Vec<String>)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .fetch_all(pool)
+        .await
+        .unwrap();
     for (label, columns) in rows {
         writeln!(out, "{label}").unwrap();
         for column in columns {

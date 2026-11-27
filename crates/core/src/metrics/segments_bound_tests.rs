@@ -3,7 +3,7 @@
 
 //! Tests for the memory bound and the prune of [`SegmentStore`].
 
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 use super::tests::{ACCOUNTS, OPS, at, count_of, segs};
 use super::*;

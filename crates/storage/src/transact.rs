@@ -18,7 +18,8 @@ use crate::StreamCapture;
 pub struct IdempotencyKey<'a> {
     /// Account that owns the token. Scopes the dedup keyspace.
     pub account_id: &'a str,
-    /// The client-supplied `ClientRequestToken`.
+    /// The client-supplied `ClientRequestToken`, each `\` doubled and each
+    /// U+0000 written `\0`, so it holds no U+0000.
     pub token: &'a str,
     /// Collision-resistant fingerprint of the request payload.
     pub fingerprint: &'a str,

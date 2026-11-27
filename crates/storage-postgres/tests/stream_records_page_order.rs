@@ -109,10 +109,12 @@ async fn a_page_is_in_sequence_order_when_the_records_were_written_in_reverse() 
         .connect(&format!("{base}/postgres"))
         .await
         .expect("connect to the postgres maintenance database");
-    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
-        .execute(&admin)
-        .await
-        .expect("create the scratch database");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE \"{db_name}\""
+    )))
+    .execute(&admin)
+    .await
+    .expect("create the scratch database");
     let url = format!("{base}/{db_name}");
     let db = PgPoolOptions::new()
         .max_connections(2)
@@ -120,7 +122,7 @@ async fn a_page_is_in_sequence_order_when_the_records_were_written_in_reverse() 
         .await
         .expect("connect to the scratch database");
     for sql in shipped_migrations() {
-        sqlx::raw_sql(&sql)
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
             .execute(&db)
             .await
             .expect("apply a shipped migration");
@@ -223,9 +225,9 @@ async fn a_page_is_in_sequence_order_when_the_records_were_written_in_reverse() 
 
     drop(engine);
     db.close().await;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
-    ))
+    )))
     .execute(&admin)
     .await
     .expect("remove the scratch database");

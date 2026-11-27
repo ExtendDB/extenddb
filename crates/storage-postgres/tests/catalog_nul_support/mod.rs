@@ -94,10 +94,11 @@ impl Drop for Guard {
                     .await
                 {
                     for n in &names {
-                        let _ =
-                            sqlx::query(&format!("DROP DATABASE IF EXISTS \"{n}\" WITH (FORCE)"))
-                                .execute(&admin)
-                                .await;
+                        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+                            "DROP DATABASE IF EXISTS \"{n}\" WITH (FORCE)"
+                        )))
+                        .execute(&admin)
+                        .await;
                     }
                     admin.close().await;
                 }
@@ -131,7 +132,7 @@ pub async fn scratch(test: &str, options: Options) -> Option<Scratch> {
     };
     let admin = pool(&format!("{base}/postgres"), 1).await;
     for n in [&catalog_name, &data_name] {
-        sqlx::query(&format!("CREATE DATABASE \"{n}\""))
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{n}\"")))
             .execute(&admin)
             .await
             .expect("create a scratch database");
@@ -253,7 +254,7 @@ pub fn stored_text(name: &str) -> String {
 
 /// The `jsonb::text` of the documents a query returns, one per row.
 pub async fn documents(pool: &PgPool, sql: &str, bind: &str) -> Vec<String> {
-    sqlx::query_scalar(sql)
+    sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
         .bind(bind)
         .fetch_all(pool)
         .await

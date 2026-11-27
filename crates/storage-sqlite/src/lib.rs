@@ -63,7 +63,8 @@ pub(crate) use wasm_sqlx::*;
 #[doc(hidden)]
 pub mod wasm_sqlx_for_tests {
     pub use crate::wasm_sqlx::{
-        Error, Executor, FromRow, Row, SqlitePool, query, query_as, query_scalar, raw_sql, sqlite,
+        AssertSqlSafe, Error, Executor, FromRow, Row, SqlitePool, query, query_as, query_scalar,
+        raw_sql, sqlite,
     };
 
     /// A fresh pool builder from the shim's crate-private
@@ -206,6 +207,8 @@ mod table_engine;
 mod table_helpers;
 mod update_table;
 mod vector_bench;
+#[cfg(all(test, feature = "search-inequality-filters"))]
+mod vector_filter_tests;
 mod vector_search;
 mod warm_throughput;
 mod worker;

@@ -530,10 +530,12 @@ async fn process_batch(
             }
             // Local to this transaction, so the claim itself (SKIP LOCKED,
             // never waits) is unaffected.
-            sqlx::query(&format!("SET LOCAL lock_timeout = '{ROW_LOCK_TIMEOUT}'"))
-                .execute(&mut *tx)
-                .await
-                .map_err(crate::data::index::db_error)?;
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "SET LOCAL lock_timeout = '{ROW_LOCK_TIMEOUT}'"
+            )))
+            .execute(&mut *tx)
+            .await
+            .map_err(crate::data::index::db_error)?;
         }
 
         match apply_claimed_row(

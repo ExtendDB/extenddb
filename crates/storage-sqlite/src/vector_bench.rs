@@ -169,6 +169,7 @@ mod tests {
             top_k: i64::try_from(top_k).expect("top_k fits"),
             hash_key: None,
             filters: &[],
+            item_filter: None,
         };
         let vector_engine = engine.as_vector_search().expect("vector capable");
 

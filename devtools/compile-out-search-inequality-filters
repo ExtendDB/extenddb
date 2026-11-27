@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+"""Remove the search-inequality-filters Cargo feature from every default list.
+
+Each crate that declares the feature has it in its `default` list. The
+storage crates and core are taken with their default features, so no cargo
+command line compiles it out. The workspace takes extenddb-engine and
+extenddb-server with their default features off: the server's feature turns
+on the engine's, the app's turns on the server's, and the browser build's
+crate, extenddb-wasm-adapter, names the feature for the engine, core and the
+SQLite backend itself.
+Removing the feature from every `default` list is how it is compiled out.
+
+This script reads every crates/*/Cargo.toml, refuses to edit any of them
+unless exactly the expected number list the feature in `default`, then
+writes the edits and checks with `cargo tree` that nothing in the workspace
+enables the feature. CI builds, lints and tests the tree it leaves.
+
+With `--check on` it edits nothing and checks the tree as it is: in the
+browser build (`-p extenddb-wasm-adapter`), extenddb-core, extenddb-engine
+and extenddb-storage-sqlite must all carry the feature (`on`) or all lack
+it (`off`). Without `--check`, the script runs that check with `off` after
+its edits.
+
+Usage: devtools/compile-out-search-inequality-filters [--check on|off]
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+FEATURE = "search-inequality-filters"
+CRATES = 7
+BROWSER = "extenddb-wasm-adapter"
+BROWSER_CRATES = ("extenddb-core", "extenddb-engine", "extenddb-storage-sqlite")
+WASM = "wasm32-unknown-unknown"
+
+
+def feature_tree(root: Path, *args: str) -> str:
+    return subprocess.run(
+        ["cargo", "tree", "--locked", "-e", "features", *args],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
+def host_target() -> str:
+    """The host's target triple, for which `cargo tree` resolves by default."""
+    info = subprocess.run(["rustc", "-vV"], check=True, capture_output=True, text=True).stdout
+    return next(line.split(": ", 1)[1] for line in info.splitlines() if line.startswith("host: "))
+
+
+def check_browser(root: Path, want: bool) -> list[str]:
+    """The crates of the browser build whose feature state is not `want`,
+    built for the host or for wasm32, so a dependency that only one of the
+    two targets has is counted."""
+    wrong = []
+    for crate in BROWSER_CRATES:
+        for target in (host_target(), WASM):
+            tree = feature_tree(root, "-p", BROWSER, "--target", target, "-i", crate)
+            if (f'{crate} feature "{FEATURE}"' in tree) != want:
+                wrong.append(f"{crate} ({target})")
+    return wrong
+
+
+def compile_out(root: Path) -> int:
+    default = re.compile(r'^default = \[(.*)\]$', re.MULTILINE)
+    edits = []
+    for manifest in sorted(root.glob("crates/*/Cargo.toml")):
+        text = manifest.read_text()
+        match = default.search(text)
+        if match is None or f'"{FEATURE}"' not in match.group(1):
+            continue
+        kept = [f for f in (e.strip() for e in match.group(1).split(",")) if f and f != f'"{FEATURE}"']
+        edits.append((manifest, text[: match.start()] + f"default = [{', '.join(kept)}]" + text[match.end() :]))
+    names = [str(m.relative_to(root)) for m, _ in edits]
+    if len(edits) != CRATES:
+        print(
+            f"error: expected {CRATES} crates with {FEATURE} in default, found {len(edits)}: {names}; "
+            "no file was edited",
+            file=sys.stderr,
+        )
+        return 1
+    for manifest, text in edits:
+        manifest.write_text(text)
+    tree = feature_tree(root, "--workspace", "--target", "all", "-i", "extenddb-core")
+    if f'feature "{FEATURE}"' in tree:
+        print(f"error: the workspace still enables {FEATURE}:\n{tree}", file=sys.stderr)
+        return 1
+    wrong = check_browser(root, False)
+    if wrong:
+        print(f"error: the browser build still enables {FEATURE} on {wrong}", file=sys.stderr)
+        return 1
+    for name in names:
+        print(f"removed {FEATURE} from the default list of {name}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--check", choices=["on", "off"])
+    args = parser.parse_args()
+    root = Path(__file__).resolve().parent.parent
+    if args.check is None:
+        return compile_out(root)
+    wrong = check_browser(root, args.check == "on")
+    if wrong:
+        state = "lack" if args.check == "on" else "carry"
+        print(
+            f"error: in the browser build ({BROWSER}), {', '.join(wrong)} {state} {FEATURE}, "
+            f"and {', '.join(BROWSER_CRATES)} must all be {args.check}",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"{BROWSER}: {', '.join(BROWSER_CRATES)} all have {FEATURE} {args.check}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

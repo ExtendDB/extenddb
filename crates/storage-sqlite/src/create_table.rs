@@ -378,13 +378,13 @@ impl SqliteEngine {
 
         match &restore {
             Some(RestoreSource::Legacy(registration)) => {
-                sqlx::query(&format!(
+                sqlx::query(sqlx::AssertSqlSafe(format!(
                     "INSERT INTO table_restores \
                      (table_id, source_backup_arn, source_table_arn, restore_date_time, \
                       status, kind, owner_generation, heartbeat_at) \
                      VALUES (?, ?, ?, ?, 'RUNNING', 'legacy', ?, {})",
                     crate::backup_catalog::NOW
-                ))
+                )))
                 .bind(&table_id)
                 .bind(registration.backup_arn)
                 .bind(registration.source_table_arn)
@@ -397,14 +397,14 @@ impl SqliteEngine {
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
             }
             Some(RestoreSource::Manifest(registration)) => {
-                sqlx::query(&format!(
+                sqlx::query(sqlx::AssertSqlSafe(format!(
                     "INSERT INTO table_restores \
                      (table_id, source_backup_arn, source_table_arn, restore_date_time, \
                       status, kind, store_kind, store_root, store_id, spool_host, \
                       owner_generation, heartbeat_at) \
                      VALUES (?, ?, ?, ?, 'RUNNING', 'manifest', ?, ?, ?, ?, ?, {})",
                     crate::backup_catalog::NOW
-                ))
+                )))
                 .bind(&table_id)
                 .bind(&registration.backup.backup_arn)
                 .bind(&registration.source_table_arn)

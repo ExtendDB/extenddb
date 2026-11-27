@@ -91,7 +91,7 @@ impl SqliteEngine {
             )
         };
 
-        sqlx::query(&ddl)
+        sqlx::query(sqlx::AssertSqlSafe(ddl))
             .execute(&mut **tx)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -153,7 +153,7 @@ impl SqliteEngine {
             col_defs.join(",\n    "),
             pk_cols.join(", ")
         );
-        sqlx::query(&ddl)
+        sqlx::query(sqlx::AssertSqlSafe(ddl))
             .execute(&mut **tx)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -162,7 +162,7 @@ impl SqliteEngine {
         // search off the full table when a HASH element is declared.
         let part_idx =
             format!("CREATE INDEX \"_vidx_part_{table_id}_{index_id}\" ON {vec_table} (part)");
-        sqlx::query(&part_idx)
+        sqlx::query(sqlx::AssertSqlSafe(part_idx))
             .execute(&mut **tx)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -188,10 +188,12 @@ impl SqliteEngine {
         index_id: &str,
     ) -> Result<(), StorageError> {
         let vec_table = vector_table_name(table_id, index_id);
-        sqlx::query(&format!("DROP TABLE IF EXISTS {vec_table}"))
-            .execute(pool)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP TABLE IF EXISTS {vec_table}"
+        )))
+        .execute(pool)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
         Ok(())
     }
 
@@ -208,10 +210,12 @@ impl SqliteEngine {
         .map_err(|e| StorageError::Internal(e.to_string()))?;
         for name in names {
             // Names come from sqlite_master, not from user input, and are quoted.
-            sqlx::query(&format!("DROP TABLE IF EXISTS \"{name}\""))
-                .execute(&mut **tx)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP TABLE IF EXISTS \"{name}\""
+            )))
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
         }
         Ok(())
     }
@@ -222,10 +226,12 @@ impl SqliteEngine {
         table_id: &str,
     ) -> Result<(), StorageError> {
         let ddb_table = data_table_name(table_id);
-        sqlx::query(&format!("DROP TABLE IF EXISTS {ddb_table}"))
-            .execute(&mut **tx)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP TABLE IF EXISTS {ddb_table}"
+        )))
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
         // Vector data tables are keyed by index, not by table, so they are not
         // reached by dropping the item table or by the catalog cascade.
         Self::drop_all_vector_data_tables(tx, table_id).await?;
@@ -273,7 +279,7 @@ impl SqliteEngine {
             col_defs.join(",\n    "),
             pk_cols.join(", ")
         );
-        sqlx::query(&ddl)
+        sqlx::query(sqlx::AssertSqlSafe(ddl))
             .execute(&mut **tx)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -291,7 +297,7 @@ impl SqliteEngine {
                 "CREATE INDEX \"idx_order_{index_id}\" ON {idx_table} ({})",
                 order_cols.join(", ")
             );
-            sqlx::query(&order_idx)
+            sqlx::query(sqlx::AssertSqlSafe(order_idx))
                 .execute(&mut **tx)
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -315,7 +321,7 @@ impl SqliteEngine {
                 "CREATE INDEX \"idx_base_key_{index_id}\" ON {idx_table} ({})",
                 base_key_cols.join(", ")
             );
-            sqlx::query(&base_key_idx)
+            sqlx::query(sqlx::AssertSqlSafe(base_key_idx))
                 .execute(&mut **tx)
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -330,10 +336,12 @@ impl SqliteEngine {
         index_id: &str,
     ) -> Result<(), StorageError> {
         let idx_table = index_table_name(index_id);
-        sqlx::query(&format!("DROP TABLE IF EXISTS {idx_table}"))
-            .execute(&mut **tx)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP TABLE IF EXISTS {idx_table}"
+        )))
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| StorageError::Internal(e.to_string()))?;
         Ok(())
     }
 
@@ -424,14 +432,15 @@ impl SqliteEngine {
         &self,
         table_id: &str,
     ) -> Result<Vec<extenddb_core::types::VectorIndexKeyInfo>, StorageError> {
-        let rows: Vec<crate::table_helpers::VectorIndexRow> = sqlx::query_as(&format!(
-            "SELECT {} FROM vector_indexes WHERE table_id = ? ORDER BY index_name",
-            crate::table_helpers::VECTOR_INDEX_COLUMNS
-        ))
-        .bind(table_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let rows: Vec<crate::table_helpers::VectorIndexRow> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT {} FROM vector_indexes WHERE table_id = ? ORDER BY index_name",
+                crate::table_helpers::VECTOR_INDEX_COLUMNS
+            )))
+            .bind(table_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let catalog_rows = rows
             .into_iter()
@@ -622,9 +631,9 @@ mod index_data_table_tests {
     /// propagation issues. `SEARCH` means an index is used, `SCAN` means a full
     /// table scan.
     async fn delete_plan(pool: &SqlitePool, where_clause: &str) -> String {
-        let rows: Vec<(i64, i64, i64, String)> = sqlx::query_as(&format!(
+        let rows: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "EXPLAIN QUERY PLAN DELETE FROM \"_ddb_probe\" WHERE {where_clause}"
-        ))
+        )))
         .fetch_all(pool)
         .await
         .unwrap();

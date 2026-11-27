@@ -106,7 +106,7 @@ async fn primary_key_columns(pool: &SqlitePool, table_id: &str) -> OpResult<Opti
         return Ok(None);
     }
     let mut key_columns: Vec<(i64, String)> = sqlx::query_as::<_, (i64, String, String, i64, Option<String>, i64)>(
-        &format!("PRAGMA table_info(\"_ddb_{table_id}\")"),
+        sqlx::AssertSqlSafe(format!("PRAGMA table_info(\"_ddb_{table_id}\")")),
     )
     .fetch_all(pool)
     .await

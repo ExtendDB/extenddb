@@ -91,7 +91,7 @@ When the management API **or the web console** mutates IAM data, it invalidates 
 | Mutation | Invalidates |
 |----------|-------------|
 | `CreateAccessKey`, `DeleteAccessKey`, `ImportAccessKey` | credential cache for that `access_key_id` |
-| `AssumeRole` | credential cache for the new ASIA*; session_data for `(account, role, session_name)` |
+| `AssumeRole` | credential cache for the new ASIA* (session data is cached under a session's access key, and the new key has signed no request) |
 | `PutUserPolicy`, `DeleteUserPolicy` | user-policies cache for `(account_id, user_name)` |
 | `AddUserToGroup`, `RemoveUserFromGroup` | user-group-policies cache for `(account_id, user_name)` |
 | `PutGroupPolicy`, `DeleteGroupPolicy` | user-group-policies for **every member** of that group (cheap: lookup membership, invalidate each) |
@@ -242,7 +242,7 @@ Caching is layered as **wrapper types** over the existing trait implementations,
                        │     boundaries        → Option<Arc<PolicyDoc>>│
                        │     principal tags    → HashMap<String, String>│
                        │     resource tags     → HashMap<String, String>│
-                       │     session data      → SessionData          │
+                       │     session data      → Option<Arc<CachedSessionData>>│
                        └────────────────┬────────────────────────────┘
                                         │
                                         ▼
@@ -307,9 +307,10 @@ value: HashMap<String, String>
 key:   String                // ARN
 value: HashMap<String, String>
 
-// Role-session data
-key:   (String, String, String) // (account_id, role_name, session_name)
-value: Option<SessionData>      // already a struct, no parsing
+// Role-session data, read by the session's access key; a role can hold
+// several sessions with one session name
+key:   (String, String, String) // (account_id, role_name, access_key_id)
+value: Option<Arc<CachedSessionData>> // parsed session policy, tags as a map, issue time
 
 // TableKeyInfo
 key:   (String, String)      // (account_id, table_name)

@@ -185,7 +185,7 @@ async fn earlier_runner_statement(s: &Scratch, url: &str, seconds: u32) -> (PgPo
         .unwrap();
     let running = pool.clone();
     tokio::spawn(async move {
-        let _ = sqlx::query(&format!("SELECT pg_sleep({seconds})"))
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!("SELECT pg_sleep({seconds})")))
             .execute(&running)
             .await;
     });

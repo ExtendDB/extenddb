@@ -20,6 +20,9 @@ mod projection;
 mod reserved_words;
 mod resolver;
 mod search_condition;
+#[cfg(feature = "search-inequality-filters")]
+pub mod search_filter;
+pub mod search_params;
 #[cfg(test)]
 mod test_timeout;
 mod tokenizer;
@@ -32,7 +35,7 @@ pub use key_condition::{
     KeyClauseOperand, KeyCondition, SortKeyCondition, key_condition_clause_operands,
     parse_key_condition,
 };
-pub use kind::ExpressionKind;
+pub use kind::{ExpressionKind, check_expression_size};
 pub use parser::{parse_condition, parse_condition_with_depth_limit};
 pub use projection::{Projection, parse_projection};
 pub use reserved_words::validate_no_reserved_words;
@@ -43,7 +46,7 @@ pub use resolver::{
 };
 pub use search_condition::{
     MAX_INLINE_FILTER_CONDITIONS, MAX_PARTITION_KEY_CONDITIONS, MAX_SEARCH_CONDITIONS,
-    SearchCondition, validate_conditions_against_search_schema,
+    SearchCondition, search_condition_name_refs, validate_conditions_against_search_schema,
     validate_search_condition_expression,
 };
 pub use tokenizer::{Token, tokenize, tokenize_for, tokenize_with_limit};

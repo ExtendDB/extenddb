@@ -58,7 +58,7 @@ jobs:
         with:
           # Pinned, like the clippy job, so a new stable does not change which
           # lints fire. The crates build with the workspace rust-version
-          # (1.91.1); this is the lint/build toolchain, above that floor.
+          # (1.94.0); this is the lint/build toolchain, above that floor.
           toolchain: 1.97.0
           targets: wasm32-unknown-unknown
           components: clippy

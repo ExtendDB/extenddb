@@ -46,7 +46,32 @@ pub const KNOWN_KEYS: &[(&str, Validator)] = &[
         extenddb_core::settings_keys::VECTOR_ALLOCATION_PHASE_DELAY_MS,
         validate_backfill_batch_delay_ms,
     ),
+    #[cfg(feature = "search-inequality-filters")]
+    (
+        extenddb_core::settings_keys::SEARCH_INEQUALITY_FILTERS,
+        validate_search_inequality_filters,
+    ),
 ];
+
+#[cfg(feature = "search-inequality-filters")]
+fn validate_search_inequality_filters(value: &str) -> Result<(), &'static str> {
+    extenddb_core::expression::search_filter::EnabledAccounts::parse(value).map(|_| ())
+}
+
+/// The value the server uses for `key` when the catalog has no row for it,
+/// for a key the server reads and no storage engine does. `None` for any
+/// other key: a storage engine's default comes from
+/// `extenddb_storage::operations::setting_default`.
+#[must_use]
+pub fn server_setting_default(key: &str) -> Option<String> {
+    #[cfg(feature = "search-inequality-filters")]
+    if key == extenddb_core::settings_keys::SEARCH_INEQUALITY_FILTERS {
+        return Some(extenddb_core::settings_keys::SEARCH_INEQUALITY_FILTERS_DEFAULT.to_owned());
+    }
+    #[cfg(not(feature = "search-inequality-filters"))]
+    let _ = key;
+    None
+}
 
 /// Read-only keys that cannot be changed via the settings API.
 pub const READONLY_KEYS: &[&str] = &[
@@ -188,6 +213,10 @@ pub async fn set_setting(
     // the read path actually consults instead of adding a second, ignored one.
     let key = extenddb_core::settings_keys::canonical_key(key);
     store.set_setting(key, value).await?;
+    #[cfg(feature = "search-inequality-filters")]
+    if key == extenddb_core::settings_keys::SEARCH_INEQUALITY_FILTERS {
+        extenddb_engine::search_filter_settings_changed();
+    }
 
     tracing::warn!(
         target: "extenddb::audit::settings",
@@ -195,3 +224,7 @@ pub async fn set_setting(
     );
     Ok(())
 }
+
+#[cfg(all(test, feature = "search-inequality-filters"))]
+#[path = "ops_settings_search_tests.rs"]
+mod search_tests;
