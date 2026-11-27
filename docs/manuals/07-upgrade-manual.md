@@ -388,6 +388,12 @@ Catalog upgrades change the schema; behavior changes alter how the running serve
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
 
+### IAM: a role session's policy, tags and issue time are read by its access key
+
+**What changed.** A request signed with a role session's credentials is authorized with the session policy, the session tags and the issue time (`aws:TokenIssueTime`) of the session whose access key signed it. Earlier releases read them by account, role and session name. AssumeRole stores a new session for every call, so once a session name had been used more than once, which session's data a request read could depend on row order.
+
+**Who is affected.** A deployment where a role has been assumed more than once under one session name, and a SQLite, PostgreSQL or MongoDB deployment that read a role session's data from the store for a request authenticated just before the session expired: there the read compared the session's expiry again, a moment after authentication had, and on PostgreSQL with the database's clock in place of the server's. No catalog migration or configuration change is required.
+
 ### v1.1.0: SearchVectors serves the extended `SearchConditionExpression` grammar
 
 **What changed.** A `SearchConditionExpression` takes the comparators `<>`, `<`, `<=`, `>` and `>=`, `BETWEEN`, `IN`, `OR`, `NOT`, parentheses, `attribute_exists` and `attribute_not_exists`, and more than one condition on an attribute, up to 50 conditions. DynamoDB accepts this grammar on the accounts and regions measured (us-east-1, eu-north-1, ap-southeast-2), although its API reference documents only `=`. Earlier releases accepted only an AND of equalities, at most 19, and refused the other forms with `ValidationException`. A Number in a condition on an inline filter attribute now compares as the nearest binary64 value of each side, as on DynamoDB, so `9007199254740992` and `9007199254740993` are equal. The equality on a Number HASH attribute still compares exactly, as on DynamoDB: with an item whose HASH attribute and inline filter attribute are both `9007199254740992`, the HASH equality with `9007199254740993` returns no item, and the inline filter equality with `9007199254740993` returns it. Earlier releases compared every Number in the condition exactly.

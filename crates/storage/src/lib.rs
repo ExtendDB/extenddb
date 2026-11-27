@@ -41,6 +41,9 @@ pub mod restore_engine;
 pub mod secret_cipher;
 pub mod secret_keys;
 pub mod server_components;
+#[doc(hidden)]
+#[cfg(feature = "test-util")]
+pub mod session_data_conformance;
 pub mod settings_store;
 pub mod snapshot;
 #[doc(hidden)]

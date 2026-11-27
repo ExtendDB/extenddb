@@ -350,4 +350,22 @@ mod tests {
         assert!(role_tags.is_empty());
         println!("✓ Non-existent resources return empty tags");
     }
+
+    /// Same-name sessions of one role each read their own session data by
+    /// their access key (`extenddb_storage::session_data_conformance`).
+    #[tokio::test]
+    async fn a_session_reads_its_own_data_by_its_access_key() {
+        if crate::helpers::skip_without_cassandra() {
+            return;
+        }
+        let engine = setup_engine().await;
+        let config = test_config();
+        let catalog_store = crate::helpers::create_catalog_store(&engine, &config);
+        extenddb_storage::session_data_conformance::run(
+            &catalog_store,
+            &unique_test_account(),
+            extenddb_storage::session_data_conformance::Expectations::default(),
+        )
+        .await;
+    }
 }

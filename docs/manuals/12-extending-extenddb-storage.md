@@ -237,6 +237,8 @@ Defined in `crates/storage/src/authorization_store.rs`. Policy lookups for autho
 | `get_user_policies` | Get all policies for a user (direct + group-inherited + role) |
 | `get_permissions_boundary` | Get the permissions boundary for a user or role |
 
+`fetch_session_data` reads a role session's policy, tags and issue time by the session's access key ID. `AssumeRole` stores a new session, with a new access key, for every call, so a role can hold several sessions with one session name; the access key is what tells them apart. The read does not leave out an expired session: authentication refuses an expired session's key before authorization reads the session's data. `extenddb_storage::session_data_conformance::run` (feature `test-util`) checks a store against a real database; each backend's test suite runs it.
+
 ### BackupEngine
 
 Defined in `crates/storage/src/lib.rs`. Backup and restore operations:

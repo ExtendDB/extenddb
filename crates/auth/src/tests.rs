@@ -219,7 +219,14 @@ async fn session_key_with_matching_token_authenticates() {
         b"{}",
     );
     let id = provider(true).authenticate(&headers, b"{}").await.unwrap();
-    assert!(matches!(id, AuthIdentity::RoleSession { .. }));
+    // The identity names the session by the key the request was signed with,
+    // which authorization reads the session's data by.
+    match id {
+        AuthIdentity::RoleSession { access_key_id, .. } => {
+            assert_eq!(access_key_id, "ASIAEXTENDDB00000000");
+        }
+        other @ AuthIdentity::User { .. } => panic!("Expected a role session, got: {other:?}"),
+    }
 }
 
 /// Measured 2026-09-16: a presented token that does not resolve has no
