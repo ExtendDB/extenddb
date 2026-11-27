@@ -113,18 +113,21 @@ impl PostgresEngine {
     }
 
     /// Start the `UPDATING` window of each GSI this `UpdateTable` created with
-    /// `WarmThroughput` again, now that its build has run.
+    /// `WarmThroughput` again, as the last step before `UpdateTable` describes
+    /// the table for its response.
     ///
     /// The row is inserted with the window starting at the insert, inside the
-    /// catalog transaction, and the build that follows waits at least
-    /// `GRACE_PUBLISH` (1 s) before it publishes the index, longer than the
-    /// default 0.25 s window. Without this the response, which is described
-    /// after the build, would report the new index's `WarmThroughput` `ACTIVE`
-    /// where the service reports it `UPDATING`.
+    /// catalog transaction. The rest of the request runs before this call,
+    /// including the index's data table, the commit and the spawn of the build
+    /// task. The time it takes does not count against the window
+    /// (`control_plane_delay_seconds`, 0.25 s when unset). The response then
+    /// reports the new index's `WarmThroughput` `UPDATING`, as the service
+    /// does. The build runs in that task, which `UpdateTable` does not wait
+    /// for.
     ///
     /// `created` holds each index's name and the record it was inserted with.
     /// The write is conditional on that record, so a `WarmThroughput` Update
-    /// of the index accepted while the build ran keeps its value.
+    /// of the index accepted after this request's commit keeps its value.
     pub(crate) async fn restart_created_gsi_warm_throughput(
         &self,
         table_id: &str,

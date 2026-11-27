@@ -75,6 +75,15 @@ pub use credential_store::DbCredentialStore;
 pub use data::catalog_check::test_pause::{
     CatalogCheckPause, CatalogCheckPoint, arm_catalog_check_pause,
 };
+/// GSI builds one engine runs at once, so a test can start one more than that.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use data::gsi_build::GSI_BUILD_SLOTS;
+/// Hold a table's GSI builds at their entry or after a number of backfill pages,
+/// so a test can act while a build is under way.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use data::gsi_build::hold_gsi_backfill_for_tests;
 /// Finish GSI builds left `CREATING`, once. The server runs it from a background
 /// worker; exported for its test.
 pub use data::gsi_build::reconcile_creating_gsis;
@@ -334,6 +343,10 @@ pub struct PostgresEngine {
     /// The permits `snapshot_open_slots` was built with, for the refusal
     /// that names the bound.
     pub(crate) snapshot_slot_limit: usize,
+    /// One permit per GSI build that may run at once (`GSI_BUILD_SLOTS` in
+    /// `data::gsi_build`), taken by `UpdateTable`'s build task and by the
+    /// recovery sweep. Shared by clones.
+    pub(crate) gsi_build_slots: Arc<tokio::sync::Semaphore>,
     /// Whether `data_pool` is the catalog pool (no separate data database).
     /// The snapshot open uses one transaction on that layout, and
     /// `DeleteTable` runs its in-use probe and its synchronous drop on the
@@ -493,6 +506,9 @@ impl PostgresEngine {
                 pool_size,
             ))),
             snapshot_slot_limit: snapshot_slot_count(pool_size),
+            gsi_build_slots: Arc::new(tokio::sync::Semaphore::new(
+                data::gsi_build::GSI_BUILD_SLOTS,
+            )),
             shared_data_pool,
             #[cfg(feature = "test-hooks")]
             drop_attempts: Arc::default(),
@@ -538,6 +554,16 @@ impl PostgresEngine {
 
     pub fn start_gsi_workers(mut self) -> Self {
         self.gsi_queue = Some(gsi_queue::GsiQueue::spawn(self.data_pool.clone()));
+        self
+    }
+
+    /// Give this engine `slots` GSI build slots instead of `GSI_BUILD_SLOTS`, so
+    /// a test can make builds wait for one. Call it before any build starts.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_gsi_build_slots_for_tests(mut self, slots: usize) -> Self {
+        self.gsi_build_slots = Arc::new(tokio::sync::Semaphore::new(slots));
         self
     }
 

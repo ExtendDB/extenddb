@@ -10,8 +10,8 @@ use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_credential_types::Credentials;
 use aws_sdk_dynamodb::config::Region;
 use aws_sdk_dynamodb::types::{
-    AttributeDefinition, AttributeValue, BillingMode, GlobalSecondaryIndex, KeySchemaElement,
-    KeyType, Projection, ProjectionType, ScalarAttributeType, TableStatus,
+    AttributeDefinition, AttributeValue, BillingMode, GlobalSecondaryIndex, IndexStatus,
+    KeySchemaElement, KeyType, Projection, ProjectionType, ScalarAttributeType, TableStatus,
 };
 use aws_sdk_dynamodb::Client;
 use aws_smithy_http_client::tls;
@@ -371,6 +371,27 @@ pub async fn wait_for_active(c: &Client, name: &str) {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     panic!("Table {name} did not become ACTIVE within 60s");
+}
+
+/// Poll DescribeTable until the table and its GSI `index` are both ACTIVE (up
+/// to 60s). UpdateTable answers while a GSI it adds is still CREATING, and until
+/// the backfill finishes the index refuses reads and the table refuses another
+/// index change.
+pub async fn wait_for_index_active(c: &Client, table: &str, index: &str) {
+    for _ in 0..300 {
+        if let Ok(resp) = c.describe_table().table_name(table).send().await {
+            if let Some(t) = resp.table() {
+                let index_active = t.global_secondary_indexes().iter().any(|g| {
+                    g.index_name() == Some(index) && g.index_status() == Some(&IndexStatus::Active)
+                });
+                if index_active && t.table_status() == Some(&TableStatus::Active) {
+                    return;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    panic!("Index {index} on {table} did not become ACTIVE within 60s");
 }
 
 /// Poll DescribeTable until the table no longer exists (up to 60s).

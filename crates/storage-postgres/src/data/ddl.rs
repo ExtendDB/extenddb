@@ -566,13 +566,22 @@ impl PostgresEngine {
         index_name: &str,
     ) -> Result<IndexInfo, StorageError> {
         // A GSI still being built is not readable: its table is partial, or not
-        // there yet. The service answers a Query or Scan naming one with "The
-        // table does not have the specified index", the same as for no index at
-        // all, which is what `IndexNotFound` becomes on the wire.
-        let idx_row: Option<(String, String, serde_json::Value, serde_json::Value)> =
+        // there yet. In its backfilling phase the service refuses a Query or
+        // Scan naming one with "Cannot read from backfilling global secondary
+        // index: <name>". Measured 2026-10-30 on six index builds on four
+        // tables: DescribeTable reported `Backfilling` true 16 to 39 s after
+        // UpdateTable. On two tables the first Query and Scan sent after that,
+        // about two minutes after UpdateTable, got the backfilling text. On a
+        // third, Queries 0 and 2 s after `Backfilling` turned true still got
+        // "The table does not have the specified index", the answer before it
+        // turned true, and Queries about 45 s after it got the backfilling
+        // text. This backend has no allocation phase, so every CREATING index
+        // gets the backfilling refusal, which the engine answers with that text
+        // for a Query or Scan and as a missing index for a PartiQL statement.
+        let idx_row: Option<(String, String, String, serde_json::Value, serde_json::Value)> =
             sqlx::query_as(
-                "SELECT index_type, index_id, key_schema, projection FROM indexes \
-             WHERE table_id = $1 AND index_name = $2 AND index_status <> 'CREATING'",
+                "SELECT index_type, index_id, index_status, key_schema, projection \
+             FROM indexes WHERE table_id = $1 AND index_name = $2",
             )
             .bind(table_id)
             .bind(index_name)
@@ -580,8 +589,11 @@ impl PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let (idx_type_str, idx_id, ks_json, proj_json) =
+        let (idx_type_str, idx_id, idx_status, ks_json, proj_json) =
             idx_row.ok_or_else(|| StorageError::IndexNotFound(index_name.to_owned()))?;
+        if idx_status == "CREATING" {
+            return Err(StorageError::IndexBackfilling(index_name.to_owned()));
+        }
 
         let index_type = match idx_type_str.as_str() {
             "GSI" => IndexType::Gsi,

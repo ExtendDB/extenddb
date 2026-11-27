@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use catalog_nul_support::{
     ACCOUNT, Options, Scratch, base_conn, include, key, s_attr, scratch, set, skip, stored_text,
+    wait_active,
 };
 use extenddb_core::expression::ExpressionMaps;
 use extenddb_core::types::{
@@ -235,6 +236,8 @@ async fn a_backfill_and_the_recovery_sweep_read_the_names_from_the_catalog() {
         .update_table(ACCOUNT, input)
         .await
         .expect("UpdateTable adding the GSI");
+    // UpdateTable returns before its build task backfills the index.
+    wait_active(&s.catalog, table).await;
     let by_u1 = index_id(&s, table, "by_u1").await;
     assert_eq!(index_rows(&s, &by_u1).await, expected_rows());
 
@@ -249,9 +252,9 @@ async fn a_backfill_and_the_recovery_sweep_read_the_names_from_the_catalog() {
         .execute(&s.data)
         .await
         .expect("remove the index rows");
-    // The build that ran inside UpdateTable held its ownership lock on a
-    // connection of its own, released when the server notices the
-    // connection closed; until then the sweep skips the index.
+    // The build task that UpdateTable started held its ownership lock on a
+    // connection of its own. The server releases the lock when it notices
+    // the connection closed, and until then the sweep skips the index.
     let mut finished = 0;
     for _ in 0..50 {
         finished = extenddb_storage_postgres::reconcile_creating_gsis(&s.engine)

@@ -283,24 +283,33 @@ pub async fn table_documents(catalog: &PgPool, table: &str) -> String {
     out.join(" ")
 }
 
-/// Wait until the table is `ACTIVE` in the catalog.
+/// Wait until the table and each of its indexes are `ACTIVE` in the catalog.
+///
+/// `UpdateTable` returns while a GSI it adds is still `CREATING`. A task of
+/// its own backfills the index after the call and then flips it to `ACTIVE`.
 pub async fn wait_active(catalog: &PgPool, table: &str) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     loop {
-        let status: Option<String> = sqlx::query_scalar(
-            "SELECT table_status FROM tables WHERE account_id = $1 AND table_name = $2",
+        // The table status, and how many of its indexes are not ACTIVE.
+        let status: Option<(String, i64)> = sqlx::query_as(
+            "SELECT t.table_status, (SELECT count(*) FROM indexes i \
+             WHERE i.table_id = t.table_id AND i.index_status <> 'ACTIVE') \
+             FROM tables t WHERE t.account_id = $1 AND t.table_name = $2",
         )
         .bind(ACCOUNT)
         .bind(table)
         .fetch_optional(catalog)
         .await
-        .expect("read the table status");
-        if status.as_deref() == Some("ACTIVE") {
+        .expect("read the table and index statuses");
+        if status
+            .as_ref()
+            .is_some_and(|(table_status, building)| table_status == "ACTIVE" && *building == 0)
+        {
             return;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "{table} still {status:?} after 90 s"
+            "{table} still {status:?} (table status, indexes not ACTIVE) after 90 s"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

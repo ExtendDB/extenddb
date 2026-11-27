@@ -309,14 +309,9 @@ async fn projected_call_error(
     };
     let schema = match &from.index {
         None => key_info.key_schema,
-        Some(index) => match ctx
-            .storage
-            .index_info_by_table_id(&key_info.table_id, index)
-            .await
-        {
-            Ok(info) => info.key_schema,
-            Err(StorageError::IndexNotFound(_)) => return Ok(message),
-            Err(e) => return Err(storage_err_to_dynamo(e)),
+        Some(index) => match common::statement_index(ctx, &key_info.table_id, index).await? {
+            Some(info) => info.key_schema,
+            None => return Ok(message),
         },
     };
     Ok(match common::ensure_single_attribute_keys(&schema) {
@@ -366,22 +361,17 @@ async fn check_read(
             .iter()
             .any(|v| &v.index_name == index_name);
         if !is_vector {
-            match ctx
-                .storage
-                .index_info_by_table_id(&key_info.table_id, index_name)
-                .await
-            {
-                Ok(info) => {
+            match common::statement_index(ctx, &key_info.table_id, index_name).await? {
+                Some(info) => {
                     if let Err(e) = common::ensure_single_attribute_keys(&info.key_schema) {
                         return untranslated(e);
                     }
                 }
-                Err(StorageError::IndexNotFound(_)) => {
+                None => {
                     return untranslated(DynamoDbError::ValidationException(
                         "The table does not have the specified index".to_owned(),
                     ));
                 }
-                Err(e) => return Err(storage_err_to_dynamo(e)),
             }
         }
         return primary_key_required();

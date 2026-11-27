@@ -20,6 +20,12 @@ pub enum StorageError {
     },
     #[error("Index not found: {0}")]
     IndexNotFound(String),
+    /// A read of a GSI that is `CREATING` and backfilling. Query and Scan
+    /// answer `ValidationException` "Cannot read from backfilling global
+    /// secondary index: <name>"; a PartiQL statement reads it as a missing
+    /// index.
+    #[error("Index is backfilling: {0}")]
+    IndexBackfilling(String),
     #[error("Index already exists: {0}")]
     IndexAlreadyExists(String),
     /// A change refused because an index on the resource is mid-transition.

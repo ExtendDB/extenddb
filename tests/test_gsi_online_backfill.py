@@ -206,9 +206,12 @@ def test_gsi_added_under_concurrent_writes_matches_table(
             # A sort key on an attribute the table had not defined before.
             defs.append({"AttributeName": "r", "AttributeType": "N"})
             schema.append({"AttributeName": "r", "KeyType": "RANGE"})
-        # UpdateTable returns when the build is done. The session client's default
-        # 60 s read timeout and retries would turn a slow build into a retried call
-        # that fails with ResourceInUse, so the control call uses a writer client.
+        # On SQLite, UpdateTable returns when the build is done; on PostgreSQL it
+        # returns with the index CREATING and the build runs after it. For SQLite,
+        # the session client's default 60 s read timeout and retries would turn a
+        # slow build into a retried call that fails with ResourceInUse, so the
+        # control call uses a writer client, and the test waits for the index to
+        # be ACTIVE on every backend.
         _client(endpoint_url).update_table(
             TableName=table,
             AttributeDefinitions=defs,
