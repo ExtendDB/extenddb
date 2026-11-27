@@ -179,13 +179,21 @@ pub fn validate_timestamp(headers: &HeaderMap) -> Result<String, DynamoDbError> 
     })?;
 
     let skew = (now - request_epoch).abs();
-    if skew > MAX_CLOCK_SKEW_SECS {
+    if skew > MAX_CLOCK_SKEW_SECS && !ignore_clock_skew() {
         return Err(DynamoDbError::UnrecognizedClientException(
             "Signature expired: the signature is too old or the request date is too far in the future.".to_owned(),
         ));
     }
 
     Ok(timestamp)
+}
+
+/// Whether `EXTENDDB_DEV_IGNORE_CLOCK_SKEW` disables the skew check
+/// for test suites that freeze or travel time.
+fn ignore_clock_skew() -> bool {
+    cfg!(feature = "dev-mode")
+        && std::env::var("EXTENDDB_DEV_IGNORE_CLOCK_SKEW")
+            .is_ok_and(|v| matches!(v.trim(), "1" | "true"))
 }
 
 /// Extract the timestamp from `X-Amz-Date` header.
