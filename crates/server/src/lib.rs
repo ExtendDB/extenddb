@@ -230,7 +230,15 @@ pub async fn start_server(
         });
         let console_router = console::router().with_state(console_state);
         app = app
-            .nest("/console", console_router)
+            // The Content-Security-Policy layer goes on at the nest, so it
+            // covers every route the console router holds by then.
+            .nest(
+                "/console",
+                console_router.layer(SetResponseHeaderLayer::overriding(
+                    axum::http::header::CONTENT_SECURITY_POLICY,
+                    console::html_policy,
+                )),
+            )
             // Redirect /console/ (trailing slash) to /console so the nested
             // root route matches. Browsers and users naturally add trailing slashes.
             .route(

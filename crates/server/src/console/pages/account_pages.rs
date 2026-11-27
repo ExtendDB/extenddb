@@ -329,7 +329,7 @@ pub async fn account_detail(
     let admin_actions = if is_admin(&session.identity) {
         format!(
             r#"<form class="inline" method="post" action="/console/accounts/{eid}/delete"
-                onsubmit="return confirm('Delete account {eid}?')">
+                data-confirm="Delete account {eid}?">
 <button class="btn btn-danger btn-sm" type="submit">Delete Account</button>
 </form>"#
         )

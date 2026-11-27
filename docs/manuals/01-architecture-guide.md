@@ -263,6 +263,7 @@ TLS is supported via rustls. `extenddb init` generates a self-signed certificate
 - CSRF tokens on all state-changing POST handlers
 - HttpOnly session cookies
 - Security headers: X-Content-Type-Options, X-Frame-Options, Referrer-Policy
+- A Content-Security-Policy on every HTML response under `/console`: no inline script runs
 - Sessions end 8 hours after login, however active they are, when the session cookie also expires
 
 ### Input Validation
@@ -298,11 +299,12 @@ The console reads all data through four of the traits that `CatalogStore` combin
 - Each request reads the principal's password hash from the catalog and ends the session if the principal was deleted or its password changed
 - CSRF tokens on all state-changing POST handlers
 - Security headers: X-Content-Type-Options (nosniff), X-Frame-Options (DENY), Referrer-Policy (strict-origin-when-cross-origin)
+- Content-Security-Policy on every HTML response under `/console` (see the security model manual)
 - Login rate limiting per user and source address, shared with the management API (see the security model manual)
 
 ### Unauthenticated Routes
 
-The documentation browser at `/console/docs` is accessible without login. All other console routes require authentication.
+The login page, the documentation browser at `/console/docs` and the console's two script files under `/console/assets/` are accessible without login. All other console routes require authentication.
 
 ## Configuration
 

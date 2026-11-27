@@ -12,8 +12,8 @@
 //! table names, index names, operations, request counts and latencies of
 //! every account, each row under its `AccountId`.
 //!
-//! HTML and JS content live in `metrics_content` to stay under the 500-line
-//! file limit.
+//! The HTML lives in `metrics_content`, and the script in
+//! `console/assets/metrics.js`.
 
 use std::sync::Arc;
 
@@ -65,19 +65,12 @@ fn render_metrics_page(session: &SessionData, version_info: &str) -> Response {
     let nav = html::nav_bar(&identity_label(&session.identity));
     let breadcrumb = html::breadcrumb(&[("Console", Some("/console")), ("Metrics", None)]);
 
-    // Build the data-ops list for JS to classify control vs data plane.
-    let data_ops_js: String = DATA_OPS
-        .iter()
-        .map(|op| format!("'{op}'"))
-        .collect::<Vec<_>>()
-        .join(",");
-
+    // The script reads the data plane operations from its data-ops
+    // attribute to tell the control plane from the data plane.
     let content = format!(
-        "{breadcrumb}\n{html}\n<script>\n\
-         const DATA_OPS = new Set([{data_ops_js}]);\n\
-         {js}\n</script>",
+        "{breadcrumb}\n{html}\n<script src=\"/console/assets/metrics.js\" data-ops=\"{ops}\"></script>",
         html = metrics_content::METRICS_HTML,
-        js = metrics_content::METRICS_JS,
+        ops = html::escape(&DATA_OPS.join(" ")),
     );
     Html(html::layout_with_version_csrf(
         "Metrics",
