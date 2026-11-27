@@ -1,11 +1,13 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for [`validate_query_start_key_bounds`] (issue #440).
+//! Tests for [`validate_query_start_key_bounds`] (issue #440), and for the
+//! start key schema checks of an index Scan and Query.
 
 use std::collections::HashMap;
 
 use extenddb_core::expression::CompareOp;
+use extenddb_core::types::{IndexType, Projection, ProjectionType, TableKeyInfo};
 
 use super::*;
 
@@ -319,4 +321,136 @@ fn every_attribute_of_a_multi_attribute_partition_is_compared() {
         check_with(&second_differs, &kc, &m, shape).as_deref(),
         Some(OUTSIDE)
     );
+}
+
+// --- Start key schema checks of an index read (measured) ---
+
+#[derive(Clone, Copy, Debug)]
+enum Read {
+    Scan,
+    Query,
+}
+
+/// A change to an index read's start key, which starts with every key set
+/// to the string `a`.
+#[derive(Clone, Copy)]
+enum Edit {
+    /// The attribute is sent as this type: `S` or `SS`.
+    Set(&'static str, &'static str),
+    /// The key is left out.
+    Omit(&'static str),
+}
+
+/// What `DynamoDB` answers.
+#[derive(Clone, Copy)]
+enum Answer {
+    Accepted,
+    /// `The provided starting key is invalid`.
+    Invalid,
+    /// The index key type sentence, which names this key and this sent type.
+    Names(&'static str, &'static str),
+}
+
+/// The measured table, every key a string.
+fn measured_table() -> (TableKeyInfo, IndexInfo, IndexInfo) {
+    let table = TableKeyInfo {
+        key_schema: schema("pk", Some("sk")),
+        attribute_definitions: ["pk", "sk", "lsi1sk", "lsi2sk"]
+            .map(|name| AttributeDefinition {
+                attribute_name: name.to_owned(),
+                attribute_type: ScalarAttributeType::S,
+            })
+            .to_vec(),
+        ..TableKeyInfo::default()
+    };
+    let index = |name: &str, index_type, key_schema| IndexInfo {
+        index_name: name.to_owned(),
+        index_id: name.to_owned(),
+        index_type,
+        key_schema,
+        projection: Projection {
+            projection_type: ProjectionType::All,
+            non_key_attributes: None,
+        },
+    };
+    let lsi1 = index("lsi1", IndexType::Lsi, schema("pk", Some("lsi1sk")));
+    let gsi2 = index("gsi2", IndexType::Gsi, schema("lsi1sk", Some("lsi2sk")));
+    (table, lsi1, gsi2)
+}
+
+fn sent_as(type_tag: &str) -> AttributeValue {
+    match type_tag {
+        "S" => s("a"),
+        "SS" => AttributeValue::SS(["a".to_owned()].into()),
+        other => panic!("no value for type {other}"),
+    }
+}
+
+/// The rows first measured on 2026-11-14 and 2026-11-16, and the answers
+/// measured on 2026-11-19, plus a start key with every key of its type.
+#[test]
+fn index_start_key_faults_answer_as_dynamodb_does() {
+    use Answer::{Accepted, Invalid, Names};
+    use Edit::{Omit, Set};
+    use Read::{Query, Scan};
+    let (table, lsi1, gsi2) = measured_table();
+    let (lsi1, gsi2) = (&lsi1, &gsi2);
+    let rows: &[(Read, &IndexInfo, &[Edit], Answer)] = &[
+        // The rows first measured on 2026-11-14 and 2026-11-16.
+        (Scan, gsi2, &[Set("lsi2sk", "SS")], Names("lsi2sk", "SS")),
+        (Scan, lsi1, &[Set("lsi1sk", "SS")], Names("lsi1sk", "SS")),
+        (Query, gsi2, &[Set("lsi2sk", "SS")], Invalid),
+        (Query, lsi1, &[Set("lsi1sk", "SS")], Invalid),
+        // A key left out and an attribute beside every key.
+        (Scan, gsi2, &[Omit("lsi2sk")], Invalid),
+        (Scan, gsi2, &[Set("extra", "S")], Invalid),
+        // Measured on 2026-11-19: a table key, and a key of the wrong type
+        // beside a key left out or an extra attribute.
+        (Scan, gsi2, &[Set("sk", "SS")], Names("sk", "SS")),
+        (
+            Scan,
+            gsi2,
+            &[Set("lsi2sk", "SS"), Omit("sk")],
+            Names("lsi2sk", "SS"),
+        ),
+        (
+            Scan,
+            gsi2,
+            &[Set("lsi2sk", "SS"), Set("x", "S")],
+            Names("lsi2sk", "SS"),
+        ),
+        // Every key of its declared type.
+        (Scan, gsi2, &[], Accepted),
+    ];
+    for &(read, index, edits, answer) in rows {
+        let mut key: Item = combined_lek_key_schema(&table.key_schema, Some(index))
+            .into_iter()
+            .map(|k| (k.attribute_name, s("a")))
+            .collect();
+        for edit in edits {
+            match *edit {
+                Set(name, type_tag) => {
+                    key.insert(name.to_owned(), sent_as(type_tag));
+                }
+                Omit(name) => {
+                    key.remove(name);
+                }
+            }
+        }
+        let expected = match answer {
+            Accepted => None,
+            Invalid => Some("The provided starting key is invalid".to_owned()),
+            Names(name, sent) => Some(format!(
+                "One or more parameter values were invalid: Type mismatch for Index Key {name} \
+                 Expected: S Actual: {sent} IndexName: {}",
+                index.index_name
+            )),
+        };
+        let result = match read {
+            Scan => validate_scan_exclusive_start_key(&key, &table, Some(index)),
+            Query => validate_query_exclusive_start_key(&key, &table, Some(index)),
+        };
+        let row = format!("{read:?} {} with {key:?}", index.index_name);
+        assert_eq!(message(result), expected, "{row}");
+    }
 }
