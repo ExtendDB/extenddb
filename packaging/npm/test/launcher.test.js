@@ -493,6 +493,7 @@ async function main() {
     process.on("warning", onWarning);
     const fake = fakeBinary({ stdout: versionOutput(LAUNCHER_VERSION) });
     const values = [2500.5, "20000", Infinity, 2 ** 32];
+    const exitListeners = process.listenerCount("exit");
     for (const startupTimeoutMs of values) {
       const label = typeof startupTimeoutMs === "string" ? `"${startupTimeoutMs}"` : startupTimeoutMs;
       const eb = await start({ binary: fake.file, memory: true, startupTimeoutMs }).catch((err) => {
@@ -505,6 +506,8 @@ async function main() {
     await new Promise((r) => setImmediate(r));
     process.off("warning", onWarning);
     assert.deepStrictEqual(warnings.filter((name) => name.startsWith("Timeout")), []);
+    // The exit listener that start() added goes away when the server exits.
+    assert.strictEqual(process.listenerCount("exit"), exitListeners);
     assert.deepStrictEqual(
       fake.invocations().map((r) => r.args[0]),
       values.flatMap(() => ["version", "serve"])
@@ -523,6 +526,7 @@ async function main() {
       versionDelayMs: 1000,
       serveDelayMs: 1500,
     });
+    const exitListeners = process.listenerCount("exit");
     const began = Date.now();
     await assert.rejects(
       () => start({ binary: fake.file, memory: true, startupTimeoutMs: 2000 }),
@@ -530,10 +534,10 @@ async function main() {
     );
     const took = Date.now() - began;
     assert.ok(took < 2900, `start() took ${took}ms with startupTimeoutMs 2000`);
-    // start() does not stop a server that misses the deadline, so stop the
-    // fake here.
+    // start() stops a server that misses the deadline before it rejects.
     const serve = fake.invocations().find((r) => r.args[0] === "serve");
-    process.kill(serve.pid, "SIGKILL");
+    assert.throws(() => process.kill(serve.pid, 0), { code: "ESRCH" });
+    assert.strictEqual(process.listenerCount("exit"), exitListeners);
   }
 
   // 11. The launcher skips a "binary" option or EXTENDDB_BINARY that names
