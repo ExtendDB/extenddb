@@ -29,6 +29,7 @@ time = { workspace = true }
 web-time = { workspace = true }
 tracing = { workspace = true }
 zeroize = { workspace = true }
+urlencoding = { workspace = true }
 
 [dev-dependencies]
 extenddb-cache = { path = "../cache", features = ["test-util"] }

@@ -20,7 +20,9 @@ use http::HeaderMap;
 /// HashedPayload
 /// ```
 ///
-/// For `DynamoDB`, the URI is always `/` and there is no query string.
+/// `uri_path` and `query_string` are the request's path and query string as
+/// its request line carries them; the canonical request holds their
+/// canonical forms (`canonical_uri`, `canonical_query_string`).
 pub fn canonical_request(
     method: &str,
     uri_path: &str,
@@ -42,10 +44,52 @@ pub fn canonical_request(
     // UNSIGNED-PAYLOAD in place of the hash fails as a plain signature
     // mismatch, which is what the service returns.
     let payload_hash = sha256_hex(body);
+    let uri_path = canonical_uri(uri_path);
+    let query_string = canonical_query_string(query_string);
 
     format!(
         "{method}\n{uri_path}\n{query_string}\n{canonical_headers}\n{signed_lower}\n{payload_hash}"
     )
+}
+
+/// The canonical URI of `path`: its empty, `.` and `..` segments removed and
+/// each segment URI-encoded again (`%` becomes `%25`), the SigV4 rule for a
+/// service other than Amazon S3. A path that ends in a slash keeps it.
+fn canonical_uri(path: &str) -> String {
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            segment => segments.push(segment),
+        }
+    }
+    let encoded: Vec<_> = segments.iter().map(|s| urlencoding::encode(s)).collect();
+    let slash = !segments.is_empty() && ["/", "/.", "/.."].iter().any(|end| path.ends_with(end));
+    format!("/{}{}", encoded.join("/"), if slash { "/" } else { "" })
+}
+
+/// The canonical query string of `query`: each name and value decoded, with
+/// `+` read as a space, and URI-encoded again, a name without `=` given an
+/// empty value, and the pairs sorted by name, then value.
+fn canonical_query_string(query: &str) -> String {
+    let encode = |part: &str| {
+        let spaced = part.replace('+', " ");
+        urlencoding::encode_binary(&urlencoding::decode_binary(spaced.as_bytes())).into_owned()
+    };
+    let mut pairs: Vec<(String, String)> = query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (encode(name), encode(value))
+        })
+        .collect();
+    pairs.sort_unstable();
+    let pairs: Vec<String> = pairs.iter().map(|(n, v)| format!("{n}={v}")).collect();
+    pairs.join("&")
 }
 
 /// Build the string-to-sign for `SigV4`.

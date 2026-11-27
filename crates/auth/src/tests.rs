@@ -173,6 +173,13 @@ pub(super) fn provider_over(store: MockCredentialStore) -> BuiltinAuthProvider {
     ))
 }
 
+/// The requests here are signed for `/` with no query string.
+impl BuiltinAuthProvider {
+    async fn authenticate(&self, h: &HeaderMap, b: &[u8]) -> Result<AuthIdentity, DynamoDbError> {
+        AuthProvider::authenticate(self, "/", "", h, b).await
+    }
+}
+
 #[tokio::test]
 async fn correctly_signed_long_term_key_authenticates() {
     let headers = signed_headers("AKIAEXTENDDB00000000", "us-east-1", None, b"{}");

@@ -595,7 +595,7 @@ mod tests {
     async fn a_refusing_server_answers_service_unavailable_on_every_route() {
         let admission = Admission::default();
         let app = Router::new()
-            .route("/", get(|| async { "served" }))
+            .fallback(|| async { "served" })
             .route("/health", get(|| async { "healthy" }))
             .layer(axum::middleware::from_fn_with_state(
                 admission.clone(),
@@ -605,7 +605,7 @@ mod tests {
         let served = app.clone().oneshot(get("/")).await.unwrap();
         assert_eq!(served.status(), StatusCode::OK);
         admission.refuse();
-        for path in ["/", "/health"] {
+        for path in ["/", "/ping", "/other/path", "/health"] {
             let refused = app.clone().oneshot(get(path)).await.unwrap();
             assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
             assert_eq!(

@@ -35,6 +35,7 @@ mod response;
 mod serve;
 mod table_name_gate;
 mod throttle_helpers;
+mod wire_routes;
 mod workers;
 
 pub use serve::{
@@ -50,7 +51,7 @@ use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect};
-use axum::routing::{get, post};
+use axum::routing::get;
 use extenddb_auth::{AuthCacheRegistry, AuthProvider};
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::metrics::MetricsCollector;
@@ -132,6 +133,9 @@ pub struct ServerTlsConfig {
 /// the sum of the shutdown bounds.
 pub const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// SP-WIRE-007: DynamoDB request body limit is 16 MB.
+pub(crate) const DYNAMODB_BODY_LIMIT: usize = 16 * 1024 * 1024;
+
 /// Build and start the HTTP server on a pre-bound listener.
 ///
 /// The caller is responsible for binding the `TcpListener` before passing it in.
@@ -151,9 +155,6 @@ pub async fn start_server(
     pid_file: Option<PathBuf>,
     tls: Option<ServerTlsConfig>,
 ) -> Result<(), anyhow::Error> {
-    // SP-WIRE-007: DynamoDB request body limit is 16 MB.
-    const DYNAMODB_BODY_LIMIT: usize = 16 * 1024 * 1024;
-
     let tls_enabled = state.tls_enabled;
     let request_timeout = state.request_timeout;
     let catalog_store = state.catalog_store.clone();
@@ -190,7 +191,10 @@ pub async fn start_server(
         ));
 
     let mut app = Router::new()
-        .route("/", post(handler::handle_request))
+        // The API at any path, the health text and the 404 page: every
+        // request no route below takes. Set before the body limit, so a POST
+        // at any path gets the 16 MiB limit.
+        .fallback(wire_routes::fallback)
         .layer(DefaultBodyLimit::max(DYNAMODB_BODY_LIMIT))
         .route("/health", get(health_check))
         // REQ-OBS-005: Prometheus-compatible metrics endpoint. Requires admin

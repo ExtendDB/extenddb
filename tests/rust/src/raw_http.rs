@@ -102,14 +102,14 @@ async fn unknown_operation() {
 }
 
 #[tokio::test]
-async fn get_method_not_allowed() {
-    // Real DynamoDB returns 200 for GET (health check); extenddb returns 405.
-    if is_real_dynamodb() {
-        return;
-    }
+async fn get_of_root_answers_the_health_text() {
+    // DynamoDB answers GET / with 200 and a text/plain health line, and so
+    // does ExtendDB (measured 2026-11-14).
     let c = http_client();
     let resp = c.get(endpoint()).send().await.unwrap();
-    assert_eq!(resp.status().as_u16(), 405);
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = resp.text().await.unwrap_or_default();
+    assert!(body.starts_with("healthy: dynamodb."), "body: {body}");
 }
 
 #[tokio::test]
