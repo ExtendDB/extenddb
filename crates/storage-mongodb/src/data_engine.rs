@@ -492,7 +492,24 @@ impl MongoEngine {
         // single-document atomicity instead. Two concurrent writes
         // serialize at the storage engine level; one wins the last-
         // writer-wins race and the other's version is overwritten.
-        // No txn, no retry loop, no possible 500 from contention.
+        //
+        // The one exception is two puts that both create the item: each
+        // finds no document and each inserts, and the second insert fails
+        // with a duplicate-key error. The collection has two unique
+        // indexes: `_id_`, and one on the key fields (`pk`, plus the sort
+        // key field on a table with a sort key). MongoDB retries such an
+        // upsert itself only when the filter is an equality on the fields
+        // of the index that raised the error. This filter names `pk` and,
+        // on a table with a sort key, the sort key field, so the server
+        // would retry a collision on the key-field index. Every
+        // duplicate-key error measured on MongoDB 7.0 names `_id_`, which
+        // the filter does not name, so the server does not retry it and
+        // this loop does. The error means another put's item is already in
+        // the collection, so the next attempt finds that item, replaces it
+        // and returns it as the old image; if a delete removed that item
+        // first, the next attempt inserts. Attempts share the transient
+        // retry budget and back off between them, as the transaction path
+        // below does.
         if condition.is_none()
             && stream.is_none()
             && self.gsi_cache_get_fresh(&key_info.table_id) == Some(false)
@@ -503,13 +520,23 @@ impl MongoEngine {
                 .upsert(true)
                 .return_document(ReturnDocument::Before)
                 .build();
-            let old_doc = coll
-                .find_one_and_replace(key_filter, new_doc)
-                .with_options(opts)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let old_item = old_doc.as_ref().map(document_to_item).transpose()?;
-            return Ok(if return_old { old_item } else { None });
+            for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+                match coll
+                    .find_one_and_replace(key_filter.clone(), &new_doc)
+                    .with_options(opts.clone())
+                    .await
+                {
+                    Ok(old_doc) => {
+                        let old_item = old_doc.as_ref().map(document_to_item).transpose()?;
+                        return Ok(if return_old { old_item } else { None });
+                    }
+                    Err(e) if is_duplicate_key(&e) => {
+                        backoff_sleep(attempt).await;
+                    }
+                    Err(e) => return Err(StorageError::Internal(e.to_string())),
+                }
+            }
+            return Err(create_race_exhausted(TRANSIENT_RETRY_ATTEMPTS));
         }
 
         let mut session = self
@@ -519,9 +546,18 @@ impl MongoEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let tx_options = self.write_transaction_options();
+        let mut lost_create_races = 0;
+        let contention_started = contention_clock_start();
 
         let mut last_cause = String::new();
-        for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+        for attempt in 0..CONTENTION_RETRY_ATTEMPTS {
+            if contention_deadline_passed(attempt, contention_started, self.contention_deadline) {
+                return Err(crate::write_conflict::contention_deadline_exhausted(
+                    "PutItem",
+                    self.contention_deadline,
+                    &last_cause,
+                ));
+            }
             let new_doc =
                 item_to_document(&item, &key_info.key_schema, &key_info.attribute_definitions)?;
             // Capture before the transaction's first database operation. If
@@ -535,6 +571,9 @@ impl MongoEngine {
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
 
+            // Set when the unconditional upsert below hit a duplicate key on
+            // `_id`.
+            let mut lost_create_race = false;
             let attempt_res: Result<Option<Item>, TxErr> = async {
                 let old_item: Option<Item>;
 
@@ -601,12 +640,35 @@ impl MongoEngine {
                         .upsert(true)
                         .return_document(ReturnDocument::Before)
                         .build();
-                    let old_doc = coll
+                    // A put that loses the create race to another put does
+                    // not reach the duplicate-key arm here. Inside a
+                    // snapshot transaction MongoDB 7.0 reports that
+                    // collision as WriteConflict (code 112,
+                    // `WiredTigerIdIndex::_insert: index: _id_`) with the
+                    // TransientTransactionError label, whether the other
+                    // put is still open or committed after this
+                    // transaction's snapshot, and `TxErr::from` retries it.
+                    // The arm is a defence: a duplicate-key error here means
+                    // a document in this transaction's snapshot holds the
+                    // item's `_id` without matching the key filter. It runs
+                    // the transaction again with the backoff of a write
+                    // conflict and counts the attempt against
+                    // `TRANSIENT_RETRY_ATTEMPTS`, and the put gives up with
+                    // the create race error once that many attempts have met
+                    // such a document.
+                    let old_doc = match coll
                         .find_one_and_replace(key_filter.clone(), new_doc)
                         .with_options(opts)
                         .session(&mut session)
                         .await
-                        .map_err(TxErr::from)?;
+                    {
+                        Ok(old_doc) => old_doc,
+                        Err(e) if is_duplicate_key(&e) => {
+                            lost_create_race = true;
+                            return Err(TxErr::Transient(e.to_string()));
+                        }
+                        Err(e) => return Err(TxErr::from(e)),
+                    };
                     old_item = old_doc.as_ref().map(document_to_item).transpose()?;
                 }
 
@@ -646,6 +708,18 @@ impl MongoEngine {
                 Err(TxErr::Transient(cause)) => {
                     last_cause = crate::write_conflict::retrying("PutItem", attempt, cause);
                     let _ = session.abort_transaction().await;
+                    if lost_create_race {
+                        lost_create_races += 1;
+                        // A duplicate key on `_id` counts against the create
+                        // race budget: a put that has met a document holding
+                        // the item's `_id` this many times is not waiting out
+                        // contention on an item, so it gives up here with the
+                        // create race error rather than spending the
+                        // contention budget.
+                        if lost_create_races >= TRANSIENT_RETRY_ATTEMPTS {
+                            return Err(create_race_exhausted(lost_create_races));
+                        }
+                    }
                     backoff_sleep(attempt).await;
                     continue;
                 }
@@ -659,7 +733,7 @@ impl MongoEngine {
         // Retry ceiling exhausted: see `write_conflict::retry_budget_exhausted`.
         Err(crate::write_conflict::retry_budget_exhausted(
             "PutItem",
-            TRANSIENT_RETRY_ATTEMPTS,
+            CONTENTION_RETRY_ATTEMPTS,
             &last_cause,
         ))
     }
@@ -732,9 +806,17 @@ impl MongoEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let tx_options = self.write_transaction_options();
+        let contention_started = contention_clock_start();
 
         let mut last_cause = String::new();
-        for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+        for attempt in 0..CONTENTION_RETRY_ATTEMPTS {
+            if contention_deadline_passed(attempt, contention_started, self.contention_deadline) {
+                return Err(crate::write_conflict::contention_deadline_exhausted(
+                    "DeleteItem",
+                    self.contention_deadline,
+                    &last_cause,
+                ));
+            }
             // Capture before the transaction's first database operation so a
             // concurrent catalog mutation cannot be hidden by the snapshot.
             let cache_generation = self.gsi_cache_generation(&key_info.table_id);
@@ -836,7 +918,7 @@ impl MongoEngine {
 
         Err(crate::write_conflict::retry_budget_exhausted(
             "DeleteItem",
-            TRANSIENT_RETRY_ATTEMPTS,
+            CONTENTION_RETRY_ATTEMPTS,
             &last_cause,
         ))
     }
@@ -989,9 +1071,17 @@ impl MongoEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let tx_options = self.write_transaction_options();
+        let contention_started = contention_clock_start();
 
         let mut last_cause = String::new();
-        for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+        for attempt in 0..CONTENTION_RETRY_ATTEMPTS {
+            if contention_deadline_passed(attempt, contention_started, self.contention_deadline) {
+                return Err(crate::write_conflict::contention_deadline_exhausted(
+                    "UpdateItem",
+                    self.contention_deadline,
+                    &last_cause,
+                ));
+            }
             // Capture before the transaction's first database operation. A
             // later UpdateTable must invalidate this observation rather than
             // allowing a stale no-index result to be published.
@@ -1205,7 +1295,7 @@ impl MongoEngine {
         // the same contention on the same item.
         Err(crate::write_conflict::retry_budget_exhausted(
             "UpdateItem",
-            TRANSIENT_RETRY_ATTEMPTS,
+            CONTENTION_RETRY_ATTEMPTS,
             &last_cause,
         ))
     }
@@ -2379,8 +2469,22 @@ impl MongoEngine {
             )
         });
 
+        let contention_started = contention_clock_start();
+
         let mut last_cause = String::new();
-        for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+        // The attempts the loop ran: every one, unless the deadline ended it.
+        let mut attempts_run = CONTENTION_RETRY_ATTEMPTS;
+        for attempt in 0..CONTENTION_RETRY_ATTEMPTS {
+            // A transaction that reaches the deadline stops retrying and
+            // falls through to the give-up after the loop, which answers
+            // `TransactionCanceledException` with a `TransactionConflict`
+            // reason per item: the error the service answers for a
+            // transaction that loses to contention. Only the single-item
+            // writes answer the deadline with HTTP 503.
+            if contention_deadline_passed(attempt, contention_started, self.contention_deadline) {
+                attempts_run = attempt;
+                break;
+            }
             let idempotency = idem_owned.as_ref().map(|(a, t, f)| IdempotencyKey {
                 account_id: a.as_str(),
                 token: t.as_str(),
@@ -2578,7 +2682,7 @@ impl MongoEngine {
         // TransactionCanceled to TransactionCanceledException; the
         // reason codes are echoed back in the message.
         tracing::warn!(
-            attempts = TRANSIENT_RETRY_ATTEMPTS,
+            attempts = attempts_run,
             error = %last_cause,
             "TransactWriteItems: could not commit; answering TransactionCanceled"
         );
@@ -3484,7 +3588,11 @@ impl MongoEngine {
             )
             .build();
 
-        for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+        // No contention deadline here. This loop runs inside the background
+        // GSI backfill job in `ttl_worker.rs`, not inside a request: no
+        // caller is waiting for a reply, and giving up on the clock would
+        // leave the index CREATING with its cursor where it stopped.
+        for attempt in 0..CONTENTION_RETRY_ATTEMPTS {
             session
                 .start_transaction()
                 .with_options(tx_options.clone())
@@ -3757,12 +3865,90 @@ pub(crate) struct GsiBackfillProgress {
 
 // ── Contention / retry helpers ──────────────────────────────────────────
 
-/// Maximum number of times to retry a write that MongoDB aborted as a
-/// transient conflict. Small enough that we don't lock a partition on
-/// sustained hot-key contention; large enough to absorb ordinary
-/// snapshot-isolation aborts. Matches the OCC retry ceiling elsewhere
-/// in this file.
+/// Maximum number of attempts of the backup and restore transactions, the
+/// in-place retry of `commitTransaction`, and the create-race give-up of an
+/// unconditional `PutItem` and of `UpdateItem`'s native upsert. The create
+/// race was measured with this backoff: a put blocked by a document that
+/// another writer removes 100 ms later commits well inside 50 attempts. With a
+/// cap of 5 the storage tests fail.
 pub(crate) const TRANSIENT_RETRY_ATTEMPTS: u32 = 50;
+
+/// Maximum number of times a contention retry loop re-runs a transaction that
+/// `MongoDB` aborted as a transient conflict.
+///
+/// `MongoDB` aborts the loser of a same-document conflict at once instead of
+/// queueing it, so a hot key is settled by retries with backoff: of N
+/// writers on one key, one commits per round and the rest start over. The
+/// backoff is random, so a writer can lose many rounds in a row, and the
+/// chance of losing every attempt falls off exponentially with the budget.
+/// Measured with 32 clients putting one key of a table with a GSI (2,016
+/// puts per run, `MongoDB` 7.0 on one 16-core host): 50 attempts left 15 to
+/// 25 percent of the puts without a commit; 400 left none in four runs at a
+/// load average of 15 and one put in 2,016 at a load average of 30, and 20
+/// of 1,984 with 64 clients. `backoff_sleep` draws each sleep uniformly from
+/// 0 to 12.8 ms once the base is capped, so 1,000 attempts sleep about 6.4 s
+/// in total on average and 12.8 s at worst, plus the attempts' own round
+/// trips, before the write gives up. Against a transaction another session
+/// holds open, where an attempt waits out `MongoDB`'s lock timeout, a put that
+/// loses all 1,000 attempts returned in 9.5 to 12.7 s over six runs on a
+/// shared host, under the SDKs' request timeouts.
+///
+/// This budget sizes the contention retry loops only: the put, delete,
+/// update, transact and GSI backfill loops and the transaction of the key
+/// repair pass, which re-run their transaction body after a conflict. The
+/// other retry loops read [`TRANSIENT_RETRY_ATTEMPTS`], because the
+/// measurements that set this one say nothing about them.
+const CONTENTION_RETRY_ATTEMPTS: u32 = 1000;
+
+/// Wall-clock deadline for the contention retry loop of one request.
+///
+/// The attempt budget bounds the number of attempts, not the time a caller
+/// waits: under many writers on one key the attempts queue behind each other,
+/// and the budget alone let a request outlive every SDK's default read
+/// timeout. The deadline is read before an attempt starts, so a request
+/// answers within the deadline plus the attempt already running. That attempt
+/// has no bound of its own: it waits for a connection from the pool
+/// (`pool_size`, 50 by default) and for the commit's own retries, which can
+/// take a couple of seconds.
+///
+/// 10 s sits above the time a put spends losing all 1,000 attempts against a
+/// document another transaction holds and below botocore's 60 s default read
+/// timeout, so a caller gets an answer to retry rather than a socket timeout.
+/// Which bound a write reaches first depends on the host's load. The caller
+/// gets the same error class on either bound: HTTP 503 for the single-item
+/// writes (see `write_conflict::retry_budget_exhausted` and
+/// `write_conflict::contention_deadline_exhausted`) and
+/// `TransactionCanceledException` for `TransactWriteItems`.
+///
+/// It governs the put, delete, update and transact loops. A loop measures the
+/// deadline from the start of its request (see `contention_clock_start`): the
+/// write requests of one `BatchWriteItem` share one deadline, and the handler
+/// returns a request that reaches it in `UnprocessedItems` when another
+/// request of the batch applied, and answers 503 when none did. The
+/// statements of one `BatchExecuteStatement` share one deadline too. The TTL
+/// worker's conditional delete runs the delete loop outside any request, so an
+/// expired item that stays contended holds the sweep until the deadline or the
+/// attempt budget ends that loop, where 50 attempts ended it before the budget
+/// was raised; the worker then logs the failure and moves to the next item.
+/// The GSI backfill loop shares the attempt budget and takes no deadline: it
+/// runs in the background worker in `ttl_worker.rs`, where no caller is
+/// waiting for a reply and giving up leaves the index CREATING.
+///
+/// The longer retry costs CPU on the `MongoDB` server: the losers of a hot key
+/// retry with a backoff capped at 12.8 ms for up to the deadline, so the
+/// server stays busy committing and aborting transactions on that key for as
+/// long as the contention lasts. The measurements behind the value (how long
+/// the 1,000 attempts take, the 256-writer runs with and without the deadline,
+/// and the CPU cost) are in the write conflict handling section of
+/// `docs/rfcs/0000-mongodb-backend.md`.
+///
+/// The engine carries the deadline in
+/// [`MongoEngine::contention_deadline`](crate::MongoEngine) so that a test can
+/// set it: a deadline shorter than the attempt budget's run time reaches the
+/// deadline first, a longer one reaches the attempt budget first, and neither
+/// test has to race 1,000 attempts against a wall clock. Every production
+/// construction uses this value.
+pub(crate) const CONTENTION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Return type of `try_build_native_update`. Distinguishes an
 /// operator-document update (`{$set, $unset, $inc}`) from an
@@ -3886,17 +4072,65 @@ pub(crate) enum CommitOutcome {
     RerunBody(String),
 }
 
-/// Detect a duplicate-key error (E11000, code 11000). Used at
-/// conditional-insert sites — a duplicate is the manifestation of a
-/// conditional-put race, so it must be surfaced as
-/// `ConditionalCheckFailedException` rather than a 500.
+/// Detect a duplicate-key error (E11000, code 11000).
+///
+/// The driver reports it in two forms: `insert_one` returns it as a write
+/// error, and `findAndModify` (`find_one_and_replace` with upsert) returns
+/// it as a command error. At conditional-insert sites a duplicate is the
+/// manifestation of a conditional-put race, so it must be surfaced as
+/// `ConditionalCheckFailedException` rather than a 500. At unconditional
+/// upsert sites it means another put created the item first, and the put
+/// is retried so that it replaces that item.
 pub(crate) fn is_duplicate_key(e: &mongodb::error::Error) -> bool {
-    matches!(
-        *e.kind,
-        mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(
-            mongodb::error::WriteError { code: 11000, .. }
-        ))
-    )
+    matches!(*e.kind, mongodb::error::ErrorKind::Command(ref c) if c.code == 11000)
+        || matches!(
+            *e.kind,
+            mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(
+                mongodb::error::WriteError { code: 11000, .. }
+            ))
+        )
+}
+
+/// The error when every attempt of an unconditional `PutItem` lost the create
+/// race: on the sessionless path, each attempt found no item, and its insert
+/// hit an item another writer created, which was deleted again before the
+/// next attempt read it; on the transaction path, `TRANSIENT_RETRY_ATTEMPTS`
+/// attempts met a document that holds the item's `_id` without matching the
+/// key filter.
+/// `attempt` is the number of attempts made. The message is the internal
+/// error (HTTP 500) the `PostgreSQL` backend returns when its own retries of
+/// this race run out.
+fn create_race_exhausted(attempt: u32) -> StorageError {
+    StorageError::Internal(format!(
+        "PutItem could not create the item after {attempt} attempts: each insert lost the \
+         create race to a concurrent writer"
+    ))
+}
+
+/// Whether the contention retry loop of a request that entered it at
+/// `started` must stop before running attempt number `attempt`, given the
+/// `deadline` the engine carries.
+///
+/// The first attempt of a request always runs, so a request never answers
+/// 503 without having tried the write once.
+fn contention_deadline_passed(
+    attempt: u32,
+    started: std::time::Instant,
+    deadline: std::time::Duration,
+) -> bool {
+    attempt > 0 && started.elapsed() >= deadline
+}
+
+/// The instant a contention retry loop measures the engine's deadline from.
+///
+/// A caller that makes several storage calls for one API request runs them
+/// inside [`extenddb_storage::request_clock::scope`], as `BatchWriteItem` and
+/// `BatchExecuteStatement` do, and then every loop of that request measures
+/// from the start the scope carries, so the request's writes share one
+/// deadline. Outside a scope, which is where a single-item request and the TTL
+/// worker call from, a loop measures from the start of its own call.
+fn contention_clock_start() -> std::time::Instant {
+    extenddb_storage::request_clock::started().unwrap_or_else(std::time::Instant::now)
 }
 
 /// Build a `mongodb::error::Error` carrying the given error labels.
@@ -4457,6 +4691,85 @@ mod tests {
         assert!(!is_transient_write_conflict(&e));
     }
 
+    /// The first attempt of a request runs whatever the clock reads, and no
+    /// attempt starts once the deadline has passed.
+    #[test]
+    fn the_contention_deadline_stops_the_loop_after_the_first_attempt() {
+        let spent = std::time::Instant::now()
+            .checked_sub(CONTENTION_DEADLINE + std::time::Duration::from_secs(1))
+            .expect("the process clock reaches one deadline back");
+        assert!(!contention_deadline_passed(0, spent, CONTENTION_DEADLINE));
+        assert!(contention_deadline_passed(1, spent, CONTENTION_DEADLINE));
+        assert!(contention_deadline_passed(
+            CONTENTION_RETRY_ATTEMPTS - 1,
+            spent,
+            CONTENTION_DEADLINE
+        ));
+        let fresh = std::time::Instant::now();
+        assert!(!contention_deadline_passed(1, fresh, CONTENTION_DEADLINE));
+        assert!(!contention_deadline_passed(
+            CONTENTION_RETRY_ATTEMPTS - 1,
+            fresh,
+            CONTENTION_DEADLINE
+        ));
+        // A deadline a test sets decides the answer, so the same elapsed
+        // time stops a short-deadline loop and lets a long-deadline loop
+        // keep its attempts.
+        assert!(contention_deadline_passed(
+            1,
+            spent,
+            std::time::Duration::from_secs(1)
+        ));
+        assert!(!contention_deadline_passed(
+            1,
+            spent,
+            CONTENTION_DEADLINE * 60
+        ));
+    }
+
+    /// A loop measures the deadline from the start its request clock scope
+    /// carries, so the writes of one batch share one deadline, and from its
+    /// own start outside a scope.
+    #[tokio::test]
+    async fn the_contention_clock_starts_with_the_request_scope() {
+        let before = std::time::Instant::now();
+        let outside = contention_clock_start();
+        assert!(outside >= before, "outside a scope the clock starts now");
+        let batch_started = before
+            .checked_sub(std::time::Duration::from_secs(30))
+            .expect("the process clock reaches 30 seconds back");
+        let inside = extenddb_storage::request_clock::scope(batch_started, async {
+            (contention_clock_start(), contention_clock_start())
+        })
+        .await;
+        assert_eq!(inside, (batch_started, batch_started));
+    }
+
+    /// Build a write error with the given code, the form `insert_one`
+    /// returns.
+    fn write_error(code: i32) -> mongodb::error::Error {
+        let write_error: mongodb::error::WriteError = bson::from_document(doc! {
+            "code": code,
+            "codeName": "SyntheticTestError",
+            "errmsg": "synthetic write error",
+        })
+        .expect("static WriteError document deserializes");
+        mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(write_error))
+            .into()
+    }
+
+    #[test]
+    fn duplicate_key_is_recognized_as_a_command_error_and_as_a_write_error() {
+        // findAndModify, which an upserting find_one_and_replace sends,
+        // reports E11000 as a command error.
+        assert!(is_duplicate_key(&command_error(11000)));
+        // insert_one reports it as a write error.
+        assert!(is_duplicate_key(&write_error(11000)));
+        assert!(!is_duplicate_key(&command_error(112)));
+        assert!(!is_duplicate_key(&write_error(112)));
+        assert!(!is_transient_write_conflict(&command_error(11000)));
+    }
+
     #[derive(Default)]
     struct RecordingGsiIndexWriter {
         direct_writes: AtomicUsize,
@@ -4492,15 +4805,11 @@ mod tests {
         let client = mongodb::Client::with_uri_str("mongodb://localhost:27017")
             .await
             .expect("MongoDB URI must parse without connecting");
-        let engine = MongoEngine {
-            client: client.clone(),
-            catalog_db: client.database("extenddb_catalog"),
-            data_db: client.database("extenddb_data"),
-            region: "us-east-1".to_owned(),
-            gsi_cache: Default::default(),
-            tx_read_concern: mongodb::options::ReadConcern::snapshot(),
-            backup_liveness: Default::default(),
-        };
+        let engine = MongoEngine::for_test(
+            &client,
+            client.database("extenddb_catalog"),
+            client.database("extenddb_data"),
+        );
         let base_coll = engine.data_db.collection::<Document>("base");
         let key_schema = vec![KeySchemaElement {
             attribute_name: "pk".to_owned(),

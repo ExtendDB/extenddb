@@ -57,7 +57,7 @@ use extenddb_core::types::{AttributeDefinition, KeySchemaElement};
 use extenddb_storage::error::StorageError;
 use futures::TryStreamExt;
 
-use super::{CommitOutcome, TRANSIENT_RETRY_ATTEMPTS, backoff_sleep, is_transient_write_conflict};
+use super::{CONTENTION_RETRY_ATTEMPTS, CommitOutcome, backoff_sleep, is_transient_write_conflict};
 use crate::MongoEngine;
 use crate::data::data_collection_name;
 use crate::data::key_fields::{is_stored_without_key, repaired_document};
@@ -321,7 +321,7 @@ impl MongoEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
         let tx_options = self.write_transaction_options();
-        for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+        for attempt in 0..CONTENTION_RETRY_ATTEMPTS {
             session
                 .start_transaction()
                 .with_options(tx_options.clone())

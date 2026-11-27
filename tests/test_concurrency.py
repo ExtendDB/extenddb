@@ -49,7 +49,8 @@ def _retry_on_internal_error(fn, max_retries: int = _MAX_RETRIES):
     TransactionConflictException (OCC contention under high concurrency,
     more likely on Cassandra where Paxos latency is higher than on
     PostgreSQL/SQLite) and ServiceUnavailable (a MongoDB write on a table with
-    a stream or an index that could not commit in the server's 50 attempts).
+    a stream or an index that could not commit in the server's 1,000 attempts
+    or 10 seconds).
     The SDK retries a 503 only once under this client's max_attempts, so the
     harness retries it as well.
     """

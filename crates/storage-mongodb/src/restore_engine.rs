@@ -211,7 +211,6 @@ fn is_duplicate_key_anywhere(e: &mongodb::error::Error) -> bool {
             .write_errors
             .as_ref()
             .is_some_and(|errors| errors.iter().any(|w| w.code == DUPLICATE_KEY)),
-        mongodb::error::ErrorKind::Command(c) => c.code == DUPLICATE_KEY,
         _ => crate::data_engine::is_duplicate_key(e),
     }
 }

@@ -15,6 +15,8 @@
 //! loops instead of folding it into `StorageError::Internal`, which answers
 //! HTTP 500.
 
+use std::time::Duration;
+
 use extenddb_storage::error::StorageError;
 
 use crate::data_engine::is_transient_write_conflict;
@@ -65,6 +67,23 @@ pub(crate) fn transaction_error(e: mongodb::error::Error) -> StorageError {
 pub(crate) fn retry_budget_exhausted(operation: &str, attempts: u32, cause: &str) -> StorageError {
     StorageError::Transient(format!(
         "{operation}: could not commit in {attempts} attempts: {cause}"
+    ))
+}
+
+/// [`retry_budget_exhausted`] for the other bound of the same retry loops: a
+/// single-item write that stopped retrying when the engine's contention
+/// deadline passed, after an attempt that failed with `cause`.
+///
+/// `deadline` is written in seconds with any fraction, so a deadline a test
+/// sets below one second does not read as 0 seconds.
+pub(crate) fn contention_deadline_exhausted(
+    operation: &str,
+    deadline: Duration,
+    cause: &str,
+) -> StorageError {
+    StorageError::Transient(format!(
+        "{operation}: could not commit in {} seconds: {cause}",
+        deadline.as_secs_f64()
     ))
 }
 
@@ -142,6 +161,25 @@ mod tests {
                 format!("DeleteItem: could not commit in 50 attempts: {cause}")
             ),
             other => panic!("want Transient, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_passed_deadline_is_transient_and_names_the_operation_the_deadline_and_the_cause() {
+        let cause = "Command failed: WriteConflict (code 112) on the item";
+        // A deadline below one second keeps its fraction.
+        for (operation, deadline, seconds) in [
+            ("PutItem", crate::data_engine::CONTENTION_DEADLINE, "10"),
+            ("DeleteItem", Duration::from_millis(250), "0.25"),
+            ("UpdateItem", Duration::from_millis(1500), "1.5"),
+        ] {
+            match contention_deadline_exhausted(operation, deadline, cause) {
+                StorageError::Transient(msg) => assert_eq!(
+                    msg,
+                    format!("{operation}: could not commit in {seconds} seconds: {cause}")
+                ),
+                other => panic!("want Transient, got {other:?}"),
+            }
         }
     }
 
