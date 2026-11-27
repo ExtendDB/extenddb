@@ -130,6 +130,7 @@ jobs:
   test:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 15
+    # Every job must be in `needs`: merge-group-fail-fast.yml cancels on any failure.
     needs: [run-tests, package]
     if: always()
     steps:

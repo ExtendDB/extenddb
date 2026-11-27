@@ -581,6 +581,7 @@ jobs:
       - cassandra-catalog-checks
       - cassandra-two-nodes
       - cassandra-authorizer
+    # Every job must be in `needs`: merge-group-fail-fast.yml cancels on any failure.
     if: always() && (github.event_name != 'push' || github.triggering_actor != 'github-merge-queue[bot]')
     steps:
       - run: |
