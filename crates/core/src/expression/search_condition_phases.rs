@@ -263,7 +263,7 @@ fn resolve_name(
                     ))
                 })?;
             resolved = Some(target.clone());
-        } else if !name.is_empty() && crate::expression::reserved_words::is_reserved(name) {
+        } else if !name.is_empty() && crate::expression::reserved_words::is_listed(name) {
             // Applied to the bare form only: the `#alias` branch exists so a
             // reserved word can be used by aliasing it.
             return Err(invalid(format!(
