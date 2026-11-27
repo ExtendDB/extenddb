@@ -29,6 +29,9 @@
 # port = 18443                 # HTTP port
 # region = "us-east-1"         # AWS region for ARN generation
 # run_dir = "~/.extenddb/run"  # Directory for PID file (~ is expanded to $HOME)
+# dev_allowed_hosts = "app.test,api.test"
+                                # Developer-mode builds only: host names the dev-mode host check allows.
+                                # See the dev_allowed_hosts row in docs/manuals/05-admin-guide.md.
 
 [storage]
 # backend = "postgres"         # Storage backend: "postgres" (default), "mongodb", or "sqlite".

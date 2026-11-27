@@ -84,6 +84,15 @@ pub struct ServerConfig {
     /// client can hold a connection open. Default 30.
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
+    /// Developer mode only: a single comma-separated string of bare host names
+    /// (no port, scheme or wildcard). The dev-mode host guard serves a browser
+    /// request, and any request to `/management` or `/metrics`, only under an
+    /// IP address, `localhost`, a `.localhost` name or one of these names.
+    /// `docs/manuals/05-admin-guide.md` describes the setting. A production
+    /// build does not use the value, but an array or a table still stops it at
+    /// startup.
+    #[serde(default)]
+    pub dev_allowed_hosts: Option<String>,
 }
 
 fn default_request_timeout_secs() -> u64 {
@@ -100,6 +109,7 @@ impl Default for ServerConfig {
             tls: TlsConfig::default(),
             throttling_enabled: None,
             request_timeout_secs: default_request_timeout_secs(),
+            dev_allowed_hosts: None,
         }
     }
 }

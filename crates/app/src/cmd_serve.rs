@@ -396,7 +396,9 @@ fn is_loopback_host(host: &str) -> bool {
 
 /// Print the developer-mode banner lines: the mode notice, the credentials to
 /// sign with, a warning block when the server is not bound to loopback, and an
-/// advisory when an ambient `AWS_ACCESS_KEY_ID` would not verify.
+/// advisory when an ambient `AWS_ACCESS_KEY_ID` would not verify. The banner
+/// ends with the browser host rule and a note for each entry dropped from
+/// `server.dev_allowed_hosts`.
 ///
 /// Resolving here (not just in `serve()`) fails fast on a misconfigured
 /// `EXTENDDB_DEV_*` pair before daemonizing, and gives the invoking user the
@@ -411,12 +413,16 @@ fn print_dev_mode_banner(
     use extenddb_server::dev_credentials;
 
     let dev_creds = dev_credentials::resolve()?;
+    let dev_hosts = extenddb_server::parse_dev_allowed_hosts(
+        app_config.server.dev_allowed_hosts.as_deref().unwrap_or(""),
+    );
     let lines = dev_mode_banner_lines(
         &config::redact_password(app_config.storage.connection_config()),
         app_config.server.bind_addr.trim(),
         port,
         &dev_creds,
         dev_credentials::ignored_aws_env_key(&dev_creds).as_deref(),
+        &dev_hosts,
     );
     // Same stream split as the main banner: stdout for the daemon parent,
     // stderr in foreground mode so supervisors capture one stream.
@@ -443,6 +449,7 @@ fn dev_mode_banner_lines(
     port: u16,
     dev_creds: &[extenddb_server::dev_credentials::DevCredential],
     ignored_aws_key: Option<&str>,
+    dev_hosts: &(Vec<String>, Vec<String>),
 ) -> Vec<String> {
     use extenddb_server::dev_credentials;
 
@@ -500,6 +507,16 @@ fn dev_mode_banner_lines(
              EXTENDDB_DEV_SECRET_ACCESS_KEY to seed an additional credential."
         ));
     }
+    // The host rule the server enforces, so the operator sees it without
+    // reading the log. Dropped entries are named too.
+    let (kept, dropped) = dev_hosts;
+    lines.push(format!("  {}", extenddb_server::dev_host_rule_line(kept)));
+    for entry in dropped {
+        lines.push(format!(
+            "  Note: {}",
+            extenddb_server::dev_host_dropped_entry_note(entry)
+        ));
+    }
     lines
 }
 
@@ -528,6 +545,12 @@ mod tests {
         }
     }
 
+    /// The banner of a server with no listed hosts, as one string.
+    fn banner(host: &str, port: u16, creds: &[DevCredential], ignored: Option<&str>) -> String {
+        dev_mode_banner_lines(":memory:", host, port, creds, ignored, &Default::default())
+            .join("\n")
+    }
+
     #[test]
     fn loopback_hosts_are_recognised() {
         for host in ["127.0.0.1", "127.1.2.3", "::1", "localhost"] {
@@ -540,16 +563,14 @@ mod tests {
 
     #[test]
     fn loopback_dev_banner_has_no_exposure_warning() {
-        let text =
-            dev_mode_banner_lines(":memory:", "127.0.0.1", 18080, &[example()], None).join("\n");
+        let text = banner("127.0.0.1", 18080, &[example()], None);
         assert!(text.contains("plain HTTP on loopback"), "{text}");
         assert!(!text.contains("WARNING"), "{text}");
     }
 
     #[test]
     fn non_loopback_dev_banner_warns_with_the_publish_command() {
-        let text =
-            dev_mode_banner_lines(":memory:", "0.0.0.0", 18080, &[example()], None).join("\n");
+        let text = banner("0.0.0.0", 18080, &[example()], None);
         // The banner used to say "on loopback" whatever the bind was.
         assert!(!text.contains("plain HTTP on loopback"), "{text}");
         assert!(text.contains("plain HTTP on 0.0.0.0"), "{text}");
@@ -564,7 +585,7 @@ mod tests {
 
     #[test]
     fn non_loopback_dev_banner_without_the_example_pair_drops_the_public_wording() {
-        let text = dev_mode_banner_lines(":memory:", "0.0.0.0", 9000, &[team()], None).join("\n");
+        let text = banner("0.0.0.0", 9000, &[team()], None);
         assert!(
             text.contains("WARNING: dev mode is listening on 0.0.0.0:9000"),
             "{text}"
@@ -582,14 +603,12 @@ mod tests {
 
     #[test]
     fn dev_banner_keeps_the_ignored_aws_key_note() {
-        let text = dev_mode_banner_lines(
-            ":memory:",
+        let text = banner(
             "127.0.0.1",
             18080,
             &[example()],
             Some("ASIAFOREIGNSESSION01"),
-        )
-        .join("\n");
+        );
         assert!(
             text.contains("'ASIAFOREIGNSESSION01' will be rejected"),
             "{text}"
@@ -599,14 +618,7 @@ mod tests {
 
     #[test]
     fn dev_banner_names_the_switch_when_it_removed_the_ignored_example_key() {
-        let text = dev_mode_banner_lines(
-            ":memory:",
-            "127.0.0.1",
-            18080,
-            &[team()],
-            Some(EXAMPLE_ACCESS_KEY_ID),
-        )
-        .join("\n");
+        let text = banner("127.0.0.1", 18080, &[team()], Some(EXAMPLE_ACCESS_KEY_ID));
         assert!(
             text.contains(&format!("'{EXAMPLE_ACCESS_KEY_ID}' will be rejected")),
             "{text}"
@@ -614,6 +626,24 @@ mod tests {
         assert!(
             text.contains(&format!("because {ENV_DISABLE_EXAMPLE} is set")),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn dev_banner_ends_with_the_host_rule_and_each_dropped_entry() {
+        let hosts = extenddb_server::parse_dev_allowed_hosts("app.test, bad host");
+        let lines =
+            dev_mode_banner_lines(":memory:", "127.0.0.1", 18080, &[example()], None, &hosts);
+        assert_eq!(
+            lines[lines.len() - 2..],
+            [
+                "  ExtendDB serves a browser request, and any request to /management or \
+                 /metrics, only when its host is an IP address, localhost, a name ending in \
+                 .localhost, or a name in server.dev_allowed_hosts (environment variable \
+                 EXTENDDB__SERVER__DEV_ALLOWED_HOSTS). Listed hosts: app.test",
+                "  Note: dev_allowed_hosts entry 'bad host' was ignored: list a bare host name \
+                 with no port, scheme or wildcard, such as app.test.",
+            ]
         );
     }
 
