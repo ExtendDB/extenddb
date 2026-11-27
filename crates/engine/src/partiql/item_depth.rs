@@ -106,13 +106,17 @@ fn holds_a_value_past_the_item_limit(operand: &Operand, params: &[AttributeValue
 /// key attribute is refused first. The update is then evaluated as the
 /// storage layer evaluates any update, against the stored item, and nothing
 /// is written: a condition that fails or an update that does not apply is the
-/// answer, then the item check on the updated item.
+/// answer. An update that stores the deep value is refused by
+/// `apply_update_validated` itself, which checks each attribute a `SET` or an
+/// `ADD` writes and answers the text of `ITEM_NESTING_MESSAGE`. The item check
+/// on the updated item runs last. It refuses only an item that already held
+/// an attribute past the limit, one the update does not write.
 ///
-/// `None` when the updated item passes the item check, which happens only
-/// when the deep value is not stored, such as `if_not_exists` on an attribute
-/// the item has. The caller then sends the update to `UpdateItem`, whose
-/// nesting check of every `ExpressionAttributeValue` refuses it, where the
-/// service applies the update (measured 2026-11-02).
+/// `None` when neither check refuses, which happens only when the deep value
+/// is not stored, such as `if_not_exists` on an attribute the item has. The
+/// caller then sends the update to `UpdateItem`, whose nesting check of every
+/// `ExpressionAttributeValue` refuses it, where the service applies the
+/// update (measured 2026-11-02).
 pub(super) async fn unwritable_update_error(
     ctx: &OperationContext,
     parts: &UpdateParts,
