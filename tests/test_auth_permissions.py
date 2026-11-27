@@ -23,7 +23,6 @@ import uuid
 
 import boto3
 import pytest
-import requests
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 
@@ -1083,21 +1082,6 @@ class TestCredentialValidation:
             )
         finally:
             self.mgmt.delete_user(self.account_id, user)
-
-    def test_missing_auth_header(self):
-        resp = requests.post(
-            self.endpoint,
-            headers={
-                "Content-Type": "application/x-amz-json-1.0",
-                "X-Amz-Target": "DynamoDB_20120810.ListTables",
-            },
-            json={},
-            timeout=30,
-            verify=not self.endpoint.startswith("https://"),
-        )
-        assert resp.status_code in (400, 403)
-        body = resp.json()
-        assert body.get("__type", "").endswith("MissingAuthenticationToken")
 
     def test_deleted_user_access_key_rejected(self):
         """After deleting a user, their access key no longer works."""

@@ -25,7 +25,7 @@ pub(crate) fn extract_operation(headers: &HeaderMap) -> Result<String, DynamoDbE
             if headers.contains_key("authorization") {
                 DynamoDbError::UnknownOperationException(String::new())
             } else {
-                DynamoDbError::MissingAuthenticationToken("Missing Authentication Token".to_owned())
+                DynamoDbError::missing_authentication_token()
             }
         })?;
 

@@ -53,7 +53,7 @@ extenddb uses SigV4 signature verification with a local credential store and IAM
 
 The steps run in this order; every rejection is HTTP 400.
 
-1. Extract the `Authorization` header (AWS4-HMAC-SHA256 scheme); absent: `MissingAuthenticationToken`
+1. Extract the `Authorization` header (AWS4-HMAC-SHA256 scheme); absent: `MissingAuthenticationTokenException`
 2. Parse credential scope, signed headers, and signature; malformed: `IncompleteSignatureException`. A request with more than one `host` or `authorization` header is refused before this point with a plain 400, as the service's front end does
 3. Check `X-Amz-Date` against the server clock: more than 15 minutes of skew is `UnrecognizedClientException` (signature expired)
 4. Check the credential scope: the region must be this server's `[server] region` and the service must be `dynamodb`; otherwise `InvalidSignatureException` carrying one sentence per failing part, region first, as the service reports it. The scope date must also be the `YYYYMMDD` prefix of `X-Amz-Date`, and its sentence comes after the region and service sentences

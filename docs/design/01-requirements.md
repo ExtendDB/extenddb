@@ -112,7 +112,7 @@ Error responses must be byte-for-byte compatible with DynamoDB:
 | `InternalServerError` | 500 | Unhandled server error |
 | `ItemCollectionSizeLimitExceededException` | 400 | Item collection exceeds 10 GB (tables with LSIs) |
 | `MalformedHttpRequestException` | 400 | Request body cannot be decompressed or parsed |
-| `MissingAuthenticationToken` | 403 | No Authorization header present |
+| `MissingAuthenticationTokenException` | 400 | No Authorization header present |
 | `ProvisionedThroughputExceededException` | 400 | Table/partition throughput limit exceeded |
 | `RequestEntityTooLargeException` | 413 | Request body exceeds maximum size |
 | `RequestLimitExceeded` | 400 | Account-level throughput quota exceeded |

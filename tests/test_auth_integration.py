@@ -686,22 +686,33 @@ class TestAuthErrors:
         finally:
             self.mgmt.delete_user(self.account_id, user)
 
-    def test_missing_auth_header(self):
-        """Request with no auth header returns MissingAuthenticationToken."""
+    # DynamoDB answers each of these unsigned requests with HTTP 400 and the
+    # body below, whose X-Amz-Crc32 is 2088342776 (measured 2026-11-21).
+    @pytest.mark.parametrize("operation,content_type,body", [
+        ("ListTables", "application/x-amz-json-1.0", {"Limit": 1}),
+        ("ListTables", "application/json", {"Limit": 1}),
+        ("DescribeTable", "application/x-amz-json-1.0", {"TableName": "no-such-table"}),
+        ("GetItem", "application/x-amz-json-1.0",
+         {"TableName": "no-such-table", "Key": {"k": {"S": "a"}}}),
+    ])
+    def test_missing_auth_header(self, operation, content_type, body):
         # Use a raw HTTP request to avoid boto3 adding auth.
         resp = requests.post(
             self.endpoint,
             headers={
-                "Content-Type": "application/x-amz-json-1.0",
-                "X-Amz-Target": "DynamoDB_20120810.ListTables",
+                "Content-Type": content_type,
+                "X-Amz-Target": f"DynamoDB_20120810.{operation}",
             },
-            json={},
+            json=body,
             timeout=30,
             verify=not self.endpoint.startswith("https://"),
         )
-        assert resp.status_code in (400, 403)
-        body = resp.json()
-        assert body.get("__type", "").endswith("MissingAuthenticationToken")
+        assert resp.status_code == 400, resp.text
+        assert resp.json() == {
+            "__type": "com.amazon.coral.service#MissingAuthenticationTokenException",
+            "message": "Request is missing Authentication Token",
+        }
+        assert resp.headers["X-Amz-Crc32"] == "2088342776"
 # ---------------------------------------------------------------------------
 # Mode 1 Backward Compatibility
 # ---------------------------------------------------------------------------
