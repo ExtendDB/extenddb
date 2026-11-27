@@ -521,6 +521,24 @@ On SQLite, a second disable of a table's stream answers `Table has no stream to 
 
 **Who is affected.** Clients that send CreateBackup or RestoreTableFromBackup to a PostgreSQL deployment at the moment such a command is refused or fails while it takes the claim. A command that took the claim released the lock when it finished in 1.0.0 too. While the claim row is younger than the server's `stale_job_after_secs`, these requests get the same answer from the row, so the change shows after a failed take, or when the command ran with a larger `stale_job_after_secs` than the server's. No catalog migration is required.
 
+### v1.1.0: a request with no `Authorization` header answers `MissingAuthenticationTokenException`
+
+**What changed** (#1290). A request with no `Authorization` header answers HTTP 400 with the type `MissingAuthenticationTokenException` and the message `Request is missing Authentication Token`, as DynamoDB does (measured 2026-11-21 in us-east-1). 1.0.0 sent the type `MissingAuthenticationToken` and the message `Missing Authentication Token`. The status does not change.
+
+**Who is affected.** A client, a test or an alarm that matches the earlier type or message. No catalog migration or configuration change is required.
+
+### v1.1.0: `init` takes an empty admin variable as unset on every backend
+
+**What changed.** `extenddb init` takes an empty `EXTENDDB_ADMIN_USER` or `EXTENDDB_ADMIN_PASSWORD` as unset on every backend: it names the admin `admin`, or generates a password. On MongoDB, 1.0.0 took the empty string as the name or the password. On Cassandra, 1.0.0 took an empty password, and an empty name stopped `init` with an error. On Cassandra, `init` with `EXTENDDB_ADMIN_PASSWORD` set and `EXTENDDB_ADMIN_USER` not set no longer prints the supplied password (#1339).
+
+**Who is affected.** MongoDB and Cassandra catalogs that `init` of an earlier release created with an empty `EXTENDDB_ADMIN_PASSWORD` or an empty `EXTENDDB_ADMIN_USER`, and Cassandra catalogs that it created with only `EXTENDDB_ADMIN_PASSWORD` set.
+
+- An empty `EXTENDDB_ADMIN_PASSWORD` gave the admin an empty password. Log in with an empty `EXTENDDB_PASSWORD` and give the admin a password: `EXTENDDB_PASSWORD= extenddb manage --user <name> change-admin-password --admin-name <name> --new-password <password>`.
+- On MongoDB, an empty `EXTENDDB_ADMIN_USER` gave the admin an empty name, and `list-admins` shows it as `"admin_name": ""`. That admin logs in with `--user ''`, and `change-admin-password --admin-name ''` changes its password. `delete-admin --admin-name ''` fails with `HTTP 404`. To delete the admin, first create another one: `extenddb manage --user '' create-admin --admin-name <name> --admin-password <password>`. Then delete the document of the admin with the empty name in `mongosh`: `db.getSiblingDB("extenddb_catalog").admin_users.deleteOne({_id: ""})`.
+- On Cassandra, `init` with an empty `EXTENDDB_ADMIN_USER` stopped with `Error: Create admin user: Internal error: Database error` and wrote no admin, because Cassandra refuses an empty key. Run the same `init` command with this release. It finishes the catalog and creates the admin `admin`.
+
+The output of a Cassandra `init` from an earlier release with only `EXTENDDB_ADMIN_PASSWORD` set holds that password, so change it if that output was kept. No catalog migration is required.
+
 ### v1.1.0: a `ClientRequestToken` is any 1 to 36 characters
 
 **What changed** (#1375). `TransactWriteItems` and `ExecuteTransaction` take a `ClientRequestToken` of 1 to 36 characters of any kind, as DynamoDB does (measured 2026-11-23). 1.0.0 measured the token in bytes and refused every character outside `[a-zA-Z0-9-]`. On every backend:
@@ -569,18 +587,6 @@ Under `off`, for an account the setting leaves out, and in a build without the `
 **What changed** (#1523). A request signed with a role session's credentials is authorized with the session policy, the session tags and the issue time (`aws:TokenIssueTime`) of the session whose access key signed it. Earlier releases read them by account, role and session name. AssumeRole stores a new session for every call, so once a session name had been used more than once, which session's data a request read could depend on row order.
 
 **Who is affected.** A deployment where a role has been assumed more than once under one session name, and a SQLite, PostgreSQL or MongoDB deployment that read a role session's data from the store for a request authenticated just before the session expired: there the read compared the session's expiry again, a moment after authentication had, and on PostgreSQL with the database's clock in place of the server's. No catalog migration or configuration change is required.
-
-### v1.1.0: `init` takes an empty admin variable as unset on every backend
-
-**What changed.** `extenddb init` takes an empty `EXTENDDB_ADMIN_USER` or `EXTENDDB_ADMIN_PASSWORD` as unset on every backend: it names the admin `admin`, or generates a password. On MongoDB, 1.0.0 took the empty string as the name or the password. On Cassandra, 1.0.0 took an empty password, and an empty name stopped `init` with an error. On Cassandra, `init` with `EXTENDDB_ADMIN_PASSWORD` set and `EXTENDDB_ADMIN_USER` not set no longer prints the supplied password (#1339).
-
-**Who is affected.** MongoDB and Cassandra catalogs that `init` of an earlier release created with an empty `EXTENDDB_ADMIN_PASSWORD` or an empty `EXTENDDB_ADMIN_USER`, and Cassandra catalogs that it created with only `EXTENDDB_ADMIN_PASSWORD` set.
-
-- An empty `EXTENDDB_ADMIN_PASSWORD` gave the admin an empty password. Log in with an empty `EXTENDDB_PASSWORD` and give the admin a password: `EXTENDDB_PASSWORD= extenddb manage --user <name> change-admin-password --admin-name <name> --new-password <password>`.
-- On MongoDB, an empty `EXTENDDB_ADMIN_USER` gave the admin an empty name, and `list-admins` shows it as `"admin_name": ""`. That admin logs in with `--user ''`, and `change-admin-password --admin-name ''` changes its password. `delete-admin --admin-name ''` fails with `HTTP 404`. To delete the admin, first create another one: `extenddb manage --user '' create-admin --admin-name <name> --admin-password <password>`. Then delete the document of the admin with the empty name in `mongosh`: `db.getSiblingDB("extenddb_catalog").admin_users.deleteOne({_id: ""})`.
-- On Cassandra, `init` with an empty `EXTENDDB_ADMIN_USER` stopped with `Error: Create admin user: Internal error: Database error` and wrote no admin, because Cassandra refuses an empty key. Run the same `init` command with this release. It finishes the catalog and creates the admin `admin`.
-
-The output of a Cassandra `init` from an earlier release with only `EXTENDDB_ADMIN_PASSWORD` set holds that password, so change it if that output was kept. No catalog migration is required.
 
 ### v1.0.0: Cassandra reads and writes at `LOCAL_QUORUM`
 
