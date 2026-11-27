@@ -98,7 +98,11 @@ pub(super) fn lock_with(
     len: usize,
     try_memfd_secret: bool,
 ) -> Result<(Region, Protection), LockError> {
-    if try_memfd_secret {
+    // Some kernels do not check RLIMIT_MEMLOCK when `memfd_secret` is mapped.
+    // The refusal then arrives as SIGBUS when the pages fault in. When the
+    // limit is below the store, take the `mlock` path, which reports the
+    // limit as an error (or succeeds for a process with CAP_IPC_LOCK).
+    if try_memfd_secret && !exceeds_memlock_limit(len) {
         match memfd_secret(len) {
             Ok(region) => return Ok((region, Protection::MemfdSecret)),
             Err(e) if matches!(e.errno, libc::ENOSYS | libc::EPERM | libc::EAGAIN) => {}
@@ -110,6 +114,20 @@ pub(super) fn lock_with(
         }
     }
     mlocked(len).map(|region| (region, Protection::LockedPages))
+}
+
+/// Whether `len` bytes are above the soft `RLIMIT_MEMLOCK`.
+#[cfg(target_os = "linux")]
+fn exceeds_memlock_limit(len: usize) -> bool {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid out-pointer for `getrlimit`.
+    if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &raw mut limit) } != 0 {
+        return false;
+    }
+    limit.rlim_cur != libc::RLIM_INFINITY && (len as u64) > limit.rlim_cur
 }
 
 /// macOS and the other Unix targets: an anonymous mapping under `mlock`.
