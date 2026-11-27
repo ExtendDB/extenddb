@@ -445,6 +445,18 @@ No catalog migration or configuration change is required.
 
 **Before upgrading** a PostgreSQL deployment, check that the environment of the ExtendDB process does not set `PGHOSTADDR`, unless every connection is to go to that address. Check that no `.pgpass` entry that ExtendDB reads has a `\` in its password. Check any log alert that matches the whole text of a PostgreSQL error. SQLite deployments get SQLite 3.54.1. MongoDB and Cassandra deployments see only the Rust version change, and only in a build from source. The upgrade needs no catalog migration and no configuration change.
 
+### v1.1.0: `init` takes an empty admin variable as unset on every backend
+
+**What changed.** `extenddb init` takes an empty `EXTENDDB_ADMIN_USER` or `EXTENDDB_ADMIN_PASSWORD` as unset on every backend: it names the admin `admin`, or generates a password. On MongoDB, 1.0.0 took the empty string as the name or the password. On Cassandra, 1.0.0 took an empty password, and an empty name stopped `init` with an error. On Cassandra, `init` with `EXTENDDB_ADMIN_PASSWORD` set and `EXTENDDB_ADMIN_USER` not set no longer prints the supplied password (#1339).
+
+**Who is affected.** MongoDB and Cassandra catalogs that `init` of an earlier release created with an empty `EXTENDDB_ADMIN_PASSWORD` or an empty `EXTENDDB_ADMIN_USER`, and Cassandra catalogs that it created with only `EXTENDDB_ADMIN_PASSWORD` set.
+
+- An empty `EXTENDDB_ADMIN_PASSWORD` gave the admin an empty password. Log in with an empty `EXTENDDB_PASSWORD` and give the admin a password: `EXTENDDB_PASSWORD= extenddb manage --user <name> change-admin-password --admin-name <name> --new-password <password>`.
+- On MongoDB, an empty `EXTENDDB_ADMIN_USER` gave the admin an empty name, and `list-admins` shows it as `"admin_name": ""`. That admin logs in with `--user ''`, and `change-admin-password --admin-name ''` changes its password. `delete-admin --admin-name ''` fails with `HTTP 404`. To delete the admin, first create another one: `extenddb manage --user '' create-admin --admin-name <name> --admin-password <password>`. Then delete the document of the admin with the empty name in `mongosh`: `db.getSiblingDB("extenddb_catalog").admin_users.deleteOne({_id: ""})`.
+- On Cassandra, `init` with an empty `EXTENDDB_ADMIN_USER` stopped with `Error: Create admin user: Internal error: Database error` and wrote no admin, because Cassandra refuses an empty key. Run the same `init` command with this release. It finishes the catalog and creates the admin `admin`.
+
+The output of a Cassandra `init` from an earlier release with only `EXTENDDB_ADMIN_PASSWORD` set holds that password, so change it if that output was kept. No catalog migration is required.
+
 ### v1.0.0: Cassandra reads and writes at `LOCAL_QUORUM`
 
 **What changed.** The Cassandra backend runs its reads and writes at `LOCAL_QUORUM`. 0.1.15 ran many of them at `ONE`, the driver's default, in each area: items (the reads of GetItem, Query and Scan among them), transactions, TTL, streams, the catalog, IAM and `init`. A read with `ConsistentRead` `false` also runs at `LOCAL_QUORUM`. A lightweight transaction runs Paxos at `LOCAL_SERIAL` and commits at `LOCAL_QUORUM`. 0.1.15 ran many of its lightweight transactions at those levels already, and others, among them the admin user creation and most IAM writes, at the driver's defaults, `SERIAL` and `ONE`. Batches ran at `LOCAL_QUORUM` before and still do. No setting changes these levels (#945).
