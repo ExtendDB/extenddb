@@ -39,6 +39,10 @@ use crate::cassandra_util::CassandraSession;
 /// The `settings` key of the lock row.
 pub(crate) const LOCK_KEY: &str = "migration_lock";
 
+/// How many times [`MigrationLock::release`] attempts the fenced delete of
+/// its lock row before it leaves the row to its TTL.
+const RELEASE_DELETE_ATTEMPTS: u32 = 3;
+
 /// The times of the lock's lease.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LeaseTimes {
@@ -389,6 +393,10 @@ impl MigrationLock {
     /// Release the lock: wait for schema agreement, so the next holder
     /// starts on a schema every node has, then delete the row if this lock
     /// still holds it. A second call does nothing.
+    ///
+    /// A retryable error on the delete is retried, since the fenced delete
+    /// (`IF value = ?`) is idempotent; a delete that never lands leaves the
+    /// row to its TTL.
     pub async fn release(&self) {
         self.renewal.abort();
         if self.check().is_err() {
@@ -403,15 +411,22 @@ impl MigrationLock {
             "DELETE FROM {}.settings WHERE key = '{LOCK_KEY}' IF value = ?",
             self.keyspace
         );
-        if let Err(e) = lwt(
-            &self.session,
-            &cql,
-            cdrs_tokio::query_values!(self.token.as_str()),
-            "release the migration lock",
-        )
-        .await
-        {
-            tracing::warn!("{e}; the lock expires within its TTL");
+        for attempt in 0..RELEASE_DELETE_ATTEMPTS {
+            match lwt(
+                &self.session,
+                &cql,
+                cdrs_tokio::query_values!(self.token.as_str()),
+                "release the migration lock",
+            )
+            .await
+            {
+                Ok(_) => return,
+                Err(e) if !retryable(&e) || attempt + 1 == RELEASE_DELETE_ATTEMPTS => {
+                    tracing::warn!("{e}; the lock expires within its TTL");
+                    return;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
         }
     }
 }
