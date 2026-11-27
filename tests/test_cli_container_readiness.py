@@ -568,3 +568,76 @@ class TestForegroundNoPidFile:
                     proc.kill()
                     proc.wait(timeout=10)
 
+
+class TestStopPidFileLock:
+    """`stop` signals only the process that holds the PID file's lock.
+
+    A running server holds a lock on its PID file. A file that nothing holds
+    was left by a server that is gone, and the PID it names may belong to
+    another process by now. Needs no backend: `stop` runs with no config file
+    and reads the PID file from the default run directory under HOME.
+    """
+
+    @staticmethod
+    def _stale_pid_file(tmp_path, port: int, pid: int) -> tuple[_IsolatedHome, str]:
+        """Write `pid` to the default PID file for `port`, with no lock on it."""
+        home = _IsolatedHome(tmp_path)
+        run_dir = os.path.join(home.home, ".extenddb", "run")
+        os.makedirs(run_dir)
+        pid_file = os.path.join(run_dir, f"extenddb-{port}.pid")
+        with open(pid_file, "w") as f:
+            f.write(f"{pid}\n")
+        return home, pid_file
+
+    @staticmethod
+    def _cli(tmp_path, home: _IsolatedHome, *args: str) -> subprocess.CompletedProcess:
+        env = os.environ.copy()
+        env.update(home.env)
+        return subprocess.run(
+            [EXTENDDB_BINARY, *args],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL,
+            env=env, cwd=tmp_path, timeout=30,
+        )
+
+    def test_stop_leaves_a_process_that_holds_no_pid_file_lock(self, tmp_path):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        bystander = subprocess.Popen(["sleep", "300"], stdin=subprocess.DEVNULL)
+        try:
+            home, pid_file = self._stale_pid_file(tmp_path, port, bystander.pid)
+            stop = self._cli(tmp_path, home, "stop", "--port", str(port))
+            output = stop.stdout + stop.stderr
+            assert stop.returncode == 0, output
+            assert "not an extenddb server" in output, output
+            assert bystander.poll() is None, "`stop` signalled a process that is not the server"
+            assert not os.path.exists(pid_file), "the stale PID file should be removed"
+        finally:
+            bystander.kill()
+            bystander.wait(timeout=10)
+
+    def test_stop_refuses_an_unlocked_pid_file_while_the_port_is_in_use(self, tmp_path):
+        """With the port in use, the process could be a server an earlier
+        release started with --write-pid-file, which holds no lock: `stop`
+        neither signals it nor removes the file, and exits 1."""
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        bystander = subprocess.Popen(["sleep", "300"], stdin=subprocess.DEVNULL)
+        try:
+            home, pid_file = self._stale_pid_file(tmp_path, port, bystander.pid)
+            stop = self._cli(tmp_path, home, "stop", "--port", str(port))
+            output = stop.stdout + stop.stderr
+            assert stop.returncode == 1, output
+            assert "cannot tell whether that process is the server" in output, output
+            assert f"kill {bystander.pid}" in output, output
+            assert bystander.poll() is None, "`stop` signalled a process it could not identify"
+            assert os.path.exists(pid_file), "the PID file should be kept"
+
+            status = self._cli(tmp_path, home, "status", "--port", str(port))
+            assert "pid unknown" in status.stdout, status.stdout + status.stderr
+        finally:
+            listener.close()
+            bystander.kill()
+            bystander.wait(timeout=10)
