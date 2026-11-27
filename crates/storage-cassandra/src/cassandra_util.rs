@@ -483,6 +483,26 @@ pub fn is_fk_violation(_err: &cdrs_tokio::error::Error) -> bool {
     false
 }
 
+/// Whether a write's outcome cannot be told from its error: the statement may
+/// have reached a replica before the answer was lost. A write timeout or
+/// failure on a lightweight transaction is the Paxos round not completing
+/// within the coordinator's view; the proposal may still commit. A caller
+/// that gets this must read the row (at `Stmt::SerialRead`) to learn whether
+/// the write landed, rather than report a retryable or internal error for a
+/// write that may have committed.
+#[must_use]
+pub(crate) fn lwt_outcome_unknown(error: &cdrs_tokio::error::Error) -> bool {
+    use cdrs_tokio::frame::message_error::ErrorType;
+    match error {
+        cdrs_tokio::error::Error::Io(_) | cdrs_tokio::error::Error::Timeout(_) => true,
+        cdrs_tokio::error::Error::Server { body, .. } => matches!(
+            body.ty,
+            ErrorType::WriteTimeout(_) | ErrorType::WriteFailure(_)
+        ),
+        _ => false,
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // Phase 1: Core Query Helpers
 // ══════════════════════════════════════════════════════════════════════════════

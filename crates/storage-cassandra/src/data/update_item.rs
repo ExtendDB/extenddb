@@ -26,6 +26,9 @@ const OCC_MAX_RETRIES: u32 = 20;
 const OCC_BASE_DELAY_MS: u64 = 2;
 /// Exponent cap for OCC backoff (max sleep = base * 2^cap = 16ms).
 const OCC_EXP_CAP: u32 = 3;
+/// Attempts to read back the row after a lost-answer LWT, so a dropped
+/// connection can reconnect before the commit check gives up (#893).
+const COMMIT_CHECK_PROBES: u32 = 6;
 
 impl CassandraEngine {
     /// Implementation of `DataEngine::update_item`.
@@ -258,7 +261,14 @@ impl CassandraEngine {
             }
         }
 
-        Err(StorageError::TransactionConflict(
+        // The version check lost to other single-item writers for the whole
+        // retry budget. No TransactWriteItems holds the row (that is the
+        // read-path TransactionConflict above), so this is contention the
+        // backend could not serialize now, not a held item. DynamoDB answers a
+        // single-item write with TransactionConflictException only while a
+        // transaction holds the item, so answer a retryable 503 that the SDKs
+        // retry rather than a 400 the application sees.
+        Err(StorageError::Transient(
             "update_item: too many concurrent writers on this item".to_owned(),
         ))
     }
@@ -425,13 +435,96 @@ impl CassandraEngine {
 
         if ttl_claim.is_none() {
             // Preserve f997485's Paxos linearization for ordinary writes.
-            let result = self
-                .session
-                .run(Stmt::Lwt, &lwt_cql, lwt_qv)
-                .await
-                .map_err(|e| StorageError::Internal(format!("occ_write lwt: {e}")))?;
-            if !crate::cassandra_util::lwt_applied(&result)? {
-                return Ok(false);
+            match self.session.run(Stmt::Lwt, &lwt_cql, lwt_qv).await {
+                Ok(result) => {
+                    if !crate::cassandra_util::lwt_applied(&result)? {
+                        return Ok(false);
+                    }
+                }
+                // The coordinator lost the answer, but the Paxos round may
+                // have committed. A committed write must not surface as a
+                // retryable or internal error, or the client's retry doubles a
+                // non-idempotent update (#893, same class as #342). Read the
+                // row at LOCAL_SERIAL (which sees a committed round, unlike the
+                // LOCAL_QUORUM occ_read) and decide from our exact image. Never
+                // re-run the body on an unknown outcome.
+                Err(e) if crate::cassandra_util::lwt_outcome_unknown(&e) => {
+                    use cdrs_tokio::types::IntoRustByName as _;
+                    // The serial read confirms whether the lost write
+                    // committed. The same fault (a dropped connection) can
+                    // break the read too, so retry it to let the pool
+                    // reconnect before giving up, or the committed write is
+                    // still reported as failed (#893).
+                    let row = {
+                        let mut got = None;
+                        let mut last = None;
+                        for probe in 0..COMMIT_CHECK_PROBES {
+                            match super::select_by_pk_at(
+                                &self.session,
+                                data_keyspace,
+                                ddb_table,
+                                "version, item_data",
+                                pk_text,
+                                sk,
+                                sk_col,
+                                Stmt::SerialRead,
+                            )
+                            .await
+                            {
+                                Ok(r) => {
+                                    got = Some(r);
+                                    break;
+                                }
+                                Err(err) => {
+                                    last = Some(err);
+                                    if probe + 1 < COMMIT_CHECK_PROBES {
+                                        tokio::time::sleep(std::time::Duration::from_millis(
+                                            50u64 << probe,
+                                        ))
+                                        .await;
+                                    }
+                                }
+                            }
+                        }
+                        match got {
+                            Some(r) => r,
+                            None => return Err(last.unwrap()),
+                        }
+                    };
+                    let stored_item: Option<String> = row
+                        .as_ref()
+                        .and_then(|r| r.get_by_name("item_data").ok().flatten());
+                    if stored_item.as_deref() != Some(item_json_str) {
+                        let stored_version: Option<i64> = row
+                            .as_ref()
+                            .and_then(|r| r.get_by_name("version").ok().flatten());
+                        // Our image is not stored. If the fence is intact (an
+                        // existing row still at the fenced version, or a create
+                        // whose row is still absent) the write provably did not
+                        // land, so retry it like a lost race.
+                        let never_applied = if item_existed {
+                            stored_version == version
+                        } else {
+                            stored_item.is_none()
+                        };
+                        if never_applied {
+                            return Ok(false);
+                        }
+                        // shortcut: the version advanced and our image is not
+                        // stored, so a committed-then-overwritten write cannot
+                        // be told from one that never committed. Fail honestly
+                        // rather than re-apply. The stronger form re-issues this
+                        // idempotent full-image LWT; verify it on an RF>1
+                        // cluster (#1152) before adding it.
+                        return Err(StorageError::Internal(
+                            "occ_write lwt outcome unknown: version advanced".to_owned(),
+                        ));
+                    }
+                    // Our exact image is stored: the write committed. Proceed.
+                }
+                Err(e) => {
+                    return Err(StorageError::Internal(format!("occ_write lwt: {e}")));
+                }
             }
             if indexes.is_empty() && stream_stmt.is_none() {
                 return Ok(true);
