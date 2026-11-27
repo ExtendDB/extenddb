@@ -405,7 +405,7 @@ impl SqliteEngine {
             "SELECT rowid FROM {ddb_table} WHERE {}",
             conditions.join(" AND ")
         );
-        let mut query = sqlx::query_as::<_, (i64,)>(&sql);
+        let mut query = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(sql));
         for bound in binds {
             query = super::bind_bound!(query, bound);
         }

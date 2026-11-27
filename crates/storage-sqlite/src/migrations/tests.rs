@@ -73,7 +73,10 @@ pub(super) async fn plain_pool(db: &Path) -> SqlitePool {
 /// Execute a released dump into a new file with the mode a server gives it.
 pub(super) async fn load_dump(db: &Path, dump: &str) {
     let pool = plain_pool(db).await;
-    sqlx::raw_sql(dump).execute(&pool).await.expect("load dump");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(dump))
+        .execute(&pool)
+        .await
+        .expect("load dump");
     sqlx::raw_sql("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL")
         .execute(&pool)
         .await
@@ -88,13 +91,16 @@ pub(super) async fn load_dump(db: &Path, dump: &str) {
 
 pub(super) async fn exec(db: &Path, sql: &str) {
     let pool = plain_pool(db).await;
-    sqlx::raw_sql(sql).execute(&pool).await.expect(sql);
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+        .execute(&pool)
+        .await
+        .expect(sql);
     pool.close().await;
 }
 
 pub(super) async fn scalar(db: &Path, sql: &str) -> Option<String> {
     let pool = plain_pool(db).await;
-    let value: Option<String> = sqlx::query_scalar(sql)
+    let value: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
         .fetch_optional(&pool)
         .await
         .expect(sql);
@@ -104,7 +110,10 @@ pub(super) async fn scalar(db: &Path, sql: &str) -> Option<String> {
 
 pub(super) async fn count(db: &Path, sql: &str) -> i64 {
     let pool = plain_pool(db).await;
-    let n: i64 = sqlx::query_scalar(sql).fetch_one(&pool).await.expect(sql);
+    let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .fetch_one(&pool)
+        .await
+        .expect(sql);
     pool.close().await;
     n
 }
@@ -357,7 +366,7 @@ impl CodeBody<SqliteStores> for RebuildTables {
     }
     async fn run(&self, stores: &SqliteStores) -> Result<Done, MigrationError> {
         let sql = rebuild_tables_sql(&stores.pool).await;
-        sqlx::raw_sql(&sql)
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql.as_str()))
             .execute(&stores.pool)
             .await
             .map_err(|e| MigrationError::store("rebuild", e))?;
@@ -448,10 +457,12 @@ async fn a_rebuild_of_tables_keeps_its_index_shard_and_stream_rows() {
     load_dump(&control, DEV_0_1_14).await;
     let pool = plain_pool(&control).await;
     let sql = rebuild_tables_sql(&pool).await;
-    sqlx::raw_sql(&format!("PRAGMA foreign_keys = ON; BEGIN; {sql} COMMIT;"))
-        .execute(&pool)
-        .await
-        .expect("rebuild with foreign keys on");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "PRAGMA foreign_keys = ON; BEGIN; {sql} COMMIT;"
+    )))
+    .execute(&pool)
+    .await
+    .expect("rebuild with foreign keys on");
     pool.close().await;
     assert_eq!(children(&control).await, (0, 0, 0));
 }

@@ -137,18 +137,23 @@ impl PostgresEngine {
                     let select_sql = format!(
                         "SELECT item_data FROM {ddb_table} WHERE pk = $1 AND {sk_col} = $2 FOR UPDATE"
                     );
-                    let row: Option<(serde_json::Value,)> =
-                        bind_sk_fetch_optional!(&select_sql, pk_text.as_ref(), sk, &mut *tx)?;
+                    let row: Option<(serde_json::Value,)> = bind_sk_fetch_optional!(
+                        sqlx::AssertSqlSafe(select_sql),
+                        pk_text.as_ref(),
+                        sk,
+                        &mut *tx
+                    )?;
                     row.map(|(v,)| v)
                 }
                 None => {
                     let select_sql =
                         format!("SELECT item_data FROM {ddb_table} WHERE pk = $1 FOR UPDATE");
-                    let row: Option<(serde_json::Value,)> = sqlx::query_as(&select_sql)
-                        .bind(pk_text.as_ref())
-                        .fetch_optional(&mut *tx)
-                        .await
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    let row: Option<(serde_json::Value,)> =
+                        sqlx::query_as(sqlx::AssertSqlSafe(select_sql))
+                            .bind(pk_text.as_ref())
+                            .fetch_optional(&mut *tx)
+                            .await
+                            .map_err(|e| StorageError::Internal(e.to_string()))?;
                     row.map(|(v,)| v)
                 }
             };
@@ -249,12 +254,18 @@ impl PostgresEngine {
                         let update_sql = format!(
                             "UPDATE {ddb_table} SET item_data = $3 WHERE pk = $1 AND {sk_col} = $2"
                         );
-                        bind_sk_execute!(&update_sql, pk_text.as_ref(), sk, &item_json, &mut *tx)?;
+                        bind_sk_execute!(
+                            sqlx::AssertSqlSafe(update_sql),
+                            pk_text.as_ref(),
+                            sk,
+                            &item_json,
+                            &mut *tx
+                        )?;
                     }
                     None => {
                         let update_sql =
                             format!("UPDATE {ddb_table} SET item_data = $2 WHERE pk = $1");
-                        sqlx::query(&update_sql)
+                        sqlx::query(sqlx::AssertSqlSafe(update_sql))
                             .bind(pk_text.as_ref())
                             .bind(&item_json)
                             .execute(&mut *tx)
@@ -272,8 +283,14 @@ impl PostgresEngine {
                         "INSERT INTO {ddb_table} (pk, {sk_col}, item_data) VALUES ($1, $2, $3) \
                          ON CONFLICT (pk, {sk_col}) DO NOTHING"
                     );
-                    bind_sk_execute!(&insert_sql, pk_text.as_ref(), sk, &item_json, &mut *tx)?
-                        .rows_affected()
+                    bind_sk_execute!(
+                        sqlx::AssertSqlSafe(insert_sql),
+                        pk_text.as_ref(),
+                        sk,
+                        &item_json,
+                        &mut *tx
+                    )?
+                    .rows_affected()
                         == 1
                 }
                 None => {
@@ -281,7 +298,7 @@ impl PostgresEngine {
                         "INSERT INTO {ddb_table} (pk, item_data) VALUES ($1, $2) \
                          ON CONFLICT (pk) DO NOTHING"
                     );
-                    sqlx::query(&insert_sql)
+                    sqlx::query(sqlx::AssertSqlSafe(insert_sql))
                         .bind(pk_text.as_ref())
                         .bind(&item_json)
                         .execute(&mut *tx)

@@ -117,8 +117,12 @@ impl PostgresEngine {
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-                let mut old: Option<(serde_json::Value,)> =
-                    bind_sk_fetch_optional!(&select_sql, pk_text.as_str(), &sk, &mut *tx)?;
+                let mut old: Option<(serde_json::Value,)> = bind_sk_fetch_optional!(
+                    sqlx::AssertSqlSafe(select_sql.as_str()),
+                    pk_text.as_str(),
+                    &sk,
+                    &mut *tx
+                )?;
 
                 let mut attempt: u32 = 0;
                 loop {
@@ -135,7 +139,13 @@ impl PostgresEngine {
                         let update_sql = format!(
                             "UPDATE {ddb_table} SET item_data = $3 WHERE pk = $1 AND {sk_col} = $2"
                         );
-                        bind_sk_execute!(&update_sql, pk_text.as_str(), &sk, &item_json, &mut *tx)?;
+                        bind_sk_execute!(
+                            sqlx::AssertSqlSafe(update_sql),
+                            pk_text.as_str(),
+                            &sk,
+                            &item_json,
+                            &mut *tx
+                        )?;
                         break;
                     }
                     // No existing item: the condition checks against an empty item
@@ -151,8 +161,13 @@ impl PostgresEngine {
                         "INSERT INTO {ddb_table} (pk, {sk_col}, item_data) VALUES ($1, $2, $3) \
                          ON CONFLICT (pk, {sk_col}) DO NOTHING"
                     );
-                    let result =
-                        bind_sk_execute!(&insert_sql, pk_text.as_str(), &sk, &item_json, &mut *tx)?;
+                    let result = bind_sk_execute!(
+                        sqlx::AssertSqlSafe(insert_sql),
+                        pk_text.as_str(),
+                        &sk,
+                        &item_json,
+                        &mut *tx
+                    )?;
                     if result.rows_affected() == 1 {
                         break;
                     }
@@ -165,7 +180,12 @@ impl PostgresEngine {
                     if attempt >= MAX_CREATE_RACE_ATTEMPTS {
                         return Err(create_race_exhausted(attempt));
                     }
-                    old = bind_sk_fetch_optional!(&select_sql, pk_text.as_str(), &sk, &mut *tx)?;
+                    old = bind_sk_fetch_optional!(
+                        sqlx::AssertSqlSafe(select_sql.as_str()),
+                        pk_text.as_str(),
+                        &sk,
+                        &mut *tx
+                    )?;
                 }
 
                 // Sync GSI/LSI update within transaction (D-4).
@@ -265,7 +285,7 @@ impl PostgresEngine {
                 );
                 super::gsi_build::pause_before_autocommit_statement().await;
                 bind_sk_execute!(
-                    &upsert_sql,
+                    sqlx::AssertSqlSafe(upsert_sql),
                     pk_text.as_str(),
                     &sk,
                     &item_json,
@@ -287,11 +307,13 @@ impl PostgresEngine {
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
                 let fetch_old = async |tx: &mut sqlx::PgConnection| {
-                    sqlx::query_as::<_, (serde_json::Value,)>(&select_sql)
-                        .bind(pk_text.as_str())
-                        .fetch_optional(tx)
-                        .await
-                        .map_err(|e| StorageError::Internal(e.to_string()))
+                    sqlx::query_as::<_, (serde_json::Value,)>(sqlx::AssertSqlSafe(
+                        select_sql.as_str(),
+                    ))
+                    .bind(pk_text.as_str())
+                    .fetch_optional(tx)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))
                 };
                 let mut old: Option<(serde_json::Value,)> = fetch_old(&mut tx).await?;
 
@@ -309,7 +331,7 @@ impl PostgresEngine {
                         // Row exists, condition passed: update in place.
                         let update_sql =
                             format!("UPDATE {ddb_table} SET item_data = $2 WHERE pk = $1");
-                        sqlx::query(&update_sql)
+                        sqlx::query(sqlx::AssertSqlSafe(update_sql))
                             .bind(pk_text.as_str())
                             .bind(&item_json)
                             .execute(&mut *tx)
@@ -329,7 +351,7 @@ impl PostgresEngine {
                         "INSERT INTO {ddb_table} (pk, item_data) VALUES ($1, $2) \
                          ON CONFLICT (pk) DO NOTHING"
                     );
-                    let result = sqlx::query(&insert_sql)
+                    let result = sqlx::query(sqlx::AssertSqlSafe(insert_sql))
                         .bind(pk_text.as_str())
                         .bind(&item_json)
                         .execute(&mut *tx)
@@ -442,7 +464,7 @@ impl PostgresEngine {
                      ON CONFLICT (pk) DO UPDATE SET item_data = EXCLUDED.item_data"
                 );
                 super::gsi_build::pause_before_autocommit_statement().await;
-                sqlx::query(&upsert_sql)
+                sqlx::query(sqlx::AssertSqlSafe(upsert_sql))
                     .bind(pk_text.as_str())
                     .bind(&item_json)
                     .execute(&self.data_pool)
@@ -477,12 +499,16 @@ impl PostgresEngine {
             let sk = parse_sk(sk_value, sk_type)?;
             let sk_col = sk_column(sk_type);
             let sql = format!("SELECT item_data FROM {ddb_table} WHERE pk = $1 AND {sk_col} = $2");
-            let row: Option<(serde_json::Value,)> =
-                bind_sk_fetch_optional!(&sql, pk_text.as_ref(), &sk, &self.data_pool)?;
+            let row: Option<(serde_json::Value,)> = bind_sk_fetch_optional!(
+                sqlx::AssertSqlSafe(sql),
+                pk_text.as_ref(),
+                &sk,
+                &self.data_pool
+            )?;
             row.map(|(v,)| v)
         } else {
             let sql = format!("SELECT item_data FROM {ddb_table} WHERE pk = $1");
-            let row: Option<(serde_json::Value,)> = sqlx::query_as(&sql)
+            let row: Option<(serde_json::Value,)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(pk_text.as_ref())
                 .fetch_optional(&self.data_pool)
                 .await

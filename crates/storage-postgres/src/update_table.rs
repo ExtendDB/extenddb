@@ -864,9 +864,11 @@ impl PostgresEngine {
                     let idx_id = &deleted_index_ids[delete_idx];
                     delete_idx += 1;
                     let idx_table = Self::index_table_name_static(idx_id);
-                    if let Err(e) = sqlx::query(&format!("DROP TABLE IF EXISTS {idx_table}"))
-                        .execute(&self.data_pool)
-                        .await
+                    if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(format!(
+                        "DROP TABLE IF EXISTS {idx_table}"
+                    )))
+                    .execute(&self.data_pool)
+                    .await
                     {
                         tracing::warn!(
                             "Failed to drop data table for deleted GSI on '{}': {e}",

@@ -51,7 +51,7 @@ impl CodeBody<SqliteStores> for WarmThroughput {
             .await
             .map_err(|e| MigrationError::store(format!("read the columns of {table}"), e))?;
             if !has_column {
-                sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN warm_throughput TEXT"))
+                sqlx::query(sqlx::AssertSqlSafe(format!("ALTER TABLE {table} ADD COLUMN warm_throughput TEXT")))
                     .execute(&stores.pool)
                     .await
                     .map_err(|e| MigrationError::store(format!("add {table}.warm_throughput"), e))?;

@@ -1,0 +1,1 @@
+{"Version":"2012-10-17","Statement":[{"Sid":"AllowTeam1","Effect":"Allow","Principal":{"AWS":["arn:aws:iam::123456789012:root"]},"Action":"sts:AssumeRole","NotResource":"arn:aws:dynamodb:us-east-1:123456789012:table/Secret","Condition":{"ForAllValues:StringLike":{"dynamodb:LeadingKeys":["${aws:userid}*"]},"StringEqualsIfExists":{"aws:PrincipalTag/team":"blue"}}}]}

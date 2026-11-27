@@ -47,11 +47,11 @@ pub(super) async fn fetch_item_in_tx(
         let sk_col = sk_column(sk_type);
         let sql = format!("SELECT item_data FROM {ddb_table} WHERE pk = ? AND {sk_col} = ?");
         let row: Option<(serde_json::Value,)> =
-            bind_sk_fetch_optional!(&sql, pk_text.as_ref(), &sk, &mut **tx)?;
+            bind_sk_fetch_optional!(sqlx::AssertSqlSafe(sql), pk_text.as_ref(), &sk, &mut **tx)?;
         row.map(|(v,)| v)
     } else {
         let sql = format!("SELECT item_data FROM {ddb_table} WHERE pk = ?");
-        let row: Option<(serde_json::Value,)> = sqlx::query_as(&sql)
+        let row: Option<(serde_json::Value,)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
             .bind(pk_text.as_ref())
             .fetch_optional(&mut **tx)
             .await
@@ -98,13 +98,19 @@ pub(crate) async fn upsert_item_in_tx(
             "INSERT INTO {ddb_table} (pk, {sk_col}, item_data) VALUES (?, ?, ?) \
              ON CONFLICT (pk, {sk_col}) DO UPDATE SET item_data = excluded.item_data"
         );
-        bind_sk_execute!(&sql, pk_text.as_ref(), &sk, &item_json, &mut **tx)?;
+        bind_sk_execute!(
+            sqlx::AssertSqlSafe(sql),
+            pk_text.as_ref(),
+            &sk,
+            &item_json,
+            &mut **tx
+        )?;
     } else {
         let sql = format!(
             "INSERT INTO {ddb_table} (pk, item_data) VALUES (?, ?) \
              ON CONFLICT (pk) DO UPDATE SET item_data = excluded.item_data"
         );
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(pk_text.as_ref())
             .bind(&item_json)
             .execute(&mut **tx)
@@ -135,10 +141,10 @@ pub(super) async fn delete_item_in_tx(
         let sk = extenddb_storage::util::parse_sk(sk_value, sk_type)?;
         let sk_col = sk_column(sk_type);
         let sql = format!("DELETE FROM {ddb_table} WHERE pk = ? AND {sk_col} = ?");
-        bind_sk_only_execute!(&sql, pk_text.as_ref(), &sk, &mut **tx)?;
+        bind_sk_only_execute!(sqlx::AssertSqlSafe(sql), pk_text.as_ref(), &sk, &mut **tx)?;
     } else {
         let sql = format!("DELETE FROM {ddb_table} WHERE pk = ?");
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(pk_text.as_ref())
             .execute(&mut **tx)
             .await

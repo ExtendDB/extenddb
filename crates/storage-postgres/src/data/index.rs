@@ -448,7 +448,7 @@ pub(crate) async fn delete_index_row_multi(
         "DELETE FROM {idx_table} WHERE {}",
         where_parts.join(" AND ")
     );
-    let mut query = sqlx::query(&sql).bind(base_pk_text);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(base_pk_text);
 
     for &(sk_name, sk_type) in base_sks {
         if let Some(sk_val) = item.get(sk_name) {
@@ -559,7 +559,7 @@ pub(crate) async fn insert_index_rows_multi(
         updates.join(", ")
     );
 
-    let mut query = sqlx::query(&sql);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
     for &(item, projected) in rows {
         query = query.bind(composite_pk_to_text(item, index_ks)?);
         for &(sk_name, sk_type) in idx_sks {

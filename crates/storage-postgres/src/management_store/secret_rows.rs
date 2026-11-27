@@ -147,11 +147,11 @@ impl PostgresCatalogStore {
         table: SecretTable,
         keys: &[String],
     ) -> OpResult<()> {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {} WHERE {} = ANY($1)",
             table.name(),
             table.key_column()
-        ))
+        )))
         .bind(keys)
         .execute(self.pool())
         .await

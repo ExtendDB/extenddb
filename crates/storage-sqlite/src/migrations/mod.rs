@@ -102,6 +102,15 @@ pub(crate) const RELEASED: &[Released] = &[
         rebless: None,
     },
     Released {
+        id: MigrationId::SortKeyDefinitions,
+        store: StoreKind::Catalog,
+        checksum: "cf7451e63b0a86d300b9fa5004cd56d88682cdbd6a344a13c6887b206a6f8436",
+        fingerprint: Some("0003_sort_key_definitions/sqlite/1"),
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: Some("sqlx 0.9 takes dynamic SQL only through sqlx::AssertSqlSafe"),
+    },
+    Released {
         id: MigrationId::IndexTableBaseKey,
         store: StoreKind::Catalog,
         checksum: "33863368aef25b7d9e678ddb4c9676de5a3c0408c818e4b3a91a88253d1b46c2",
@@ -109,6 +118,15 @@ pub(crate) const RELEASED: &[Released] = &[
         kind: Kind::Breaking,
         convergent: true,
         rebless: None,
+    },
+    Released {
+        id: MigrationId::IndexTableBaseKey,
+        store: StoreKind::Catalog,
+        checksum: "5a43cbaf985ceeefc88c801ba32f194aec4a0639a41c225b1ff5207b5ca27692",
+        fingerprint: Some("0004_index_table_base_key/sqlite/1"),
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: Some("sqlx 0.9 takes dynamic SQL only through sqlx::AssertSqlSafe"),
     },
     Released {
         id: MigrationId::DropContinuousBackups,
@@ -127,6 +145,15 @@ pub(crate) const RELEASED: &[Released] = &[
         kind: Kind::Breaking,
         convergent: true,
         rebless: None,
+    },
+    Released {
+        id: MigrationId::BackupCatalogIndex,
+        store: StoreKind::Catalog,
+        checksum: "36ba7b04006342e4abd1b5a6a2e03c531a9a9639d9b251c720205a63ca4649ec",
+        fingerprint: Some("0006_backup_catalog_index/sqlite/1"),
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: Some("sqlx 0.9 takes dynamic SQL only through sqlx::AssertSqlSafe"),
     },
     Released {
         id: MigrationId::StreamPending,
@@ -154,6 +181,15 @@ pub(crate) const RELEASED: &[Released] = &[
         kind: Kind::Breaking,
         convergent: true,
         rebless: None,
+    },
+    Released {
+        id: MigrationId::WarmThroughput,
+        store: StoreKind::Catalog,
+        checksum: "6fdb9da9038a2ec037a132696c824406a3316a16fba85739231b69f9258113ef",
+        fingerprint: Some("0009_warm_throughput/sqlite/1"),
+        kind: Kind::Breaking,
+        convergent: true,
+        rebless: Some("sqlx 0.9 takes dynamic SQL only through sqlx::AssertSqlSafe"),
     },
     Released {
         id: MigrationId::AccountMetrics,

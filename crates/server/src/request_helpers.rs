@@ -245,6 +245,13 @@ pub(crate) async fn authorize_request(
         authz_resource::validate_tag_resource_arn_shape(arn)?;
     }
 
+    // A Query's request-time checks run before the IAM decision, after the
+    // cross-account refusal above; see
+    // `extenddb_engine::query_key_values::validate_query_request_body`.
+    if operation == "Query" {
+        extenddb_engine::query_key_values::validate_query_request_body(input)?;
+    }
+
     // A StreamArn (DescribeStream, GetShardIterator) or BackupArn
     // (DescribeBackup, DeleteBackup) that is not a well-formed ARN of that kind,
     // and an export TableArn that does not parse, are refused with
@@ -491,6 +498,10 @@ pub(crate) async fn authorize_request(
                 key_info.as_ref(),
                 &state.limits,
             ),
+            // The service sets no `dynamodb:Attributes` value on a
+            // SearchVectors, so a bare negated operator over the key matches
+            // as it does in IAM (see `request_attributes`).
+            attributes_absent_on_service: operation == "SearchVectors",
             select: input
                 .get("Select")
                 .and_then(|v| v.as_str())

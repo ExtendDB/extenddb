@@ -928,9 +928,9 @@ mod vector_propagation_tests {
 
     async fn indexed_rows(engine: &SqliteEngine, table_id: &str) -> Vec<String> {
         let vec_table = crate::data::vector_table_name(table_id, INDEX_ID);
-        sqlx::query_as::<_, (String,)>(&format!(
+        sqlx::query_as::<_, (String,)>(sqlx::AssertSqlSafe(format!(
             "SELECT item_data FROM {vec_table} ORDER BY base_pk"
-        ))
+        )))
         .fetch_all(&engine.pool)
         .await
         .expect("read vector rows")
@@ -1239,7 +1239,7 @@ mod vector_propagation_tests {
         // dropped out from under its queued row.
         write(&engine, &table_id, None, Some(&item("b", 7)), 60_000).await;
         let dropped = crate::data::vector_table_name(&table_id, INDEX_ID);
-        sqlx::query(&format!("DROP TABLE {dropped}"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE {dropped}")))
             .execute(&engine.pool)
             .await
             .expect("drop index data table");
@@ -1250,10 +1250,12 @@ mod vector_propagation_tests {
         assert_eq!(queue_depth(&engine).await, 0, "no row may be left behind");
 
         let survivor = crate::data::vector_table_name(&table_id, survivor_index);
-        let (rows,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {survivor}"))
-            .fetch_one(&engine.pool)
-            .await
-            .expect("count survivor");
+        let (rows,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {survivor}"
+        )))
+        .fetch_one(&engine.pool)
+        .await
+        .expect("count survivor");
         assert_eq!(
             rows, 1,
             "the sibling index must still be maintained when another index vanishes"

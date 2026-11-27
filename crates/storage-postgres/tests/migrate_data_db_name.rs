@@ -98,9 +98,11 @@ impl Drop for Deployment {
                     return;
                 };
                 for n in names {
-                    let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{n}\" WITH (FORCE)"))
-                        .execute(&admin)
-                        .await;
+                    let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+                        "DROP DATABASE IF EXISTS \"{n}\" WITH (FORCE)"
+                    )))
+                    .execute(&admin)
+                    .await;
                 }
                 admin.close().await;
             });
@@ -222,15 +224,18 @@ async fn migrate_uses_the_data_database_name_init_recorded() {
     // Once it exists, the explicit name wins over the database the catalog's
     // connection string row names, on that row's server: the status reads
     // its empty ledger instead of refusing the two names.
-    sqlx::query(&format!("CREATE DATABASE \"{}\"", d.derived_db))
-        .execute(&d.admin)
-        .await
-        .expect("create the derived database");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE \"{}\"",
+        d.derived_db
+    )))
+    .execute(&d.admin)
+    .await
+    .expect("create the derived database");
     let status = PostgresCatalogMigrations.status(&explicit).await;
-    let _ = sqlx::query(&format!(
+    let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
         "DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)",
         d.derived_db
-    ))
+    )))
     .execute(&d.admin)
     .await;
     assert!(

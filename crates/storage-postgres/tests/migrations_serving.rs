@@ -235,11 +235,17 @@ async fn an_attempt_the_database_cannot_answer_is_unavailable() {
             s.catalog_name
         )
     };
-    sqlx::query(&allow(false)).execute(&admin).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(allow(false)))
+        .execute(&admin)
+        .await
+        .unwrap();
     end_the_serving_session(&admin, &s).await;
     lost(&registration).await;
     let attempt = registration.register_again().await;
-    sqlx::query(&allow(true)).execute(&admin).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(allow(true)))
+        .execute(&admin)
+        .await
+        .unwrap();
     match attempt {
         Reregistration::Unavailable(why) => assert!(why.contains("connect"), "{why}"),
         other => panic!("an attempt the database cannot answer: {other:?}"),

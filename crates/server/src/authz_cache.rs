@@ -12,7 +12,8 @@
 //! - Permissions boundary — `Option<Arc<PolicyDocument>>`.
 //! - Principal tags — pre-flattened `HashMap<String, String>`.
 //! - Resource tags — same.
-//! - Role-session data (policy + session tags) — pre-parsed.
+//! - Role-session data (policy, session tags, issue time) of the session
+//!   with a given access key — pre-parsed.
 //!
 //! Self-induced changes from the management API are propagated via the
 //! [`AuthCacheRegistry`] (write-through invalidation). Off-instance changes
@@ -113,6 +114,9 @@ pub struct CachedAuthzStore {
     role_policies: SwrCache<(String, String), PolicyList, OpError>,
     role_boundary: SwrCache<(String, String), Arc<PolicyDocument>, OpError>,
     role_tags: SwrCache<(String, String), TagMap, OpError>,
+    /// Keyed by `(account_id, role_name, access_key_id)`. The store reads a
+    /// session's data by its access key alone; the account and the role are
+    /// in the key so that a role's or an account's entries can be dropped.
     session_data: SwrCache<(String, String, String), Arc<CachedSessionData>, OpError>,
     resource_tags: SwrCache<String, TagMap, OpError>,
     /// Principal creation time (RFC 3339), part of the `aws:userid` derivation.
@@ -315,18 +319,23 @@ impl CachedAuthzStore {
             .unwrap_or_else(|| Arc::new(HashMap::new())))
     }
 
-    /// Fetch role-session data (parsed session policy + tags).
+    /// Fetch the data (parsed session policy, session tags, issue time) of
+    /// the role session whose access key ID is `access_key_id`, or `None` if
+    /// no session has that key. The session is read by its access key alone:
+    /// `account_id` and `role_name` only place the entry in the cache, so that
+    /// deleting the role or the account drops it, and must be the session's
+    /// own account and role.
     pub async fn fetch_session_data(
         &self,
         account_id: &str,
         role_name: &str,
-        session_name: &str,
+        access_key_id: &str,
     ) -> OpResult<Option<Arc<CachedSessionData>>> {
         self.session_data
             .get((
                 account_id.to_owned(),
                 role_name.to_owned(),
-                session_name.to_owned(),
+                access_key_id.to_owned(),
             ))
             .await
     }
@@ -450,23 +459,13 @@ impl CachedAuthzStore {
             .await;
     }
 
-    pub async fn invalidate_session(&self, account_id: &str, role_name: &str, session_name: &str) {
-        self.session_data
-            .invalidate(&(
-                account_id.to_owned(),
-                role_name.to_owned(),
-                session_name.to_owned(),
-            ))
-            .await;
-    }
-
     pub async fn invalidate_resource_tags(&self, arn: &str) {
         self.resource_tags.invalidate(&arn.to_owned()).await;
     }
 
     /// Drop every cached session-data entry for `(account_id, role_name)`.
     /// Used when a role is deleted; the cache's key is
-    /// `(account, role, session)`, so we predicate on the first two.
+    /// `(account, role, access key ID)`, so we predicate on the first two.
     pub fn invalidate_role_sessions(&self, account_id: &str, role_name: &str) {
         let acct = account_id.to_owned();
         let role = role_name.to_owned();
@@ -690,15 +689,6 @@ impl extenddb_auth::AuthzCacheInvalidator for CachedAuthzStore {
         role_name: &'a str,
     ) -> BoxFuture<'a, ()> {
         Box::pin(self.invalidate_role_created_at(account_id, role_name))
-    }
-
-    fn invalidate_session<'a>(
-        &'a self,
-        account_id: &'a str,
-        role_name: &'a str,
-        session_name: &'a str,
-    ) -> BoxFuture<'a, ()> {
-        Box::pin(self.invalidate_session(account_id, role_name, session_name))
     }
 
     fn invalidate_resource_tags<'a>(&'a self, arn: &'a str) -> BoxFuture<'a, ()> {
@@ -941,21 +931,19 @@ fn make_role_created_at_loader(inner: Arc<dyn AuthorizationStore>) -> CreatedAtL
 }
 
 fn make_session_data_loader(inner: Arc<dyn AuthorizationStore>) -> SessionLoader {
-    Arc::new(move |(account_id, role_name, session_name): (String, String, String)|
+    Arc::new(move |(account_id, role_name, access_key_id): (String, String, String)|
         -> BoxFuture<'static, OpResult<Option<Arc<CachedSessionData>>>> {
         let inner = inner.clone();
         async move {
-            let raw: Option<SessionData> = inner
-                .fetch_session_data(&account_id, &role_name, &session_name)
-                .await?;
+            let raw: Option<SessionData> = inner.fetch_session_data(&access_key_id).await?;
             let Some(data) = raw else { return Ok(None) };
 
             let session_policy = match data.session_policy {
                 Some(json_str) => Some(parse_document(
                     &json_str,
                     &format_args!(
-                        "the session policy of role {role_name} session {session_name} in \
-                         account {account_id}"
+                        "the session policy of the session with access key {access_key_id} \
+                         of role {role_name} in account {account_id}"
                     ),
                 )?),
                 None => None,
@@ -1004,7 +992,6 @@ pub(crate) mod tests {
     use super::*;
 
     type PrincipalKey = (String, String);
-    type SessionKey = (String, String, String);
     type TagPairs = Vec<(String, String)>;
 
     /// Counts calls per method so tests can assert the cache prevents repeats.
@@ -1028,7 +1015,8 @@ pub(crate) mod tests {
         pub(crate) role_policies: Mutex<HashMap<PrincipalKey, Vec<String>>>,
         role_boundary: Mutex<HashMap<PrincipalKey, Option<String>>>,
         role_tags: Mutex<HashMap<PrincipalKey, TagPairs>>,
-        session_data: Mutex<HashMap<SessionKey, Option<SessionData>>>,
+        /// Session data by access key ID.
+        session_data: Mutex<HashMap<String, Option<SessionData>>>,
         pub(crate) resource_tags: Mutex<HashMap<String, TagPairs>>,
     }
 
@@ -1155,21 +1143,14 @@ pub(crate) mod tests {
 
         fn fetch_session_data(
             &self,
-            account_id: &str,
-            role_name: &str,
-            session_name: &str,
+            access_key_id: &str,
         ) -> BoxFuture<'_, OpResult<Option<SessionData>>> {
             self.session_data_calls.fetch_add(1, Ordering::SeqCst);
-            let key = (
-                account_id.to_owned(),
-                role_name.to_owned(),
-                session_name.to_owned(),
-            );
             let v = self
                 .session_data
                 .lock()
                 .unwrap()
-                .get(&key)
+                .get(access_key_id)
                 .cloned()
                 .unwrap_or(None);
             Box::pin(async move { Ok(v) })
@@ -1378,7 +1359,7 @@ pub(crate) mod tests {
     async fn session_data_round_trip() {
         let inner = Arc::new(CountingAuthzStore::default());
         inner.session_data.lock().unwrap().insert(
-            ("a".to_owned(), "r".to_owned(), "s".to_owned()),
+            "ASIAKEY1".to_owned(),
             Some(SessionData {
                 session_policy: Some(allow_policy("dynamodb:Query")),
                 session_tags: vec![("Project".to_owned(), "Atlas".to_owned())],
@@ -1388,12 +1369,12 @@ pub(crate) mod tests {
         let cache = CachedAuthzStore::new(inner.clone(), fast_authz_cfg());
 
         let s1 = cache
-            .fetch_session_data("a", "r", "s")
+            .fetch_session_data("a", "r", "ASIAKEY1")
             .await
             .unwrap()
             .unwrap();
         let s2 = cache
-            .fetch_session_data("a", "r", "s")
+            .fetch_session_data("a", "r", "ASIAKEY1")
             .await
             .unwrap()
             .unwrap();
@@ -1404,19 +1385,71 @@ pub(crate) mod tests {
         assert_eq!(inner.session_data_calls.load(Ordering::SeqCst), 1);
     }
 
+    /// Two sessions of one role, as `AssumeRole` stores two under one session
+    /// name: the cached data of one is never served for the other's key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_session_is_never_served_another_sessions_cached_data() {
+        let inner = Arc::new(CountingAuthzStore::default());
+        for (key, project, issued) in [
+            ("ASIAKEY1", "Atlas", "2026-11-01T00:00:01Z"),
+            ("ASIAKEY2", "Borealis", "2026-11-01T00:00:02Z"),
+        ] {
+            inner.session_data.lock().unwrap().insert(
+                key.to_owned(),
+                Some(SessionData {
+                    session_policy: None,
+                    session_tags: vec![("Project".to_owned(), project.to_owned())],
+                    created_at: Some(issued.to_owned()),
+                }),
+            );
+        }
+        let cache = CachedAuthzStore::new(inner.clone(), fast_authz_cfg());
+
+        let first = cache
+            .fetch_session_data("a", "r", "ASIAKEY1")
+            .await
+            .unwrap()
+            .unwrap();
+        let second = cache
+            .fetch_session_data("a", "r", "ASIAKEY2")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first.session_tags.get("Project"), Some(&"Atlas".to_owned()));
+        assert_eq!(
+            second.session_tags.get("Project"),
+            Some(&"Borealis".to_owned())
+        );
+        assert_eq!(
+            first.token_issue_time.as_deref(),
+            Some("2026-11-01T00:00:01Z")
+        );
+        assert_eq!(
+            second.token_issue_time.as_deref(),
+            Some("2026-11-01T00:00:02Z")
+        );
+        assert_eq!(
+            inner.session_data_calls.load(Ordering::SeqCst),
+            2,
+            "the second session's key misses the cache and reads the store"
+        );
+    }
+
     // ─────────────────────────────────────────────────────────────────
     // PR3 tests — fanout invalidation
     // ─────────────────────────────────────────────────────────────────
 
     /// `invalidate_role_sessions` drops every cached session for a given
-    /// (account, role), regardless of session_name.
+    /// (account, role), whatever its access key.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn invalidate_role_sessions_drops_all_sessions_for_role() {
         let inner = Arc::new(CountingAuthzStore::default());
-        // Two sessions for the same role.
-        for s in &["s1", "s2"] {
+        // Two sessions for the same role, and one for a different role,
+        // which must NOT be invalidated.
+        for key in ["ASIAKEY1", "ASIAKEY2", "ASIAKEY3"] {
             inner.session_data.lock().unwrap().insert(
-                ("a".to_owned(), "r".to_owned(), (*s).to_owned()),
+                key.to_owned(),
                 Some(SessionData {
                     session_policy: None,
                     session_tags: vec![],
@@ -1424,22 +1457,19 @@ pub(crate) mod tests {
                 }),
             );
         }
-        // One session for a different role — must NOT be invalidated.
-        inner.session_data.lock().unwrap().insert(
-            ("a".to_owned(), "other-role".to_owned(), "s1".to_owned()),
-            Some(SessionData {
-                session_policy: None,
-                session_tags: vec![],
-                created_at: None,
-            }),
-        );
         let cache = CachedAuthzStore::new(inner.clone(), fast_authz_cfg());
 
         // Prime all three sessions.
-        cache.fetch_session_data("a", "r", "s1").await.unwrap();
-        cache.fetch_session_data("a", "r", "s2").await.unwrap();
         cache
-            .fetch_session_data("a", "other-role", "s1")
+            .fetch_session_data("a", "r", "ASIAKEY1")
+            .await
+            .unwrap();
+        cache
+            .fetch_session_data("a", "r", "ASIAKEY2")
+            .await
+            .unwrap();
+        cache
+            .fetch_session_data("a", "other-role", "ASIAKEY3")
             .await
             .unwrap();
         let primed = inner.session_data_calls.load(Ordering::SeqCst);
@@ -1450,10 +1480,16 @@ pub(crate) mod tests {
 
         // Now re-fetch — sessions for role "r" hit the inner store again;
         // the session for "other-role" remains cached.
-        cache.fetch_session_data("a", "r", "s1").await.unwrap();
-        cache.fetch_session_data("a", "r", "s2").await.unwrap();
         cache
-            .fetch_session_data("a", "other-role", "s1")
+            .fetch_session_data("a", "r", "ASIAKEY1")
+            .await
+            .unwrap();
+        cache
+            .fetch_session_data("a", "r", "ASIAKEY2")
+            .await
+            .unwrap();
+        cache
+            .fetch_session_data("a", "other-role", "ASIAKEY3")
             .await
             .unwrap();
 
@@ -1514,6 +1550,45 @@ pub(crate) mod tests {
             inner.user_tags_calls.load(Ordering::SeqCst),
             tags_calls + 1,
             "a1 user_tags re-fetched"
+        );
+    }
+
+    /// `invalidate_account` drops the cached session data of every role
+    /// session in the account, and leaves another account's sessions cached.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn invalidate_account_drops_the_accounts_session_data() {
+        let inner = Arc::new(CountingAuthzStore::default());
+        for key in ["ASIAKEY1", "ASIAKEY2", "ASIAKEY3"] {
+            inner.session_data.lock().unwrap().insert(
+                key.to_owned(),
+                Some(SessionData {
+                    session_policy: None,
+                    session_tags: vec![],
+                    created_at: None,
+                }),
+            );
+        }
+        let cache = CachedAuthzStore::new(inner.clone(), fast_authz_cfg());
+        let sessions = [
+            ("a1", "r", "ASIAKEY1"),
+            ("a1", "other-role", "ASIAKEY2"),
+            ("a2", "r", "ASIAKEY3"),
+        ];
+        for (account, role, key) in sessions {
+            cache.fetch_session_data(account, role, key).await.unwrap();
+        }
+        let primed = inner.session_data_calls.load(Ordering::SeqCst);
+
+        cache.invalidate_account("a1");
+        cache.session_data.run_pending_tasks().await;
+
+        for (account, role, key) in sessions {
+            cache.fetch_session_data(account, role, key).await.unwrap();
+        }
+        assert_eq!(
+            inner.session_data_calls.load(Ordering::SeqCst) - primed,
+            2,
+            "both of a1's sessions are re-fetched, a2's stays cached"
         );
     }
 }

@@ -57,6 +57,7 @@ fn parse(json: &str) -> PolicyDocument {
     PolicyDocument::from_json(json).unwrap()
 }
 
+mod absent_attributes;
 mod arn_value_tokens;
 mod case_three;
 mod combined;

@@ -465,6 +465,7 @@ fn principal_is_named_as_the_service_names_it() {
         account_id: A.to_owned(),
         role_name: "r".to_owned(),
         session_name: "s".to_owned(),
+        access_key_id: "ASIAIOSFODNN7EXAMPLE".to_owned(),
     };
     assert_eq!(
         principal_arn(&role),

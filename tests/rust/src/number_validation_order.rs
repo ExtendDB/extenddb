@@ -305,9 +305,10 @@ const LONG_NAME: &str = "Attribute name is too large, must be less than 65536 by
 /// The answer for `1E2147483648`.
 const OVERFLOW: &str =
     "Number overflow. Attempting to store a number with magnitude larger than supported range";
-/// A 37-character `ClientRequestToken`, one over the limit.
-const TOKEN_TEXT: &str =
-    "failed to satisfy constraint: Member must have length less than or equal to 36";
+/// The refusal of a 37-character `ClientRequestToken`, one over the limit.
+const TOKEN_TEXT: &str = "ValidationException:1 validation error detected: Value at \
+     'ClientRequestToken' failed to satisfy constraint: Member must have length less than \
+     or equal to 36";
 
 /// An attribute name of 65,536 bytes, one over the limit.
 fn long_name() -> String {
@@ -345,18 +346,10 @@ fn assert_name_or_overflow(err: &str) {
 
 /// Assert the refusal of a 37-character `ClientRequestToken`. The service's
 /// message names the member `ClientRequestToken`, measured twice on
-/// 2026-11-11 (06:34 and 08:25 UTC), where it named it `clientRequestToken`
-/// on 2026-10-27. ExtendDB still writes `clientRequestToken`, which issue
-/// #959 tracks, so the check ignores the case of the member name.
+/// 2026-11-11 (06:34 and 08:25 UTC) and twice on 2026-11-23; on 2026-10-27
+/// it named it `clientRequestToken`.
 pub(crate) fn assert_token_refused(err: &str) {
-    let lower = err.to_ascii_lowercase();
-    assert!(
-        err.starts_with("ValidationException:")
-            && lower.contains("value at 'clientrequesttoken'")
-            && err.contains(TOKEN_TEXT),
-        "expected the token's constraint message, got {}",
-        &err[..err.len().min(300)]
-    );
+    assert_eq!(err, TOKEN_TEXT);
 }
 
 #[tokio::test]

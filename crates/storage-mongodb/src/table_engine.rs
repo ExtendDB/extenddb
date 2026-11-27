@@ -1299,7 +1299,7 @@ impl MongoEngine {
         let table_doc = tables_coll
             .find_one(doc! { "_id": { "account_id": account_id, "table_name": table_name } })
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?
+            .map_err(|e| crate::error_class::catalog_read_err(&e))?
             .ok_or_else(|| StorageError::TableNotFound(table_name.to_string()))?;
 
         self.table_key_info_from_doc(&table_doc, true).await
@@ -1320,7 +1320,7 @@ impl MongoEngine {
         let table_doc = tables_coll
             .find_one(doc! { "table_id": table_id })
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?
+            .map_err(|e| crate::error_class::catalog_read_err(&e))?
             .ok_or_else(|| StorageError::TableNotFound(table_id.to_string()))?;
 
         self.table_key_info_from_doc(&table_doc, false).await
@@ -1388,12 +1388,12 @@ impl MongoEngine {
         let mut idx_cursor = indexes_coll
             .find(doc! { "_id.table_id": &table_id })
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            .map_err(|e| crate::error_class::catalog_read_err(&e))?;
         let mut infos = Vec::new();
         while let Some(idx_doc) = idx_cursor
             .try_next()
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?
+            .map_err(|e| crate::error_class::catalog_read_err(&e))?
         {
             infos.push(index_info_from_doc(&idx_doc)?);
         }
@@ -1451,7 +1451,7 @@ impl MongoEngine {
         let index_doc = indexes_coll
             .find_one(doc! { "_id": { "table_id": table_id, "index_name": index_name } })
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?
+            .map_err(|e| crate::error_class::catalog_read_err(&e))?
             .ok_or_else(|| StorageError::IndexNotFound(index_name.to_string()))?;
 
         let index_id = index_doc
@@ -2004,7 +2004,7 @@ fn active_table_filter(filter: &Document) -> Document {
 
 #[cfg(test)]
 mod tests {
-    use super::active_table_filter;
+    use super::{StorageError, active_table_filter};
     use mongodb::bson::doc;
 
     #[test]
@@ -2014,5 +2014,29 @@ mod tests {
         assert_eq!(active.get_str("table_status"), Ok("ACTIVE"));
         assert_eq!(active.get_document("_id"), filter.get_document("_id"));
         assert_eq!(active.len(), 2);
+    }
+
+    /// The `indexes` read of `table_key_info_from_doc`. Through the lookups
+    /// the closed-port engine fails at the `tables` read before it, so this
+    /// test hands the function a catalog document as `create_table` writes
+    /// one, and the index list is then the first read that reaches the driver.
+    #[tokio::test]
+    async fn an_unreachable_deployment_makes_the_index_list_read_transient() {
+        let engine = crate::error_class::engine_on_a_closed_port().await;
+        let table_doc = doc! {
+            "_id": { "account_id": "444455556666", "table_name": "t" },
+            "table_id": "t-id",
+            "table_status": "ACTIVE",
+            "key_schema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
+            "attribute_definitions": [{ "AttributeName": "pk", "AttributeType": "S" }],
+        };
+        let err = engine
+            .table_key_info_from_doc(&table_doc, true)
+            .await
+            .expect_err("no server is listening on port 1");
+        assert!(
+            matches!(err, StorageError::Transient(_)),
+            "the index list read must report an unreachable deployment as Transient, got {err:?}"
+        );
     }
 }

@@ -5,7 +5,9 @@
 //!
 //! The whole search is one query. Distance, partition scoping, inline filters,
 //! ordering and the row limit all evaluate in the server, so the wire carries the
-//! `top_k` hits rather than every candidate row. That is the reason the embedding
+//! `top_k` hits rather than every candidate row. A search with a condition that
+//! this process evaluates reads the ordering in bounded pages instead, as
+//! `vector_search_filtered` describes. Scoring in the server is the reason the embedding
 //! is stored in pgvector's own column type: the SQLite backend has to stream every
 //! row of a partition and compute distances in process, which is the cost
 //! ADR-0004 accepted for a backend that cannot load an extension.
@@ -156,6 +158,42 @@ fn report_score(function: DistanceFunction, ordered: f64) -> f64 {
     }
 }
 
+/// Map a search statement's failure to the error the search reports.
+fn map_search_error(e: sqlx::Error, index_name: &str) -> StorageError {
+    let mapped = crate::vector::map_vector_sql_error(e);
+    // The data table is gone, which happens when the index is deleted between
+    // the catalog read and the search statement. That is a deleted index, so
+    // it answers like one instead of reporting an internal failure the caller
+    // can do nothing about.
+    if crate::gsi_queue::is_undefined_table(&mapped) {
+        StorageError::IndexNotFound(index_name.to_owned())
+    } else {
+        mapped
+    }
+}
+
+/// One hit: the stored item with its vector attribute, and the reported score.
+fn hit(
+    mut item: extenddb_core::types::Item,
+    vector_attribute_name: &str,
+    embedding: &Vector,
+    function: DistanceFunction,
+    ordered: f64,
+) -> VectorHit {
+    // Reinstated from the stored f32s rather than from a second copy in the
+    // payload, so what comes back is the narrowed value that was actually
+    // indexed. The engine drops it again unless a projection expression names
+    // it.
+    item.insert(
+        vector_attribute_name.to_owned(),
+        extenddb_core::validation::vector_item::vector_attribute(embedding.as_slice()),
+    );
+    VectorHit {
+        item,
+        score: report_score(function, ordered),
+    }
+}
+
 impl VectorSearchEngine for PostgresEngine {
     fn search_vectors(&self, req: VectorSearch<'_>) -> BoxedFuture<'_, VectorSearchResult> {
         // The request borrows from the caller's frame, so own what the future needs.
@@ -177,6 +215,7 @@ impl VectorSearchEngine for PostgresEngine {
             .iter()
             .map(|(name, value)| ((*name).to_owned(), (*value).clone()))
             .collect();
+        let item_filter = req.item_filter.clone();
 
         Box::pin(async move {
             let partition = partition?;
@@ -255,63 +294,90 @@ impl VectorSearchEngine for PostgresEngine {
             // alone leaves their relative order up to the plan, and two identical
             // searches can disagree about which of them the top_k cut keeps.
             let base_sks = crate::data::all_sort_key_info(&base_key_schema, &base_attr_defs);
-            let tie_break = crate::data::vector_index::base_key_columns(&base_sks)
-                .into_iter()
+            let key_columns = crate::data::vector_index::base_key_columns(&base_sks);
+            let tie_break = key_columns
+                .iter()
                 .map(|col| format!("{col} ASC"))
                 .collect::<Vec<_>>()
                 .join(", ");
 
+            let score = score_expression(function, 4);
+            if let Some(condition) = &item_filter {
+                let filters = filters
+                    .iter()
+                    .map(|(name, value)| {
+                        serde_json::to_string(value)
+                            .map(|json| (name.clone(), json))
+                            .map_err(|e| StorageError::Internal(format!("filter value: {e}")))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let statement = crate::vector_search_filtered::ScanStatement {
+                    score,
+                    from: format!("FROM {vec_table} WHERE part = $2{predicates}"),
+                    key_columns,
+                    vec_table,
+                    vector: Vector::from(query_vector),
+                    partition: partition.into_bytes(),
+                    norm: query_norm,
+                    filters,
+                };
+                let rows = crate::vector_search_filtered::fetch_matching(
+                    &statement,
+                    &self.data_pool,
+                    condition.as_ref(),
+                    top_k,
+                    &|e| map_search_error(e, &index_name),
+                )
+                .await?;
+                return Ok(VectorSearchOutput {
+                    hits: rows
+                        .into_iter()
+                        .map(|(ordered, embedding, item)| {
+                            hit(item, &vector_attribute_name, &embedding, function, ordered)
+                        })
+                        .collect(),
+                    distance_function: function,
+                });
+            }
+
             let sql = format!(
                 "SELECT {score} AS score, embedding, item_data \
                  FROM {vec_table} WHERE part = $2{predicates} \
-                 ORDER BY score ASC, {tie_break} LIMIT $3",
-                score = score_expression(function, 4),
+                 ORDER BY score ASC, {tie_break} LIMIT $3"
             );
 
             // Bound as a typed vector rather than a text literal, so the value that
             // reaches the server is the same f32 sequence the engine validated.
-            let mut query = sqlx::query_as::<_, (f64, Vector, serde_json::Value)>(&sql)
-                .bind(Vector::from(query_vector))
-                // Bytes, matching the BYTEA column: the unscoped sentinel contains
-                // a NUL, so a text comparison would not even be storable.
-                .bind(partition.into_bytes())
-                .bind(top_k)
-                .bind(query_norm);
+            let mut query =
+                sqlx::query_as::<_, (f64, Vector, serde_json::Value)>(sqlx::AssertSqlSafe(sql))
+                    .bind(Vector::from(query_vector))
+                    // Bytes, matching the BYTEA column: the unscoped sentinel contains
+                    // a NUL, so a text comparison would not even be storable.
+                    .bind(partition.into_bytes())
+                    .bind(top_k)
+                    .bind(query_norm);
             for (name, value) in &filters {
                 let value_json = serde_json::to_string(value)
                     .map_err(|e| StorageError::Internal(format!("filter value: {e}")))?;
                 query = query.bind(name).bind(value_json);
             }
 
-            let rows = query.fetch_all(&self.data_pool).await.map_err(|e| {
-                let mapped = crate::vector::map_vector_sql_error(e);
-                // The data table is gone, which happens when the index is deleted
-                // between the catalog read above and this statement. That is a
-                // deleted index, so it answers like one instead of reporting an
-                // internal failure the caller can do nothing about.
-                if crate::gsi_queue::is_undefined_table(&mapped) {
-                    StorageError::IndexNotFound(index_name.clone())
-                } else {
-                    mapped
-                }
-            })?;
+            let rows = query
+                .fetch_all(&self.data_pool)
+                .await
+                .map_err(|e| map_search_error(e, &index_name))?;
 
             let mut hits = Vec::with_capacity(rows.len());
             for (ordered, embedding, item_json) in rows {
-                let mut item: extenddb_core::types::Item = serde_json::from_value(item_json)
+                let item: extenddb_core::types::Item = serde_json::from_value(item_json)
                     .map_err(|e| StorageError::Internal(format!("stored item: {e}")))?;
-                // Reinstated from the stored f32s rather than from a second copy in
-                // the payload, so what comes back is the narrowed value that was
-                // actually indexed. The engine drops it again unless a projection
-                // expression names it.
-                item.insert(
-                    vector_attribute_name.clone(),
-                    extenddb_core::validation::vector_item::vector_attribute(embedding.as_slice()),
-                );
-                hits.push(VectorHit {
+                hits.push(hit(
                     item,
-                    score: report_score(function, ordered),
-                });
+                    &vector_attribute_name,
+                    &embedding,
+                    function,
+                    ordered,
+                ));
             }
 
             Ok(VectorSearchOutput {

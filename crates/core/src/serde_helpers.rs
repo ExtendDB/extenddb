@@ -20,7 +20,7 @@ const MAX_PLACEHOLDER_KEY_BYTES: usize = 255;
 
 /// A placeholder identifier (the text after the `#` / `:`) is one or more of
 /// `[A-Za-z0-9_]`.
-fn is_placeholder_ident(rest: &str) -> bool {
+pub(crate) fn is_placeholder_ident(rest: &str) -> bool {
     !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
@@ -28,7 +28,7 @@ fn is_placeholder_ident(rest: &str) -> bool {
 ///
 /// `include_size_in_too_long`: the Names too-long message appends
 /// `; size of key: N`, the Values one does not (Amazon `DynamoDB` quirk).
-fn validate_placeholder_key(
+pub(crate) fn validate_placeholder_key(
     key: &str,
     prefix: char,
     field_name: &str,

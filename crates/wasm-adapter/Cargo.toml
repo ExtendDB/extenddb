@@ -20,6 +20,21 @@ publish = false
 # `cargo build -p extenddb-wasm-adapter` (the wasm build-check) work.
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# The engine is taken with its default features off (the workspace entry), so
+# this crate names the search-inequality-filters feature for the engine, core
+# and the SQLite backend together. Without it the engine would compile the
+# extended search grammar out while core and the backend compile it in, and
+# the browser build would serve the equality-only grammar.
+# devtools/compile-out-search-inequality-filters removes it from this default
+# list as from the others.
+default = ["search-inequality-filters"]
+search-inequality-filters = [
+    "extenddb-core/search-inequality-filters",
+    "extenddb-engine/search-inequality-filters",
+    "extenddb-storage-sqlite/search-inequality-filters",
+]
+
 [dependencies]
 extenddb-auth = { workspace = true }
 extenddb-core = { workspace = true }

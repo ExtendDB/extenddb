@@ -131,6 +131,65 @@ pub(crate) async fn handle_request(
         }
     };
 
+    // A SearchVectors request is checked before it is authorized, as far as
+    // the checks need no table: the body, IndexName, SearchVector, TopK, the
+    // expression maps, the projection and the search condition. They run once
+    // the table name passes `check_table_name_chars`; a table name outside
+    // its pattern answers first, from `authorize_request`, and no length
+    // check applies to the table name here (#1462). The checked request goes
+    // to the engine at dispatch, so the checks run once. A failure is recorded
+    // in the request metrics as an engine error is: the error, the request
+    // count and the latency segments, the checks' time as the dispatch
+    // segment.
+    let mut checked_search = None;
+    if operation == "SearchVectors"
+        && crate::table_name_gate::check_table_name_chars(&operation, &input, &account_id).is_ok()
+    {
+        let check_start = std::time::Instant::now();
+        match extenddb_engine::check_search_vectors_request(
+            &input,
+            &state.storage,
+            &account_id,
+            &state.limits,
+        )
+        .await
+        {
+            Ok(checked) => checked_search = Some(checked),
+            Err(e) => {
+                #[allow(clippy::cast_precision_loss)]
+                let dispatch_us = check_start.elapsed().as_micros() as f64;
+                let metric_table = metric_table_name(&operation, &input, &state.limits);
+                record_error_metrics(
+                    &state.metrics,
+                    &e,
+                    &account_id,
+                    metric_table.as_deref(),
+                    &operation,
+                );
+                let response_start = std::time::Instant::now();
+                let response = error_response(&e, &request_id);
+                #[allow(clippy::cast_precision_loss)]
+                let response_us = response_start.elapsed().as_micros() as f64;
+                #[allow(clippy::cast_precision_loss)]
+                let total_us = handler_start.elapsed().as_micros() as f64;
+                state.metrics.record_request_count(&account_id, &operation);
+                state.metrics.record_segments(
+                    &account_id,
+                    &operation,
+                    &extenddb_core::metrics::LatencySegments {
+                        auth_us,
+                        authz_us: 0.0,
+                        throttle_us: 0.0,
+                        dispatch_us,
+                        response_us,
+                        total_us,
+                    },
+                );
+                return response;
+            }
+        }
+    }
+
     // --- Authz segment ---
     let authz_start = std::time::Instant::now();
     let authorized_key_info;
@@ -267,8 +326,10 @@ pub(crate) async fn handle_request(
 
     // --- Dispatch segment ---
     let dispatch_start = std::time::Instant::now();
-    let dispatch_result =
-        extenddb_engine::dispatch(&operation, input, &ctx, &state.server_addr).await;
+    let dispatch_result = match checked_search {
+        Some(checked) => extenddb_engine::handle_checked_search_vectors(checked, &ctx).await,
+        None => extenddb_engine::dispatch(&operation, input, &ctx, &state.server_addr).await,
+    };
     #[allow(clippy::cast_precision_loss)]
     let dispatch_us = dispatch_start.elapsed().as_micros() as f64;
     // P120c: Record storage query metrics for the request's dispatch phase.
@@ -396,8 +457,7 @@ pub(crate) async fn handle_request(
     state.metrics.record_segments(
         &ctx.account_id,
         &operation,
-        metric_table.as_deref(),
-        extenddb_core::metrics::LatencySegments {
+        &extenddb_core::metrics::LatencySegments {
             auth_us,
             authz_us,
             throttle_us,

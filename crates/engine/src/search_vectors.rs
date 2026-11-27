@@ -4,58 +4,31 @@
 //! `SearchVectors` operation handler.
 //!
 //! Runs a similarity search over a vector index: parses the query vector, an
-//! optional single-equality prefilter, and an optional projection, calls the
-//! storage layer for the top-k nearest neighbors, and returns each item with
-//! its similarity score.
+//! optional `SearchConditionExpression`, and an optional projection, calls
+//! the storage layer for the top-k nearest neighbors that satisfy the
+//! condition, and returns each item with its similarity score. The condition
+//! reaches the storage layer as a HASH equality, inline-filter equalities and,
+//! for the conditions those cannot express, an item filter.
 
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::expression::{
-    ExpressionMaps, Projection, validate_conditions_against_search_schema,
-    validate_search_condition_expression,
-};
-use extenddb_core::types::{
-    AttributeValue, DescribeTableInput, Item, ReturnConsumedCapacity, SearchSchemaElementType,
-    item_size_bytes,
-};
+use extenddb_core::expression::{ExpressionMaps, Projection};
+use extenddb_core::types::{DescribeTableInput, Item, ReturnConsumedCapacity, item_size_bytes};
+
+#[path = "search_vectors_condition.rs"]
+mod condition;
+
+#[path = "search_vectors_request.rs"]
+mod request;
 
 use crate::OperationContext;
 use crate::create_table::storage_err_to_dynamo;
 use crate::serialize_output;
 use crate::{DispatchMetrics, DispatchResult};
-
-/// Minimum length of a vector index name.
-const MIN_INDEX_NAME_LENGTH: usize = 3;
-/// Maximum number of nearest neighbors a single search may request.
-const MAX_TOP_K: i64 = 100;
-/// Maximum number of elements in a search vector.
-const MAX_SEARCH_VECTOR_LENGTH: usize = 4096;
-/// `SearchVectors` request body.
-#[derive(Debug, Clone, Deserialize)]
-struct SearchVectorsInput {
-    #[serde(rename = "TableName")]
-    table_name: String,
-    #[serde(rename = "IndexName")]
-    index_name: String,
-    #[serde(rename = "SearchVector")]
-    search_vector: Vec<AttributeValue>,
-    #[serde(rename = "TopK")]
-    top_k: i64,
-    #[serde(rename = "SearchConditionExpression")]
-    search_condition_expression: Option<String>,
-    #[serde(rename = "ProjectionExpression")]
-    projection_expression: Option<String>,
-    #[serde(rename = "ExpressionAttributeNames")]
-    expression_attribute_names: Option<HashMap<String, String>>,
-    #[serde(rename = "ExpressionAttributeValues")]
-    expression_attribute_values: Option<HashMap<String, AttributeValue>>,
-    #[serde(rename = "ReturnConsumedCapacity", default)]
-    return_consumed_capacity: ReturnConsumedCapacity,
-}
 
 /// A single search result: the item plus its similarity score.
 #[derive(Debug, Serialize)]
@@ -75,6 +48,33 @@ struct SearchVectorsOutput {
     consumed_capacity: Option<extenddb_core::types::VectorCapacity>,
 }
 
+/// A `SearchVectors` request whose checks that need no table passed, as
+/// [`check_search_vectors_request`] returns it. The server hands it to
+/// [`handle_checked_search_vectors`], so the checks, the search condition's
+/// parse and the read of the `search_inequality_filters` setting run once
+/// per request.
+pub struct CheckedSearchVectors(request::Checked);
+
+/// The checks of a `SearchVectors` request that need no table: the body,
+/// the backend's vector search, `IndexName`, `SearchVector`, `TopK`, the
+/// expression maps, the projection and the search condition. The service
+/// makes them before it authorizes the request, so the server calls this
+/// ahead of the IAM decision.
+///
+/// # Errors
+///
+/// Returns the error of the first failed check.
+pub async fn check_search_vectors_request(
+    body: &Value,
+    storage: &std::sync::Arc<dyn extenddb_storage::StorageEngine>,
+    account_id: &str,
+    limits: &extenddb_core::limits::LimitsConfig,
+) -> Result<CheckedSearchVectors, DynamoDbError> {
+    request::check(body, storage, account_id, limits)
+        .await
+        .map(CheckedSearchVectors)
+}
+
 /// Handle a `SearchVectors` request.
 ///
 /// # Errors
@@ -85,53 +85,35 @@ pub async fn handle_search_vectors(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
-    let input: SearchVectorsInput =
-        serde_json::from_value(body).map_err(crate::deserialize_error)?;
+    let checked = request::check(&body, &ctx.storage, &ctx.account_id, &ctx.limits).await?;
+    search(checked, ctx).await
+}
 
+/// Handle a `SearchVectors` request that [`check_search_vectors_request`]
+/// checked for the account and storage engine of `ctx`.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError` for missing tables/indexes, the checks that need
+/// the index, or storage errors.
+pub async fn handle_checked_search_vectors(
+    checked: CheckedSearchVectors,
+    ctx: &OperationContext,
+) -> Result<DispatchResult, DynamoDbError> {
+    search(checked.0, ctx).await
+}
+
+async fn search(
+    checked: request::Checked,
+    ctx: &OperationContext,
+) -> Result<DispatchResult, DynamoDbError> {
+    let request::Checked {
+        input,
+        query_vector,
+        parsed,
+    } = checked;
     let vector_search =
         crate::vector_gate::ensure_search_supported(ctx.storage.as_vector_search())?;
-
-    // Request-shape validation runs before the table lookup, so a malformed
-    // request against a missing table reports the validation error rather than
-    // ResourceNotFound.
-
-    // IndexName length.
-    if input.index_name.len() < MIN_INDEX_NAME_LENGTH {
-        return Err(DynamoDbError::ValidationException(format!(
-            "1 validation error detected: Value at 'IndexName' failed to satisfy constraint: \
-             Member must have length greater than or equal to {MIN_INDEX_NAME_LENGTH}"
-        )));
-    }
-
-    // SearchVector length and element types.
-    let query_vector = parse_search_vector(&input.search_vector)?;
-
-    // TopK bounds. The lower bound reports the standard constraint message; the
-    // upper bound reports the documented range message.
-    if input.top_k < 1 {
-        return Err(DynamoDbError::ValidationException(
-            "1 validation error detected: Value at 'TopK' failed to satisfy constraint: \
-             Member must have value greater than or equal to 1"
-                .to_owned(),
-        ));
-    }
-    if input.top_k > MAX_TOP_K {
-        return Err(DynamoDbError::ValidationException(format!(
-            "Provided TopK value '{}' is out of valid range. \
-             The value must be between 1 and {MAX_TOP_K} inclusive",
-            input.top_k
-        )));
-    }
-
-    // Structural validation of the filter expression (schema-independent).
-    let conditions = match input.search_condition_expression.as_deref() {
-        Some(expr) => validate_search_condition_expression(
-            expr,
-            input.expression_attribute_names.as_ref(),
-            input.expression_attribute_values.as_ref(),
-        )?,
-        None => Vec::new(),
-    };
 
     let key_info = ctx
         .table_key_info(&input.table_name)
@@ -185,11 +167,14 @@ pub async fn handle_search_vectors(
         )));
     }
 
-    let (hash_key, filters) = resolve_search_scope(
-        &conditions,
+    let (hash_key, filters, item_filter) = condition::resolve(
+        &parsed,
         vector_index.search_schema.as_deref(),
         &table.attribute_definitions,
-    )?;
+        &ctx.storage,
+        &ctx.account_id,
+    )
+    .await?;
 
     let search_output = vector_search
         .search_vectors(extenddb_storage::VectorSearch {
@@ -199,6 +184,7 @@ pub async fn handle_search_vectors(
             top_k: input.top_k,
             hash_key,
             filters: &filters,
+            item_filter,
         })
         .await
         .map_err(storage_err_to_dynamo)?;
@@ -323,50 +309,6 @@ pub async fn handle_search_vectors(
     })
 }
 
-/// Validate a `SearchVector` and convert it into `f32`.
-///
-/// Checks the length bounds (1..=`MAX_SEARCH_VECTOR_LENGTH`) and that every
-/// element is a finite number before converting.
-fn parse_search_vector(values: &[AttributeValue]) -> Result<Vec<f32>, DynamoDbError> {
-    if values.is_empty() {
-        return Err(DynamoDbError::ValidationException(
-            "1 validation error detected: Value at 'SearchVector' failed to satisfy constraint: \
-             Member must have length greater than or equal to 1"
-                .to_owned(),
-        ));
-    }
-    if values.len() > MAX_SEARCH_VECTOR_LENGTH {
-        return Err(DynamoDbError::ValidationException(format!(
-            "1 validation error detected: Value at 'SearchVector' failed to satisfy constraint: \
-             Member must have length less than or equal to {MAX_SEARCH_VECTOR_LENGTH}"
-        )));
-    }
-    let mut out = Vec::with_capacity(values.len());
-    for v in values {
-        match v {
-            AttributeValue::N(n) => {
-                let f = n.parse::<f32>().map_err(|_| {
-                    DynamoDbError::ValidationException(
-                        "Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute".to_owned(),
-                    )
-                })?;
-                if !f.is_finite() {
-                    return Err(DynamoDbError::ValidationException(
-                        "Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute".to_owned(),
-                    ));
-                }
-                out.push(f);
-            }
-            _ => {
-                return Err(DynamoDbError::ValidationException(
-                    "Search vector contains invalid values. All values in the search vector must be a 32-bit floating-point number attribute".to_owned(),
-                ));
-            }
-        }
-    }
-    Ok(out)
-}
-
 /// Bytes reported as `ConsumedCapacity.VectorSearchRequestBytes` for one search.
 ///
 /// `returned_non_vector_bytes` is the summed stored size of the items actually
@@ -438,97 +380,17 @@ fn search_request_bytes(
         .max(MIN_SEARCH_BYTES)
 }
 
-/// Resolved search scope: the partition-scoping HASH equality, if the index
-/// declares one, and the remaining inline-filter equalities.
-type SearchScope<'a> = (
-    Option<(&'a str, &'a AttributeValue)>,
-    Vec<(&'a str, &'a AttributeValue)>,
-);
-
-/// Validate a search's conditions against the index search schema, then split
-/// them into the partition scope and the remaining inline filters.
-///
-/// The index's HASH element scopes the search to one partition; the remaining
-/// conditions narrow within it. Declaring a HASH element is optional, but when
-/// the index has one the service requires the search to supply it.
-///
-/// Validation runs unconditionally, including when the caller supplied no
-/// `SearchConditionExpression` at all. That is the whole point of doing it here
-/// rather than at the call site behind a non-empty check: an index declaring a
-/// HASH element and a search with no expression is a validation failure, and
-/// skipping the check for empty conditions would return `None` for `hash_key`
-/// and hand the backend an unscoped search. `VectorSearch::hash_key` promises
-/// backend authors that `Some` is a mandatory predicate whenever the index
-/// declares a HASH element, so that promise has to hold on every path.
-///
-/// # Errors
-///
-/// Returns `DynamoDbError::ValidationException` when the conditions reference an
-/// attribute outside the search schema, omit a declared HASH attribute, or carry
-/// a value whose type disagrees with the table's attribute definitions.
-fn resolve_search_scope<'a>(
-    conditions: &'a [extenddb_core::expression::SearchCondition],
-    search_schema: Option<&'a [extenddb_core::types::SearchSchemaElement]>,
-    attribute_definitions: &[extenddb_core::types::AttributeDefinition],
-) -> Result<SearchScope<'a>, DynamoDbError> {
-    let hash_attr = search_schema
-        .unwrap_or_default()
-        .iter()
-        .find(|e| e.element_type == SearchSchemaElementType::Hash)
-        .map(|e| e.attribute_name.as_str());
-
-    let hash_key: Option<(&str, &AttributeValue)> = hash_attr.and_then(|name| {
-        conditions
-            .iter()
-            .find(|c| c.attribute_name == name)
-            .map(|c| (c.attribute_name.as_str(), &c.value))
-    });
-
-    // Refuse rather than search unscoped, and do it BEFORE the schema validation
-    // below so the caller gets the service's own wording. An earlier comment here
-    // asserted that "validation upstream guarantees it is present", which was
-    // untrue: no such validation existed, so a search that omitted the condition
-    // ran without a partition scope and returned HTTP 200 with ZERO results. That
-    // is the worst available failure mode, a silent wrong answer, and it told the
-    // caller "no matches" for a request the service rejects outright.
-    //
-    // The service distinguishes the two missing-HASH failure modes, both
-    // measured against the service 2026-08-19 in us-east-1 (table
-    // msgprobe-hashvix): omitting the SearchConditionExpression entirely gets
-    // the message below, while an expression that is supplied but omits the
-    // HASH attribute gets the validator's "must have all HASH attributes in
-    // configured SearchSchema". So this guard fires only for the empty case,
-    // and the omits-HASH case falls through to the validator.
-    if hash_attr.is_some() && conditions.is_empty() {
-        return Err(DynamoDbError::ValidationException(
-            "SearchConditionExpression must be provided when SearchSchema has a HASH key"
-                .to_owned(),
-        ));
-    }
-
-    validate_conditions_against_search_schema(conditions, search_schema, attribute_definitions)?;
-
-    // The validation above is what makes this hold; assert it so a future
-    // change that weakens the validator fails here rather than silently
-    // serving an unscoped search.
-    debug_assert!(
-        hash_attr.is_none() || hash_key.is_some(),
-        "index declares a HASH element but the resolved scope has no hash_key"
-    );
-
-    let filters: Vec<(&str, &AttributeValue)> = conditions
-        .iter()
-        .filter(|c| Some(c.attribute_name.as_str()) != hash_attr)
-        .map(|c| (c.attribute_name.as_str(), &c.value))
-        .collect();
-
-    Ok((hash_key, filters))
-}
+#[cfg(test)]
+#[path = "search_vectors_order_tests.rs"]
+mod order_tests;
 
 #[cfg(test)]
 mod tests {
+    use super::condition::resolve_search_scope;
+    use super::request::{MAX_SEARCH_VECTOR_LENGTH, parse_search_vector};
     use super::*;
     use extenddb_core::expression::SearchCondition;
+    use extenddb_core::types::AttributeValue;
     use extenddb_core::types::{
         AttributeDefinition, ScalarAttributeType, SearchSchemaElement, SearchSchemaElementType,
     };

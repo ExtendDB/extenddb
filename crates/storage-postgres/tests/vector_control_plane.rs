@@ -103,10 +103,12 @@ impl Scratch {
         drop(engine);
         catalog.close().await;
         for name in extra_databases.iter().chain(std::iter::once(&db_name)) {
-            sqlx::query(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
-                .execute(&admin)
-                .await
-                .expect("drop a scratch database");
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"
+            )))
+            .execute(&admin)
+            .await
+            .expect("drop a scratch database");
         }
         admin.close().await;
     }
@@ -173,10 +175,12 @@ async fn scratch(pgvector: Pgvector) -> Scratch {
         .connect(&format!("{base}/postgres"))
         .await
         .expect("connect to the postgres maintenance database");
-    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
-        .execute(&admin)
-        .await
-        .expect("create the scratch database");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE \"{db_name}\""
+    )))
+    .execute(&admin)
+    .await
+    .expect("create the scratch database");
 
     let url = format!("{base}/{db_name}");
     let catalog = PgPoolOptions::new()
@@ -196,7 +200,7 @@ async fn scratch(pgvector: Pgvector) -> Scratch {
     // database, so every shipped migration file from both directories is
     // applied to it, in filename order.
     for sql in shipped_migrations() {
-        sqlx::raw_sql(&sql)
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
             .execute(&catalog)
             .await
             .expect("apply a shipped migration");
@@ -955,12 +959,21 @@ async fn update_table_creates_a_vector_index_and_backfills_what_is_already_there
         1,
         "the pre-existing item must be backfilled"
     );
-    let holds: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM vector_index_holds WHERE table_id = $1")
+    // `mark_active` commits the ACTIVE flip on the catalog first and releases the hold
+    // afterwards, in a second statement on the data database. The poll above can see
+    // ACTIVE between the two, so wait for the release instead of reading the count once.
+    let mut holds: i64 = -1;
+    for _ in 0..100 {
+        holds = sqlx::query_scalar("SELECT COUNT(*) FROM vector_index_holds WHERE table_id = $1")
             .bind(&id)
             .fetch_one(s.engine.data_pool())
             .await
             .expect("count the holds");
+        if holds == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     assert_eq!(holds, 0, "the hold must be released after the ACTIVE flip");
     let (backfilling, owner): (Option<bool>, Option<String>) =
         sqlx::query_as("SELECT backfilling, build_owner FROM vector_indexes WHERE table_id = $1")
@@ -1666,9 +1679,9 @@ async fn put(engine: &PostgresEngine, key_info: &TableKeyInfo, item: Item) {
 
 /// Rows in a vector index's data table, as (partition bytes, payload).
 async fn index_rows(catalog: &PgPool, table: &str) -> Vec<(Vec<u8>, serde_json::Value)> {
-    sqlx::query_as(&format!(
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT part, item_data FROM \"{table}\" ORDER BY base_pk"
-    ))
+    )))
     .fetch_all(catalog)
     .await
     .expect("read the index rows")
@@ -1929,11 +1942,11 @@ async fn a_write_sees_an_index_created_after_its_key_info_was_cached() {
     .execute(&s.catalog)
     .await
     .expect("add the index row");
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE \"_ddb_vec_{index_id}\" (part BYTEA NOT NULL, base_pk TEXT NOT NULL, \
          embedding vector(2) NOT NULL, nrm DOUBLE PRECISION NOT NULL, item_data JSONB NOT NULL, \
          PRIMARY KEY (base_pk))"
-    ))
+    )))
     .execute(&s.catalog)
     .await
     .expect("create the data table");
@@ -2113,7 +2126,7 @@ async fn a_queued_row_whose_index_table_is_gone_is_consumed_not_retried_forever(
     // so the worker could not recognise the race, retried the same lowest-id row
     // forever, and every row behind it in that worker's partition stopped applying:
     // a silent quarter of the table's writes, until someone deleted the row by hand.
-    sqlx::query(&format!("DROP TABLE \"{table}\""))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE \"{table}\"")))
         .execute(&s.catalog)
         .await
         .expect("drop the index data table");
@@ -2554,10 +2567,12 @@ async fn startup_rebuilds_a_half_built_index_and_frees_a_stale_hold() {
     .execute(&s.catalog)
     .await
     .expect("simulate a dead build");
-    sqlx::query(&format!("DELETE FROM \"{table}\" WHERE base_pk LIKE '%b%'"))
-        .execute(&s.catalog)
-        .await
-        .expect("leave the data table half populated");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DELETE FROM \"{table}\" WHERE base_pk LIKE '%b%'"
+    )))
+    .execute(&s.catalog)
+    .await
+    .expect("leave the data table half populated");
     let index_id: String =
         sqlx::query_scalar("SELECT index_id FROM vector_indexes WHERE table_id = $1")
             .bind(&id)
@@ -2690,10 +2705,12 @@ async fn scratch_with_pgvector_omitted_but_data_installed(
     // The catalog, deliberately without the extension.
     let catalog = scratch(Pgvector::Omit).await;
     let data_db = format!("{}_data", catalog.db_name);
-    sqlx::query(&format!("CREATE DATABASE \"{data_db}\""))
-        .execute(&catalog.admin)
-        .await
-        .expect("create the separate data database");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE \"{data_db}\""
+    )))
+    .execute(&catalog.admin)
+    .await
+    .expect("create the separate data database");
 
     let data_url = format!("{base}/{data_db}");
     let data = PgPoolOptions::new()
@@ -3049,7 +3066,7 @@ async fn an_inline_write_survives_the_index_data_table_disappearing() {
         .expect("key info");
     let table = only_index_table(&s.catalog).await;
 
-    sqlx::query(&format!("DROP TABLE \"{table}\""))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE \"{table}\"")))
         .execute(&s.catalog)
         .await
         .expect("drop the vector data table out from under the write path");

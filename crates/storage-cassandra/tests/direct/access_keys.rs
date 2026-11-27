@@ -111,7 +111,7 @@ mod tests {
         // Fetch session data via AuthorizationStore
         use extenddb_storage::authorization_store::AuthorizationStore;
         let session_data = catalog_store
-            .fetch_session_data(&account_id, &role_name, &session_name)
+            .fetch_session_data(&access_key_id)
             .await
             .unwrap();
 

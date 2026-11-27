@@ -481,10 +481,10 @@ async fn active_table_id(
     table_name: &str,
     lock: &str,
 ) -> Result<String, StorageError> {
-    let row: Option<(String, String)> = sqlx::query_as(&format!(
+    let row: Option<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT table_id, table_status FROM tables \
          WHERE account_id = $1 AND table_name = $2{lock}"
-    ))
+    )))
     .bind(account_id)
     .bind(table_name)
     .fetch_optional(&mut *conn)
@@ -506,9 +506,11 @@ async fn lock_data_table(
     table_name: &str,
 ) -> Result<(), StorageError> {
     let ddb_table = data_table_name(table_id);
-    match sqlx::query(&format!("LOCK TABLE {ddb_table} IN ACCESS SHARE MODE"))
-        .execute(&mut *conn)
-        .await
+    match sqlx::query(sqlx::AssertSqlSafe(format!(
+        "LOCK TABLE {ddb_table} IN ACCESS SHARE MODE"
+    )))
+    .execute(&mut *conn)
+    .await
     {
         Ok(_) => Ok(()),
         Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("42P01") => {
@@ -890,7 +892,7 @@ async fn fetch_page(
     } else {
         &query.first
     };
-    let mut q = sqlx::query(sql);
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
     for value in after.into_iter().flatten() {
         q = match value {
             KeyValue::Text(s) | KeyValue::Numeric(s) => q.bind(s.as_str()),
