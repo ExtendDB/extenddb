@@ -40,6 +40,10 @@ concurrency:
 # second wait loop confirms the node is back up with PasswordAuthenticator
 # active. cassandra-two-nodes keeps the default AllowAllAuthenticator.
 
+# On a push to main by the merge queue the test-only jobs and the summary job
+# are skipped; see the note in integration.yml. cassandra-rust builds only
+# tests/rust, whose target/ rust-cache does not save, so it is skipped too.
+
 jobs:
   cassandra-storage:
     # Dedicated ExtendDB runner group (Ubuntu 24.04, 4 vCPU / 16 GB, capped at
@@ -156,6 +160,7 @@ jobs:
     # runner.
     timeout-minutes: 60
     needs: build-cassandra
+    if: github.event_name != 'push' || github.triggering_actor != 'github-merge-queue[bot]'
     # Five shards by test file, each with its own Cassandra node;
     # cassandra-integration checks that together they collected every test
     # of the whole suite.
@@ -234,6 +239,7 @@ jobs:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 45
     needs: build-cassandra
+    if: github.event_name != 'push' || github.triggering_actor != 'github-merge-queue[bot]'
     services:
       cassandra:
         image: cassandra:4.1
@@ -512,6 +518,7 @@ jobs:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 45
     needs: build-cassandra
+    if: github.event_name != 'push' || github.triggering_actor != 'github-merge-queue[bot]'
     services:
       cassandra:
         image: cassandra:4.1
@@ -574,7 +581,8 @@ jobs:
       - cassandra-catalog-checks
       - cassandra-two-nodes
       - cassandra-authorizer
-    if: always()
+    # Every job must be in `needs`: merge-group-fail-fast.yml cancels on any failure.
+    if: always() && (github.event_name != 'push' || github.triggering_actor != 'github-merge-queue[bot]')
     steps:
       - run: |
           if [ "${{ needs.cassandra-storage.result }}" != "success" ] || \

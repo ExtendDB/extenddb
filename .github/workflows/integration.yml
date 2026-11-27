@@ -19,6 +19,17 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# A push to main by the merge queue (github-merge-queue[bot]) lands the merge
+# group commit this workflow passed: the queue merges a group only after its
+# required checks succeed. On that push the jobs that only run tests are
+# skipped (their `if:` holds the condition), and so is the summary job that
+# checks their results. The jobs that build into target/ under
+# Swatinem/rust-cache still run, because a push to main is the only run that
+# saves the caches the other runs restore. run-rust-integration and
+# run-rust-integration-sqlite build only tests/rust, whose target/ rust-cache
+# does not save, so they are skipped too. A person's push to main, or a
+# person's re-run of the queue's push run, runs every job.
+
 jobs:
   # One release build per feature set. The jobs below download the binary
   # instead of each compiling the same one, so the cargo flags and features of
@@ -95,6 +106,7 @@ jobs:
     # wire tests on #411's) and leaves room for a slow runner.
     timeout-minutes: 70
     needs: build-postgres
+    if: github.event_name != 'push' || github.triggering_actor != 'github-merge-queue[bot]'
     # Three shards by test file (devtools/test-shards); the integration job
     # checks that together they collected every test of the whole suite.
     strategy:
@@ -286,6 +298,7 @@ jobs:
     # runner.
     timeout-minutes: 25
     needs: build-postgres
+    if: github.event_name != 'push' || github.triggering_actor != 'github-merge-queue[bot]'
     services:
       postgres:
         # The shards' image, so the suites' servers run against the same
@@ -358,6 +371,7 @@ jobs:
     # on #411's) and leaves room for a slow runner.
     timeout-minutes: 60
     needs: build-sqlite
+    if: github.event_name != 'push' || github.triggering_actor != 'github-merge-queue[bot]'
     strategy:
       fail-fast: false
       matrix:
@@ -500,6 +514,7 @@ jobs:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 40
     needs: build-sqlite
+    if: github.event_name != 'push' || github.triggering_actor != 'github-merge-queue[bot]'
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -666,6 +681,7 @@ jobs:
     # leaves room for a slow runner.
     timeout-minutes: 50
     needs: build-postgres
+    if: github.event_name != 'push' || github.triggering_actor != 'github-merge-queue[bot]'
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -939,6 +955,7 @@ jobs:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 40
     needs: build-sqlite
+    if: github.event_name != 'push' || github.triggering_actor != 'github-merge-queue[bot]'
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -1034,7 +1051,8 @@ jobs:
         run-rust-integration-postgres-novector,
         run-rust-integration-sqlite,
       ]
-    if: always()
+    # Every job must be in `needs`: merge-group-fail-fast.yml cancels on any failure.
+    if: always() && (github.event_name != 'push' || github.triggering_actor != 'github-merge-queue[bot]')
     steps:
       - run: |
           if [ "${{ needs.run-integration.result }}" != "success" ] || \

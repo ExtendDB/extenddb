@@ -28,6 +28,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# On a push to main by the merge queue the test-only jobs and the summary job
+# are skipped; see the note in integration.yml.
+
 jobs:
   # One release build shared by the jobs that test it; see integration.yml.
   build-mongodb:
@@ -61,6 +64,7 @@ jobs:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 40
     needs: build-mongodb
+    if: github.event_name != 'push' || github.triggering_actor != 'github-merge-queue[bot]'
     # Three shards by test file; mongodb-integration checks that together
     # they collected every test of the whole suite.
     strategy:
@@ -209,6 +213,7 @@ jobs:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 40
     needs: build-mongodb
+    if: github.event_name != 'push' || github.triggering_actor != 'github-merge-queue[bot]'
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
@@ -254,6 +259,7 @@ jobs:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 40
     needs: build-mongodb
+    if: github.event_name != 'push' || github.triggering_actor != 'github-merge-queue[bot]'
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
@@ -308,7 +314,8 @@ jobs:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 40
     needs: [mongodb-pytest, mongodb-rust, mongodb-backup-store, mongodb-catalog, mongodb-production-build, mongodb-snapshot]
-    if: always()
+    # Every job must be in `needs`: merge-group-fail-fast.yml cancels on any failure.
+    if: always() && (github.event_name != 'push' || github.triggering_actor != 'github-merge-queue[bot]')
     steps:
       - run: |
           if [ "${{ needs.mongodb-pytest.result }}" != "success" ] || \

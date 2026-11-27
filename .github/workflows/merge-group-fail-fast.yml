@@ -1,0 +1,168 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Ends a failed merge group early. Once a workflow that reports one of the
+# base branch's required checks has a failed job, the group cannot merge, yet
+# its other runs go on: in November 2026 a failed group spent 300 to 390 more
+# runner-minutes on the capped extenddb pool after its first failure. The
+# watch job finds the first failure, and the cancel job then cancels every
+# other run of the group, which frees those runners for the groups behind it.
+# A cancelled run's summary job still runs (`if: always()`) and reports the
+# failure; it runs on the capped pool, so when the pool is busy the queue may
+# learn of the failure no sooner than before, but never later.
+#
+# The check-run list shows a job as failed only once the job has ended, after
+# its own `if: failure()` steps. The group's other jobs are cancelled in
+# whatever step they are in: one that would have failed later shows as
+# cancelled, and one still in its `if: failure()` steps may not finish them.
+#
+# Neither job checks out or runs repository code. Neither is a required check:
+# when they fail or never start, the queue behaves as it did without them.
+
+name: Merge group fail-fast
+
+on:
+  merge_group:
+
+permissions: {}
+
+jobs:
+  watch:
+    # A loop of API calls: a standard runner, off the capped extenddb pool.
+    runs-on: ubuntu-latest
+    # The queue gives a group's checks six hours, the most a GitHub-hosted job
+    # may run; the loop stops ten minutes short of it.
+    timeout-minutes: 360
+    permissions:
+      actions: read # list this merge group's workflow runs
+      checks: read # read the results of its jobs
+      contents: read # read the base branch's required checks
+    outputs:
+      ids: ${{ steps.watch.outputs.ids }}
+    steps:
+      - id: watch
+        name: Wait for the group's required workflows or a failure
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.merge_group.head_sha }}
+          BASE: ${{ github.event.merge_group.base_ref }}
+          SELF: ${{ github.run_id }}
+          # Each workflow with the required check it reports. A workflow counts
+          # only while branch protection requires its check, read at the start;
+          # if it cannot be read, none counts. Every job of a listed workflow
+          # must be in its summary job's needs, with no continue-on-error,
+          # because any failed job of a counted workflow cancels the group.
+          REQUIRED: >-
+            .github/workflows/test.yml=test
+            .github/workflows/fmt.yml=fmt
+            .github/workflows/clippy.yml=clippy
+            .github/workflows/integration.yml=integration
+            .github/workflows/integration-mongodb.yml=mongodb-integration
+            .github/workflows/licenses.yml=notices-current
+            .github/workflows/integration-cassandra.yml=cassandra-integration
+        run: |
+          # The loop handles a failed API call itself, so a failure must not
+          # end the step (the default shell runs with -e).
+          set +e -uo pipefail
+          api() { timeout 60 gh api "$@"; }
+          # With no commit the run list below would hold every merge group's
+          # runs, and the cancel job would cancel them all.
+          if [ -z "$SHA" ] || [ -z "$BASE" ]; then
+            echo "The event names no merge group commit or base branch; not watching"
+            exit 0
+          fi
+          # shellcheck disable=SC2086 # the list is split on whitespace
+          if ! required=$(api "repos/$REPO/branches/${BASE#refs/heads/}" \
+                --jq '.protection.required_status_checks.checks[]?.context' |
+              jq -R . | jq -sc . |
+              jq -c --argjson pairs "$(printf '%s\n' $REQUIRED | jq -R 'split("=")' | jq -sc .)" \
+                '. as $checks | [$pairs[] | select(.[1] | IN($checks[])) | .[0]]') ||
+              [ "$required" = "[]" ]; then
+            echo "No listed workflow's check is required, or the checks could not be read; not watching"
+            exit 0
+          fi
+          echo "Watching: $required"
+
+          started=$(date +%s)
+          deadline=$(( started + 350 * 60 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            # A failed job of a watched workflow, or a watched run that ended
+            # in failure with no failed job (a startup failure, say). The
+            # lists go through stdin, which has no size limit, and a call or a
+            # jq that fails counts as no answer, never as a failure.
+            if ! runs=$(api --paginate \
+                  "repos/$REPO/actions/runs?event=merge_group&head_sha=$SHA&per_page=100" \
+                  --jq '.workflow_runs[] | {id, path, status, conclusion, suite: .check_suite_id}' |
+                  jq -sc .) ||
+                ! checks=$(api --paginate \
+                  "repos/$REPO/commits/$SHA/check-runs?filter=latest&per_page=100" \
+                  --jq '.check_runs[] | {name, status, conclusion, suite: .check_suite.id}' |
+                  jq -sc .) ||
+                ! failed=$(printf '%s\n%s\n' "$runs" "$checks" |
+                  jq -sc --argjson required "$required" '
+                .[0] as $runs | .[1] as $checks
+                | [$runs[] | select(.path | IN($required[]))] as $req
+                | ($req | map(.suite)) as $suites
+                | [($checks[]
+                    | select(.status == "completed"
+                             and (.conclusion | IN("failure", "timed_out"))
+                             and (.suite | IN($suites[])))
+                    | .name),
+                   ($req[]
+                    | select(.status == "completed"
+                             and (.conclusion | IN("failure", "timed_out", "startup_failure")))
+                    | "run of \(.path)")]
+                | unique'); then
+              echo "Could not read the merge group's runs and jobs; trying again"
+              sleep 30
+              continue
+            fi
+            if [ "$failed" != "[]" ]; then
+              echo "::notice::Failed: $(jq -r 'join(", ")' <<<"$failed"). Cancelling the rest of this merge group."
+              echo "ids=$(jq -r --argjson self "$SELF" \
+                '[.[] | select(.status != "completed" and .id != $self) | .id] | join(" ")' \
+                <<<"$runs")" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            # Done once every watched workflow's run has finished. A run that
+            # was never created would hold the loop to its deadline, so after
+            # ten minutes the runs that exist are taken as the whole group.
+            if jq -e --argjson required "$required" \
+                --argjson waited "$(( $(date +%s) - started ))" '
+                map(select(.path | IN($required[]))) as $req
+                | ($req | length) > 0
+                  and all($req[]; .status == "completed")
+                  and (($req | map(.path) | unique | length) == ($required | length)
+                       or $waited > 600)' <<<"$runs" >/dev/null; then
+              echo "The required workflows finished with no failure"
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "Stopped watching after 350 minutes"
+
+  cancel:
+    needs: watch
+    if: needs.watch.outputs.ids != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write # cancel this merge group's workflow runs
+    steps:
+      - name: Cancel the group's other runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          IDS: ${{ needs.watch.outputs.ids }}
+        run: |
+          set +e -u
+          for id in $IDS; do
+            if out=$(timeout 60 gh run cancel "$id" 2>&1); then
+              echo "Cancelled run $id"
+            elif grep -q "is completed" <<<"$out"; then
+              echo "Run $id had already finished"
+            else
+              echo "::warning::Could not cancel run $id: $out"
+            fi
+          done
