@@ -10,10 +10,11 @@ attribute's ``AttributeDefinitions`` type (``One or more parameter values were
 invalid: Condition parameter type does not match schema type``). Every expected
 answer below was measured against the service on 2026-10-24 (15:10, 21:00,
 21:06 and 23:42 UTC), 2026-10-25 (11:31 UTC), 2026-11-06 (the begins_with
-rows after b20) and 2026-11-11 (rows b48 to b50, f8, f9, g9 and g10, and the
-digit runs) on tables with S/S, S/N and B/B keys, a GSI, an LSI and a GSI with
-two HASH attributes. A Unicode decimal digit below U+10000 in an N value counts
-as the digit it stands for.
+rows after b20), 2026-11-11 (rows b48 to b50, f8, f9, g9 and g10, and the
+digit runs) and 2026-11-22 (rows k1 to k16, the values of legacy KeyConditions
+and QueryFilter) on tables with S/S, S/N, N/N and B/B keys, a GSI, an LSI and
+a GSI with two HASH attributes. A Unicode decimal digit below U+10000 in an N
+value counts as the digit it stands for.
 The rows also pin where the two checks fall against the other Query checks:
 the numeric check after Limit, the ReturnConsumedCapacity enum and the
 expression parameter mix check, and before the Select enum and the table
@@ -165,6 +166,29 @@ def mp_table(dynamodb_client):
         yield name
 
 
+@pytest.fixture(scope="module")
+def nn_table(dynamodb_client):
+    """pk N, sk N; KEYS_ONLY GSI ngsi on n N (hash only). No items."""
+    with scoped_table(
+        dynamodb_client,
+        attribute_definitions=[
+            {"AttributeName": "pk", "AttributeType": "N"},
+            {"AttributeName": "sk", "AttributeType": "N"},
+            {"AttributeName": "n", "AttributeType": "N"},
+        ],
+        key_schema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        GlobalSecondaryIndexes=[{
+            "IndexName": "ngsi",
+            "KeySchema": [{"AttributeName": "n", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "KEYS_ONLY"},
+        }],
+    ) as name:
+        yield name
+
+
 NB = {"N": "bob"}
 N5 = {"N": "5"}
 SX = {"S": "x"}
@@ -258,6 +282,15 @@ MIXES = {
 
 def kce(expr, values, **extra):
     return {"KeyConditionExpression": expr, "ExpressionAttributeValues": values, **extra}
+
+
+def eq(value):
+    return {"ComparisonOperator": "EQ", "AttributeValueList": [value]}
+
+
+N1 = {"N": "1"}
+KC_ABC = {"KeyConditions": {"pk": eq({"N": "abc"})}}
+QF_BOB = {"QueryFilter": {"a": eq(NB)}}
 
 
 # (row, table, Query arguments, expected error code, expected message).
@@ -510,6 +543,34 @@ ROWS = [
     ("b50 two HASH attributes, h2 = N beside a non-key clause", "mp",
      kce("h1 = :a AND h2 = :b AND z = :c", {":a": SX, ":b": {"N": "1"}, ":c": SX},
          IndexName="mpi"), V, MISSED_R),
+    # The values of legacy KeyConditions and QueryFilter get the numeric check,
+    # after the ExpressionAttributeValues numbers and ahead of the Select enum,
+    # the key type and the value count (measured on Amazon DynamoDB in
+    # us-east-1 on 22 Nov 2026, each twice; k12 on a table with a pk S key).
+    ("k1 legacy pk EQ N abc", "nn", KC_ABC, V, NUMERIC + "abc"),
+    ("k2 legacy pk EQ N empty", "nn", {"KeyConditions": {"pk": eq({"N": ""})}}, V, NUMERIC),
+    ("k9 legacy pk EQ N space 5", "nn", {"KeyConditions": {"pk": eq({"N": " 5"})}}, V, NUMERIC + " 5"),
+    ("k3 legacy sk BETWEEN N 1 and N x", "nn", {"KeyConditions": {"pk": eq(N1), "sk": {
+        "ComparisonOperator": "BETWEEN", "AttributeValueList": [N1, {"N": "x"}]}}}, V, NUMERIC + "x"),
+    ("k4 legacy sk GT N 1e200", "nn", {"KeyConditions": {"pk": eq(N1), "sk": {
+        "ComparisonOperator": "GT", "AttributeValueList": [{"N": "1e200"}]}}}, V, OVERFLOW_MSG),
+    ("k14 legacy GSI n EQ N abc", "nn",
+     {"IndexName": "ngsi", "KeyConditions": {"n": eq({"N": "abc"})}}, V, NUMERIC + "abc"),
+    ("k15 legacy GSI n EQ N empty", "nn",
+     {"IndexName": "ngsi", "KeyConditions": {"n": eq({"N": ""})}}, V, NUMERIC),
+    ("k12 legacy pk EQ N abc on a pk S key", "mp", KC_ABC, V, NUMERIC + "abc"),
+    ("k13 legacy pk EQ with two values", "nn", {"KeyConditions": {"pk": {
+        "ComparisonOperator": "EQ", "AttributeValueList": [{"N": "abc"}, N1]}}}, V, NUMERIC + "abc"),
+    ("k5 legacy N abc with invalid Select", "nn", {**KC_ABC, "Select": "BAD"}, V, NUMERIC + "abc"),
+    ("k6 legacy N abc with invalid ReturnConsumedCapacity", "nn",
+     {**KC_ABC, "ReturnConsumedCapacity": "BAD"}, V, RCC_MSG.replace("'bad'", "'BAD'")),
+    ("k8 legacy N abc with Limit 0", "nn", {**KC_ABC, "Limit": 0}, V, LIMIT_MSG),
+    ("k11 legacy N abc with N bob in FilterExpression", "nn",
+     {**KC_ABC, "FilterExpression": "a = :v", "ExpressionAttributeValues": {":v": NB}},
+     V, NUMERIC + "bob"),
+    ("k7 legacy N abc with QueryFilter N bob", "nn", {**KC_ABC, **QF_BOB}, V, NUMERIC + "bob"),
+    ("k16 legacy pk EQ N 1 with QueryFilter N bob", "nn",
+     {"KeyConditions": {"pk": eq(N1)}, **QF_BOB}, V, NUMERIC + "bob"),
 ]
 
 
@@ -517,8 +578,9 @@ class TestKeyConditionValueTypes:
     """Each row: a Query and the service's answer."""
 
     @pytest.fixture
-    def tables(self, ss_table, ns_table, bb_table, mp_table):
-        return {"ss": ss_table, "ns": ns_table, "bb": bb_table, "mp": mp_table, "missing": MISSING}
+    def tables(self, ss_table, ns_table, bb_table, mp_table, nn_table):
+        return {"ss": ss_table, "ns": ns_table, "bb": bb_table, "mp": mp_table, "nn": nn_table,
+                "missing": MISSING}
 
     @pytest.mark.parametrize("row,table,kwargs,code,expected", ROWS, ids=[r[0] for r in ROWS])
     def test_rows(self, dynamodb_client_no_validation, tables, row, table, kwargs, code, expected):
@@ -532,10 +594,14 @@ class TestKeyConditionValueTypes:
             ExpressionAttributeValues={":u": {"S": "bob"}})
         assert [it["pk"]["S"] for it in resp["Items"]] == ["bob"]
 
-    def test_control_matching_types_on_every_table(self, dynamodb_client, ss_table, ns_table, bb_table):
+    def test_control_matching_types_on_every_table(
+            self, dynamodb_client, ss_table, ns_table, bb_table, nn_table):
         assert dynamodb_client.query(
             TableName=ss_table, KeyConditionExpression="pk = :u AND sk = :s",
             ExpressionAttributeValues={":u": {"S": "nope"}, ":s": SX})["Count"] == 0
+        # k10, measured on 22 Nov 2026: legacy pk EQ N 1 answers Count 0.
+        assert dynamodb_client.query(
+            TableName=nn_table, KeyConditions={"pk": eq(N1)})["Count"] == 0
         assert dynamodb_client.query(
             TableName=ns_table, KeyConditionExpression="pk = :u AND sk > :s",
             ExpressionAttributeValues={":u": {"S": "bob"}, ":s": {"N": "1"}})["Count"] == 1

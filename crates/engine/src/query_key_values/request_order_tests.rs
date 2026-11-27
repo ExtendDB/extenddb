@@ -4,7 +4,7 @@
 //! fault reported ahead of them.
 
 use extenddb_core::error::DynamoDbError;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::tests::{LIMIT_ZERO, NUMERIC_BOB, RCC_BAD, message, one_error};
 use super::{LIMIT_BELOW_ONE, validate_query_request_body};
@@ -377,4 +377,57 @@ fn a_shape_fault_in_another_field_is_reported_ahead_of_the_checks() {
         "ExpressionAttributeValues": "x",
     });
     assert!(validate_query_request_body(&shape_fault_only).is_ok());
+}
+
+#[test]
+fn legacy_condition_values_get_the_number_check() {
+    // Rows K1 to K16, measured 2026-11-22, each request twice: table `n` has
+    // `pk` (N) and `sk` (N) keys and a GSI `ngsi` on `n` (N), and table `s` a
+    // `pk` (S) key. K12 (a value of the wrong key type) and K13 (two values
+    // for EQ) also fail checks the handler makes after these.
+    //
+    // Each row holds the row, the members beside `"TableName": "n"`, and the
+    // answer (null when the request passes these checks).
+    let cond =
+        |op: &str, values: Value| json!({"ComparisonOperator": op, "AttributeValueList": values});
+    let eq = |n: &str| cond("EQ", json!([{"N": n}]));
+    let num = |v: &str| format!("The parameter cannot be converted to a numeric value: {v}");
+    let overflow =
+        "Number overflow. Attempting to store a number with magnitude larger than supported range";
+    let rcc = one_error(&RCC_BAD.replace("'bad'", "'BAD'"));
+    let (k1, bob) = (json!({"pk": eq("abc")}), json!({"a": eq("bob")}));
+    let between = cond("BETWEEN", json!([{"N": "1"}, {"N": "x"}]));
+    let gt = cond("GT", json!([{"N": "1e200"}]));
+    let two = cond("EQ", json!([{"N": "abc"}, {"N": "1"}]));
+    let rows = [
+        json!(["K1", {"KeyConditions": k1}, num("abc")]),
+        json!(["K2", {"KeyConditions": {"pk": eq("")}}, num("")]),
+        json!(["K9", {"KeyConditions": {"pk": eq(" 5")}}, num(" 5")]),
+        json!(["K3", {"KeyConditions": {"pk": eq("1"), "sk": between}}, num("x")]),
+        json!(["K4", {"KeyConditions": {"pk": eq("1"), "sk": gt}}, overflow]),
+        json!(["K10", {"KeyConditions": {"pk": eq("1")}}, null]),
+        json!(["K14", {"IndexName": "ngsi", "KeyConditions": {"n": eq("abc")}}, num("abc")]),
+        json!(["K15", {"IndexName": "ngsi", "KeyConditions": {"n": eq("")}}, num("")]),
+        json!(["K12", {"TableName": "s", "KeyConditions": k1}, num("abc")]),
+        json!(["K13", {"KeyConditions": {"pk": two}}, num("abc")]),
+        json!(["K5", {"KeyConditions": k1, "Select": "BAD"}, num("abc")]),
+        json!(["K6", {"KeyConditions": k1, "ReturnConsumedCapacity": "BAD"}, rcc]),
+        json!(["K8", {"KeyConditions": k1, "Limit": 0}, LIMIT_BELOW_ONE]),
+        json!(["K11", {"KeyConditions": k1, "FilterExpression": "a = :v",
+            "ExpressionAttributeValues": {":v": {"N": "bob"}}}, NUMERIC_BOB]),
+        json!(["K7", {"KeyConditions": k1, "QueryFilter": bob}, NUMERIC_BOB]),
+        json!(["K16", {"KeyConditions": {"pk": eq("1")}, "QueryFilter": bob}, NUMERIC_BOB]),
+    ];
+    for row in rows {
+        let mut body = json!({"TableName": "n"});
+        for (member, value) in row[1].as_object().into_iter().flatten() {
+            body[member] = value.clone();
+        }
+        assert_eq!(
+            message(validate_query_request_body(&body)).as_deref(),
+            row[2].as_str(),
+            "{}",
+            row[0]
+        );
+    }
 }
