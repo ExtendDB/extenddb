@@ -245,11 +245,19 @@ pub(crate) async fn authorize_request(
         authz_resource::validate_tag_resource_arn_shape(arn)?;
     }
 
-    // A Query's request-time checks run before the IAM decision, after the
-    // cross-account refusal above; see
-    // `extenddb_engine::query_key_values::validate_query_request_body`.
-    if operation == "Query" {
-        extenddb_engine::query_key_values::validate_query_request_body(input)?;
+    // A Query's and a Scan's request-time checks run before the IAM decision,
+    // after the cross-account refusal above; see
+    // `extenddb_engine::query_key_values::validate_query_request_body` and
+    // `extenddb_engine::scan_request::validate_scan_request_body`. The service
+    // answers a malformed Scan with its ValidationException for a principal
+    // that may not Scan the table (measured 2026-11-19 with a role allowed
+    // only DescribeTable: an `N` value that is not a number, a `Limit` of 0
+    // and a `Segment` of -1 each answer ValidationException). The checks read
+    // only the request body.
+    match operation {
+        "Query" => extenddb_engine::query_key_values::validate_query_request_body(input)?,
+        "Scan" => extenddb_engine::scan_request::validate_scan_request_body(input)?,
+        _ => {}
     }
 
     // A StreamArn (DescribeStream, GetShardIterator) or BackupArn
