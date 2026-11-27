@@ -22,9 +22,14 @@ import json
 import uuid
 
 import pytest
+from botocore import xform_name
 from botocore.exceptions import ClientError
 
 from conftest import scoped_table
+
+# A table that is never created: a member of the wrong JSON type is refused
+# before the table is read.
+MISSING_TABLE = f"extenddb-test-{uuid.uuid4().hex[:12]}"
 
 
 @pytest.fixture(scope="module")
@@ -34,9 +39,9 @@ def hash_table(dynamodb_client):
         yield name
 
 
-def _error_code_and_keys(client, operation: str, call) -> tuple[str, list[str]]:
-    """Run ``call``, which must fail, and return the error code and the sorted
-    top-level keys of the raw response body."""
+def _error_code_and_keys(client, operation: str, call) -> tuple[str, list[str], int]:
+    """Run ``call``, which must fail, and return the error code, the sorted
+    top-level keys of the raw response body and the HTTP status."""
     raw: list[bytes] = []
 
     def capture(response_dict, **_kwargs):
@@ -49,11 +54,16 @@ def _error_code_and_keys(client, operation: str, call) -> tuple[str, list[str]]:
             call()
     finally:
         client.meta.events.unregister(event, capture)
-    return exc_info.value.response["Error"]["Code"], sorted(json.loads(raw[-1]))
+    response = exc_info.value.response
+    return (
+        response["Error"]["Code"],
+        sorted(json.loads(raw[-1])),
+        response["ResponseMetadata"]["HTTPStatusCode"],
+    )
 
 
 def test_transaction_canceled_carries_message_under_capital_m(dynamodb_client, hash_table):
-    code, keys = _error_code_and_keys(
+    code, keys, _ = _error_code_and_keys(
         dynamodb_client,
         "TransactWriteItems",
         lambda: dynamodb_client.transact_write_items(
@@ -87,13 +97,53 @@ def test_idempotent_parameter_mismatch_carries_message_under_capital_m(
         )
 
     put("first")
-    code, keys = _error_code_and_keys(dynamodb_client, "TransactWriteItems", lambda: put("second"))
+    code, keys, _ = _error_code_and_keys(
+        dynamodb_client, "TransactWriteItems", lambda: put("second")
+    )
     assert code == "IdempotentParameterMismatchException"
     assert keys == ["Message", "__type"]
 
 
+# Raw bodies measured in us-east-1 on 2026-11-20, each request sent twice,
+# and for the ExecuteStatement parameter on 2026-11-18. With parameter
+# validation off, the client sends each member as it is written here.
+@pytest.mark.parametrize(
+    "operation, params",
+    [
+        (
+            "Query",
+            {
+                "TableName": MISSING_TABLE,
+                "KeyConditionExpression": "pk = :v",
+                "ExpressionAttributeValues": {":v": {"S": "k"}},
+                "Limit": "0",
+            },
+        ),
+        ("GetItem", {"TableName": MISSING_TABLE, "Key": {"pk": {"S": "k"}}, "ConsistentRead": "x"}),
+        ("PutItem", {"TableName": MISSING_TABLE, "Item": {"pk": {"S": "k"}}, "ReturnValues": 5}),
+        (
+            "ExecuteStatement",
+            {
+                "Statement": f"SELECT * FROM \"{MISSING_TABLE}\" WHERE pk = ?",
+                "Parameters": [{"S": 5}],
+            },
+        ),
+    ],
+)
+def test_serialization_error_carries_message_under_capital_m(
+    dynamodb_client_no_validation, operation, params
+):
+    client = dynamodb_client_no_validation
+    call = getattr(client, xform_name(operation))
+    code, keys, status = _error_code_and_keys(client, operation, lambda: call(**params))
+    # The texts are not asserted: ExtendDB's texts differ from DynamoDB's (#1012, #884).
+    assert status == 400
+    assert code == "SerializationException"
+    assert keys == ["Message", "__type"]
+
+
 def test_conditional_check_failed_carries_message_under_lower_case(dynamodb_client, hash_table):
-    code, keys = _error_code_and_keys(
+    code, keys, _ = _error_code_and_keys(
         dynamodb_client,
         "PutItem",
         lambda: dynamodb_client.put_item(
@@ -107,7 +157,7 @@ def test_conditional_check_failed_carries_message_under_lower_case(dynamodb_clie
 
 
 def test_validation_error_carries_message_under_lower_case(dynamodb_client, hash_table):
-    code, keys = _error_code_and_keys(
+    code, keys, _ = _error_code_and_keys(
         dynamodb_client,
         "GetItem",
         lambda: dynamodb_client.get_item(TableName=hash_table, Key={"pk": {"N": "1"}}),
