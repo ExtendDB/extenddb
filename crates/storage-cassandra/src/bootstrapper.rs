@@ -808,15 +808,12 @@ impl Bootstrapper for CassandraBootstrapper {
         let keyspace = self.engine.catalog_keyspace();
 
         let username = env_user.unwrap_or("admin");
-        let from_env = env_user.is_some() && env_password.is_some();
 
         println!("--- Creating admin user...");
 
-        // Generate or use provided password
-        let password = if let Some(pw) = env_password {
-            pw.to_string()
-        } else {
-            generate_random_password()
+        let (password, from_env) = match env_password {
+            Some(p) => (p.to_owned(), true),
+            None => (generate_random_password(), false),
         };
 
         // Hash password (using bcrypt in blocking task to avoid blocking async runtime)
