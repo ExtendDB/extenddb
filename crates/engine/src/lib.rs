@@ -61,6 +61,8 @@ pub use pre_dispatch::{ParsedRequest, parse_request};
 pub mod private_fs;
 mod put_item;
 mod query;
+#[cfg(test)]
+mod query_key_size_tests;
 pub mod query_key_values;
 mod read_helpers;
 mod request_limits;
