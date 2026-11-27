@@ -224,7 +224,18 @@ pub(crate) async fn handle_request(
         .await
         {
             Ok(ki) => authorized_key_info = ki,
-            Err(e) => return error_response(&e, &request_id),
+            Err(e) => {
+                // A request refused here (a table name or ARN that breaks the
+                // rules, a batch outside its count limits, an IAM denial) is
+                // answered with an HTTP 400, which CloudWatch counts in
+                // UserErrors, so it records UserErrors and RequestCount as a
+                // request the engine refuses does. A storage fault of the key
+                // info lookup is a system error, and `record_error_metrics`
+                // tells the two apart.
+                record_error_metrics(&state.metrics, &e, &account_id, None, &operation);
+                state.metrics.record_request_count(&account_id, &operation);
+                return error_response(&e, &request_id);
+            }
         }
         // The engine authorizes each PartiQL statement through it.
         item_authorizer =
