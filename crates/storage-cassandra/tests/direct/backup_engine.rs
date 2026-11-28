@@ -1178,9 +1178,7 @@ async fn test_backup_and_target_are_held_while_restoring() {
 /// into the target's name is `TableBeingRestored` naming the target and its
 /// source backup. Once the target is ACTIVE a
 /// restore of the backup is accepted and a restore into the name is
-/// `TableAlreadyExists`. The registration is one lightweight transaction
-/// conditioned on `active_restores = null`, so two simultaneous restores of
-/// one backup admit exactly one.
+/// `TableAlreadyExists`.
 #[tokio::test]
 async fn test_a_restore_is_refused_while_a_target_of_its_backup_is_creating() {
     if crate::helpers::skip_without_cassandra() {
@@ -1306,17 +1304,41 @@ async fn test_a_restore_is_refused_while_a_target_of_its_backup_is_creating() {
         Duration::from_secs(180),
     )
     .await;
+}
 
-    // Simultaneous: four restores of b2 started together, exactly one admitted.
+/// Four restores of one backup started together admit exactly one; the
+/// other three are `BackupInUse` naming the backup and leave no target
+/// behind. A restore that passes the early in-use check creates its
+/// target's tables before it registers, and that takes a schema agreement
+/// round that can outlast a copy. The admitted restore's copy is held until
+/// all four have been answered, so a slow registration meets the first
+/// one's `active_restores` entry instead of an empty map (#869). The test
+/// checks that the admitted target is still CREATING when the four have
+/// answered, and that the copy reached the hold, so a hook that does
+/// nothing fails it.
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn test_simultaneous_restores_of_one_backup_admit_exactly_one() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    // The hold makes the item count irrelevant to the race.
+    const ITEMS: usize = 200;
+    let engine = setup_engine().await;
+    let (account, _source, backup_arn) = backed_up_plain_table(&engine, "SimSource", ITEMS).await;
+    let account_id = account.account_id.clone();
+
+    let copy_pause =
+        extenddb_storage_cassandra::test_hooks::pause_before_legacy_restore_copy(&backup_arn);
     let results = futures::future::join_all((0..4).map(|i| {
         let engine = engine.clone();
         let account_id = account_id.clone();
-        let b2 = b2.clone();
+        let backup_arn = backup_arn.clone();
         async move {
             restore(
                 &engine,
                 &account_id,
-                &b2,
+                &backup_arn,
                 &format!("SimTarget{i}"),
                 &RestoreTableOverrides::default(),
             )
@@ -1330,21 +1352,39 @@ async fn test_a_restore_is_refused_while_a_target_of_its_backup_is_creating() {
         .filter_map(|(i, r)| r.is_ok().then_some(i))
         .collect();
     assert_eq!(accepted.len(), 1, "exactly one is accepted: {results:?}");
+    let admitted = format!("SimTarget{}", accepted[0]);
+    // Liveness: the four have answered while the admitted copy is held.
+    assert_eq!(
+        describe(&engine, &account_id, &admitted).await.table_status,
+        TableStatus::Creating,
+        "the admitted target is still CREATING when the four have answered"
+    );
     for (i, result) in results.iter().enumerate() {
-        if i != accepted[0] {
-            assert!(
-                matches!(result, Err(StorageError::BackupInUse(_))),
-                "restore {i}: {result:?}"
-            );
+        if i == accepted[0] {
+            continue;
         }
+        assert!(
+            matches!(result, Err(StorageError::BackupInUse(m)) if m.contains(&backup_arn)),
+            "restore {i} is BackupInUse naming the backup: {result:?}"
+        );
+        let gone = engine
+            .describe_table(
+                &account_id,
+                DescribeTableInput {
+                    table_name: format!("SimTarget{i}"),
+                },
+            )
+            .await;
+        assert!(
+            matches!(gone, Err(StorageError::TableNotFound(_))),
+            "the refused restore {i} left no target: {gone:?}"
+        );
     }
-    wait_active(
-        &engine,
-        &account_id,
-        &format!("SimTarget{}", accepted[0]),
-        Duration::from_secs(180),
-    )
-    .await;
+    copy_pause.release();
+    tokio::time::timeout(Duration::from_secs(60), copy_pause.reached())
+        .await
+        .expect("the admitted restore reached the copy hold");
+    wait_active(&engine, &account_id, &admitted, Duration::from_secs(180)).await;
 }
 
 /// (e) A backup row with no definition (written before V005) restores as a

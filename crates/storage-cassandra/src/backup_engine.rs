@@ -1309,6 +1309,7 @@ impl CassandraEngine {
     /// aborts it) when the copy ends, and on every other exit from this
     /// function, a panic or cancellation included.
     async fn run_restore_copy(self, job: RestoreJob, heartbeat: JobHeartbeat) {
+        crate::test_hooks::before_legacy_restore_copy(&job.backup_arn).await;
         let outcome = self.copy_backup_into_target(&job, &heartbeat).await;
         drop(heartbeat);
         match outcome {
