@@ -9,9 +9,16 @@
 //! statement has been read. The service's order is (measured 2026-11-02):
 //!
 //! 1. a syntax error anywhere in the statement;
-//! 2. a refusal of the statement's target, found before the WHERE condition
+//! 2. in ExecuteStatement and BatchExecuteStatement, an `EXISTS(SELECT ...)`
+//!    statement, ahead of every refusal below and of the checks made once
+//!    the statement parses (measured 2026-11-13 and 2026-11-14). The parse
+//!    reads on past the refusal of an `attribute_exists` operand that is not
+//!    a path in such a statement, since a syntax error after it comes first
+//!    (measured 2026-11-18). Another refusal the parse stops at, such as
+//!    `a IN 1`, still comes first here, where the service answers the
+//!    EXISTS text or a later syntax error (measured 2026-11-18, #1111);
+//! 3. a refusal of the statement's target, found before the WHERE condition
 //!    (an alias on the table, a FROM path);
-//! 3. in ExecuteStatement, an `EXISTS(SELECT ...)` statement;
 //! 4. for a request, a table name outside the name rule;
 //! 5. an alias in the select list, and an UPDATE whose target is an index;
 //! 6. a LIMIT clause;
@@ -23,18 +30,20 @@
 //!
 //! Measured: an alias on the table before a FROM path refusal and before the
 //! name rule, and an empty FROM path component and a path of three
-//! components before the name rule; EXISTS in ExecuteStatement before the
-//! name rule and `+`; the name rule before an alias in the select list, an
-//! UPDATE of an index, a LIMIT clause, `+`, a number that breaks an item
-//! number rule with 301 operators, 301 operators and an IN list of 101
-//! members; LIMIT before a number, a missing parameter, `+`, 301 operators
-//! and an IN list of 101 members in the condition; the walk before the IN
-//! limit and the count; the count before a SET value, a SET parameter, a
-//! unary plus, an IS test and a parameter inside a list in a SET clause, in
-//! both UPDATE forms; the walk of the condition before a SET clause written
-//! before it. Not measured: an alias on the table against EXISTS, an
-//! INSERT's value against the name rule, and a DELETE of an index against
-//! the name rule (it keeps its place in 2).
+//! components before the name rule; EXISTS before the name rule and `+`,
+//! and before an alias on the table and a FROM path refusal (2026-11-13 and
+//! 2026-11-14); a syntax error after an alias or after an `attribute_exists`
+//! operand that is not a path before EXISTS (2026-11-18); the name rule
+//! before an alias in the select list, an UPDATE of an index, a LIMIT
+//! clause, `+`, a number that breaks an item number rule with 301
+//! operators, 301 operators and an IN list of 101 members; LIMIT before a
+//! number, a missing parameter, `+`, 301 operators and an IN list of 101
+//! members in the condition; the walk before the IN limit and the count;
+//! the count before a SET value, a SET parameter, a unary plus, an IS test
+//! and a parameter inside a list in a SET clause, in both UPDATE forms; the
+//! walk of the condition before a SET clause written before it. Not
+//! measured: an INSERT's value against the name rule, and a DELETE of an
+//! index against the name rule (it keeps its place in 3).
 //!
 //! In the SET clause, a sign before a value that is not a number comes after
 //! the number literals of the clause that break an item number rule, in
@@ -315,6 +324,9 @@ impl Parser {
         // refusal stopped the parse in.
         let reached = match &result {
             Err(e) if e.is_syntax() => return result,
+            Ok(Statement::Exists(_)) if self.refuse_exists => {
+                return Err(ParseError::new(EXISTS_OUTSIDE_TRANSACTION));
+            }
             Err(_) => self.part(),
             Ok(_) => Part::AfterWhere,
         };
@@ -324,11 +336,8 @@ impl Parser {
             Err(_) if stopped_at_in => call.is_none(),
             _ => true,
         };
-        let exists = (self.refuse_exists && matches!(&result, Ok(Statement::Exists(_))))
-            .then(|| EXISTS_OUTSIDE_TRANSACTION.to_owned());
         let mut refusal = found
             .before_where
-            .or(exists)
             .or_else(|| self.table_name_refusal())
             .or(found.after_name_rule)
             .or(found.clause);

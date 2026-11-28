@@ -157,19 +157,53 @@ fn the_table_name_rule_comes_before_a_select_list_alias_and_an_update_of_an_inde
 }
 
 #[test]
-fn execute_statement_refuses_exists_before_the_table_name_rule() {
+fn a_request_outside_a_transaction_refuses_exists_ahead_of_its_other_refusals() {
     use crate::partiql::parser::{EXISTS_OUTSIDE_TRANSACTION, parse_for_execute_statement};
-    for sql in [
-        "EXISTS(SELECT * FROM \"tt\" WHERE pk = 'a' AND b = 1 + 1)",
-        "EXISTS(SELECT * FROM \"tbl\" WHERE pk = 'a' AND b = 1e126)",
+    // ExecuteStatement and BatchExecuteStatement answer the EXISTS refusal
+    // for each statement with the parameters given (measured on a table
+    // name of 40 characters: 2026-11-02 for the first, 2026-11-13 and
+    // 2026-11-14 from the alias to `l[99999999999]`, 2026-11-18 for the
+    // last).
+    let t = format!("\"{}\"", "t".repeat(40));
+    for (statement, given) in [
+        (
+            "EXISTS(SELECT * FROM \"tt\" WHERE pk = 'a' AND b = 1 + 1)",
+            0,
+        ),
+        (
+            "EXISTS(SELECT * FROM \"tbl\" WHERE pk = 'a' AND b = 1e126)",
+            0,
+        ),
+        ("EXISTS(SELECT * FROM <t> AS x WHERE pk = 1)", 0),
+        ("EXISTS(SELECT * FROM <t> WHERE attribute_exists(1))", 0),
+        ("EXISTS(SELECT * FROM <t>.\"\" WHERE pk = 1)", 0),
+        ("EXISTS(SELECT * FROM <t>.\"i\".\"x\" WHERE pk = 1)", 0),
+        ("EXISTS(SELECT * FROM <t> WHERE pk = ?)", 0),
+        ("EXISTS(SELECT * FROM <t> WHERE pk = ? AND foo(1))", 0),
+        ("EXISTS(SELECT * FROM <t> WHERE foo(1) AND pk = ?)", 0),
+        ("EXISTS(SELECT * FROM <t> WHERE pk = 1 AND s < true)", 0),
+        ("EXISTS(SELECT * FROM <t> WHERE pk = 1 AND x = 99e999)", 0),
+        ("EXISTS(SELECT * FROM <t> WHERE pk = <<>>)", 0),
+        ("EXISTS(SELECT * FROM <t> WHERE x = [?])", 0),
+        ("EXISTS(SELECT * FROM <t> WHERE l[99999999999] = 1)", 0),
+        ("EXISTS(SELECT * FROM <t> WHERE pk = 1)", 1),
     ] {
+        let sql = statement.replace("<t>", &t);
         assert_eq!(
-            parse_for_execute_statement(sql, 0).unwrap_err().message,
+            parse_for_execute_statement(&sql, given)
+                .unwrap_err()
+                .message,
             EXISTS_OUTSIDE_TRANSACTION,
             "{sql}"
         );
-        // Elsewhere the statement keeps the order of its checks.
-        assert_ne!(refusal(sql, 0), EXISTS_OUTSIDE_TRANSACTION, "{sql}");
+        // ExecuteTransaction keeps the order of the statement's checks.
+        assert_ne!(
+            parse_for_request(&sql, given)
+                .map(drop)
+                .map_err(|e| e.message),
+            Err(EXISTS_OUTSIDE_TRANSACTION.to_owned()),
+            "{sql}"
+        );
     }
     assert_eq!(
         refusal(
@@ -178,13 +212,21 @@ fn execute_statement_refuses_exists_before_the_table_name_rule() {
         ),
         NAME_RULE
     );
-    // An alias on the table and a syntax error come first.
-    assert_eq!(
-        parse_for_execute_statement("EXISTS(SELECT * FROM \"tbl\" x WHERE pk = 'a')", 0)
-            .unwrap_err()
-            .message,
-        "Aliasing is not supported"
-    );
+    // A syntax error anywhere in the statement comes first, also after a
+    // refusal the parse otherwise stops at (measured 2026-11-13 and
+    // 2026-11-14 for the first, 2026-11-18 for the others).
+    for statement in [
+        "EXISTS(SELECT * FROM <t> WHERE pk = )",
+        "EXISTS(SELECT * FROM <t> AS x WHERE pk = )",
+        "EXISTS(SELECT * FROM <t> WHERE attribute_exists(1) AND pk = )",
+    ] {
+        let sql = statement.replace("<t>", &t);
+        assert_eq!(
+            parse_for_execute_statement(&sql, 0).unwrap_err().message,
+            format!("{WF}Unexpected term"),
+            "{sql}"
+        );
+    }
 }
 
 #[test]

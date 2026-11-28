@@ -48,6 +48,8 @@ mod authorize;
 mod base_join;
 mod batch;
 mod common;
+#[cfg(test)]
+mod exists_tests;
 mod expr_bridge;
 mod index_read;
 mod item_depth;
@@ -89,8 +91,9 @@ impl PartiqlExecutor for OperationContext {
         request_checks::check_execute_statement(&body)?;
         check_parameters(body.get("Parameters")).map_err(DynamoDbError::ValidationException)?;
         let req = SingleRequest::from_body(&body)?;
-        // An EXISTS statement is refused by the parser, in its place among
-        // the refusals of a statement that parses (measured 2026-11-02).
+        // The parse refuses an EXISTS statement (see
+        // `parse_for_execute_statement`), after a parameter refused for its
+        // content (measured 2026-11-18).
         let statement = parse_for_execute_statement(&req.statement, req.parameters.len())
             .map_err(|e| DynamoDbError::ValidationException(e.message))?;
         match &statement {
