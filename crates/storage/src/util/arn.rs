@@ -75,8 +75,15 @@ pub fn table_arn(region: &str, account_id: &str, table_name: &str) -> String {
 /// Parsing goes through [`extenddb_core::arn::parse`], the one parser shared
 /// with request validation and authorization, so a string the engine resolves
 /// to a stream is exactly a string authorization canonicalizes to the same
-/// stream. A missing `arn:` prefix, fewer than five fields, or a resource that
-/// is not `table/<name>/stream/<label>` is rejected.
+/// stream. The partition, service, region and account are not checked.
+///
+/// # Errors
+///
+/// `Validation` with `Invalid StreamArn` for a missing `arn:` prefix, fewer
+/// than five fields, or a resource that is not `table/<name>/stream/<label>`:
+/// the service's answer to such a `ListStreams` start ARN and to an empty
+/// `StreamArn` in `DescribeStream` and `GetShardIterator` (measured
+/// 2026-11-21).
 pub fn parse_stream_arn(arn: &str) -> Result<(String, String), StorageError> {
     match extenddb_core::arn::parse(arn) {
         Some(extenddb_core::arn::TableResource {
@@ -84,9 +91,7 @@ pub fn parse_stream_arn(arn: &str) -> Result<(String, String), StorageError> {
             sub: Some(extenddb_core::arn::SubResource::Stream(label)),
             ..
         }) => Ok((table, label)),
-        _ => Err(StorageError::Validation(format!(
-            "Invalid stream ARN format: {arn}"
-        ))),
+        _ => Err(StorageError::Validation("Invalid StreamArn".to_owned())),
     }
 }
 
@@ -134,8 +139,8 @@ pub fn shard_does_not_exist() -> StorageError {
 #[cfg(test)]
 mod stream_not_found_tests {
     use super::{
-        SHARD_DOES_NOT_EXIST, STREAM_DOES_NOT_EXIST, shard_does_not_exist, stream_does_not_exist,
-        stream_not_found,
+        SHARD_DOES_NOT_EXIST, STREAM_DOES_NOT_EXIST, parse_stream_arn, shard_does_not_exist,
+        stream_does_not_exist, stream_not_found,
     };
     use crate::error::StorageError;
 
@@ -146,6 +151,21 @@ mod stream_not_found_tests {
         match error {
             StorageError::TableNotFound(msg) => msg,
             other => panic!("expected TableNotFound, got {other:?}"),
+        }
+    }
+
+    /// The service's answer to a `ListStreams` start ARN that is not a stream
+    /// ARN (measured 2026-11-21): a table ARN, which parses, and a value that
+    /// does not. Which strings are stream ARNs is tested with the shared parser.
+    #[test]
+    fn a_value_that_is_not_a_stream_arn_is_invalid_stream_arn() {
+        for arn in ["arn:aws:dynamodb:us-east-1:111111111111:table/T", "x"] {
+            match parse_stream_arn(arn) {
+                Err(StorageError::Validation(msg)) => {
+                    assert_eq!(msg, "Invalid StreamArn", "{arn}");
+                }
+                other => panic!("{arn}: expected Validation, got {other:?}"),
+            }
         }
     }
 
