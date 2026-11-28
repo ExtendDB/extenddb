@@ -140,9 +140,17 @@ fn evaluate_set_value(
                 })
         }
         Expr::Arithmetic { left, op, right } => {
-            let lv = evaluate_set_value(left, item, maps)?;
-            let rv = evaluate_set_value(right, item, maps)?;
-            evaluate_arithmetic(&lv, &rv, *op)
+            let AttributeValue::N(l) = evaluate_set_value(left, item, maps)? else {
+                return Err(operand_type_error());
+            };
+            let AttributeValue::N(r) = evaluate_set_value(right, item, maps)? else {
+                return Err(operand_type_error());
+            };
+            let (l, r) = (arithmetic_operand(&l)?, arithmetic_operand(&r)?);
+            arithmetic_result(&match op {
+                ArithOp::Add => l + r,
+                ArithOp::Sub => l - r,
+            })
         }
         Expr::Function { name, args } => evaluate_set_function(name, args, item, maps),
         _ => Err(DynamoDbError::ValidationException(
@@ -151,23 +159,13 @@ fn evaluate_set_value(
     }
 }
 
-/// Evaluate arithmetic: N + N or N - N.
-fn evaluate_arithmetic(
-    left: &AttributeValue,
-    right: &AttributeValue,
-    op: ArithOp,
-) -> Result<AttributeValue, DynamoDbError> {
-    let (AttributeValue::N(l), AttributeValue::N(r)) = (left, right) else {
-        return Err(DynamoDbError::ValidationException(
-            "An operand in the update expression has an incorrect data type".to_owned(),
-        ));
-    };
-
-    let (l, r) = (arithmetic_operand(l)?, arithmetic_operand(r)?);
-    arithmetic_result(&match op {
-        ArithOp::Add => l + r,
-        ArithOp::Sub => l - r,
-    })
+/// The error for an operand of `+`, `-` or `list_append` of the wrong type.
+/// The service checks each operand before the next and reports the first that
+/// fails (measured in us-east-1 on 2026-11-14, 2026-11-16 and 2026-11-19).
+fn operand_type_error() -> DynamoDbError {
+    DynamoDbError::ValidationException(
+        "An operand in the update expression has an incorrect data type".to_owned(),
+    )
 }
 
 /// An operand of `+`, `-` or a number `ADD`, as a decimal, once it is known
@@ -261,17 +259,14 @@ fn evaluate_set_function(
                         .to_owned(),
                 ));
             }
-            let left = evaluate_set_value(&args[0], item, maps)?;
-            let right = evaluate_set_value(&args[1], item, maps)?;
-            match (left, right) {
-                (AttributeValue::L(mut a), AttributeValue::L(b)) => {
-                    a.extend(b);
-                    Ok(AttributeValue::L(a))
-                }
-                _ => Err(DynamoDbError::ValidationException(
-                    "An operand in the update expression has an incorrect data type".to_owned(),
-                )),
-            }
+            let AttributeValue::L(mut a) = evaluate_set_value(&args[0], item, maps)? else {
+                return Err(operand_type_error());
+            };
+            let AttributeValue::L(b) = evaluate_set_value(&args[1], item, maps)? else {
+                return Err(operand_type_error());
+            };
+            a.extend(b);
+            Ok(AttributeValue::L(a))
         }
         _ => Err(DynamoDbError::ValidationException(format!(
             "Invalid UpdateExpression: unknown function '{name}'"
