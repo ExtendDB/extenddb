@@ -21,6 +21,8 @@ extenddb always runs as a daemon. On startup it:
 7. Starts the HTTP server
 8. Spawns background tasks (log level polling, stream cleanup, TTL expiry)
 
+The `extenddb serve` that started the daemon returns once the daemon answers `GET /health`, and exits 1 when the daemon exits first. Before it answers, the daemon connects to its storage backend and runs its startup recovery, such as an index rebuild after a crash. A daemon that has not answered within 60 seconds is reported started with a warning, and it goes on starting. `extenddb healthcheck` reports when it answers. `serve --foreground` runs the server itself and does not wait.
+
 ### Checking Status
 
 ```bash

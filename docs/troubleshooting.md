@@ -352,6 +352,8 @@ The last ring write of `rotate` is conditional too, on the two-DEK ring of its f
 
 **Fix:** Check that extenddb is running with `extenddb status`. If using a non-default port or config, pass the same `--config` or `--port` to `extenddb stop`.
 
+For a server started with `--port 0`, pass the port that `serve` printed.
+
 ### `Failed to read PID file <path>: <error>`
 
 **Cause:** The PID file exists but cannot be read (permission denied, I/O error).
