@@ -18,6 +18,8 @@ on:
       - '.github/workflows/npm-build-matrix.yml'
       - '.github/workflows/npm-build-dryrun.yml'
       - 'packaging/npm/**'
+      - 'packaging/github-action/**'
+      - 'action.yml'
       - 'crates/**'
       - 'Cargo.toml'
       - 'Cargo.lock'

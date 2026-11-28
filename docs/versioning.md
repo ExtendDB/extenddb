@@ -18,6 +18,7 @@ The [beta tier](../README.md#storage-backends) adds one exception to these rules
 - Configuration: the keys of `extenddb.toml`, their `EXTENDDB__` environment variables and the runtime settings of `extenddb settings` keep their names and meanings. A key that a minor release adds has a default that keeps the earlier behavior. A server refuses a key that it does not know, so before a rollback, remove each key that a later release added.
 - The CLI: the subcommands, flags and exit codes of `extenddb` stay. The [catalog status table](manuals/07-upgrade-manual.md#the-catalog-status) gives the exit codes of `serve`, `migrate` and `verify`. `healthcheck` exits 0 when `/health` answers 2xx, and 1 otherwise. The text of messages and log lines can change in any release.
 - The management API that `extenddb manage` calls, and the options and return values of `start()` in the `@extenddb/dev` npm package.
+- The inputs and outputs of the GitHub Action in `action.yml`, and the environment variables that it sets.
 - The HTTP status code of a `/health` response and its `status` field.
 - The supported database versions: a minor release ends support for a database version only after the version's upstream end of life. The minor release before it announces the change.
 - The catalog and the on-disk formats, under the rules in the next section.

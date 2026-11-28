@@ -35,7 +35,9 @@ Every launcher, in every language:
   returns: endpoint URL, port (ephemeral by default), region (`us-east-1`),
   the seeded credentials, and a stop handle that terminates the child
   (SIGTERM, then SIGKILL after 5s).
-- Does not outlive the caller: best-effort kill on process exit.
+- Does not outlive the caller: best-effort kill on process exit. The npm
+  launcher's `detached` option is the one exception: the GitHub Action below
+  uses it so that the server runs until the job ends.
 
 ## npm
 
@@ -66,6 +68,21 @@ falls back to `EXTENDDB_BINARY` or `PATH`, and that binary must be the
 wrapper's release too. To use a binary that you build, build it from tag
 `v<release>`, where `<release>` is the wrapper's version.
 
+## GitHub Action
+
+`action.yml` at the repository root is a JavaScript action. The comments at
+the top of `github-action/main.js` and `github-action/post.js` say what each
+step does.
+
+The action at tag `vX.Y.Z` runs the `X.Y.Z` binary, as the launcher does, so
+the action has no version of its own. The npm build matrix runs the action
+against each platform's built binary (the `binary` input), in the
+pull-request dry run and before each npm publish.
+
+When you publish a release, tick "Publish this Action to the GitHub
+Marketplace" on its release page. Before the first listing, an organization
+owner accepts the GitHub Marketplace Developer Agreement.
+
 ## Testing
 
 `test/launcher.test.js` runs against a real dev binary:
@@ -76,7 +93,10 @@ EXTENDDB_BINARY=/path/to/extenddb node test/launcher.test.js
 
 It proves the contract's load-bearing clauses: file mode is the default and
 persists across two server lifetimes, memory mode creates no files and is
-genuinely ephemeral, and contradictory options are refused.
+genuinely ephemeral, and contradictory options are refused. It also proves
+that a detached server outlives the process that started it, keeps its
+stdout out of the log, and stops when its pid is killed or `stop()` is
+called.
 With fake binaries, it also proves that the wrapper refuses a binary of
 another release before `serve` runs.
 

@@ -51,10 +51,13 @@ calls in an async function (top-level `await` is ESM-only).
 | `port` | ephemeral | Fixed port instead of an OS-assigned one. |
 | `binary` | bundled | Path to an `extenddb` binary of this package's release, overriding the bundled one. |
 | `startupTimeoutMs` | `15000` | The time budget of `start()`, shared by the binary's version check and the wait for the server to become healthy. A health probe in flight at the deadline can add up to 1 s. |
+| `detached` | `false` | Leave the server running after the calling process exits. The server's stderr goes to the returned `log` file. |
 
 The returned object carries `endpoint`, `port`, `credentials`, `region`,
 `storage`, and `stop()`, which shuts the server down and resolves when the
-process has exited.
+process has exited. With `detached`, it also carries `pid`, the server's
+process ID, and `log`, the path of its log file. A process other than the
+caller stops a detached server with `process.kill(pid)`.
 
 `start()` runs only a binary of this package's release. It looks for the
 binary in the `binary` option, then `EXTENDDB_BINARY`, then the platform
