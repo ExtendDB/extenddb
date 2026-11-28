@@ -79,7 +79,7 @@ pub enum DynamoDbError {
     IdempotentParameterMismatchException(String),
     #[error("{0}")]
     SerializationException(String),
-    /// SP-ERR-002: HTTP 404.
+    /// SP-ERR-002: HTTP 400.
     #[error("{0}")]
     UnknownOperationException(String),
     #[error("{0}")]
@@ -89,10 +89,10 @@ pub enum DynamoDbError {
     /// SP-ERR-002: HTTP 400.
     #[error("{0}")]
     MissingAuthenticationToken(String),
-    /// SP-ERR-002: HTTP 403.
+    /// SP-ERR-002: HTTP 400.
     #[error("{0}")]
     IncompleteSignature(String),
-    /// SP-ERR-002: HTTP 403.
+    /// SP-ERR-002: HTTP 400.
     #[error("{0}")]
     UnrecognizedClientException(String),
     /// Returned when session credentials (ASIA*) have expired.
@@ -145,7 +145,7 @@ pub enum DynamoDbError {
     /// SP-ERR-002: Per-request timeout. HTTP 408.
     #[error("{0}")]
     RequestTimeoutException(String),
-    /// SP-ERR-002: `SigV4` signature mismatch. HTTP 403.
+    /// SP-ERR-002: `SigV4` signature mismatch. HTTP 400.
     #[error("{0}")]
     InvalidSignatureException(String),
 }

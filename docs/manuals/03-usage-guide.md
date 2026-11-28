@@ -561,7 +561,7 @@ extenddb reproduces DynamoDB error responses exactly. Common errors:
 | `ProvisionedThroughputExceededException` | 400 | Throughput limit exceeded |
 | `ItemCollectionSizeLimitExceededException` | 400 | LSI item collection > 10 GB |
 | `AccessDeniedException` | 400 | IAM policy denied the request |
-| `UnrecognizedClientException` | 403 | Invalid access key |
+| `UnrecognizedClientException` | 400 | Invalid access key |
 | `InternalServerError` | 500 | Unexpected server error |
 
 ## Supported Features Summary
