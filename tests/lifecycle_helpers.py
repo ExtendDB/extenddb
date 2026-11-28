@@ -134,13 +134,16 @@ def _init_args(cli_env):
     return args
 
 
-def _run_extenddb(*args, config=None, timeout=30, check=True, env_override=None, stdin=None):
+def _run_extenddb(
+    *args, config=None, timeout=30, check=True, env_override=None, stdin=None, cwd=None
+):
     """Run a extenddb CLI command and return the CompletedProcess.
 
     Standard input is empty unless `stdin` is an open file, for a command that
     reads one (`encryption-key set-data-connection`). extenddb commands must be
     fully non-interactive.
-    Use env_override to pass EXTENDDB_ADMIN_PASSWORD etc.
+    Use env_override to pass EXTENDDB_ADMIN_PASSWORD etc., and cwd to start
+    the command in another directory.
     """
     cmd = [EXTENDDB_BINARY]
     cmd.extend(args)
@@ -158,6 +161,7 @@ def _run_extenddb(*args, config=None, timeout=30, check=True, env_override=None,
         check=check,
         stdin=subprocess.DEVNULL if stdin is None else stdin,
         env=env,
+        cwd=cwd,
     )
 
 
@@ -206,9 +210,13 @@ def cli_env(tmp_path):
     # Cleanup: stop server if running, destroy, drop database. `--port` keeps
     # `stop` on this fixture's port: a config that was never patched (or never
     # written) resolves to the default port, whose PID file belongs to the
-    # shared test server.
+    # shared test server. It runs in the config's directory, where a
+    # relative `run_dir` resolves.
     try:
-        _run_extenddb("stop", "--port", str(port), config=config_path, check=False, timeout=10)
+        _run_extenddb(
+            "stop", "--port", str(port), config=config_path, check=False, timeout=10,
+            cwd=str(tmp_path),
+        )
     except Exception:
         pass
     try:

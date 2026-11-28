@@ -149,9 +149,10 @@ pub struct Summary {
 impl Summary {
     /// The `[auth.encryption]` line for the configuration. A relative path
     /// is made absolute against this process's working directory, as the
-    /// migration advice prints a config path, because a daemon `serve` reads
-    /// the file from `/`. Symlinks stay as given: the file rule resolves them
-    /// at each read, and a Kubernetes secret volume replaces its target.
+    /// migration advice prints a config path, because the configuration
+    /// refuses a relative `key_file`. Symlinks stay as given: the file rule
+    /// resolves them at each read, and a Kubernetes secret volume replaces
+    /// its target.
     #[must_use]
     pub fn key_file_line(&self) -> String {
         let path = std::path::absolute(&self.key_file)

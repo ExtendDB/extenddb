@@ -243,7 +243,25 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
             // before daemonizing so startup verification reads the new daemon's
             // PID rather than a dead one from a previous run.
             let _ = std::fs::remove_file(pid_file);
-            let daemon = Daemonize::new().pid_file(pid_file);
+            // daemonize moves the daemon to / unless told otherwise. Keep the
+            // directory `serve` was started in, so relative paths in the
+            // config and in requests resolve as they do with --foreground.
+            // When this process cannot enter that directory, the daemon runs
+            // in / as before, and serve says so.
+            let workdir = match std::env::set_current_dir(".") {
+                Ok(()) => ".",
+                Err(e) => {
+                    eprintln!(
+                        "WARNING: serve cannot enter the directory it was started in ({e}), so \
+                         the daemon runs in / and resolves relative paths against /. Start serve \
+                         from a directory this user can enter, or make the paths absolute."
+                    );
+                    "/"
+                }
+            };
+            let daemon = Daemonize::new()
+                .pid_file(pid_file)
+                .working_directory(workdir);
             match daemon.execute() {
                 daemonize::Outcome::Parent(Ok(_)) => {
                     // Parent process: wait for the PID file to appear (written by

@@ -319,7 +319,8 @@ fn the_summary_names_the_keys_and_ends_with_the_notice() {
     assert!(text.contains("The KEK of a catalog copy is lost"), "{text}");
     assert!(!text.contains(NO_REVOCATION_NOTICE), "{text}");
 
-    // A daemon `serve` runs from `/`, so a relative path is printed absolute.
+    // The configuration refuses a relative key_file, so a relative path is
+    // printed absolute.
     let relative = Summary {
         key_file: "kek".to_owned(),
         ..summary
