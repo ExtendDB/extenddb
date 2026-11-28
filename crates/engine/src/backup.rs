@@ -66,12 +66,13 @@ use crate::{OperationContext, serialize_output};
 /// therefore tell "my backup does not exist" (`BackupNotFoundException`, from
 /// the backend) from "that ARN belongs to another account".
 ///
-/// The service trims a trailing newline and resolves an ARN naming another
-/// region of the caller's account (measured on DynamoDB). The backends look
-/// up the exact string they stored, which carries the `server.region` in
-/// force when the backup was created, so the engine tries the ARN rebuilt in
-/// this deployment's region first and, when that is not found and the caller
-/// wrote a different ARN, the ARN as written (trimmed); see
+/// The service ignores one trailing line terminator and resolves an ARN
+/// naming another region of the caller's account (measured on DynamoDB). The
+/// backends look up the exact string they stored, which carries the
+/// `server.region` in force when the backup was created, so the engine tries
+/// the ARN rebuilt in this deployment's region first and, when that is not
+/// found and the caller wrote a different ARN, the ARN as written (the
+/// terminator stripped); see
 /// [`resolve_backup`]. A backup created under an earlier `server.region`
 /// therefore stays reachable by the ARN `ListBackups` reports for it.
 ///
@@ -176,6 +177,17 @@ fn backup_not_found(arn: &str) -> DynamoDbError {
         "{}: {arn}",
         extenddb_storage::backup_catalog::BACKUP_NOT_FOUND
     ))
+}
+
+/// A `BackupNotFoundException` of `DescribeBackup`, `DeleteBackup` or
+/// `RestoreTableFromBackup` names the `BackupArn` as the request wrote it,
+/// its trailing line terminator included, where the lookup used the stripped
+/// spelling (measured on DynamoDB on 2026-11-21).
+fn named_as_requested(e: DynamoDbError, requested: Option<&str>) -> DynamoDbError {
+    match (e, requested) {
+        (DynamoDbError::BackupNotFoundException(_), Some(arn)) => backup_not_found(arn),
+        (e, _) => e,
+    }
 }
 
 /// The error for a CREATING row, or one whose backup a CREATING restore
@@ -520,7 +532,9 @@ pub(crate) async fn handle_describe_backup(
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
     let backup_arn = backup_arn_field(&body, &ctx.account_id, &ctx.region)?;
-    let desc = describe_backup(&*ctx.storage, &ctx.account_id, &ctx.region, &backup_arn).await?;
+    let desc = describe_backup(&*ctx.storage, &ctx.account_id, &ctx.region, &backup_arn)
+        .await
+        .map_err(|e| named_as_requested(e, body["BackupArn"].as_str()))?;
     serialize_output(&json!({ "BackupDescription": desc }))
 }
 
@@ -713,7 +727,8 @@ pub(crate) async fn handle_delete_backup(
         &ctx.region,
         &backup_arn,
     )
-    .await?;
+    .await
+    .map_err(|e| named_as_requested(e, body["BackupArn"].as_str()))?;
     serialize_output(&json!({ "BackupDescription": desc }))
 }
 
@@ -1140,6 +1155,7 @@ pub(crate) async fn handle_restore_table_from_backup(
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
     let auth_cache = ctx.auth_cache.clone();
+    let requested = body["BackupArn"].as_str().map(str::to_owned);
     restore_table_from_backup_detached(
         Arc::clone(&ctx.storage),
         Arc::clone(&ctx.backup),
@@ -1166,6 +1182,7 @@ pub(crate) async fn handle_restore_table_from_backup(
         },
     )
     .await
+    .map_err(|e| named_as_requested(e, requested.as_deref()))
 }
 
 /// Run one restore, and then `after` with the target name, in a task of its

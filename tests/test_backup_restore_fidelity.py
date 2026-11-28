@@ -2328,8 +2328,7 @@ def test_backup_arn_shapes_the_service_refuses_and_trims(dynamodb_client):
             assert desc["BackupDetails"]["BackupArn"] == backup_arn, resolving
             assert desc["BackupDetails"]["BackupStatus"] == "AVAILABLE"
 
-        not_valid = "Invalid Request: BackupArn is not valid"
-        invalid_id = "Invalid Backup ARN"
+        not_valid, invalid_id = _ARN_NOT_VALID, _INVALID_BACKUP_ARN
         bad = [
             (f"{prefix}/{backup_id}\x00", not_valid),
             (f"{prefix}/{backup_id}\x07", not_valid),
@@ -2366,6 +2365,96 @@ def test_backup_arn_shapes_the_service_refuses_and_trims(dynamodb_client):
             client.describe_table(TableName=f"{source}-x")
     finally:
         _cleanup(client, backup_arn, source)
+
+
+# Whitespace around a BackupArn, measured on DynamoDB on 2026-11-21. Each
+# row below was sent at least twice, with the same answer each time. One
+# trailing line terminator (\n, \r\n, \r, U+0085, U+2028 or U+2029)
+# resolves on DescribeBackup and as an ExclusiveStartBackupArn; it is not sent
+# to DeleteBackup or RestoreTableFromBackup, which would act on the backup.
+# Other whitespace after the ARN, and any whitespace before it, is refused.
+# For a backup that does not exist, BackupNotFoundException names the ARN as
+# the request wrote it, its line terminator included.
+_ARN_NOT_VALID = "Invalid Request: BackupArn is not valid"
+_INVALID_BACKUP_ARN = "Invalid Backup ARN"
+_CURSOR_NOT_VALID = (
+    "Invalid Request: The supplied ExclusiveStartBackupArn is not a valid backup arn"
+)
+_NOT_FOUND = "Backup not found: "
+_RESOLVING_SUFFIXES = ["\n", "\r\n", "\r", "\u0085", "\u2028", "\u2029"]
+_REFUSED_SUFFIXES = [
+    "\n\n", "\r\n\r\n", "\n\r", "\r\r", " \n", "\n ", " ", "\t", "\x0c", "\x0b", "\u00a0",
+]
+_REFUSED_AROUND = [
+    (" ", ""), ("\t", ""), ("\n", ""), ("\r\n", ""), ("\x0c", ""), ("\x0b", ""),
+    ("\u00a0", ""), ("\n", "\n"),
+]
+
+
+def _whitespace_cases():
+    for suffix in _RESOLVING_SUFFIXES:
+        for op in ("DescribeBackup", "ListBackups"):
+            yield pytest.param(op, "", suffix, None, id=f"{op}-{suffix!r}")
+    for suffix in _REFUSED_SUFFIXES:
+        for op in ("DescribeBackup", "DeleteBackup", "RestoreTableFromBackup"):
+            yield pytest.param(op, "", suffix, _ARN_NOT_VALID, id=f"{op}-{suffix!r}")
+        yield pytest.param(
+            "ListBackups", "", suffix, _CURSOR_NOT_VALID, id=f"ListBackups-{suffix!r}",
+            marks=pytest.mark.xfail(
+                not _is_real_dynamodb(), strict=True,
+                reason="ExtendDB answers the BackupArn text for a malformed cursor (#1315)",
+            ),
+        )
+    for prefix, suffix in _REFUSED_AROUND:
+        for op in ("DescribeBackup", "DeleteBackup", "RestoreTableFromBackup", "ListBackups"):
+            yield pytest.param(
+                op, prefix, suffix, _INVALID_BACKUP_ARN, id=f"{op}-{prefix!r}-{suffix!r}"
+            )
+    for suffix in ["", *_RESOLVING_SUFFIXES]:
+        for op in ("DescribeBackup", "DeleteBackup", "RestoreTableFromBackup"):
+            yield pytest.param(op, "", suffix, _NOT_FOUND, id=f"{op}-missing-{suffix!r}")
+
+
+@pytest.fixture(scope="module")
+def whitespace_backup(dynamodb_client):
+    """A table and one AVAILABLE backup of it, shared by the whitespace cases:
+    a refused spelling changes nothing, and no resolving spelling is sent to
+    DeleteBackup or RestoreTableFromBackup."""
+    source = f"restore-arnspace-{uuid.uuid4().hex[:10]}"
+    backup_arn = None
+    try:
+        _simple_source(dynamodb_client, source)
+        backup_arn = _create_backup(dynamodb_client, source)
+        yield source, backup_arn
+    finally:
+        _cleanup(dynamodb_client, backup_arn, f"{source}-x", source)
+
+
+@pytest.mark.parametrize(("operation", "prefix", "suffix", "expected"), list(_whitespace_cases()))
+def test_backup_arn_whitespace_as_the_service_reads_it(
+    whitespace_backup, operation, prefix, suffix, expected
+):
+    source, backup_arn = whitespace_backup
+    if expected == _NOT_FOUND:
+        # The same ARN with another hex suffix in its backup id names no backup.
+        other = "1" * 8 if backup_arn.endswith("0" * 8) else "0" * 8
+        backup_arn = backup_arn[:-8] + other
+    spelled = prefix + backup_arn + suffix
+    if operation == "ListBackups":
+        body = {"TableName": source, "ExclusiveStartBackupArn": spelled}
+    else:
+        body = {"BackupArn": spelled}
+    if operation == "RestoreTableFromBackup":
+        body["TargetTableName"] = f"{source}-x"
+    resp = _signed(operation, body)
+    if expected is None:
+        assert resp.status_code == 200, (spelled, resp.text)
+    elif expected == _NOT_FOUND:
+        assert resp.status_code == 400, (spelled, resp.text)
+        assert _error(resp) == ("BackupNotFoundException", _NOT_FOUND + spelled), spelled
+    else:
+        assert resp.status_code == 400, (spelled, resp.text)
+        assert _error(resp) == ("ValidationException", expected), spelled
 
 
 def test_list_backups_cursor_and_time_range_are_checked(dynamodb_client):

@@ -50,15 +50,24 @@ pub(crate) fn canonical_backup_arn(
 /// measured on DynamoDB; its text was not captured, so the "not valid" one
 /// is used), before the account is looked at.
 ///
+/// An ARN that starts with whitespace is `Invalid Backup ARN`, also when one
+/// line terminator follows it (the rows measured in
+/// `tests/test_backup_restore_fidelity.py`).
+///
 /// [`ARN_PARTITION`]: extenddb_storage::util::ARN_PARTITION
 pub(crate) fn check_backup_arn(
     backup_arn: &str,
 ) -> Result<extenddb_storage::util::BackupArnParts<'_>, DynamoDbError> {
     use extenddb_storage::util::BackupArnError;
+    if backup_arn.starts_with(char::is_whitespace) {
+        return Err(DynamoDbError::ValidationException(
+            INVALID_BACKUP_ARN.to_owned(),
+        ));
+    }
     let parts = extenddb_storage::util::check_backup_arn(backup_arn).map_err(|e| {
         DynamoDbError::ValidationException(match e {
             BackupArnError::Invalid => BACKUP_ARN_NOT_VALID.to_owned(),
-            BackupArnError::Id => "Invalid Backup ARN".to_owned(),
+            BackupArnError::Id => INVALID_BACKUP_ARN.to_owned(),
         })
     })?;
     if parts.partition != extenddb_storage::util::ARN_PARTITION {
@@ -72,6 +81,10 @@ pub(crate) fn check_backup_arn(
 /// The service's text for a `BackupArn` that is not an ARN of the right
 /// shape (measured on DynamoDB).
 pub(crate) const BACKUP_ARN_NOT_VALID: &str = "Invalid Request: BackupArn is not valid";
+
+/// The service's text for a `BackupArn` whose backup id is not one, or that
+/// starts with whitespace (measured on DynamoDB).
+const INVALID_BACKUP_ARN: &str = "Invalid Backup ARN";
 
 pub(crate) fn required_str<'a>(
     body: &'a Value,
@@ -354,7 +367,7 @@ pub(crate) async fn list_backups<S: BackupCatalog + LegacyBackupReader + ?Sized>
 /// the region and table-name texts were captured as fragments ("does not
 /// match the region", "does not match the table name predicate") and are
 /// completed on the account text's pattern. Returns the cursor as this
-/// deployment issued it (whitespace trimmed).
+/// deployment issued it (one trailing line terminator stripped).
 fn list_backups_cursor(
     arn: &str,
     account_id: &str,

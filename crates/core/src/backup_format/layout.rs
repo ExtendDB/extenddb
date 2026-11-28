@@ -154,8 +154,8 @@ pub fn backup_creation_date_time(id_or_arn: &str) -> Option<f64> {
 /// The parts of a well-formed backup ARN, borrowed from the input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackupArnParts<'a> {
-    /// The ARN with surrounding ASCII whitespace removed, as the other fields
-    /// were read from it.
+    /// The ARN with one trailing line terminator removed
+    /// ([`trim_backup_arn`]), as the other fields were read from it.
     pub arn: &'a str,
     pub partition: &'a str,
     pub region: &'a str,
@@ -240,18 +240,18 @@ pub fn check_store_prefix_table_name(table_name: &str) -> Result<(), FormatError
     Ok(())
 }
 
-/// Strip surrounding ASCII whitespace from a `BackupArn`. Measured on
-/// `DynamoDB`: an ARN with a trailing newline or CRLF resolves, and one with a
-/// leading space or tab is refused with `Invalid Backup ARN`. This parser
-/// trims both ends and every ASCII whitespace character, as main's parser
-/// did; the leading-whitespace case is kept for compatibility with callers
-/// of that parser, not because the service accepts it. Every layer that
-/// reads a backup ARN from a request, the engine through
-/// [`check_backup_arn`] and authorization before it derives the resource,
-/// trims with this one function so they act on the same string.
+/// Strip one trailing line terminator (`\r\n`, `\n`, `\r`, U+0085, U+2028 or
+/// U+2029) from a `BackupArn`. The service ignores it and refuses every other
+/// whitespace around the ARN (measured on 2026-11-21, the whitespace rows of
+/// `tests/test_backup_restore_fidelity.py`). Other whitespace stays for
+/// [`check_backup_arn`] to refuse. Authorization and the engine strip with
+/// this function before they read the backup, so they act on the same
+/// string.
 #[must_use]
 pub fn trim_backup_arn(arn: &str) -> &str {
-    arn.trim_matches(|c: char| c.is_ascii_whitespace())
+    arn.strip_suffix("\r\n")
+        .or_else(|| arn.strip_suffix(['\n', '\r', '\u{85}', '\u{2028}', '\u{2029}']))
+        .unwrap_or(arn)
 }
 
 /// Format a backup ARN from its parts. The one place the string is built;
@@ -273,18 +273,16 @@ pub fn parse_backup_arn(arn: &str) -> Option<BackupArnParts<'_>> {
     check_backup_arn(arn).ok()
 }
 
-/// Parse a backup ARN after trimming surrounding ASCII whitespace with
-/// [`trim_backup_arn`] (wider than the service, which resolves a trailing
-/// newline or CRLF and refuses leading whitespace; see there), with the
-/// length limit below applied to what remains, refusing one that is not exactly six
-/// colon-separated fields, not `arn:<partition>:dynamodb:...`, has an empty
-/// or malformed region, account, or table name, a resource other than
-/// `table/<name>/backup/<id>`, a control or non-ASCII character, more than
-/// [`MAX_BACKUP_ARN_LEN`] bytes, or an id that is not a backup id
-/// ([`is_backup_id`]). The region and partition are checked for shape only:
-/// an ARN in another region of the caller's account resolves on the service,
-/// so the engine substitutes its own region rather than refuse it, and the
-/// engine decides which partitions it serves.
+/// Parse a backup ARN after stripping one trailing line terminator with
+/// [`trim_backup_arn`], with the length limit below applied to what remains,
+/// refusing one that is not exactly six colon-separated fields, not
+/// `arn:<partition>:dynamodb:...`, has an empty or malformed region, account,
+/// or table name, a resource other than `table/<name>/backup/<id>`, a control
+/// or non-ASCII character, more than [`MAX_BACKUP_ARN_LEN`] bytes, or an id
+/// that is not a backup id ([`is_backup_id`]). The region and partition are
+/// checked for shape only: an ARN in another region of the caller's account
+/// resolves on the service, so the engine substitutes its own region rather
+/// than refuse it, and the engine decides which partitions it serves.
 ///
 /// The field split is [`crate::arn::fields`], shared with authorization.
 ///
@@ -378,7 +376,8 @@ impl BackupArn {
             ))
         })?;
         // A separator inside a component would have parsed back as different
-        // fields; a leading or trailing space would have been trimmed away.
+        // fields, and a trailing line terminator on the backup id would have
+        // been stripped away.
         if (
             parts.partition,
             parts.region,
@@ -796,10 +795,9 @@ mod tests {
             ))
             .is_err()
         );
-        // Surrounding whitespace is trimmed at both ends (the service trims
-        // only a trailing newline; `trim_backup_arn`); the parsed ARN is the
-        // trimmed one.
-        let padded = format!(" {ARN}\n");
+        // One trailing line terminator is stripped (`trim_backup_arn`); the
+        // parsed ARN is the stripped one.
+        let padded = format!("{ARN}\n");
         assert_eq!(BackupArn::parse(&padded).unwrap().to_arn_string(), ARN);
     }
 
@@ -904,13 +902,32 @@ mod tests {
         );
         assert_eq!(arn, ARN);
         assert_eq!(BackupArn::parse(ARN).unwrap().to_arn_string(), arn);
-        assert_eq!(trim_backup_arn(" \t\n"), "");
-        assert_eq!(trim_backup_arn(&format!("\t{ARN}\n")), ARN);
-        assert_eq!(
-            trim_backup_arn("\u{a0}x"),
-            "\u{a0}x",
-            "non-ASCII whitespace is not trimmed"
-        );
+    }
+
+    #[test]
+    fn only_one_trailing_line_terminator_is_stripped() {
+        let rows: &[(&str, &str, bool)] = &[
+            ("", "", true),
+            ("", "\n", true),
+            ("", "\r\n", true),
+            ("", "\r", true),
+            ("", "\u{85}", true),
+            ("", "\u{2028}", true),
+            ("", "\u{2029}", true),
+            ("", "\n\n", false),
+            ("", "\r\n\r\n", false),
+            ("", "\n\r", false),
+            ("", " ", false),
+            ("", "\u{a0}", false),
+            (" ", "", false),
+            ("\n", "", false),
+        ];
+        for (before, after, resolves) in rows {
+            let spelled = format!("{before}{ARN}{after}");
+            assert_eq!(trim_backup_arn(&spelled) == ARN, *resolves, "{spelled:?}");
+            let expected = (!*resolves).then_some(BackupArnError::Invalid);
+            assert_eq!(check_backup_arn(&spelled).err(), expected, "{spelled:?}");
+        }
     }
 
     #[test]
@@ -954,9 +971,9 @@ mod tests {
         assert!(err.to_string().contains("Mu sic"), "{err}");
         assert!(BackupArn::new("aws", "us:east", "1234", "Music", ID).is_err());
         assert!(BackupArn::new("", "us-east-1", "1234", "Music", ID).is_err());
-        // A component with surrounding whitespace would parse back trimmed.
-        // Inner components are refused by the character rules; the round-trip
-        // comparison is what catches whitespace at the two ends of the string.
+        // The character rules refuse whitespace in a component. The one
+        // exception is a trailing line terminator on the backup id, which the
+        // parse strips; the round-trip comparison catches that one.
         assert!(BackupArn::new("aws", "us-east-1", "1234", "Music ", ID).is_err());
         assert!(BackupArn::new("aws", "us-east-1", " 1234", "Music", ID).is_err());
         assert!(BackupArn::new(" aws", "us-east-1", "1234", "Music", ID).is_err());

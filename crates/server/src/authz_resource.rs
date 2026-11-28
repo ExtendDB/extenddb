@@ -256,12 +256,12 @@ fn canonical_resource(arn: &str, region: &str, account_id: &str) -> String {
     }
 }
 
-/// A `BackupArn` with the surrounding ASCII whitespace the engine trims
-/// before it resolves the backup (`check_backup_arn`) trimmed here too, so
-/// authorization evaluates the backup the engine acts on. Without this, a Deny
-/// on a backup ARN would be bypassed by sending the ARN with a trailing
-/// newline: authorization would evaluate `.../backup/<id>\n` and the engine
-/// act on `.../backup/<id>`.
+/// A `BackupArn` with the one trailing line terminator that the engine
+/// strips before it resolves the backup (`trim_backup_arn`) stripped here
+/// too, so authorization evaluates the backup the engine acts on. Without
+/// this, a Deny on a backup ARN would be bypassed by sending the ARN with a
+/// trailing newline: authorization would evaluate `.../backup/<id>\n` and the
+/// engine act on `.../backup/<id>`.
 fn backup_arn_field(input: &Value) -> String {
     str_field(input, "BackupArn")
         .map(|arn| extenddb_core::backup_format::trim_backup_arn(&arn).to_owned())
@@ -867,16 +867,16 @@ mod tests {
         t[0].resource.clone()
     }
 
-    /// The engine trims surrounding ASCII whitespace from a `BackupArn`
-    /// before it resolves the backup, so authorization evaluates the trimmed
+    /// The engine strips one trailing line terminator from a `BackupArn`
+    /// before it resolves the backup, so authorization evaluates the stripped
     /// backup and a Deny on it cannot be bypassed with a trailing newline.
     #[test]
-    fn backup_arn_with_surrounding_whitespace_authorizes_the_trimmed_backup() {
+    fn backup_arn_with_a_trailing_line_terminator_authorizes_the_stripped_backup() {
         let arn = format!("arn:aws:dynamodb:{R}:{A}:table/T/backup/01791976431438-73d8d5bc");
         for spelled in [
             format!("{arn}\n"),
-            format!(" {arn}"),
-            format!("\t{arn}\r\n"),
+            format!("{arn}\r\n"),
+            format!("{arn}\u{2028}"),
         ] {
             for op in ["DescribeBackup", "DeleteBackup"] {
                 assert!(validate_operation_arns(op, &json!({ "BackupArn": spelled }), R).is_ok());
@@ -894,7 +894,8 @@ mod tests {
             );
             assert_eq!(
                 (restore[0].action.as_str(), restore[0].resource.as_str()),
-                ("RestoreTableFromBackup", arn.as_str())
+                ("RestoreTableFromBackup", arn.as_str()),
+                "{spelled:?}"
             );
         }
     }
