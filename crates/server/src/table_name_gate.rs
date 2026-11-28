@@ -258,7 +258,7 @@ fn check_request_items_keys(operation: &str, input: &Value) -> Result<(), Dynamo
             continue;
         }
         if key.starts_with("arn:") {
-            let refused = match arn_gate::table_arn_fault(key) {
+            let refused = match arn_gate::table_arn_fault(key, false) {
                 None => false,
                 Some(arn_gate::ArnFault::Account) if operation == "BatchWriteItem" => {
                     extenddb_core::arn::fields(key).is_some_and(|f| f.account.contains('\u{0}'))
@@ -372,7 +372,7 @@ mod tests {
             json!({ "TableName": "" }),
             json!({ "TableName": null }),
             json!({ "TableName": 7 }),
-            json!({ "TableName": "arn:aws:dynamodb:us-east-1:123456789012:table/t" }),
+            json!({ "TableName": "arn:aws:dynamodb:us-east-1:123456789012:table/t367name" }),
         ] {
             assert!(message("GetItem", input.clone()).is_none(), "{input}");
         }
