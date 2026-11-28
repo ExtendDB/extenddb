@@ -92,7 +92,7 @@ The expected sequence:
 - `put-item` returns empty JSON `{}`.
 - `get-item` returns `{"Item": {...}}` matching what was written.
 
-If any operation fails, consult ``references/troubleshooting/01-symptom-index.md``. Common failure modes include `InvalidSignatureException` (clock skew or secret key mismatch), `UnrecognizedClientException` (access key ID not found), `AccessDeniedException` (policy missing `dynamodb:*`), and `Could not connect to the endpoint URL` (server not running or wrong endpoint URL).
+If any operation fails, consult ``references/troubleshooting/01-symptom-index.md``. Common failure modes include `InvalidSignatureException` (secret key mismatch), `UnrecognizedClientException` (access key ID not found), `AccessDeniedException` (policy missing `dynamodb:*`), and `Could not connect to the endpoint URL` (server not running or wrong endpoint URL).
 
 ## 7. Teardown (optional)
 
