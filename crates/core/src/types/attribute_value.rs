@@ -74,6 +74,39 @@ pub const EMPTY_ATTRIBUTE_VALUE: &str =
 /// The deserializer's text for a value with more than one type descriptor.
 pub const MULTI_ATTRIBUTE_VALUE: &str = "Supplied AttributeValue has more than one datatypes set, must contain exactly one of the supported datatypes";
 
+/// The service's texts for a `B` value or a `BS` member it cannot decode
+/// (measured 2026-11-20), with its spelling. See [`decode_base64`].
+const BASE64_TEXTS: [&str; 3] = [
+    "Buffer is too short for base64 encoding",
+    "Base64 encoded length is expected a multiple of 4 bytes but found: ",
+    "Invalid last non-pad Base64 character dectected",
+];
+
+/// Decode the text of a `B` value or a `BS` member.
+pub fn decode_base64(text: &str) -> Result<Vec<u8>, String> {
+    let [too_short, length, last_character] = BASE64_TEXTS;
+    BASE64.decode(text).map_err(|_| match text.len() {
+        1 => too_short.to_owned(),
+        2 if text == "==" => String::new(),
+        n if n % 4 != 0 => format!("{length}{n}"),
+        _ if text
+            .trim_end_matches('=')
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/') =>
+        {
+            last_character.to_owned()
+        }
+        _ => String::new(),
+    })
+}
+
+/// Whether `message` is a text of [`decode_base64`], which the service sends
+/// as it is, and an empty one as no message.
+#[must_use]
+pub fn is_base64_refusal(message: &str) -> bool {
+    message.is_empty() || BASE64_TEXTS.iter().any(|text| message.starts_with(text))
+}
+
 impl<'de> Visitor<'de> for AttributeValueVisitor {
     type Value = AttributeValue;
 
@@ -151,10 +184,7 @@ fn from_descriptor(key: &str, value: serde_json::Value) -> Result<AttributeValue
             let b64 = value
                 .as_str()
                 .ok_or_else(|| "B value must be a base64 string".to_owned())?;
-            let bytes = BASE64
-                .decode(b64)
-                .map_err(|e| format!("invalid base64: {e}"))?;
-            Ok(AttributeValue::B(bytes))
+            Ok(AttributeValue::B(decode_base64(b64)?))
         }
         "SS" => string_set(&value),
         "NS" => number_set(&value),
@@ -271,9 +301,7 @@ fn binary_set(value: &serde_json::Value) -> Result<AttributeValue, String> {
         .iter()
         .map(|v| {
             let b64 = v.as_str().ok_or_else(|| EMPTY_ATTRIBUTE_VALUE.to_owned())?;
-            BASE64
-                .decode(b64)
-                .map_err(|e| format!("invalid base64: {e}"))
+            decode_base64(b64)
         })
         .collect::<Result<_, _>>()?;
     if set.len() != arr.len() {
@@ -708,5 +736,93 @@ mod tests {
             msg.contains("Supplied AttributeValue is empty"),
             "expected DDB EMPTY_ATTRIBUTE_VALUE wording for empty inside M, got: {msg}"
         );
+    }
+
+    /// The service's answer to each `B` value (measured 2026-11-20, and
+    /// 2026-11-25 for `//==` and `++==`): the decoded bytes, or the text of
+    /// the refusal, empty for no message. A `BS` member, and a value inside
+    /// an `M` or an `L`, get the same text.
+    #[test]
+    fn a_value_that_is_not_base64_gets_the_service_text() {
+        let short = || Err("Buffer is too short for base64 encoding".to_owned());
+        let length = |n: usize| {
+            Err(format!(
+                "Base64 encoded length is expected a multiple of 4 bytes but found: {n}"
+            ))
+        };
+        let last = || Err("Invalid last non-pad Base64 character dectected".to_owned());
+        let none = || Err(String::new());
+        let rows: [(&str, Result<&str, String>); 50] = [
+            ("YWJj", Ok("abc")),
+            ("YQ==", Ok("a")),
+            ("YWE=", Ok("aa")),
+            ("AA==", Ok("\0")),
+            ("AAA=", Ok("\0\0")),
+            ("a", short()),
+            ("Y", short()),
+            ("!", short()),
+            ("=", short()),
+            ("!!", length(2)),
+            ("YR", length(2)),
+            ("Y=", length(2)),
+            ("!=", length(2)),
+            ("\u{e9}", length(2)),
+            ("===", length(3)),
+            ("A==", length(3)),
+            ("YR=", length(3)),
+            ("YQ==\n", length(5)),
+            ("Y Q==", length(5)),
+            ("abcde", length(5)),
+            ("YWJjZ", length(5)),
+            ("YQ===", length(5)),
+            ("=====", length(5)),
+            ("YQ==YQ", length(6)),
+            ("======", length(6)),
+            ("Y===", last()),
+            ("YR==", last()),
+            ("YWF=", last()),
+            ("YWJjYR==", last()),
+            ("YWJj====", last()),
+            ("====", last()),
+            ("A===", last()),
+            ("AB==", last()),
+            ("AAB=", last()),
+            ("//==", last()),
+            ("++==", last()),
+            ("==", none()),
+            ("!!!!", none()),
+            ("!!==", none()),
+            ("YQ!=", none()),
+            ("YQ=A", none()),
+            ("YWJ!", none()),
+            ("YW!j", none()),
+            ("!WJj", none()),
+            ("-_-_", none()),
+            ("YQ==YQ==", none()),
+            ("YWJjYWJj!!!!", none()),
+            ("\u{e9}\u{e9}", none()),
+            ("\u{1f600}", none()),
+            ("YQ\u{e9}", none()),
+        ];
+        for (text, want) in rows {
+            let want = want.map(|bytes| bytes.as_bytes().to_vec());
+            assert_eq!(decode_base64(text), want, "{text:?}");
+            for json in [
+                serde_json::json!({"B": text}),
+                serde_json::json!({"BS": [text]}),
+                serde_json::json!({"M": {"x": {"B": text}}}),
+                serde_json::json!({"L": [{"B": text}]}),
+            ] {
+                let got = serde_json::from_value::<AttributeValue>(json.clone());
+                assert_eq!(
+                    got.err().map(|e| e.to_string()),
+                    want.clone().err(),
+                    "{json}"
+                );
+            }
+        }
+        let set = serde_json::json!({"BS": ["YQ==", "!!!!"]});
+        let got = serde_json::from_value::<AttributeValue>(set);
+        assert_eq!(got.err().map(|e| e.to_string()), Some(String::new()));
     }
 }

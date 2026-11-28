@@ -240,7 +240,8 @@ pub(crate) fn require_stream_enabled_member(body: &serde_json::Value) -> Result<
 ///
 /// Enum validation errors (produced by custom Deserialize impls) contain
 /// "validation error detected" and should be returned as `ValidationException`.
-/// All other deserialization failures are `SerializationException`.
+/// All other deserialization failures are `SerializationException` (see
+/// [`serialization_exception`]).
 pub(crate) fn deserialize_error(e: serde_json::Error) -> DynamoDbError {
     let msg = e.to_string();
     if msg.contains("validation error detected")
@@ -256,8 +257,20 @@ pub(crate) fn deserialize_error(e: serde_json::Error) -> DynamoDbError {
     {
         DynamoDbError::ValidationException(msg)
     } else {
+        serialization_exception(msg)
+    }
+}
+
+/// The `SerializationException` for a deserializer's text. The text of a `B`
+/// value that does not decode is the service's own and goes out as it is, an
+/// empty one as no message (see `extenddb_core::types::decode_base64`). Any
+/// other text follows the service's prefix.
+pub(crate) fn serialization_exception(msg: String) -> DynamoDbError {
+    if extenddb_core::types::is_base64_refusal(&msg) {
+        DynamoDbError::SerializationException(msg)
+    } else {
         DynamoDbError::SerializationException(format!(
-            "Start of structure or map found where not expected: {e}"
+            "Start of structure or map found where not expected: {msg}"
         ))
     }
 }

@@ -13,7 +13,9 @@ mod table;
 mod transaction;
 mod warm_throughput;
 
-pub use attribute_value::{AttributeValue, EMPTY_ATTRIBUTE_VALUE, MULTI_ATTRIBUTE_VALUE};
+pub use attribute_value::{
+    AttributeValue, EMPTY_ATTRIBUTE_VALUE, MULTI_ATTRIBUTE_VALUE, decode_base64, is_base64_refusal,
+};
 pub use backup::{
     BackupDescription, BackupDetails, BackupSummary, ContinuousBackupsDescription,
     GlobalSecondaryIndexInfo, LocalSecondaryIndexInfo, PointInTimeRecoveryDescription,

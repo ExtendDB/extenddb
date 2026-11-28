@@ -45,13 +45,11 @@
 //! reported can differ from the service's, which walks the request's order
 //! (measured 2026-11-02).
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use super::number::{check_number, parameter_message};
-use crate::types::AttributeValue;
+use crate::types::{AttributeValue, decode_base64};
 use crate::validation::MAX_ITEM_NESTING_DEPTH;
 pub use crate::validation::number::NUMBER_SET_DUPLICATES;
 use crate::validation::number::has_equal_numbers;
@@ -109,7 +107,7 @@ fn check_types(value: &Value) -> Result<(), String> {
     for (tag, payload) in typed_members(members) {
         match (tag, payload) {
             ("S" | "N", Value::String(_)) | ("NULL" | "BOOL", Value::Bool(_)) => {}
-            ("B", Value::String(text)) => check_base64(text)?,
+            ("B", Value::String(text)) => drop(decode_base64(text)?),
             ("SS" | "NS", Value::Array(items)) => {
                 if items
                     .iter()
@@ -121,7 +119,7 @@ fn check_types(value: &Value) -> Result<(), String> {
             ("BS", Value::Array(items)) => {
                 for item in items {
                     match item {
-                        Value::String(text) => check_base64(text)?,
+                        Value::String(text) => drop(decode_base64(text)?),
                         Value::Null => {}
                         _ => return Err("BS member must be a base64 string".to_owned()),
                     }
@@ -154,13 +152,6 @@ fn wrong_payload(tag: &str) -> String {
         _ => "an array",
     };
     format!("{tag} value must be {expected}")
-}
-
-fn check_base64(text: &str) -> Result<(), String> {
-    BASE64
-        .decode(text)
-        .map(drop)
-        .map_err(|e| format!("invalid base64: {e}"))
 }
 
 /// The members of an attribute value the model reads: those it names whose
@@ -548,6 +539,8 @@ mod tests {
             }
             format!("[{v}]")
         };
+        const LENGTH_3: &str =
+            "Base64 encoded length is expected a multiple of 4 bytes but found: 3";
         for (json, message) in [
             ("[{\"BOOL\":\"x\"}]", "BOOL value must be a boolean"),
             ("[{\"NULL\":\"x\"}]", "NULL value must be a boolean"),
@@ -588,20 +581,18 @@ mod tests {
                 "BOOL value must be a boolean",
             ),
             (deep_bool.as_str(), "BOOL value must be a boolean"),
+            // A `B` value or a `BS` member the service cannot decode, with
+            // its text (measured 2026-11-20, 2026-11-21 and 2026-11-25).
+            ("[{\"B\":\"%%%\"}]", LENGTH_3),
+            ("[{\"BS\":[\"%%%\"]}]", LENGTH_3),
+            ("[{\"B\":\"AQ=\"}]", LENGTH_3),
+            ("[{\"B\":\"!!!!\"}]", ""),
         ] {
             assert_eq!(
                 check_parameter_types(&doc(json)),
                 Err(message.to_owned()),
                 "{json}"
             );
-        }
-        for json in [
-            "[{\"B\":\"%%%\"}]",
-            "[{\"BS\":[\"%%%\"]}]",
-            "[{\"B\":\"AQ=\"}]",
-        ] {
-            let refusal = check_parameter_types(&doc(json)).unwrap_err();
-            assert!(refusal.starts_with("invalid base64: "), "{json}: {refusal}");
         }
         let refusal = check_parameter_types(&doc("[\"a\"]")).unwrap_err();
         assert!(refusal.starts_with("invalid type: string"), "{refusal}");

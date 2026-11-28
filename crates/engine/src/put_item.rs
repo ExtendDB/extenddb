@@ -88,9 +88,7 @@ pub async fn handle_put_item(
         {
             DynamoDbError::ValidationException(msg)
         } else {
-            DynamoDbError::SerializationException(format!(
-                "Start of structure or map found where not expected: {e}"
-            ))
+            crate::serialization_exception(msg)
         }
     })?;
 
