@@ -138,29 +138,22 @@ pub(crate) fn pay_per_request_after(
     }
 }
 
-/// `validate_index_name` with the pattern clause located at the update's
-/// member path, as the service reports it (measured 2026-10-24). The length
-/// clauses keep the bare `indexName` location, which is not measured for
-/// UpdateTable.
+/// `validate_index_name` at the member path of an `action` (`create`,
+/// `update` or `delete`) in element `position` (0-based) of
+/// `GlobalSecondaryIndexUpdates`, as the service reports each clause
+/// (measured 2026-10-24 and 2026-11-18).
 fn validate_update_index_name(
     name: &str,
     position: usize,
     action: &str,
 ) -> Result<(), DynamoDbError> {
-    match extenddb_core::validation::validate_index_name(name) {
-        Err(DynamoDbError::ValidationException(m))
-            if m.contains("' at 'indexName' ") && m.contains("regular expression pattern") =>
-        {
-            Err(DynamoDbError::ValidationException(m.replace(
-                "' at 'indexName' ",
-                &format!(
-                    "' at 'globalSecondaryIndexUpdates.{}.member.{action}.indexName' ",
-                    position + 1
-                ),
-            )))
-        }
-        other => other,
-    }
+    extenddb_core::validation::validate_index_name(
+        name,
+        &format!(
+            "globalSecondaryIndexUpdates.{}.member.{action}.indexName",
+            position + 1
+        ),
+    )
 }
 
 /// Apply the element rules to `input`.
@@ -218,17 +211,13 @@ pub(crate) fn validate_gsi_updates(input: &UpdateTableInput) -> Result<(), Dynam
             // a throughput beside it is refused here, in every billing mode;
             // one without it is refused by [`refuse_bare_updates`] once the
             // table's billing mode is known.
-            extenddb_core::validation::validate_index_name(&upd.index_name)?;
+            validate_update_index_name(&upd.index_name, position, "update")?;
             if upd.warm_throughput.is_some() && upd.carries_throughput() {
                 return Err(DynamoDbError::ValidationException(
                     index_warm_throughput_only_operation(&upd.index_name),
                 ));
             }
         }
-        // Create and Delete names are validated the way CreateTable does,
-        // except that the pattern clause carries the member's path (measured
-        // 2026-10-24: `globalSecondaryIndexUpdates.<n>.member.create.indexName`,
-        // 1-based). The path of an Update's name is not measured.
         if let Some(create) = &update.create {
             validate_update_index_name(&create.index_name, position, "create")?;
             extenddb_core::validation::validate_index_throughput_minimum(
@@ -537,33 +526,66 @@ mod tests {
     }
 
     #[test]
-    fn an_index_name_outside_the_pattern_is_reported_at_its_member_path() {
-        let cases = [
-            (
-                json!([create("g\u{0}2")]),
-                "globalSecondaryIndexUpdates.1.member.create.indexName",
-            ),
-            (
-                json!([
-                    { "Delete": { "IndexName": "gix" } },
-                    { "Delete": { "IndexName": "g\u{0}2" } },
-                ]),
-                "globalSecondaryIndexUpdates.2.member.delete.indexName",
-            ),
+    fn an_index_name_is_refused_at_its_member_path() {
+        // One clause per failed constraint, the length first. DynamoDB's
+        // answers were measured 2026-10-24 (the U+0000 rows), 2026-11-14
+        // (#1021, the emoji rows of Create) and 2026-11-18 (the rest), and
+        // list two clauses of one member in either order.
+        const SHORT: &str = "Member must have length greater than or equal to 3";
+        const LONG: &str = "Member must have length less than or equal to 255";
+        const PATTERN: &str = "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+";
+        let update = |name: &str| {
+            json!({ "Update": {
+                "IndexName": name,
+                "ProvisionedThroughput": { "ReadCapacityUnits": 1, "WriteCapacityUnits": 1 },
+            }})
+        };
+        let delete = |name: &str| json!({ "Delete": { "IndexName": name } });
+        let emoji2 = "\u{1F600}".repeat(2);
+        let emoji128 = "\u{1F600}".repeat(128);
+        let a256 = "a".repeat(256);
+        // (1-based position of the element, its action, the name, the clauses)
+        let rows: [(usize, &str, &str, &[&str]); 14] = [
+            (1, "create", "g\u{0}2", &[PATTERN]),
+            (2, "delete", "g\u{0}2", &[PATTERN]),
+            (1, "create", &emoji2, &[SHORT, PATTERN]),
+            (1, "create", &emoji128, &[PATTERN]),
+            (1, "create", "ab", &[SHORT]),
+            (1, "create", &a256, &[LONG]),
+            (1, "update", "ab", &[SHORT]),
+            (1, "update", &a256, &[LONG]),
+            (1, "update", &emoji2, &[SHORT, PATTERN]),
+            (1, "update", &emoji128, &[PATTERN]),
+            (1, "delete", "ab", &[SHORT]),
+            (1, "delete", &a256, &[LONG]),
+            (1, "delete", &emoji2, &[SHORT, PATTERN]),
+            (1, "delete", &emoji128, &[PATTERN]),
         ];
-        for (updates, path) in cases {
-            assert_eq!(
-                message(validate_gsi_updates(&input(updates))),
-                format!(
-                    "1 validation error detected: Value 'g\u{0}2' at '{path}' failed to \
-                     satisfy constraint: Member must satisfy regular expression pattern: \
-                     [a-zA-Z0-9_.-]+"
+        for (position, action, name, clauses) in rows {
+            let mut updates = vec![delete("gix"); position - 1];
+            updates.push(match action {
+                "create" => create(name),
+                "update" => update(name),
+                _ => delete(name),
+            });
+            let path = format!("globalSecondaryIndexUpdates.{position}.member.{action}.indexName");
+            let at =
+                |c: &str| format!("Value '{name}' at '{path}' failed to satisfy constraint: {c}");
+            let expected = match clauses {
+                [one] => format!("1 validation error detected: {}", at(one)),
+                [first, second] => format!(
+                    "2 validation errors detected: {}; {}",
+                    at(first),
+                    at(second)
                 ),
-                "{path}"
+                _ => unreachable!("{clauses:?}"),
+            };
+            assert_eq!(
+                message(validate_gsi_updates(&input(Value::Array(updates)))),
+                expected,
+                "{path}, {} characters",
+                name.chars().count()
             );
         }
-        // A length fault keeps the bare location, which is not measured here.
-        let m = message(validate_gsi_updates(&input(json!([create("ab")]))));
-        assert!(m.contains("' at 'indexName' "), "{m}");
     }
 }

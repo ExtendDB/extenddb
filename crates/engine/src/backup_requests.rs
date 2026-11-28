@@ -21,6 +21,7 @@
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::BackupSummary;
+use extenddb_core::validation::validate_name_member;
 use extenddb_storage::backup_catalog::TimeBounds;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{BackupCatalog, LegacyBackupReader};
@@ -86,57 +87,9 @@ pub(crate) fn required_str<'a>(
     })
 }
 
-/// The service model's constraints on `BackupName` and `TableName` (botocore
-/// 1.33.13: length 3 to 255, pattern `[a-zA-Z0-9_.-]+`), with the service's
-/// texts: one constraint failed is `1 validation error detected: Value '<v>'
-/// at '<path>' failed to satisfy constraint: <c>`; both failed join under
-/// `2 validation errors detected:` with `; ` between (measured on DynamoDB;
-/// the order of the two clauses was not captured, so length
-/// comes first, as `CreateTable`'s table-name check reports it). The value is
-/// echoed as sent, as the service does, so a long name makes a long message.
-///
-/// Length is counted in characters, as the model's `min`/`max` are, so a
-/// name of two-byte characters is measured as the service measures it.
-/// `BackupName` takes the model's 3 to 255; a `TableName` member takes the
-/// deployment's `LimitsConfig` bounds ([`table_name_bounds`]), as
-/// `CreateTable` does, so a table the deployment could create can be backed
-/// up and listed.
-pub(crate) fn validate_name_member(
-    value: &str,
-    path: &str,
-    (min, max): (usize, usize),
-) -> Result<(), DynamoDbError> {
-    let mut failed = Vec::new();
-    let length = value.chars().count();
-    let too_short = format!("Member must have length greater than or equal to {min}");
-    let too_long = format!("Member must have length less than or equal to {max}");
-    if length < min {
-        failed.push(too_short.as_str());
-    } else if length > max {
-        failed.push(too_long.as_str());
-    }
-    if !value
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-')
-    {
-        failed.push("Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+");
-    }
-    match failed.len() {
-        0 => Ok(()),
-        n => Err(DynamoDbError::ValidationException(format!(
-            "{n} validation error{} detected: {}",
-            if n == 1 { "" } else { "s" },
-            failed
-                .iter()
-                .map(|c| format!("Value '{value}' at '{path}' failed to satisfy constraint: {c}"))
-                .collect::<Vec<_>>()
-                .join("; ")
-        ))),
-    }
-}
-
 /// The length bounds for a `TableName` member: the deployment's, which
-/// default to the model's 3 to 255.
+/// default to the model's 3 to 255. `CreateTable` takes the same bounds, so a
+/// table the deployment could create can be backed up and listed.
 fn table_name_bounds(limits: &LimitsConfig) -> (usize, usize) {
     (limits.min_table_name_length, limits.max_table_name_length)
 }

@@ -26,6 +26,7 @@ use extenddb_core::types::{
     LocalSecondaryIndexInfo, ProvisionedThroughput, RestoreSummary, SourceTableFeatureDetails,
     SseDescription, StreamSpecification, TableDescription, TableStatus,
 };
+use extenddb_core::validation::validate_name_member;
 use extenddb_storage::backup_catalog::{
     BackupKey, BackupRow, BackupStatus, DeleteStart, is_backup_not_found,
 };
@@ -50,7 +51,7 @@ pub use store_identity::{STORE_IDENTITY_KEY, StoreIdentityFile, StoreProblem};
 
 use crate::backup_requests::{
     canonical_backup_arn, check_backup_arn, create_backup_table_name, required_str,
-    storage_err_to_dynamo, validate_name_member,
+    storage_err_to_dynamo,
 };
 use crate::{OperationContext, serialize_output};
 

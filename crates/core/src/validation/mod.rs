@@ -75,33 +75,68 @@ pub fn validate_table_name_chars(name: &str) -> Result<(), DynamoDbError> {
     Ok(())
 }
 
-/// Validate an index name per `DynamoDB` rules: 3–255 chars, `[a-zA-Z0-9_.-]+`.
+/// The service model's constraints on a name member, `min` to `max`
+/// characters of the table-name alphabet, with the service's texts, the
+/// length clause first. DynamoDB lists the two clauses of an index name in
+/// either order.
 ///
-/// Same character rules as table names. Defense-in-depth: prevents SQL injection
-/// via index names that are interpolated into DDL identifiers in storage-postgres.
+/// The length is counted in characters (Unicode scalar values). DynamoDB
+/// counts an index name this way: it refuses two U+1F600 as shorter than 3
+/// and accepts the length of 128 of them (measured in us-east-1 on
+/// 2026-11-14).
 ///
 /// # Errors
 ///
-/// Returns `ValidationException` if the name is too short, too long, or contains
-/// invalid characters.
-pub fn validate_index_name(name: &str) -> Result<(), DynamoDbError> {
-    if name.len() < 3 || name.len() > 255 {
-        return Err(DynamoDbError::ValidationException(format!(
-            "1 validation error detected: Value '{name}' at 'indexName' failed to satisfy constraint: \
-             Member must have length greater than or equal to 3 and less than or equal to 255"
-        )));
+/// `ValidationException` with one clause per failed constraint.
+pub fn validate_name_member(
+    value: &str,
+    path: &str,
+    (min, max): (usize, usize),
+) -> Result<(), DynamoDbError> {
+    let length = value.chars().count();
+    let too_short = format!("Member must have length greater than or equal to {min}");
+    let too_long = format!("Member must have length less than or equal to {max}");
+    let mut failed = Vec::new();
+    if length < min {
+        failed.push((value, path, too_short.as_str()));
+    } else if length > max {
+        failed.push((value, path, too_long.as_str()));
     }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
-    {
-        return Err(DynamoDbError::ValidationException(format!(
-            "1 validation error detected: Value '{name}' at 'indexName' failed to satisfy constraint: \
-             Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
-        )));
+    if validate_table_name_chars(value).is_err() {
+        failed.push((
+            value,
+            path,
+            "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+",
+        ));
     }
-    Ok(())
+    if failed.is_empty() {
+        return Ok(());
+    }
+    Err(DynamoDbError::ValidationException(
+        crate::error::validation_errors(&failed),
+    ))
 }
+
+/// Validate an index name: 3 to 255 characters of `[a-zA-Z0-9_.-]`. Each
+/// failed constraint is reported at `location`, the member path of the name
+/// (`globalSecondaryIndexes.<n>.member.indexName`, 1-based), as DynamoDB
+/// reports it for the GSI, LSI and vector index members of CreateTable and
+/// UpdateTable (measured in us-east-1 on 2026-11-06, 2026-11-14 and
+/// 2026-11-18).
+///
+/// Defense-in-depth: prevents SQL injection via index names that are
+/// interpolated into DDL identifiers in storage-postgres. A name that passes
+/// is ASCII, so its length in bytes is its length in characters.
+///
+/// # Errors
+///
+/// `ValidationException` from [`validate_name_member`].
+pub fn validate_index_name(name: &str, location: &str) -> Result<(), DynamoDbError> {
+    validate_name_member(name, location, (3, 255))
+}
+
+#[cfg(test)]
+mod index_name_tests;
 
 /// Validate a `CreateTable` request.
 ///
@@ -441,7 +476,7 @@ fn validate_one_vector_index(
              Member must not be null"
         )));
     }
-    validate_index_name(&vi.index_name)?;
+    validate_index_name(&vi.index_name, &format!("{member_path}.indexName"))?;
     validate_search_schema_shape(vi.search_schema.as_deref())?;
     // The two bounds are reported by DIFFERENT layers with different messages.
     // Dimensions below 1 never reaches the semantic check on the service: the
@@ -581,7 +616,13 @@ pub fn validate_vector_index_updates(
             validate_vector_index_attribute_definitions(create, attribute_definitions)?;
         }
         if let Some(delete) = update.delete.as_ref() {
-            validate_index_name(&delete.index_name)?;
+            validate_index_name(
+                &delete.index_name,
+                &format!(
+                    "vectorIndexUpdates.{}.member.delete.indexName",
+                    position + 1
+                ),
+            )?;
         }
     }
     // One online index action per call, enforced with the online-index
@@ -816,8 +857,11 @@ fn validate_gsi_key_schemas(input: &CreateTableInput) -> Result<(), DynamoDbErro
     let Some(gsis) = &input.global_secondary_indexes else {
         return Ok(());
     };
-    for gsi in gsis {
-        validate_index_name(&gsi.index_name)?;
+    for (position, gsi) in gsis.iter().enumerate() {
+        validate_index_name(
+            &gsi.index_name,
+            &format!("globalSecondaryIndexes.{}.member.indexName", position + 1),
+        )?;
         if gsi.key_schema.is_empty() {
             return Err(DynamoDbError::ValidationException(format!(
                 "One or more parameter values were invalid: No defined key schema for index: {}",
@@ -842,8 +886,11 @@ fn validate_lsi_key_schemas(input: &CreateTableInput) -> Result<(), DynamoDbErro
         return Ok(());
     };
     let table_hash_key = &input.key_schema[0].attribute_name;
-    for lsi in lsis {
-        validate_index_name(&lsi.index_name)?;
+    for (position, lsi) in lsis.iter().enumerate() {
+        validate_index_name(
+            &lsi.index_name,
+            &format!("localSecondaryIndexes.{}.member.indexName", position + 1),
+        )?;
         match lsi.key_schema.as_slice() {
             [hash, range] => {
                 if hash.key_type != KeyType::Hash {
