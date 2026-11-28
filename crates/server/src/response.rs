@@ -37,9 +37,10 @@ pub(crate) fn success_response(body: &Value, request_id: &str) -> Response {
 /// key `error_document` picks. REQ-ERR-003: Omit the message field when empty
 /// (real `DynamoDB` behavior, verified 2026-05-04).
 pub(crate) fn error_response(error: &DynamoDbError, request_id: &str) -> Response {
-    // The body shape (`__type`, optional message, `CancellationReasons`, `Item`)
-    // is built by the shared `error_document` helper so the wire body and the
-    // in-process body come from the same code; this transport adds the HTTP status and headers.
+    // The body shape (`__type`, optional message, `CancellationReasons`, the
+    // throttle reasons list, `Item`) is built by the shared `error_document`
+    // helper so the wire body and the in-process body come from the same code;
+    // this transport adds the HTTP status and headers.
     let body = error_document(error);
     let body_bytes =
         serde_json::to_vec(&body).unwrap_or_else(|_| SERIALIZATION_FAILURE_BODY.to_vec());

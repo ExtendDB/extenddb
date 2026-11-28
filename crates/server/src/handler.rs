@@ -22,7 +22,7 @@ use crate::request_helpers::{
 use crate::response::{error_response, record_error_metrics, success_response};
 use crate::throttle_helpers::{
     classify_data_operation, extract_partition_value, table_description_to_throughput,
-    update_throttle_buckets,
+    throttle_error, update_throttle_buckets,
 };
 
 /// Main Virtual `DynamoDB` request handler.
@@ -261,8 +261,17 @@ pub(crate) async fn handle_request(
     let throttle_start = std::time::Instant::now();
     let (is_read_op, is_write_op) = classify_data_operation(&operation);
     let partition_value = extract_partition_value(&input, &operation);
+    // A name the table name rules refuse (length or pattern), and the ARN of
+    // a table in another Region, are not throttled: the engine answers them
+    // as it does with capacity left. The service refuses such a name before
+    // any throttle (measured 2026-11-25 with GetItem and PutItem on `ab`, an
+    // empty name, 256 characters and the ARN of a table in another Region).
+    // The ARN of a table in this account and Region is checked by the name it
+    // carries, and a throttle refusal names that table.
     if let Some(ref tn) = table_name
         && (is_read_op || is_write_op)
+        && let name = crate::authz_resource::key_lookup_name(tn, &state.region, &ctx.account_id)
+        && extenddb_core::validation::validate_table_name(&name, &state.limits).is_ok()
     {
         if !state.throttle.is_registered(&ctx.account_id, tn)
             && let Ok(desc) = ctx
@@ -288,8 +297,12 @@ pub(crate) async fn handle_request(
             is_write_op,
             partition_value.as_deref(),
         );
-        if result != extenddb_core::throttle::ThrottleResult::Allowed {
-            let metric = if result == extenddb_core::throttle::ThrottleResult::ThrottledRead {
+        if let Some(cause) = result.cause() {
+            let throttled_read = matches!(
+                result,
+                extenddb_core::throttle::ThrottleResult::ThrottledRead(_)
+            );
+            let metric = if throttled_read {
                 extenddb_core::metrics::MetricName::ReadThrottleEvents
             } else {
                 extenddb_core::metrics::MetricName::WriteThrottleEvents
@@ -310,13 +323,15 @@ pub(crate) async fn handle_request(
                 None,
                 Some(&operation),
             );
+            // The service names the throttled resource and the limit on a
+            // throttle: one reason with the table ARN, the same string
+            // DescribeTable returns as TableArn. The error class, the message
+            // and the limit follow the bucket that refused and the table's
+            // billing mode.
+            let table_arn =
+                extenddb_storage::util::table_arn(&state.region, &ctx.account_id, &name);
             return error_response(
-                &DynamoDbError::ProvisionedThroughputExceededException(
-                    "The level of configured provisioned throughput for the table \
-                         was exceeded. Consider increasing your provisioning level \
-                         with the UpdateTable API."
-                        .to_owned(),
-                ),
+                &throttle_error(cause, throttled_read, &table_arn),
                 &request_id,
             );
         }
@@ -483,3 +498,6 @@ pub(crate) async fn handle_request(
 
     response
 }
+
+#[cfg(test)]
+mod throttle_wire_tests;
