@@ -237,8 +237,8 @@ case "$step" in
         # (the build scripts, the crates they depend on, procedural macros): a
         # listed call there (a build script that reads
         # std::time::SystemTime::now) fails the step unless an allow covers it.
-        # --release lints the profile the module ships in: the README and the
-        # corpus step build it with --release.
+        # --release lints the profile the module ships in: docs/webassembly.md
+        # and the corpus step build it with --release.
         # CLIPPY_CONF_DIR is set for this cargo only, so other clippy runs
         # (clippy.yml's, the pedantic step's) do not read those lists. --lib
         # checks the adapter's library alone, which is also what cargo checks
@@ -351,13 +351,13 @@ case "$step" in
         # workflow's tool cache or install step puts one in ~/.cargo/bin).
         # --no-opt skips wasm-opt, which the workflow does not install: without
         # it, wasm-pack would run a wasm-opt it finds on PATH or in its cache,
-        # so the module the checks run would depend on the machine. The
-        # README's "Building it" says how wasm-pack finds or downloads its
-        # tools, and what else it does, including the `cargo metadata` that
-        # updates an out-of-date Cargo.lock before the build. Running that
-        # command first with --locked makes the step stop on such a lock, as
-        # the build step's `cargo build --locked` does, and leaves the lock as
-        # it was.
+        # so the module the checks run would depend on the machine.
+        # docs/webassembly.md's "Building it" says how wasm-pack finds or
+        # downloads its tools, and what else it does, including the
+        # `cargo metadata` that updates an out-of-date Cargo.lock before the
+        # build. Running that command first with --locked makes the step stop
+        # on such a lock, as the build step's `cargo build --locked` does, and
+        # leaves the lock as it was.
         if ! command -v wasm-pack >/dev/null 2>&1; then
             die "wasm-pack is not on PATH; install the version .github/workflows/wasm.yml installs (cargo install --locked --version <that version> wasm-pack)"
         fi

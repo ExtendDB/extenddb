@@ -75,7 +75,7 @@ These mechanisms failed in the following ways:
 - No test started from a catalog that a released binary created, and no test
   compared an upgraded catalog with a fresh one.
 
-v1.0 supports one serving instance per catalog (`README.md:141`). Upgrades
+v1.0 supports one serving instance per catalog (`README.md`, "What ExtendDB is not"). Upgrades
 have to run in place: `destroy` drops the databases with their items, and
 ADR-0003 accepted that only while no deployment depended on a catalog.
 

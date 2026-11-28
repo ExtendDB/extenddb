@@ -14,7 +14,7 @@ test -d ~/venvs/extenddb-venv && echo "found extenddb-venv in ~/venvs/" || true
 Two standard locations:
 
 - `.venv/` at the repo root, created by `scripts/install-linux.sh` and `scripts/install-macos.sh` (recommended).
-- `~/venvs/extenddb-venv/`, created by the README instructions.
+- `~/venvs/extenddb-venv/`, created by the Python Environment Setup instructions in `docs/manuals/06-developer-test-guide.md`.
 
 Either works. If both exist, prefer `.venv/` since the install scripts maintain it.
 

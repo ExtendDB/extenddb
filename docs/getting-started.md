@@ -43,7 +43,7 @@ See [Local Development with Docker Compose](local-dev-docker-compose.md).
   - Cassandra 4.1+ running locally (see `docs/cassandra-setup.md`)
 - Rust toolchain (1.94.0+)
 - AWS CLI v2 (for testing)
-- Python 3.10+ with virtual environment (see [Python Environment Setup](../README.md#python-environment-setup) in the README)
+- Python 3.10+ with virtual environment (see [Python Environment Setup](manuals/06-developer-test-guide.md#python-environment-setup) in the Developer & Test Guide)
 
 ## 1. Build extenddb
 
@@ -120,7 +120,7 @@ For remote PostgreSQL or Aurora, supply the admin password with `--pg-pass`:
   --pg-user postgres --pg-pass <admin-password>
 ```
 
-When `--pg-pass` is omitted entirely, `extenddb init` connects without a password, relying on
+When neither `--pg-pass` nor `EXTENDDB_PG_PASSWORD` is set, `extenddb init` connects without a password, relying on
 PostgreSQL peer/ident authentication (works only on localhost via Unix socket).
 
 **Note:** When using Unix socket connections, specify the socket directory with `--pg-host` using an

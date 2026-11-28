@@ -8,8 +8,8 @@
 //! cannot run the HTTP server, which listens on a TCP socket, so in its place
 //! JavaScript makes a direct in-process call: it hands a `DynamoDB` request in
 //! and gets the response back. The calls skip the server's own checks of a
-//! request; the README section "Checks the server makes that this build does
-//! not" lists them.
+//! request; the `docs/webassembly.md` section "Checks the server makes that
+//! this build does not" lists them.
 //!
 //! # Layout
 //! - `runtime` — the portable engine wrapper: builds an `OperationContext`
@@ -29,8 +29,8 @@
 //! under a single fixed account.
 //!
 //! The module doc of `runtime` says what the adapter does with a request
-//! before the engine's handlers see it, and the README section "What it
-//! refuses" lists every request the build refuses, with its error.
+//! before the engine's handlers see it, and the `docs/webassembly.md` section
+//! "What it refuses" lists every request the build refuses, with its error.
 
 mod runtime;
 

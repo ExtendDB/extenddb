@@ -47,9 +47,9 @@ jobs:
     timeout-minutes: 30
     env:
       # The wasm-pack release to install; the comment on the wasm tooling
-      # steps below says why. README.md's "Building it" describes what one
-      # named wasm-pack release does, so a change of this value needs that
-      # section checked against the new release, and the release it names
+      # steps below says why. docs/webassembly.md's "Building it" describes
+      # what one named wasm-pack release does, so a change of this value needs
+      # that section checked against the new release, and the release it names
       # changed to match.
       WASM_PACK_VERSION: "0.15.1"
     steps:
@@ -87,11 +87,11 @@ jobs:
       # below, read the description the crate's macros put into the module,
       # and both stop with a "different bindgen format" error when that
       # description's schema version is not their own; the corpus step's
-      # wasm-pack needs a wasm-bindgen of that version too (README.md's
-      # "Building it" says where it looks for one). The cache key holds both
-      # versions, so a cache hit restores tools of those versions and a miss
-      # installs them; both land in ~/.cargo/bin, and a hit skips their
-      # multi-minute compile.
+      # wasm-pack needs a wasm-bindgen of that version too
+      # (docs/webassembly.md's "Building it" says where it looks for one). The
+      # cache key holds both versions, so a cache hit restores tools of those
+      # versions and a miss installs them; both land in ~/.cargo/bin, and a hit
+      # skips their multi-minute compile.
       - name: Read the wasm-bindgen version from Cargo.lock
         id: wasm-bindgen
         run: |

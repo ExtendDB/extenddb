@@ -32,8 +32,8 @@
 //!
 //! On wasm32 the engine and the `SQLite` backend refuse some requests after
 //! that, where the code that would serve them is not compiled or cannot run
-//! there. The README section "What it refuses" lists every request this build
-//! refuses, with its error.
+//! there. The `docs/webassembly.md` section "What it refuses" lists every
+//! request this build refuses, with its error.
 //!
 //! # Checks the HTTP server makes that this build does not
 //!
@@ -45,9 +45,9 @@
 //! neither for an operation [`unsupported_reason`] names, which it refuses
 //! first. A request one of the others would refuse gets the answer
 //! this build gives it anyway: the engine handler's for the operation, or one
-//! of the refusals above. The README section "Checks the server makes that
-//! this build does not" describes the others, with the server's answer and
-//! this build's.
+//! of the refusals above. The `docs/webassembly.md` section "Checks the server
+//! makes that this build does not" describes the others, with the server's
+//! answer and this build's.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

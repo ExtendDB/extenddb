@@ -85,9 +85,11 @@ mongosh --eval "rs.initiate()"
 | Replica set | `rs0` |
 | Connection string | `mongodb://localhost:27017/?replicaSet=rs0` |
 
-For Docker on a non-default port:
+For the Docker container above, reached from the host, add `directConnection=true`,
+because the replica set names its member by the container's hostname, which the
+host cannot resolve:
 ```
-mongodb://localhost:27018/?replicaSet=rs0&directConnection=true
+mongodb://localhost:27017/?replicaSet=rs0&directConnection=true
 ```
 
 ## Building with MongoDB Support
@@ -105,8 +107,20 @@ one binary per backend.
 
 ## Initializing ExtendDB with MongoDB
 
+On MongoDB, `init` reads the connection string from `extenddb.toml`, so write
+that file first, then run `init` with `--overwrite`, which regenerates the file
+and keeps the connection string. The `umask 077` creates the file readable by
+your user only, as `init` writes it:
+
 ```bash
-./target/release/extenddb init --backend mongodb --config extenddb.toml
+(umask 077 && cat > extenddb.toml) <<'EOF'
+[storage]
+backend = "mongodb"
+
+[storage.mongodb]
+connection_string = "mongodb://localhost:27017/?replicaSet=rs0&directConnection=true"
+EOF
+./target/release/extenddb init --backend mongodb --config extenddb.toml --overwrite
 ```
 
 This creates:
@@ -122,7 +136,7 @@ The generated config will contain:
 backend = "mongodb"
 
 [storage.mongodb]
-connection_string = "mongodb://localhost:27017/?replicaSet=rs0"
+connection_string = "mongodb://localhost:27017/?replicaSet=rs0&directConnection=true"
 ```
 
 ## Starting the Server
@@ -130,6 +144,22 @@ connection_string = "mongodb://localhost:27017/?replicaSet=rs0"
 ```bash
 ./target/release/extenddb serve --config extenddb.toml
 ```
+
+## Creating an Account for Your First Request
+
+On MongoDB, `manage list-accounts` lists no account after `init`, because the
+default account `init` writes has no 12-digit account ID. Create an account and
+use its ID for the IAM user and access key. With the admin password in
+`EXTENDDB_PASSWORD`:
+
+```bash
+ACCOUNT_ID=$(./target/release/extenddb manage --user admin \
+    create-account --account-name dev | grep -o '[0-9]\{12\}' | head -n 1)
+```
+
+Then continue with `create-user`, `put-user-policy` and `create-access-key`
+as in step 3 of [Make your first request](../README.md#make-your-first-request),
+and configure the AWS CLI as in its step 4.
 
 ## Config Mapping
 
@@ -155,13 +185,17 @@ export EXTENDDB__STORAGE__MONGODB__CONNECTION_STRING="mongodb://localhost:27017/
 
 ## Verifying the Connection
 
+Run these after steps 3 and 4 of
+[Make your first request](../README.md#make-your-first-request), which give
+the AWS CLI an ExtendDB key and the certificate:
+
 ```bash
 # Health check
-curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:8000/health
+curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
 
 # List tables (should return empty)
 aws dynamodb list-tables \
-    --endpoint-url https://127.0.0.1:8000 \
+    --endpoint-url https://127.0.0.1:18443 \
     --region us-east-1
 ```
 
