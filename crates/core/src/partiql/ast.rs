@@ -183,7 +183,7 @@ pub struct FromSource {
 }
 
 /// A document path: a first attribute then zero or more attribute or index steps.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Path {
     pub root: String,
     pub steps: Vec<PathStep>,
@@ -377,6 +377,8 @@ pub enum TypeName {
     Timestamp,
     Date,
     Time,
+    /// `TIME WITH TIME ZONE`, with or without a precision.
+    TimeWithTimeZone,
     Character,
     CharacterVarying,
     String,
@@ -472,6 +474,7 @@ impl TypeName {
             Self::Timestamp => "TimestampType",
             Self::Date => "DateType",
             Self::Time => "TimeType",
+            Self::TimeWithTimeZone => "TimeWithTimeZoneType",
             Self::Character => "CharacterType",
             Self::CharacterVarying => "CharacterVaryingType",
             Self::String => "StringType",

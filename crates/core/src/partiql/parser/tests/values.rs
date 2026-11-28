@@ -211,6 +211,34 @@ fn a_parameter_in_a_bag_is_refused_at_its_position() {
 }
 
 #[test]
+fn a_bag_member_that_is_neither_a_number_nor_a_string_is_refused_at_its_position() {
+    let refusal = "Unsupported data type in Bag. DynamoDB only supports either numbers or \
+                   strings in bags";
+    for (member, length) in [("true", 4), ("null", 4), ("{'a': 1}", 1), ("[1]", 1)] {
+        let sql =
+            format!("INSERT INTO \"tbl\" VALUE {{'pk':'pq-gr-bag', 'sk':'1', 's':<<{member}>>}}");
+        let column = sql.find(member).unwrap() + 1;
+        assert_eq!(
+            err(&sql),
+            format!("{refusal} at 1:{column}:{length}"),
+            "{member}"
+        );
+        let sql = format!("UPDATE \"tbl\" SET s = <<1, {member}>> WHERE pk = 'p'");
+        let column = sql.find(member).unwrap() + 1;
+        assert_eq!(
+            err(&sql),
+            format!("{refusal} at 1:{column}:{length}"),
+            "{member}"
+        );
+    }
+    // A bag of numbers and strings together is not measured for a position.
+    assert_eq!(
+        err("UPDATE \"tbl\" SET s = <<1, 'a'>> WHERE pk = 'p'"),
+        refusal
+    );
+}
+
+#[test]
 fn a_sign_before_a_set_value_that_is_not_a_number() {
     assert_eq!(
         err("UPDATE \"t\" SET a = -b WHERE pk = 'p'"),

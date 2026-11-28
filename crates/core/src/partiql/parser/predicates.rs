@@ -355,12 +355,13 @@ impl Parser {
         Ok(true)
     }
 
-    /// The members of a bag after IN, with the current token on its `<<`:
-    /// the operands of the IN in the order they are written, each a value, a
-    /// parameter or a name (measured 2026-11-02: `a IN <<?>>` and `a IN
-    /// <<pk>>` run). A member is named as the value itself in a refusal
+    /// The members of a bag after IN, or the items of an INSERT with no VALUE
+    /// (see `Parser::insert_without_value`), with the current token on its
+    /// `<<`: the operands of the IN in the order they are written, each a
+    /// value, a parameter or a name (measured 2026-11-02: `a IN <<?>>` and `a
+    /// IN <<pk>>` run). A member is named as the value itself in a refusal
     /// (measured 2026-11-02: `a IN <<1e126>>` is refused under root).
-    fn in_bag(&mut self) -> PResult<Vec<Operand>> {
+    pub(super) fn in_bag(&mut self) -> PResult<Vec<Operand>> {
         self.bump();
         let mut members = Vec::new();
         if !matches!(self.peek().kind, TokenKind::RDoubleAngle) {

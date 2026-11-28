@@ -7,14 +7,16 @@
 //!
 //! The parser recurses once per parenthesized group, literal container and
 //! nested operand (a call's arguments, a reserved word that reads an
-//! expression, the expression an inner bracket of a path holds). Runs of
-//! `NOT` and of signs are read in a loop, so they cost no depth, and so are
-//! the steps of a path, the brackets of a path in brackets included. A
-//! statement is first parsed on the calling thread with a small depth
-//! budget; one that needs more is parsed again on a thread of its own with a
-//! large stack and the full caps, so the depth an accepted statement may reach
-//! does not depend on the caller's stack. Past a cap the statement is refused
-//! with a syntax error instead of overflowing a stack.
+//! expression, the expression an inner bracket of a path holds), and once
+//! per query or DELETE where a term starts, which counts as several nested
+//! operands (see [`QUERY_WEIGHT`]). Runs of `NOT` and of signs are read in a
+//! loop, so they cost no depth, and so are the steps of a path, the brackets
+//! of a path in brackets included. A statement is first parsed on the calling
+//! thread with a small depth budget; one that needs more is parsed again on a
+//! thread of its own with a large stack and the full caps, so the depth an
+//! accepted statement may reach does not depend on the caller's stack. Past a
+//! cap the statement is refused with a syntax error instead of overflowing a
+//! stack.
 //!
 //! Stack use per level on a debug build (measured 2026-11-02 by bisecting
 //! the stack of a thread that parses one statement): 8.6 KB per
@@ -61,6 +63,15 @@ pub const MAX_LITERAL_DEPTH: usize = 1000;
 /// reserved word that reads an expression after it. The service's limit is
 /// not measured.
 pub const MAX_OPERAND_DEPTH: usize = 100;
+
+/// The nested operands a query or a DELETE where a term starts counts for: its
+/// source, its condition and a query's select list add frames that take about
+/// the stack of this many nested operands (measured 2026-11-16 on a debug
+/// build: about 35 KB per query in an IN list, against 6.8 KB per nested
+/// operand). With the weight, a run of DELETEs at the length limit parses on
+/// 256 KB of the caller's stack, as a run of calls does; without it a run of
+/// DELETEs as values overflowed 768 KB (measured 2026-11-17 on a debug build).
+const QUERY_WEIGHT: usize = 4;
 
 /// The depth (all kinds together) a parse may reach on the calling thread
 /// before it moves to a thread of its own.
@@ -123,6 +134,9 @@ pub(super) enum Nest {
     Literal,
     /// An operand read inside another one.
     Operand,
+    /// A query or a DELETE where a term starts, which counts as
+    /// [`QUERY_WEIGHT`] operands.
+    Query,
 }
 
 /// How deep the parser has recursed, by kind, and whether the inline budget
@@ -150,15 +164,16 @@ impl Nesting {
     }
 
     fn enter(&mut self, kind: Nest) -> PResult<()> {
-        let (depth, cap) = match kind {
-            Nest::Group => (&mut self.group, MAX_GROUP_DEPTH),
-            Nest::Literal => (&mut self.literal, MAX_LITERAL_DEPTH),
-            Nest::Operand => (&mut self.operand, MAX_OPERAND_DEPTH),
+        let (depth, cap, weight) = match kind {
+            Nest::Group => (&mut self.group, MAX_GROUP_DEPTH, 1),
+            Nest::Literal => (&mut self.literal, MAX_LITERAL_DEPTH, 1),
+            Nest::Operand => (&mut self.operand, MAX_OPERAND_DEPTH, 1),
+            Nest::Query => (&mut self.operand, MAX_OPERAND_DEPTH, QUERY_WEIGHT),
         };
-        if *depth >= cap {
+        if *depth + weight > cap {
             return Err(ParseError::well_formed(TOO_DEEP));
         }
-        *depth += 1;
+        *depth += weight;
         if self.inline && self.group + self.literal + self.operand > INLINE_DEPTH {
             self.out_of_budget = true;
             return Err(ParseError::well_formed(TOO_DEEP));
@@ -177,12 +192,13 @@ impl Nesting {
     }
 
     fn leave(&mut self, kind: Nest) {
-        let depth = match kind {
-            Nest::Group => &mut self.group,
-            Nest::Literal => &mut self.literal,
-            Nest::Operand => &mut self.operand,
+        let (depth, weight) = match kind {
+            Nest::Group => (&mut self.group, 1),
+            Nest::Literal => (&mut self.literal, 1),
+            Nest::Operand => (&mut self.operand, 1),
+            Nest::Query => (&mut self.operand, QUERY_WEIGHT),
         };
-        *depth -= 1;
+        *depth -= weight;
     }
 }
 

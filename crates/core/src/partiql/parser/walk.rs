@@ -74,11 +74,11 @@
 //! A refusal the parse stops at comes after those found before it that come
 //! ahead of its part of the statement in this order.
 
-use super::limits::{MAX_IN_OPERANDS, too_many_in_operands, too_many_operators};
+use super::limits::{MAX_IN_OPERANDS, Nest, too_many_in_operands, too_many_operators};
 use super::operands::SignedNumber;
 use super::{
     EXISTS_OUTSIDE_TRANSACTION, IN_OPERANDS, PARAMETER_COUNT_MISMATCH, PResult, ParseError, Parser,
-    Statement,
+    Request, Statement,
 };
 use crate::partiql::ast::Operand;
 use crate::partiql::from_path;
@@ -297,6 +297,27 @@ impl Parser {
         self.found = Findings::default();
     }
 
+    /// Run `read` one level of `kind` deeper and drop what it finds: the
+    /// refusals, the operator counts and the state of the condition being
+    /// read are put back afterwards, whatever `read` returns (see
+    /// [`Parser::expression_in_brackets`] and [`Parser::subquery_term`]).
+    pub(super) fn read_and_drop<T>(
+        &mut self,
+        kind: Nest,
+        read: impl FnOnce(&mut Self) -> PResult<T>,
+    ) -> PResult<T> {
+        let found = std::mem::take(&mut self.found);
+        let (operators, refusals) = (self.operators, self.operator_refusals);
+        let (after_not, bare_left) = (self.after_not, self.bare_left);
+        let result = self.nested(kind, read);
+        self.found = found;
+        self.operators = operators;
+        self.operator_refusals = refusals;
+        self.after_not = after_not;
+        self.bare_left = bare_left;
+        result
+    }
+
     /// For a request, the refusal of a table name outside the name rule.
     fn table_name_refusal(&self) -> Option<String> {
         let table = self
@@ -324,8 +345,9 @@ impl Parser {
             Err(_) if stopped_at_in => call.is_none(),
             _ => true,
         };
-        let exists = (self.refuse_exists && matches!(&result, Ok(Statement::Exists(_))))
-            .then(|| EXISTS_OUTSIDE_TRANSACTION.to_owned());
+        let exists = (self.request == Request::ExecuteStatement
+            && matches!(&result, Ok(Statement::Exists(_))))
+        .then(|| EXISTS_OUTSIDE_TRANSACTION.to_owned());
         let mut refusal = found
             .before_where
             .or(exists)

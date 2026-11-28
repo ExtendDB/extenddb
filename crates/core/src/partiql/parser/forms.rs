@@ -9,12 +9,14 @@
 //!
 //! Every message is the service's (measured 2026-11-02).
 
+use super::terms::BareForm;
 use super::{PResult, ParseError, Parser};
 use crate::partiql::ast::{
-    BooleanComparison, Operand, Path, SelectStatement, SetAction, SetMembersAction, SetMembersOp,
+    BooleanComparison, Operand, Path, SetAction, SetMembersAction, SetMembersOp, Statement,
     UpdateStatement, WhereExpr,
 };
 use crate::partiql::lexer::TokenKind;
+use crate::partiql::values;
 use crate::types::AttributeValue;
 
 /// The functions a WHERE condition recognizes.
@@ -134,20 +136,10 @@ impl Parser {
             )
     }
 
-    /// `set_add(` or `set_delete(` at the current token, in any case.
+    /// `set_add(` or `set_delete(` at the current token, in any case, as a
+    /// value on its own (see [`values::whole_value_set_call`]).
     fn set_function_ahead(&self) -> Option<SetMembersOp> {
-        if !self.at_call() {
-            return None;
-        }
-        match &self.peek().kind {
-            TokenKind::Ident(name) if name.eq_ignore_ascii_case("set_add") => {
-                Some(SetMembersOp::Add)
-            }
-            TokenKind::Ident(name) if name.eq_ignore_ascii_case("set_delete") => {
-                Some(SetMembersOp::Delete)
-            }
-            _ => None,
-        }
+        values::whole_value_set_call(&self.tokens, self.pos)
     }
 
     /// `set_add(<target>, <set>)` or `set_delete(<target>, <set>)` as the value
@@ -216,16 +208,26 @@ impl Parser {
             )
     }
 
-    /// `EXISTS(SELECT ...)`, with the current token on `EXISTS`.
-    pub(super) fn exists_statement(&mut self) -> PResult<SelectStatement> {
+    /// `EXISTS(SELECT ...)`, with the current token on `EXISTS`. With more
+    /// arguments after the query it is a call like any other, refused as the
+    /// statement it is (measured 2026-11-13 in ExecuteTransaction:
+    /// `EXISTS(SELECT * FROM "t" WHERE pk = 1, 1)`).
+    pub(super) fn exists_statement(&mut self) -> PResult<Statement> {
         self.bump();
         self.bump();
         self.bump();
         let select = self.select(false)?;
+        let call = matches!(self.peek().kind, TokenKind::Comma);
+        while self.eat(&TokenKind::Comma) {
+            self.operand()?;
+        }
         if !self.eat(&TokenKind::RParen) {
             return Err(ParseError::well_formed("Expected ) to close function call"));
         }
-        Ok(select)
+        if call {
+            return self.refuse_statement(BareForm::Call);
+        }
+        Ok(Statement::Exists(select))
     }
 
     /// A predicate compared with a boolean literal, as in
