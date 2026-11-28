@@ -834,6 +834,16 @@ def test_two_writes_that_reach_one_item_are_duplicates(dynamodb_client, gtable, 
             "UPDATE {t} SET m[0] = 1 WHERE pk = '{k}' AND sk = 'b'",
             "The document path provided in the update expression is invalid for update",
         ),
+        # An index past the end of the list `l` (measured 2026-11-20 on a
+        # table keyed on pk alone, after a statement that succeeds).
+        (
+            "UPDATE {t} SET l[5].x = 1 WHERE pk = '{k}' AND sk = 'b'",
+            "The document path provided in the update expression is invalid for update",
+        ),
+        (
+            "UPDATE {t} SET a = l[5] WHERE pk = '{k}' AND sk = 'b'",
+            "The provided expression refers to an attribute that does not exist in the item",
+        ),
         ("UPDATE {t} SET g = 1 WHERE pk = '{k}' AND sk = 'b'", INDEX_KEY_TYPE),
         ("INSERT INTO {t} VALUE {{'pk':'{n}','sk':'b','g':1}}", INDEX_KEY_TYPE),
         # Both come ahead of a path into a key attribute among the other
@@ -866,6 +876,8 @@ def test_two_writes_that_reach_one_item_are_duplicates(dynamodb_client, gtable, 
         "set-add-to-a-number",
         "path-into-a-number",
         "index-into-a-map",
+        "path-through-an-index-past-the-end",
+        "value-at-an-index-past-the-end",
         "set-index-key-type",
         "insert-index-key-type",
         "set-partition-key-ahead-of-a-path-into-a-key",
@@ -878,12 +890,13 @@ def test_two_writes_that_reach_one_item_are_duplicates(dynamodb_client, gtable, 
 def test_an_error_of_the_item_operation_names_the_table(
     dynamodb_client, gtable, statement, message
 ):
-    pk = put(dynamodb_client, gtable, "tn")
+    extra = {"l": {"L": [{"N": "4"}, {"N": "5"}]}}
+    pk = put(dynamodb_client, gtable, "tn", **extra)
     resp = _batch(
         dynamodb_client, [{"Statement": _sql(statement, gtable, k="tn", n="tn-new")}]
     )
     assert resp["Responses"] == [_validation(message, gtable)]
-    assert _gget(dynamodb_client, gtable, pk) == item(pk)
+    assert _gget(dynamodb_client, gtable, pk) == item(pk, **extra)
 
 
 def test_an_error_of_reading_the_statement_names_no_table(dynamodb_client, gtable):

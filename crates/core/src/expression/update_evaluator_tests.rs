@@ -638,6 +638,35 @@ fn set_intermediate_map_path_missing_fails() {
     assert!(result.is_err());
 }
 
+/// A SET path through a list index past the end of the list, with more path
+/// elements after the index, is invalid for update, as a path through a
+/// missing map key is. `k` is `[4, 5]` and `m` is `{x: 1}` (measured
+/// 2026-11-20, us-east-1, `UpdateItem`, each request twice). The ADD form is
+/// in `update_add_parent_tests.rs`.
+#[test]
+fn a_path_through_a_list_index_past_the_end() {
+    const INVALID: &str =
+        "The document path provided in the update expression is invalid for update";
+    let n = |v: &str| AttributeValue::N(v.to_owned());
+    let stored = BTreeMap::from([
+        ("k".to_owned(), AttributeValue::L(vec![n("4"), n("5")])),
+        (
+            "m".to_owned(),
+            AttributeValue::M(BTreeMap::from([("x".to_owned(), n("1"))])),
+        ),
+    ]);
+    let values = HashMap::from([("v".to_owned(), n("1"))]);
+    for expression in ["SET k[5].x = :v", "SET k[5][0] = :v", "SET m.q.x = :v"] {
+        let mut item = stored.clone();
+        let result = apply(expression, &mut item, HashMap::new(), values.clone());
+        assert!(
+            matches!(&result, Err(DynamoDbError::ValidationException(m)) if m == INVALID),
+            "`{expression}`: {result:?}"
+        );
+        assert_eq!(item, stored, "`{expression}`");
+    }
+}
+
 #[test]
 fn set_snapshot_semantics_second_clause_reads_old_value() {
     let mut item = BTreeMap::new();

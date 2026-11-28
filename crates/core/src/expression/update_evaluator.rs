@@ -557,15 +557,9 @@ fn set_nested(
                 )),
             }
         }
-        (PathElement::Index(idx), AttributeValue::L(list)) => {
-            if *idx < list.len() {
-                set_nested(&mut list[*idx], &path[1..], value, maps)
-            } else {
-                Err(DynamoDbError::ValidationException(
-                    "The provided expression refers to an attribute that does not exist in the item"
-                        .to_owned(),
-                ))
-            }
+        // An index past the end is invalid for update (measured 2026-11-20).
+        (PathElement::Index(idx), AttributeValue::L(list)) if *idx < list.len() => {
+            set_nested(&mut list[*idx], &path[1..], value, maps)
         }
         _ => Err(DynamoDbError::ValidationException(
             "The document path provided in the update expression is invalid for update".to_owned(),
