@@ -200,6 +200,8 @@ mod sqlite_util;
 mod store;
 mod stream;
 mod stream_at_timestamp;
+#[cfg(test)]
+mod stream_cleanup_tests;
 mod stream_lifecycle;
 #[cfg(test)]
 mod stream_tests;
