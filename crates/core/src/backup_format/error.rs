@@ -90,10 +90,10 @@ fn bounded_text(s: &str, max: usize) -> String {
 /// its 1-based number in the file, and serde's position is within that line
 /// (each line is parsed on its own). serde takes a position from the end of
 /// a message raised inside the deserializer (` at line 3 column 4`), and a
-/// type descriptor or attribute name quoted at the end of such a message can
-/// carry that text, so serde's line is not always 1. The column is shown,
-/// as `at column N of the line`, only when serde's line is 1; otherwise the
-/// message is shown as serde rendered it, with no position of this type's.
+/// message that quotes input at its end could carry that text, so serde's
+/// line is not taken to be 1. The column is shown, as `at column N of the
+/// line`, only when serde's line is 1; otherwise the message is shown as
+/// serde rendered it, with no position of this type's.
 pub struct JsonError {
     inner: serde_json::Error,
     data_file_line: Option<u64>,

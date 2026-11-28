@@ -66,7 +66,7 @@ use extenddb_core::expression::{
     Expr, PathElement, Token, key_condition_clause_operands, parse_key_condition,
     tokenize_with_limit,
 };
-use extenddb_core::types::{KeySchemaElement, KeyType, TableKeyInfo};
+use extenddb_core::types::{KeySchemaElement, KeyType, TableKeyInfo, type_descriptor};
 use serde_json::Value;
 
 /// Find the HASH (partition) key attribute name of a key schema.
@@ -98,14 +98,18 @@ pub(crate) enum NumberForm {
 /// Turn a `DynamoDB` typed scalar (`{"S": "v"}`, `{"N": "10"}`, `{"B": "AQI="}`)
 /// into the string the service compares for LeadingKeys.
 ///
-/// S and B are compared as sent. An N value is written in `form`, the form the
-/// service uses for the operation path. The policy value is left exactly as
-/// written, which is what the service does, so under a fence of `["10"]` the
-/// spelling `10.0` matches on `GetItem` and does not match on
-/// `TransactGetItems`. An N value the engine would reject as malformed yields
+/// The value is read by the member the engine's deserializer reads it by
+/// (`type_descriptor`): a member whose name is no type descriptor, or whose
+/// payload is JSON null, is ignored, so `{"X": "a", "S": "b"}` is the key `b`
+/// here as it is in the engine. S and B are compared as sent. An N value is
+/// written in `form`, the form the service uses for the operation path. The
+/// policy value is left exactly as written, which is what the service does,
+/// so under a fence of `["10"]` the spelling `10.0` matches on `GetItem` and
+/// does not match on `TransactGetItems`. A value with no type descriptor or
+/// with two, and an N value the engine would reject as malformed, yield
 /// `None`, so the engine returns `ValidationException` before any data flows.
 pub(crate) fn extract_typed_value(type_val: &Value, form: NumberForm) -> Option<String> {
-    let (type_tag, inner) = type_val.as_object()?.iter().next()?;
+    let (type_tag, inner) = type_descriptor(type_val.as_object()?).ok()?;
     let raw = inner.as_str().unwrap_or_default();
     if type_tag == "N" {
         let normalized =

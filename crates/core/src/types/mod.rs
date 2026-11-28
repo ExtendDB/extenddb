@@ -83,3 +83,9 @@ pub use warm_throughput::{
     ON_DEMAND_WARM_READ_UNITS, ON_DEMAND_WARM_WRITE_UNITS, WarmThroughput, WarmThroughputDefaults,
     WarmThroughputDescription, WarmThroughputRecord, WarmThroughputStatus, epoch_seconds_now,
 };
+
+/// The deserializer's test for a member of a value object, and the member it
+/// reads a value by, for the readers that read a value before it is
+/// deserialized.
+pub(crate) use attribute_value::is_type_descriptor;
+pub use attribute_value::type_descriptor;

@@ -252,6 +252,58 @@ fn malformed_n_leading_key_is_absent() {
     assert_eq!(r, None);
 }
 
+#[test]
+fn the_key_is_read_by_the_member_the_engine_reads_it_by() {
+    // The engine ignores a member whose name is no type descriptor and a
+    // descriptor whose payload is JSON null, in either member order, so the
+    // key the policy sees is the partition the engine reads. A value with no
+    // descriptor left or with two is not a determinable partition value: the
+    // engine refuses the request.
+    let bob = Some("bob".to_owned());
+    for (value, expected) in [
+        (json!({"A": "alice", "S": "bob"}), bob.clone()),
+        (json!({"S": "bob", "A": "alice"}), bob.clone()),
+        (json!({"N": null, "S": "bob"}), bob.clone()),
+        (json!({"S": "bob", "N": null}), bob.clone()),
+        (json!({"X": "1", "N": "010"}), Some("10".to_owned())),
+        (json!({"A": "alice"}), None),
+        (json!({"S": null}), None),
+        (json!({}), None),
+        (json!({"S": "alice", "N": "1"}), None),
+    ] {
+        assert_eq!(
+            extract_typed_value(&value, NumberForm::Normalized),
+            expected,
+            "{value}"
+        );
+        // Through a GetItem key, a Query placeholder and a batch key.
+        let get = json!({"TableName": "t", "Key": {"pk": value, "sk": {"S": "x"}}});
+        assert_eq!(
+            single_table_leading_keys(&get, "GetItem", Some(&main_table()), MAX_TOKENS),
+            expected.clone().map(|v| vec![v]),
+            "GetItem {value}"
+        );
+        let query = json!({
+            "TableName": "t",
+            "KeyConditionExpression": "pk = :v",
+            "ExpressionAttributeValues": {":v": value},
+        });
+        assert_eq!(
+            single_table_leading_keys(&query, "Query", Some(&main_table()), MAX_TOKENS),
+            expected.clone().map(|v| vec![v]),
+            "Query {value}"
+        );
+        let ki = HashMap::from([("t".to_owned(), Some(main_table()))]);
+        let batch = json!({"RequestItems": {"t": {"Keys": [{"pk": value, "sk": {"S": "x"}}]}}});
+        let targets = batch_transact_targets("BatchGetItem", &batch, &ki).unwrap();
+        assert_eq!(
+            targets[0].leading_keys,
+            expected.clone().map(|v| vec![v]),
+            "BatchGetItem {value}"
+        );
+    }
+}
+
 // ---- query: the defect ---------------------------------------------------
 
 #[test]

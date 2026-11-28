@@ -23,11 +23,14 @@
 //! repeated name is a [`FormatError::Json`], as `ImportTable` refuses it;
 //! nested maps are read by the wire `AttributeValue` deserializer, which
 //! this format leaves alone, so a repeated name inside an `M` is last-wins);
-//! a repeated type descriptor at the top of an attribute value
+//! the deserializer ignores a member whose name is no type descriptor and a
+//! descriptor of JSON null, as the request path does, so `{"S":"0","X":"A"}`
+//! and `{"S":"x","S":null}` read as `S("0")` and `S("x")`; a type descriptor
+//! repeated with two non-null payloads at the top of an attribute value
 //! (`{"S":"x","S":"y"}`) is refused on this path, because the line is
 //! parsed from text and the deserializer sees both keys, while the request
 //! path, which parses a body to a `serde_json::Value` first, keeps the last
-//! (`S("y")`); the writer emits neither shape, so no written file is
+//! (`S("y")`); the writer emits none of these shapes, so no written file is
 //! affected. There are no blank lines. JSON whitespace around the object is
 //! JSON's own rule and is accepted, so a `\r` before the newline (a CRLF
 //! file) parses; it is a byte of the line and counts toward
@@ -2794,13 +2797,14 @@ mod tests {
     }
 
     /// `Debug` is how `unwrap`, `expect` and a `tracing` `?err` field print
-    /// an error, so it is bounded like `Display`: a 1 MB attribute
-    /// descriptor that serde quotes in full.
+    /// an error, so it is bounded like `Display`: a 1 MB string where an
+    /// attribute value or the `Item` member is expected, which serde quotes
+    /// in full.
     #[test]
     fn json_error_debug_is_bounded() {
         let long = "Q".repeat(1_000_000);
         for body in [
-            format!("{{\"Item\":{{\"pk\":{{\"{long}\":\"a\"}}}}}}\n"),
+            format!("{{\"Item\":{{\"pk\":{{\"L\":[\"{long}\"]}}}}}}\n"),
             format!("{{\"{long}\":1}}\n"),
         ] {
             let mut sink = Vec::new();
@@ -2859,8 +2863,8 @@ mod tests {
         assert_eq!((json.line(), json.column()), (1, 23));
         assert_eq!(
             err.to_string(),
-            "JSON error: data file line 3: unknown AttributeValue type descriptor: Q \
-             at column 23 of the line"
+            "JSON error: data file line 3: Supplied AttributeValue is empty, must contain \
+             exactly one of the supported datatypes at column 23 of the line"
         );
         // Invalid UTF-8 on line 2.
         let bad_utf8 = b"{\"Item\":{\"pk\":{\"S\":\"\xff\"}}}\n";
@@ -2875,21 +2879,6 @@ mod tests {
         // A blank first line is line 1.
         let err = decode_data_file(&gzip(&[b"\n"]), DataFileExpectations::default()).unwrap_err();
         assert!(err.to_string().contains("data file line 1: "), "{err}");
-        // A descriptor name ending in ` at line 3 column 4` sets serde's
-        // position; no column is shown for it, and the name is kept whole.
-        let forged = br#"{"Item":{"a":{"L":[{"X at line 3 column 4":1}]}}}
-"#;
-        let err =
-            decode_data_file(&gzip(&[&good, forged]), DataFileExpectations::default()).unwrap_err();
-        let FormatError::Json(json) = &err else {
-            panic!("{err}")
-        };
-        assert_eq!((json.line(), json.column()), (3, 4));
-        assert_eq!(
-            err.to_string(),
-            "JSON error: data file line 2: unknown AttributeValue type descriptor: X \
-             at line 3 column 4"
-        );
     }
 
     /// A prehashed decoder does not hash the bytes and does not compare the

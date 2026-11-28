@@ -1072,15 +1072,15 @@ mod member_names {
                 "{name}: {other_case} is accepted"
             );
         }
-        // A descriptor the reader knows fails on its payload or parses;
-        // one it does not know fails on the descriptor, whatever the
-        // payload.
+        // A descriptor the reader knows fails on a number payload, which
+        // none of them takes; one it does not know is ignored, which leaves
+        // the value with no descriptor.
         let unknown = |candidate: &str| {
-            serde_json::from_value::<AttributeValue>(serde_json::json!({ candidate: null }))
+            serde_json::from_value::<AttributeValue>(serde_json::json!({ candidate: 1 }))
                 .err()
                 .is_some_and(|e| {
                     e.to_string()
-                        .starts_with("unknown AttributeValue type descriptor")
+                        .starts_with("Supplied AttributeValue is empty")
                 })
         };
         let mut accepted = std::collections::BTreeSet::new();

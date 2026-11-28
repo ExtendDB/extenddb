@@ -529,7 +529,7 @@ The system must support all 10 DynamoDB attribute value types:
 | `M` | Map | `BTreeMap<String, AttributeValue>` (unordered, heterogeneous) |
 
 **Requirements:**
-- REQ-TYPE-001: Each AttributeValue must have exactly one type descriptor set; reject with `SerializationException` otherwise
+- REQ-TYPE-001: Each AttributeValue must have exactly one type descriptor set once a member whose name is no type descriptor and a descriptor of JSON null are ignored; reject with `ValidationException` otherwise (`Supplied AttributeValue is empty, must contain exactly one of the supported datatypes` for none, `Supplied AttributeValue has more than one datatypes set, must contain exactly one of the supported datatypes` for two or more)
 - REQ-TYPE-002: Empty strings and binary values are allowed for non-key attributes
 - REQ-TYPE-003: Empty sets (SS, NS, BS) are not allowed; reject with `ValidationException`
 - REQ-TYPE-004: Number type must preserve up to 38 digits of precision

@@ -136,10 +136,14 @@ where
         "ExpressionAttributeValues",
         false,
         |key, value| {
-            // Empty AttributeValue (no datatype). Caught here so the error names
-            // its key. Mirrors the empty-object check in `types::attribute_value`;
-            // keep in sync. Only the empty case is prefixed, matching DynamoDB.
-            if value.as_object().is_some_and(serde_json::Map::is_empty) {
+            // An AttributeValue with no type descriptor: `{}`, or members the
+            // deserializer ignores only. Caught here so the error names its
+            // key. Only the empty case is prefixed here.
+            if value.as_object().is_some_and(|members| {
+                !members
+                    .iter()
+                    .any(|(k, v)| crate::types::is_type_descriptor(k, v))
+            }) {
                 return Err(format!(
                     "ExpressionAttributeValues contains invalid value: Supplied \
                      AttributeValue is empty, must contain exactly one of the \
@@ -276,15 +280,24 @@ mod tests {
 
     #[test]
     fn values_empty_attribute_value_rejected() {
-        let msg = values_err(r#"{"values":{":v":{}}}"#);
-        assert!(
-            msg.contains(
-                "ExpressionAttributeValues contains invalid value: Supplied \
-                 AttributeValue is empty, must contain exactly one of the \
-                 supported datatypes for key :v"
-            ),
-            "{msg}"
-        );
+        // `{}`, and the values whose members the deserializer ignores
+        // (measured 2026-11-23 on Query, wrapped alike).
+        for value in [
+            "{}",
+            r#"{"X":"1"}"#,
+            r#"{"S":null}"#,
+            r#"{"S":null,"X":"1"}"#,
+        ] {
+            let msg = values_err(&format!(r#"{{"values":{{":v":{value}}}}}"#));
+            assert!(
+                msg.contains(
+                    "ExpressionAttributeValues contains invalid value: Supplied \
+                     AttributeValue is empty, must contain exactly one of the \
+                     supported datatypes for key :v"
+                ),
+                "{value}: {msg}"
+            );
+        }
     }
 
     #[test]

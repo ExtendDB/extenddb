@@ -82,17 +82,64 @@ impl<'de> Visitor<'de> for AttributeValueVisitor {
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-        let (key, value): (String, serde_json::Value) = map
-            .next_entry()?
-            .ok_or_else(|| de::Error::custom(EMPTY_ATTRIBUTE_VALUE))?;
-
-        // REQ-TYPE-001: reject if multiple keys
-        if map.next_key::<String>()?.is_some() {
-            return Err(de::Error::custom(MULTI_ATTRIBUTE_VALUE));
+        let mut members = Vec::new();
+        while let Some(member) = map.next_entry::<String, serde_json::Value>()? {
+            members.push(member);
         }
-
-        from_descriptor(&key, value).map_err(de::Error::custom)
+        from_members(members).map_err(de::Error::custom)
     }
+}
+
+/// The type descriptors `DynamoDB` defines.
+const TYPE_DESCRIPTORS: [&str; 10] = ["S", "N", "B", "SS", "NS", "BS", "BOOL", "NULL", "L", "M"];
+
+/// Whether the member `name: payload` of a value object is a type descriptor
+/// the value is read by: one of [`TYPE_DESCRIPTORS`] whose payload is not
+/// JSON null. `DynamoDB` ignores every other member, at the top level and
+/// inside an `L` or an `M` (measured 2026-11-23): `{"S": "a", "X": "1"}` and
+/// `{"S": "a", "N": null}` are the string `a`, and `{"X": "1"}` and
+/// `{"S": null}` have no type.
+pub(crate) fn is_type_descriptor(name: &str, payload: &serde_json::Value) -> bool {
+    TYPE_DESCRIPTORS.contains(&name) && !payload.is_null()
+}
+
+/// The member of a value object the value is read by: the one member
+/// [`is_type_descriptor`] passes, whatever order the members come in, so a
+/// build that keeps the request's member order and one that sorts the members
+/// read the same descriptor. The deserializer, the readers ahead of it that
+/// bind `dynamodb:LeadingKeys` and the throttling key, and the PartiQL
+/// parameter checks call it, so they read the member the engine reads.
+///
+/// # Errors
+///
+/// The text the deserializer refuses the object with (REQ-TYPE-001):
+/// `EMPTY_ATTRIBUTE_VALUE` when no member passes, `MULTI_ATTRIBUTE_VALUE`
+/// when two or more do.
+pub fn type_descriptor<K, V>(
+    members: impl IntoIterator<Item = (K, V)>,
+) -> Result<(K, V), &'static str>
+where
+    K: AsRef<str>,
+    V: std::borrow::Borrow<serde_json::Value>,
+{
+    let mut descriptors = members
+        .into_iter()
+        .filter(|(name, payload)| is_type_descriptor(name.as_ref(), payload.borrow()));
+    match (descriptors.next(), descriptors.next()) {
+        (None, _) => Err(EMPTY_ATTRIBUTE_VALUE),
+        (Some(_), Some(_)) => Err(MULTI_ATTRIBUTE_VALUE),
+        (Some(member), None) => Ok(member),
+    }
+}
+
+/// The value the members of one object describe, at any level: the one
+/// member [`type_descriptor`] leaves, read by [`from_descriptor`]. The
+/// payload is read after the count.
+fn from_members(
+    members: impl IntoIterator<Item = (String, serde_json::Value)>,
+) -> Result<AttributeValue, String> {
+    let (name, payload) = type_descriptor(members)?;
+    from_descriptor(&name, payload)
 }
 
 /// An element of an `L` or a value of an `M`, converted from the
@@ -104,29 +151,12 @@ impl<'de> Visitor<'de> for AttributeValueVisitor {
 /// leaves at once. The result and every error message are those of
 /// `serde_json::from_value::<AttributeValue>(value)`: a non-object goes
 /// through it unchanged (serde's "invalid type" text; nothing below it is
-/// visited), and an object takes the steps `visit_map` takes; the message is
-/// the one `visit_map` produces, rendered once per level as `from_value`
-/// rendered it: `serde_json::Error::custom` parses a trailing
-/// ` at line N column M` out of the message it is given and drops it when
-/// N is 0, so each nesting level strips one such suffix, and
-/// [`rendered_per_level`] repeats that here.
+/// visited), and an object takes the steps `visit_map` takes.
 fn from_nested(value: serde_json::Value) -> Result<AttributeValue, String> {
-    let serde_json::Value::Object(object) = value else {
-        return serde_json::from_value(value).map_err(|e| e.to_string());
-    };
-    let mut entries = object.into_iter();
-    match (entries.next(), entries.next()) {
-        (None, _) => Err(EMPTY_ATTRIBUTE_VALUE.to_owned()),
-        (Some(_), Some(_)) => Err(MULTI_ATTRIBUTE_VALUE.to_owned()),
-        (Some((key, value)), None) => from_descriptor(&key, value),
+    match value {
+        serde_json::Value::Object(members) => from_members(members),
+        other => serde_json::from_value(other).map_err(|e| e.to_string()),
     }
-    .map_err(rendered_per_level)
-}
-
-/// The text `serde_json::from_value` gave for a message its deserializer
-/// raised: the message through `serde_json::Error::custom`, displayed.
-fn rendered_per_level(message: String) -> String {
-    <serde_json::Error as de::Error>::custom(message).to_string()
 }
 
 /// The value of one type descriptor: `key` is the descriptor (`S`, `L`, ...)
@@ -192,7 +222,8 @@ fn from_descriptor(key: &str, value: serde_json::Value) -> Result<AttributeValue
             )),
             _ => Err("M value must be an object".to_owned()),
         },
-        other => Err(format!("unknown AttributeValue type descriptor: {other}")),
+        // Not reached: `from_members` passes a member of `TYPE_DESCRIPTORS`.
+        _ => Err(EMPTY_ATTRIBUTE_VALUE.to_owned()),
     }
 }
 
@@ -446,11 +477,88 @@ mod tests {
         assert!(err.to_string().contains("empty"));
     }
 
+    /// A member that is no type descriptor (a name `DynamoDB` does not
+    /// define, or a defined one with a JSON null payload) is ignored, at the
+    /// top level and inside `L` and `M`; the descriptors left are counted.
+    /// The rows and their answers were measured on 2026-11-23 through Query,
+    /// PutItem and GetItem, each twice. Read from a `serde_json::Value`, the
+    /// engine's path.
     #[test]
-    fn unknown_type_descriptor_rejected() {
-        let json = r#"{"X":"hello"}"#;
-        let err = serde_json::from_str::<AttributeValue>(json).unwrap_err();
-        assert!(err.to_string().contains("unknown"));
+    fn members_that_are_no_type_descriptor_are_ignored() {
+        let s = |v: &str| Ok(AttributeValue::S(v.to_owned()));
+        let n = |v: &str| Ok(AttributeValue::N(v.to_owned()));
+        let empty = Err(EMPTY_ATTRIBUTE_VALUE.to_owned());
+        let multi = Err(MULTI_ATTRIBUTE_VALUE.to_owned());
+        let cases = [
+            (r#"{"S":"a","X":"1"}"#, s("a")),
+            (r#"{"X":"1","S":"a"}"#, s("a")),
+            (r#"{"S":null,"N":"1"}"#, n("1")),
+            (r#"{"N":"1","S":null}"#, n("1")),
+            (r#"{"S":"a","N":null,"X":"1"}"#, s("a")),
+            (r#"{"S":"a","N":"1"}"#, multi.clone()),
+            (r#"{"X":"1"}"#, empty.clone()),
+            (r#"{"S":null}"#, empty.clone()),
+            (r#"{"S":null,"X":"1"}"#, empty.clone()),
+            (r#"{"S":null,"N":null}"#, empty.clone()),
+            ("{}", empty.clone()),
+            // The number is read here and refused by the validation layer.
+            (r#"{"N":"bob","X":"1"}"#, n("bob")),
+            (r#"{"NULL":true,"S":null}"#, Ok(AttributeValue::Null)),
+            (
+                r#"{"BOOL":false,"S":null}"#,
+                Ok(AttributeValue::Bool(false)),
+            ),
+            (
+                r#"{"L":[{"S":"a","X":"1"}]}"#,
+                s("a").map(|a| AttributeValue::L(vec![a])),
+            ),
+            (
+                r#"{"L":[{"S":null,"N":"1"}]}"#,
+                n("1").map(|a| AttributeValue::L(vec![a])),
+            ),
+            (r#"{"L":[{"X":"1"}]}"#, empty.clone()),
+            (r#"{"L":[{"S":"a","N":"1"}]}"#, multi),
+            (
+                r#"{"M":{"k":{"S":"a","X":"1"}}}"#,
+                s("a").map(|a| AttributeValue::M(BTreeMap::from([("k".to_owned(), a)]))),
+            ),
+            (r#"{"M":{"k":{"S":null}}}"#, empty.clone()),
+            (r#"{"M":{"k":{"S":null,"N":null}}}"#, empty),
+            (r#"{"L":null,"S":"a"}"#, s("a")),
+        ];
+        for (json, want) in cases {
+            let value: serde_json::Value = serde_json::from_str(json).unwrap();
+            let got = serde_json::from_value::<AttributeValue>(value).map_err(|e| e.to_string());
+            assert_eq!(got, want, "{json}");
+        }
+    }
+
+    /// The member a reader of a value's raw JSON reads the value by is the
+    /// one the deserializer reads it by, in either member order: each row
+    /// gives the members as a list of pairs, so the order is the row's and
+    /// not the JSON map's.
+    #[test]
+    fn type_descriptor_is_the_one_counted_member_in_either_order() {
+        let cases = [
+            (r#"[["A","alice"],["S","bob"]]"#, Ok("S")),
+            (r#"[["S","bob"],["A","alice"]]"#, Ok("S")),
+            (r#"[["N",null],["S","bob"]]"#, Ok("S")),
+            (r#"[["S","bob"],["N",null]]"#, Ok("S")),
+            (r#"[["A","alice"]]"#, Err(EMPTY_ATTRIBUTE_VALUE)),
+            (r#"[["S",null]]"#, Err(EMPTY_ATTRIBUTE_VALUE)),
+            ("[]", Err(EMPTY_ATTRIBUTE_VALUE)),
+            (r#"[["S","a"],["N","1"]]"#, Err(MULTI_ATTRIBUTE_VALUE)),
+            (r#"[["N","1"],["S","a"]]"#, Err(MULTI_ATTRIBUTE_VALUE)),
+        ];
+        for (json, want) in cases {
+            let members: Vec<(String, serde_json::Value)> = serde_json::from_str(json).unwrap();
+            let borrowed = members.iter().map(|(name, payload)| (name, payload));
+            let got = type_descriptor(borrowed).map(|(name, payload)| {
+                assert!(!payload.is_null(), "{json}");
+                name.as_str()
+            });
+            assert_eq!(got, want, "{json}");
+        }
     }
 
     #[test]
@@ -606,7 +714,7 @@ mod tests {
             ),
             (
                 r#"{"L":[{"L":[{"Q":1}]}]}"#,
-                "unknown AttributeValue type descriptor: Q".to_owned(),
+                EMPTY_ATTRIBUTE_VALUE.to_owned(),
                 " at line 1 column 23",
             ),
             (
@@ -638,62 +746,6 @@ mod tests {
                 "{json}"
             );
             let value: serde_json::Value = serde_json::from_str(json).unwrap();
-            let from_value = serde_json::from_value::<AttributeValue>(value).unwrap_err();
-            assert_eq!(from_value.to_string(), message, "{json}");
-        }
-        // A message ending in ` at line 0 column 0` loses one such suffix
-        // per nesting level, as `serde_json::Error::custom` parses it out at
-        // each level; a nonzero position is kept. The texts are those the
-        // per-level `from_value` deserializer produced.
-        let at0 = " at line 0 column 0";
-        let unknown = "unknown AttributeValue type descriptor: X";
-        let cases = [
-            (
-                format!(r#"{{"M":{{"k":{{"X{at0}{at0}":1}}}}}}"#),
-                unknown.to_owned(),
-                " at line 1 column 57",
-            ),
-            (
-                format!(r#"{{"L":[{{"X{at0}{at0}":1}}]}}"#),
-                unknown.to_owned(),
-                " at line 1 column 53",
-            ),
-            (
-                format!(r#"{{"L":[{{"M":{{"k":{{"X{at0}{at0}{at0}":1}}}}}}]}}"#),
-                unknown.to_owned(),
-                " at line 1 column 84",
-            ),
-            (
-                format!(r#"{{"M":{{"k":{{"X{at0}":1}}}}}}"#),
-                unknown.to_owned(),
-                " at line 1 column 38",
-            ),
-            (
-                format!(r#"{{"X{at0}{at0}":1}}"#),
-                format!("{unknown}{at0}"),
-                " at line 1 column 45",
-            ),
-            // One suffix more than the levels strip: the nested level and
-            // the outer one take one each, and the third stays in the text.
-            (
-                format!(r#"{{"L":[{{"X{at0}{at0}{at0}":1}}]}}"#),
-                format!("{unknown}{at0}"),
-                " at line 1 column 72",
-            ),
-            (
-                r#"{"M":{"k":{"X at line 3 column 4":1}}}"#.to_owned(),
-                format!("{unknown} at line 3 column 4"),
-                "",
-            ),
-        ];
-        for (json, message, position) in cases {
-            let from_text = serde_json::from_str::<AttributeValue>(&json).unwrap_err();
-            assert_eq!(
-                from_text.to_string(),
-                format!("{message}{position}"),
-                "{json}"
-            );
-            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
             let from_value = serde_json::from_value::<AttributeValue>(value).unwrap_err();
             assert_eq!(from_value.to_string(), message, "{json}");
         }
