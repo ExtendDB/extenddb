@@ -892,6 +892,62 @@ catalog migration is required.
 
 ---
 
+### v1.1.0: SQLite database files are created 0600, and the commands that open them set them to 0600
+
+**What changed.** On Unix, the commands that open a SQLite database set the
+database file and its `-wal`, `-shm` and `-journal` files to mode 0600 when
+they are wider. They do so before SQLite opens the database. They are `init`,
+`migrate --yes`, `serve`, `settings`, `verify`, the `encryption-key` commands
+(`status`, `switch`, `rewrap`, `rotate`, `reset` and `set-data-connection`)
+and the `backup` commands (`list`, `purge`, `sync` and `remove-target`). A
+command that creates a missing database file creates it with mode 0600, also
+under a umask that removes the owner's bits. Only regular files change, and a
+file at 0600 or narrower keeps its mode. In 1.0.0, `init` and the migration
+runner created a missing database file with mode 0600 less the umask. After
+the engine's pool connected, `serve` and the `backup` commands set the
+database file and its `-wal` and `-shm` files to 0600. They did this only for
+a database configured as a plain path, and ignored a mode they could not set.
+`migrate --yes`, `settings`, `verify`, `destroy` and the `encryption-key`
+commands set no mode on an existing file. Now a command that cannot set a mode
+fails, with `cannot set the mode of SQLite file <path>: <error>` or
+`cannot set the mode of SQLite database <path>: <error>`. `destroy` continues
+when it cannot read the catalog, as in 1.0.0, and then removes the files.
+
+**Who is affected.** A deployment whose database files are wider than 0600,
+for example files that an earlier release left at 0644:
+
+- The first of these commands that the files' owner runs sets the files to
+  0600.
+- On a read-only mount, these commands fail with
+  `Read-only file system (os error 30)`. In 1.0.0, `settings` and `verify`
+  opened such a database. They still open a read-only mount whose files are
+  0600.
+- For files that belong to another user, these commands fail with
+  `Operation not permitted (os error 1)`. Examples are a database shared
+  through group permissions, and a host directory mounted into a container
+  that runs as a different user. `serve` and `migrate --yes` fail this way
+  when no lock file is present. In 1.0.0 the lock file already refused that
+  user for `serve`, `migrate --yes` and `destroy` whenever it existed.
+
+When the user cannot search the directory that holds the database, `settings`
+and `verify` now fail with
+`cannot set the mode of SQLite file <path>: Permission denied (os error 13)`,
+where 1.0.0 printed SQLite's `unable to open database file`.
+
+**Before upgrading** a database on a read-only mount, run one of these
+commands against the same files on a writable mount, as the files' owner. For
+example, run `extenddb verify --config <config>`. Or set the modes yourself as
+the owner:
+
+```bash
+chmod 600 extenddb.sqlite extenddb.sqlite-wal extenddb.sqlite-shm
+```
+
+For files that belong to another user, run extenddb as that user. No catalog
+migration is required.
+
+---
+
 ### v0.1.15: export files are created 0600 and the import and export directories the server creates 0700
 
 **What changed.** On Unix, `ExportTableToPointInTime` creates its file with

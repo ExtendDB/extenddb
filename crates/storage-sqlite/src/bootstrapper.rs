@@ -107,14 +107,14 @@ impl SqliteBootstrapper {
                 ))
             })?;
         }
-        SqlitePoolOptions::new()
+        let options = SqlitePoolOptions::new()
             .max_connections(1)
             .after_connect(|conn, _| {
                 Box::pin(
                     async move { crate::sqlite_util::set_connection_pragmas(conn, true).await },
                 )
-            })
-            .connect(&sqlite_url(&self.path))
+            });
+        crate::file_mode::connect(&self.path, options)
             .await
             .map_err(|e| OpError::Internal(format!("open SQLite database '{}': {e}", self.path)))
     }
@@ -158,15 +158,9 @@ impl Bootstrapper for SqliteBootstrapper {
                 ))
             })?;
         }
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        match options.open(path) {
-            Ok(_) => Ok(()),
+        let created = crate::file_mode::create_owner_only(path).map_err(OpError::Internal)?;
+        match created {
+            Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(exists()),
             Err(e) => Err(OpError::Internal(format!(
                 "create SQLite database '{}': {e}",

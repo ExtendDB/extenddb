@@ -22,7 +22,8 @@ mod commands;
 // The copy taken before a migration, through `libsqlite3-sys`'s online backup.
 #[cfg(not(target_arch = "wasm32"))]
 mod copy;
-// Creates and opens database files, for `SqliteMigrations::open_with` only.
+// The error for a database that cannot be opened, for
+// `SqliteMigrations::open_with` only.
 #[cfg(not(target_arch = "wasm32"))]
 mod open;
 // Locks, reads and migrates a database file; wasm32 opens none.

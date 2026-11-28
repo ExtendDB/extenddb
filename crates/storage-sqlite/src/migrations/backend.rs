@@ -251,7 +251,23 @@ impl SqliteMigrations {
                     MigrationError::store(format!("create the directory of {location}"), e)
                 })?;
             }
-            super::open::create_private(path)?;
+            // A dangling symlink names the file it will become, so the target
+            // is created here and the connection never creates the database.
+            let target = crate::serve_lock::resolve_dangling_symlinks(path);
+            let created =
+                crate::file_mode::create_owner_only(&target).map_err(MigrationError::Store)?;
+            if let Err(e) = created
+                && e.kind() != std::io::ErrorKind::AlreadyExists
+            {
+                return Err(MigrationError::store(
+                    format!("create the database file {}", target.display()),
+                    e,
+                ));
+            }
+            // Files an earlier version left wider than 0600 are narrowed
+            // before SQLite opens them, so the sidecars this connection
+            // creates take 0600 from the database file.
+            crate::file_mode::prepare(location).map_err(MigrationError::Store)?;
         }
         let options = sqlx::sqlite::SqliteConnectOptions::from_str(&sqlite_url(location))
             .map_err(|e| MigrationError::store(format!("open SQLite database {location}"), e))?

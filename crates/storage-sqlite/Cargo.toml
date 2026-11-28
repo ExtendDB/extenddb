@@ -46,6 +46,10 @@ bigdecimal = { workspace = true }
 crc32fast = { workspace = true }
 zeroize = { workspace = true }
 web-time = { workspace = true }
+# `database_file` reads a location's query as sqlx reads it, on both targets.
+# The crate `url` re-exports; `url` itself would add its IDNA tables to the
+# wasm32 build.
+form_urlencoded = "1"
 
 # Storage transport, split per target. Native keeps `sqlx` (SQLite feature) and
 # the C `libsqlite3-sys`; native SQLite is the behaviour this backend is
@@ -107,6 +111,8 @@ extenddb-backup-store = { path = "../backup-store" }
 # every tracing event of a child process.
 log = "0.4"
 tracing-subscriber = { workspace = true }
+# Scratch directories that are removed when a test panics.
+tempfile = "3"
 # The crate's own tests need `test-hooks`; a dev-dependency on itself turns
 # the feature on for test builds only.
 extenddb-storage-sqlite = { path = ".", features = ["test-hooks"] }

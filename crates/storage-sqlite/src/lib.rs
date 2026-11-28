@@ -172,6 +172,9 @@ mod create_table;
 mod credential_store;
 mod data;
 mod delete_table;
+// wasm32 calls only `prepare`, which sets no mode there; the module compiles
+// its other items off wasm32.
+mod file_mode;
 // `ServerRuntimeHooks`: the server's background workers, not run on wasm32.
 #[cfg(not(target_arch = "wasm32"))]
 mod hooks;
@@ -196,6 +199,7 @@ mod server_backend;
 // Uses `sqlx` API the shim does not provide; on wasm32 `SnapshotEngine` answers `Unsupported`.
 #[cfg(not(target_arch = "wasm32"))]
 mod snapshot_engine;
+mod sqlite_uri;
 mod sqlite_util;
 mod store;
 mod stream;
