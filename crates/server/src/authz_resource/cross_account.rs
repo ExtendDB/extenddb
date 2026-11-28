@@ -54,7 +54,9 @@
 //! An account exists here when this deployment's catalog holds it. Fields the
 //! service reads as a name rather than an ARN (`ListStreams` `TableName`,
 //! `RestoreTableToPointInTime` `SourceTableName`, the `ImportTable` table name,
-//! a restore's `TargetTableName`) are not checked.
+//! a restore's `TargetTableName`) are not checked, and neither is a
+//! `TableName` that the service ignores
+//! ([`crate::table_name_gate::has_no_table_member`]).
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -125,8 +127,8 @@ pub(crate) fn find(operation: &str, input: &Value, account_id: &str) -> Option<O
         "BatchGetItem" | "BatchWriteItem" | "TransactGetItems" | "TransactWriteItems" => {
             batch_or_transaction(operation, input, account_id)
         }
-        "ListStreams" | "ImportTable" | "ListTables" | "DescribeLimits" | "DescribeEndpoints"
-        | "GetRecords" => None,
+        "ListStreams" | "ImportTable" | "ListTables" => None,
+        _ if crate::table_name_gate::has_no_table_member(operation) => None,
         // An index query names the index ARN, built from the table ARN as
         // written (measured: `.../table/<T>/index/<I>`). SearchVectors names
         // its index the same way, as `authz_targets` does.
