@@ -137,7 +137,8 @@ fn the_walk_reports_the_first_problem_in_the_condition() {
 
 #[test]
 fn the_walk_meets_an_operator_before_its_operands() {
-    for condition in ["b = 1e126 + 1", "b = 1 + 1e126"] {
+    // The service's answer for the last condition is not measured.
+    for condition in ["b = 1e126 + 1", "b = 1 + 1e126", "b = 1 + (c - d)"] {
         assert_walk(condition, |_| PLUS.to_owned());
     }
     assert_walk("? IS NULL AND c = 1e126", |_| IS_LEFT_SIDE.to_owned());

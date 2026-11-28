@@ -18,8 +18,9 @@
 //! 7. the first problem the walk of the WHERE condition meets (below);
 //! 8. the IN list limit and the operator count of the condition, whichever
 //!    the condition meets first;
-//! 9. the refusals in an UPDATE's SET and REMOVE clauses and in an INSERT's
-//!    value, wherever they are written, then those after the condition.
+//! 9. the operator count of the SET values, then the refusals in an
+//!    UPDATE's SET and REMOVE clauses and in an INSERT's value, wherever they
+//!    are written, then those after the condition.
 //!
 //! Measured: an alias on the table before a FROM path refusal and before the
 //! name rule, and an empty FROM path component and a path of three
@@ -33,8 +34,9 @@
 //! unary plus, an IS test and a parameter inside a list in a SET clause, in
 //! both UPDATE forms; the walk of the condition before a SET clause written
 //! before it. Not measured: an alias on the table against EXISTS, an
-//! INSERT's value against the name rule, and a DELETE of an index against
-//! the name rule (it keeps its place in 2).
+//! INSERT's value against the name rule, a DELETE of an index against the
+//! name rule (it keeps its place in 2), and the operator count of the SET
+//! values against the refusals around it.
 //!
 //! In the SET clause, a sign before a value that is not a number comes after
 //! the number literals of the clause that break an item number rule, in
@@ -74,7 +76,7 @@
 //! A refusal the parse stops at comes after those found before it that come
 //! ahead of its part of the statement in this order.
 
-use super::limits::{MAX_IN_OPERANDS, too_many_in_operands, too_many_operators};
+use super::limits::{MAX_IN_OPERANDS, MAX_OPERATORS, too_many_in_operands, too_many_operators};
 use super::operands::SignedNumber;
 use super::{
     EXISTS_OUTSIDE_TRANSACTION, IN_OPERANDS, PARAMETER_COUNT_MISMATCH, PResult, ParseError, Parser,
@@ -345,7 +347,9 @@ impl Parser {
                 Some(sign) if found.values_is_sign => Some(found.set_number.unwrap_or(sign)),
                 values => values,
             };
-            refusal = refusal.or(values);
+            refusal = refusal
+                .or_else(|| (self.value_operators > MAX_OPERATORS).then(too_many_operators))
+                .or(values);
         }
         if reached >= Part::AfterWhere {
             refusal = refusal.or(found.after_where);

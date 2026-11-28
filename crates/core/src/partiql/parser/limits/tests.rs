@@ -11,6 +11,8 @@ use crate::types::AttributeValue;
 
 const WF: &str = "Statement wasn't well formed, can't be processed: ";
 const SELECT: &str = "SELECT * FROM \"t\" WHERE ";
+const KEYED: &str = "SELECT * FROM \"t\" WHERE pk = 'q' AND ";
+const KEY: &str = " WHERE pk = 'q'";
 
 fn err(sql: &str) -> String {
     parse(sql).unwrap_err().message
@@ -127,7 +129,7 @@ fn a_long_condition_is_refused_without_overflowing() {
 }
 
 #[test]
-fn a_condition_may_nest_1000_groups() {
+fn a_condition_may_nest_2000_groups() {
     assert!(parse(&groups(MAX_GROUP_DEPTH)).is_ok());
     assert_eq!(err(&groups(MAX_GROUP_DEPTH + 1)), too_deep());
     // 8,029 characters.
@@ -243,27 +245,27 @@ fn a_literal_may_nest_1000_containers() {
 }
 
 #[test]
-fn an_operand_may_nest_100_operands() {
-    // The innermost `x` is the hundredth operand.
-    assert!(parse(&calls(MAX_OPERAND_DEPTH - 1)).is_ok());
+fn an_operand_may_nest_500_operands() {
+    // The innermost `x` is the five hundredth operand. Past 300 calls a SET
+    // value is refused for its operators once it is read.
+    assert_eq!(err(&calls(MAX_OPERAND_DEPTH - 1)), too_many_operators());
     assert_eq!(err(&calls(MAX_OPERAND_DEPTH)), too_deep());
     assert_eq!(err(&calls(2700)), too_deep());
-    assert_eq!(
-        err(&format!("{SELECT}a = {}b", "not ".repeat(2000))),
-        too_deep()
-    );
 }
 
-/// The worst parse the caps allow: groups, operands and a literal each
-/// at their cap.
+/// The deepest statement found within the length limit: groups round a
+/// condition, round a bracket in a bracket, round calls with a bracket in
+/// their argument, round nested `FROM ... WHERE` forms, round lists (the
+/// module comment of `limits.rs` gives the stack it uses).
 fn worst() -> String {
     format!(
-        "{SELECT}{}a = {}{}1{}{}{}",
+        "{SELECT}{}m[k[{}a = {}b = {}1{}{}]] = 1{}",
         "(".repeat(MAX_GROUP_DEPTH),
-        "size(".repeat(MAX_OPERAND_DEPTH - 1),
-        "{'a': ".repeat(MAX_LITERAL_DEPTH),
-        "}".repeat(MAX_LITERAL_DEPTH),
-        ")".repeat(MAX_OPERAND_DEPTH - 1),
+        "f(j[".repeat(131),
+        "FROM a WHERE ".repeat(104),
+        "[".repeat(MAX_LITERAL_DEPTH),
+        "]".repeat(MAX_LITERAL_DEPTH),
+        "])".repeat(131),
         ")".repeat(MAX_GROUP_DEPTH)
     )
 }
@@ -271,13 +273,21 @@ fn worst() -> String {
 #[test]
 fn the_worst_parse_fits_half_the_large_stack() {
     let statement = worst();
+    assert!(
+        statement.len() <= MAX_STATEMENT_LENGTH,
+        "{}",
+        statement.len()
+    );
     let answer = std::thread::Builder::new()
         .stack_size(LARGE_STACK_BYTES / 2)
         .spawn(move || parse_with_full_caps(&statement).map(|_| ()))
         .unwrap()
         .join()
         .unwrap();
-    assert_eq!(answer.unwrap_err().message, nesting(".a"));
+    assert_eq!(
+        answer.unwrap_err().message,
+        format!("{WF}Expected data manipulation")
+    );
 }
 
 /// `head`, as many `open` as fit in the length limit, `inner`, as many
@@ -303,8 +313,6 @@ fn answer(sql: &str) -> Result<(), String> {
 /// error, the parser refuses the statement as nested too deep.
 fn nesting_forms() -> Vec<(&'static str, String, Result<(), String>)> {
     const WHERE: &str = "SELECT * FROM \"t\" WHERE ";
-    const KEYED: &str = "SELECT * FROM \"t\" WHERE pk = 'p' AND ";
-    const KEY: &str = " WHERE pk = 'p'";
     const INSERT: &str = "INSERT INTO \"t\" VALUE {'pk': 'x', 'v': ";
     let deep = || Err(too_deep());
     let refused_at = |column: usize, length: usize| {
@@ -492,23 +500,32 @@ fn nesting_forms() -> Vec<(&'static str, String, Result<(), String>)> {
             fill(WHERE, "NOT ", "a = 1", "", ""),
             Err(too_many_operators()),
         ),
-        ("NOTs in a SET value", set("x = ", "NOT ", "a", ""), deep()),
+        (
+            "NOTs in a SET value",
+            set("x = ", "NOT ", "a", ""),
+            Err(format!("{WF}Unexpected operator")),
+        ),
         (
             "NOTs in a bare statement",
             fill("", "NOT ", "a", "", ""),
             Err(crate::partiql::parser::EXISTS_OUTSIDE_TRANSACTION.to_owned()),
         ),
+        // 1,359 `+`, past the operators the SET values may hold.
         (
             "arithmetic in parentheses",
             set("x = ", "(", "a", " + 1)"),
-            deep(),
+            Err(too_many_operators()),
         ),
         (
             "signs before parentheses",
             set("x = ", "-(", "a", ")"),
             deep(),
         ),
-        ("CASE words", keyed("a = ", "CASE ", "b", "", ""), deep()),
+        (
+            "CASE words",
+            keyed("a = ", "CASE ", "b", "", ""),
+            Err(format!("{WF}Unexpected keyword")),
+        ),
         (
             "lists in an INSERT value",
             fill(INSERT, "[", "1", "]", "}"),
@@ -566,10 +583,169 @@ fn every_nesting_form_at_the_length_limit_parses_on_a_small_stack() {
     }
 }
 
+/// The depths the service was measured at, with the answer each statement
+/// gets: `Ok(())` where it parses. Measured 2026-11-24 on a table that does
+/// not exist, each statement twice: the service read every statement here
+/// that parses (it answered for the table), except that it failed with an
+/// internal error once each 1500 and 1800 levels of parentheses round a
+/// name, 1500 round a path and 1500 round an INSERT value; it failed 700
+/// nested `size` calls and 2000 nested bags, which the parser refuses as
+/// nested past the caps, and it refused 301 and 440 nested `if_not_exists`
+/// calls for their operators, as the parser does. Where the service refused
+/// a statement for another reason (nested `size` calls for the operand
+/// type, `NOT` before a SET value, `CASE` words, 1160 nested maps for their
+/// nesting), the parser's own answer is given. The rows one group past the
+/// cap are the parser's own boundary, where the service is not measured.
+fn measured_depths() -> Vec<(&'static str, String, Result<(), String>)> {
+    let deep = || Err(too_deep());
+    let parens = |n: usize, inner: &str| format!("{}{inner}{}", "(".repeat(n), ")".repeat(n));
+    let set_value = |n: usize, open: &str, inner: &str, close: &str| {
+        format!(
+            "UPDATE \"t\" SET x = {}{inner}{}{KEY}",
+            open.repeat(n),
+            close.repeat(n)
+        )
+    };
+    let mut rows = Vec::new();
+    for n in [99, 100, 101, 1000, 1001, 1200, 1500, 1800, MAX_GROUP_DEPTH] {
+        rows.push((
+            "a name in parentheses",
+            format!("{KEYED}a = {}", parens(n, "b")),
+            Ok(()),
+        ));
+    }
+    rows.push((
+        "a name in parentheses",
+        format!("{KEYED}a = {}", parens(MAX_GROUP_DEPTH + 1, "b")),
+        deep(),
+    ));
+    for n in [100, 1001] {
+        rows.push((
+            "a string in parentheses",
+            format!("{KEYED}a = {}", parens(n, "'x'")),
+            Ok(()),
+        ));
+        rows.push((
+            "a SET value in parentheses",
+            format!("UPDATE \"t\" SET x = {}{KEY}", parens(n, "a")),
+            Ok(()),
+        ));
+    }
+    for n in [1000, 1001, 1500, MAX_GROUP_DEPTH] {
+        rows.push((
+            "a path in groups",
+            format!("{KEYED}{} = 1", parens(n, "a")),
+            Ok(()),
+        ));
+    }
+    rows.push((
+        "a path in groups",
+        format!("{KEYED}{} = 1", parens(MAX_GROUP_DEPTH + 1, "a")),
+        deep(),
+    ));
+    for (n, want) in [
+        (1001, Ok(())),
+        (1500, Ok(())),
+        (MAX_GROUP_DEPTH + 1, deep()),
+    ] {
+        rows.push((
+            "an INSERT value in parentheses",
+            format!(
+                "INSERT INTO \"t\" VALUE {{'pk': 'q', 'x': {}}}",
+                parens(n, "'v'")
+            ),
+            want,
+        ));
+    }
+    // The outer pair of parentheses is the IN list's.
+    for (n, want) in [
+        (1002, Ok(())),
+        (1500, Ok(())),
+        (MAX_GROUP_DEPTH + 2, deep()),
+    ] {
+        rows.push((
+            "an IN member in parentheses",
+            format!("{KEYED}a IN {}", parens(n, "1")),
+            want,
+        ));
+    }
+    for n in [100, 101, 300] {
+        rows.push((
+            "nested if_not_exists calls",
+            set_value(n, "if_not_exists(x, ", "1", ")"),
+            Ok(()),
+        ));
+        rows.push((
+            "nested list_append calls",
+            set_value(n, "list_append(", "l", ", [1])"),
+            Ok(()),
+        ));
+    }
+    for n in [301, 440] {
+        rows.push((
+            "nested if_not_exists calls",
+            set_value(n, "if_not_exists(x, ", "1", ")"),
+            Err(too_many_operators()),
+        ));
+    }
+    // A size call in parentheses is a syntax error at any depth, where the
+    // service refuses the operand type.
+    for (n, want) in [
+        (101, Err(format!("{WF}Expected a comparison operator"))),
+        (700, deep()),
+    ] {
+        rows.push((
+            "nested size calls in parentheses",
+            format!("{KEYED}{}a{} = 1", "(size(".repeat(n), "))".repeat(n)),
+            want,
+        ));
+    }
+    for n in [100, 2031] {
+        rows.push((
+            "NOTs before a SET value",
+            set_value(n, "NOT ", "a", ""),
+            Err(format!("{WF}Unexpected operator")),
+        ));
+    }
+    for n in [100, 1626] {
+        rows.push((
+            "CASE words",
+            format!("{KEYED}a = {}b", "CASE ".repeat(n)),
+            Err(format!("{WF}Unexpected keyword")),
+        ));
+    }
+    // The service reads 1160 nested maps, the most the length limit holds,
+    // and refuses them for their nesting; the literal cap is 1000.
+    rows.push((
+        "maps in an INSERT value",
+        format!(
+            "INSERT INTO \"t\" VALUE {{'pk': 'q', 'x': {}1{}}}",
+            "{'a': ".repeat(1160),
+            "}".repeat(1160)
+        ),
+        deep(),
+    ));
+    rows.push((
+        "bags",
+        format!("{KEYED}a = {}1{}", "<<".repeat(2000), ">>".repeat(2000)),
+        deep(),
+    ));
+    rows
+}
+
+#[test]
+fn every_measured_depth_gets_its_answer() {
+    for (form, sql, want) in measured_depths() {
+        assert!(sql.len() <= MAX_STATEMENT_LENGTH, "{form}: {}", sql.len());
+        assert_eq!(answer(&sql), want, "{form}: {}", sql.len());
+    }
+}
+
 #[test]
 fn a_deep_statement_takes_little_of_the_callers_stack() {
-    // The inline budget keeps the caller's share to about 310 KB on a
-    // debug build; the rest of the parse runs on its own thread.
+    // The inline budget keeps the caller's share within 700 KB on a debug
+    // build (a chain of `FROM ... WHERE`; 324 KB for these two); the rest of
+    // the parse runs on its own thread.
     let answers = std::thread::Builder::new()
         .stack_size(1 << 20)
         .spawn(|| {
@@ -582,14 +758,18 @@ fn a_deep_statement_takes_little_of_the_callers_stack() {
         .join()
         .unwrap();
     assert_eq!(answers[0], Ok(()));
-    assert_eq!(answers[1].clone().unwrap_err().message, nesting(".a"));
+    assert_eq!(
+        answers[1].clone().unwrap_err().message,
+        format!("{WF}Expected data manipulation")
+    );
 }
 
 /// The most deeply nested statements that parse, by the bound on each: the
-/// operator count for a condition's tree, the operand cap for calls, the
-/// literal nesting rule for a value, and the literal cap for the condition
-/// of a SELECT with a call in its select list, which the parser leaves to
-/// the engine (see `walk`).
+/// operator count for a condition's tree, calls in it included, the
+/// operator count of the SET values for calls and arithmetic in a value,
+/// the literal nesting rule for a value, and the literal cap for the
+/// condition of a SELECT with a call in its select list, which the parser
+/// leaves to the engine (see `walk`).
 fn deepest_that_parse() -> Vec<String> {
     vec![
         nots(MAX_OPERATORS - 1),
@@ -606,15 +786,20 @@ fn deepest_that_parse() -> Vec<String> {
         format!("{SELECT}a = 1{}", " = true".repeat(MAX_OPERATORS - 1)),
         format!(
             "{SELECT}{}a{} = 1",
-            "size(".repeat(MAX_OPERAND_DEPTH - 1),
-            ")".repeat(MAX_OPERAND_DEPTH - 1)
+            "size(".repeat(MAX_OPERATORS - 1),
+            ")".repeat(MAX_OPERATORS - 1)
         ),
         format!(
             "{SELECT}x = {}1{}",
             "[".repeat(MAX_LITERAL_NESTING - 1),
             "]".repeat(MAX_LITERAL_NESTING - 1)
         ),
-        calls(MAX_OPERAND_DEPTH - 1),
+        calls(MAX_OPERATORS),
+        format!(
+            "UPDATE \"t\" SET x = {}a{} WHERE pk = 'p'",
+            "(".repeat(MAX_OPERATORS),
+            " + 1)".repeat(MAX_OPERATORS)
+        ),
         format!(
             "SELECT COUNT(*) FROM \"t\" WHERE x = {}1{}",
             "[".repeat(MAX_LITERAL_DEPTH),
@@ -635,10 +820,15 @@ fn the_deepest_statements_that_parse_are_walked_on_a_small_stack() {
     // worker, whose stack is tokio's default of 2 MiB. The parser's bounds
     // keep each walk and the drop of the tree within that stack on a debug
     // build. The most is for the literal checks of the last statement's
-    // condition, a value 1000 levels deep: 870 KB on Linux x86_64 (measured
-    // 2026-11-06), and about 1.1 MB on macOS arm64, whose debug frames are
-    // larger. The server refuses that statement for its projected call
-    // before these checks run.
+    // condition, a value 1000 levels deep: 880 KB on Linux x86_64 (measured
+    // 2026-11-24 with mincore; 870 KB on 2026-11-06), and about 1.1 MB on
+    // macOS arm64, whose debug frames are larger (measured 2026-11-06). The
+    // 300 nested calls take 200 KB and the 300 levels of arithmetic 150 KB,
+    // and ExecuteStatement takes 983 KB of the request's thread for 300
+    // nested `if_not_exists` calls or 300 levels of arithmetic in a SET
+    // value, the engine's translation included (measured 2026-11-24). The
+    // server refuses the last statement for its projected call before these
+    // checks run.
     const WORKER_STACK_BYTES: usize = 2 << 20;
     let statements: Vec<(String, Statement)> = deepest_that_parse()
         .into_iter()
