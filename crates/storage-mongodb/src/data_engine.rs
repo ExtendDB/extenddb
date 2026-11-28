@@ -2288,7 +2288,7 @@ impl MongoEngine {
         let mut reasons: Vec<CancellationReason> = Vec::with_capacity(ops.len());
         let mut any_failed = false;
         for (key_info, key) in ops {
-            match validation::validate_key_only(
+            match validation::validate_batch_key_only(
                 key,
                 &key_info.key_schema,
                 &key_info.attribute_definitions,
