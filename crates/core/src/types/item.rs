@@ -115,7 +115,10 @@ impl<'de> Deserialize<'de> for ConditionalOperator {
 pub struct PutItemInput {
     #[serde(rename = "TableName")]
     pub table_name: String,
-    #[serde(rename = "Item")]
+    #[serde(
+        rename = "Item",
+        deserialize_with = "crate::serde_helpers::deserialize_item"
+    )]
     pub item: Item,
     #[serde(rename = "ReturnValues", default)]
     pub return_values: ReturnValues,

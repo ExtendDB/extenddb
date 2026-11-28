@@ -161,7 +161,11 @@ pub struct ScanInput {
     #[serde(rename = "ScanFilter")]
     pub scan_filter: Option<HashMap<String, Condition>>,
     /// Legacy `AttributesToGet` — desugared to `ProjectionExpression`.
-    #[serde(rename = "AttributesToGet")]
+    #[serde(
+        rename = "AttributesToGet",
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_attributes_to_get"
+    )]
     pub attributes_to_get: Option<Vec<String>>,
     /// Logical operator for combining multiple legacy filter conditions.
     #[serde(rename = "ConditionalOperator")]

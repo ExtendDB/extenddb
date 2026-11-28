@@ -9,11 +9,27 @@
 //! (`<prefix>[A-Za-z0-9_]+`, <=255 bytes incl. prefix), non-empty mapped value.
 
 use std::collections::HashMap;
+use std::fmt;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::de::{self, Deserialize, Deserializer};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
-use crate::types::AttributeValue;
+use crate::types::{AttributeValue, Item};
+
+/// The refusal of an attribute value that is JSON null, the same for an
+/// item attribute as for a member of a PartiQL parameter.
+pub const NULL_MEMBER: &str = "The supplied Item contains a null AttributeValue";
+
+/// The refusal of a JSON null at the attribute or map member `name`.
+#[must_use]
+pub fn null_member(name: &str) -> String {
+    format!("{NULL_MEMBER}: {name} is null")
+}
+
+/// The refusal of an attribute name that is empty or JSON null.
+pub const EMPTY_ATTRIBUTE_NAME: &str = "Empty attribute name";
 
 /// Maximum placeholder key length in bytes, including the `#` / `:` prefix.
 const MAX_PLACEHOLDER_KEY_BYTES: usize = 255;
@@ -109,7 +125,7 @@ where
             if value.as_str().is_some_and(str::is_empty) {
                 return Err(format!(
                     "ExpressionAttributeNames contains invalid value: \
-                     Empty attribute name for key {key}"
+                     {EMPTY_ATTRIBUTE_NAME} for key {key}"
                 ));
             }
             Ok(())
@@ -150,6 +166,182 @@ where
         },
         serde_json::from_value::<AttributeValue>,
     )
+}
+
+/// Deserialize an item, refusing an attribute that is JSON null by name, as
+/// Amazon `DynamoDB` refuses it (measured 2026-11-14 and 2026-11-17). The
+/// attributes are read in map order, and the first fault is reported unless
+/// a later value has the wrong JSON type. `DynamoDB` refuses such a value
+/// ahead of a null or empty value wherever it stands (measured 2026-11-17).
+/// In a `serde_json::Value`, map order is name order unless serde_json's
+/// `preserve_order` is on. For an item with `"c": null` and `"ba": null`,
+/// `DynamoDB` names `c`, so its order of two nulls is not name order
+/// (measured 2026-11-17).
+///
+/// # Errors
+///
+/// Returns the deserializer error type when the item does not deserialize or
+/// holds a null attribute.
+pub fn deserialize_item<'de, D>(deserializer: D) -> Result<Item, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct ItemVisitor;
+
+    impl<'de> de::Visitor<'de> for ItemVisitor {
+        type Value = Item;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a map")
+        }
+
+        fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Item, A::Error> {
+            let mut item = Item::new();
+            while let Some(name) = map.next_key::<String>()? {
+                let fault = match map.next_value::<Option<AttributeValue>>() {
+                    Ok(Some(value)) => {
+                        item.insert(name, value);
+                        continue;
+                    }
+                    Ok(None) => de::Error::custom(null_member(&name)),
+                    Err(fault) => fault,
+                };
+                return Err(first_type_fault(map).unwrap_or(fault));
+            }
+            Ok(item)
+        }
+    }
+
+    deserializer.deserialize_map(ItemVisitor)
+}
+
+/// The first value left in `map` that [`check_parameter_types`] refuses.
+/// A null is skipped. A read error ends the search, and the caller then
+/// reports the fault it holds.
+fn first_type_fault<'de, A: de::MapAccess<'de>>(mut map: A) -> Option<A::Error> {
+    while let Ok(Some((de::IgnoredAny, value))) = map.next_entry::<_, Option<Value>>() {
+        if let Err(fault) = check_parameter_types(value.as_slice()) {
+            return Some(de::Error::custom(fault));
+        }
+    }
+    None
+}
+
+/// The members an attribute value may hold. Any other member is ignored.
+const TYPES: [&str; 10] = ["S", "N", "B", "SS", "NS", "BS", "M", "L", "NULL", "BOOL"];
+
+/// Check the JSON types of a statement's parameters (wire attribute
+/// values), the first of the two passes of the PartiQL parameter checks.
+/// The caller checks every statement of the request this way before it
+/// checks anything else of the request. [`deserialize_item`] checks the
+/// values an item holds after its first fault the same way.
+///
+/// The walk visits every map and list. The request body's JSON nesting
+/// limit bounds its depth, at most one level for each two JSON levels.
+///
+/// # Errors
+///
+/// Returns a description of the first value whose JSON the attribute value
+/// model cannot read: a value that is not a JSON object, or a member with a
+/// payload of the wrong JSON type.
+pub fn check_parameter_types(parameters: &[Value]) -> Result<(), String> {
+    parameters.iter().try_for_each(check_types)
+}
+
+fn check_types(value: &Value) -> Result<(), String> {
+    let Value::Object(members) = value else {
+        return Err(AttributeValue::deserialize(value).err().map_or_else(
+            || "an attribute value must be a JSON object".to_owned(),
+            |e| e.to_string(),
+        ));
+    };
+    for (tag, payload) in typed_members(members) {
+        match (tag, payload) {
+            ("S" | "N", Value::String(_)) | ("NULL" | "BOOL", Value::Bool(_)) => {}
+            ("B", Value::String(text)) => check_base64(text)?,
+            ("SS" | "NS", Value::Array(items)) => {
+                if items
+                    .iter()
+                    .any(|item| !item.is_string() && !item.is_null())
+                {
+                    return Err(format!("{tag} member must be a string"));
+                }
+            }
+            ("BS", Value::Array(items)) => {
+                for item in items {
+                    match item {
+                        Value::String(text) => check_base64(text)?,
+                        Value::Null => {}
+                        _ => return Err("BS member must be a base64 string".to_owned()),
+                    }
+                }
+            }
+            ("M", Value::Object(entries)) => {
+                for member in entries.values().filter(|member| !member.is_null()) {
+                    check_types(member)?;
+                }
+            }
+            ("L", Value::Array(items)) => {
+                for item in items.iter().filter(|item| !item.is_null()) {
+                    check_types(item)?;
+                }
+            }
+            (tag, _) => return Err(wrong_payload(tag)),
+        }
+    }
+    Ok(())
+}
+
+/// The description of a payload of the wrong JSON type, in the attribute
+/// value deserializer's words.
+fn wrong_payload(tag: &str) -> String {
+    let expected = match tag {
+        "S" | "N" => "a string",
+        "B" => "a base64 string",
+        "NULL" | "BOOL" => "a boolean",
+        "M" => "an object",
+        _ => "an array",
+    };
+    format!("{tag} value must be {expected}")
+}
+
+fn check_base64(text: &str) -> Result<(), String> {
+    BASE64
+        .decode(text)
+        .map(drop)
+        .map_err(|e| format!("invalid base64: {e}"))
+}
+
+/// The members of an attribute value the model reads: those it names whose
+/// value is not null, in the order the value holds them.
+pub(crate) fn typed_members(members: &Map<String, Value>) -> impl Iterator<Item = (&str, &Value)> {
+    members
+        .iter()
+        .filter(|(tag, payload)| !payload.is_null() && TYPES.contains(&tag.as_str()))
+        .map(|(tag, payload)| (tag.as_str(), payload))
+}
+
+/// Deserialize `AttributesToGet`: an element that is JSON null is refused as
+/// an empty attribute name (measured 2026-11-14).
+///
+/// # Errors
+///
+/// Returns the deserializer error type when the list does not deserialize or
+/// holds a null element.
+pub fn deserialize_attributes_to_get<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<Vec<Option<String>>>::deserialize(deserializer)?
+        .map(|names| {
+            names
+                .into_iter()
+                .map(|name| name.ok_or_else(|| de::Error::custom(EMPTY_ATTRIBUTE_NAME)))
+                .collect()
+        })
+        .transpose()
 }
 
 #[cfg(test)]

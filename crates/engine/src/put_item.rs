@@ -85,6 +85,7 @@ pub async fn handle_put_item(
             || msg.contains("Syntax error; key")
             || msg.contains("AttributeValue is empty")
             || msg.contains("AttributeValue has more than one datatypes set")
+            || msg.starts_with(extenddb_core::serde_helpers::NULL_MEMBER)
         {
             DynamoDbError::ValidationException(msg)
         } else {

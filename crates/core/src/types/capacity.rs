@@ -22,7 +22,11 @@ pub enum ReturnConsumedCapacity {
 
 impl<'de> Deserialize<'de> for ReturnConsumedCapacity {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
+        // A JSON null is read as a request without the member (measured
+        // 2026-11-14).
+        let Some(s) = Option::<String>::deserialize(deserializer)? else {
+            return Ok(Self::None);
+        };
         match s.as_str() {
             "NONE" => Ok(Self::None),
             "TOTAL" => Ok(Self::Total),
