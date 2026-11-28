@@ -22,9 +22,9 @@ use extenddb_core::backup_format::{BackupArn, check_store_prefix_table_name, is_
 use extenddb_core::error::{DynamoDbError, ErrorMessageKey, error_message};
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{
-    BackupDescription, BillingMode, CreateTableInput, GlobalSecondaryIndexInfo,
-    LocalSecondaryIndexInfo, ProvisionedThroughput, RestoreSummary, SourceTableFeatureDetails,
-    SseDescription, StreamSpecification, TableDescription, TableStatus,
+    BackupDescription, BillingMode, GlobalSecondaryIndexInfo, LocalSecondaryIndexInfo,
+    ProvisionedThroughput, RestoreSummary, SourceTableFeatureDetails, SseDescription,
+    StreamSpecification, TableDescription, TableStatus,
 };
 use extenddb_storage::backup_catalog::{
     BackupKey, BackupRow, BackupStatus, DeleteStart, is_backup_not_found,
@@ -1042,50 +1042,39 @@ pub(crate) async fn finish_backup_delete<S: BackupCatalog + ?Sized>(
 /// [`overrides`].
 const UNSUPPORTED_RESTORE_TABLE_OVERRIDE_FIELDS: [&str; 1] = ["VectorIndexOverride"];
 
-/// The rules that depend only on the request itself: a PROVISIONED override
-/// needs a throughput, and a throughput must be well formed. Checked before
-/// anything is read from storage.
+/// The rules that depend only on the request itself, checked before anything
+/// is read from storage: a PROVISIONED override needs a throughput, and each
+/// throughput member is at least 1, the service model's constraint (both
+/// with the service's texts, measured on DynamoDB on 13 and 14 Nov 2026).
+/// The throughput overrides are checked against the backup's billing mode
+/// when they are applied ([`overrides`]).
 fn validate_override_shape(overrides: &RestoreTableOverrides) -> Result<(), DynamoDbError> {
     if matches!(overrides.billing_mode, Some(BillingMode::Provisioned))
         && overrides.provisioned_throughput.is_none()
     {
-        return Err(DynamoDbError::ValidationException(
-            "One or more parameter values were invalid: ProvisionedThroughputOverride must \
-             be specified when BillingModeOverride is PROVISIONED"
-                .to_owned(),
-        ));
+        return Err(overrides::throughput_required(None, overrides.billing_mode));
     }
 
     if let Some(throughput) = &overrides.provisioned_throughput {
-        let input = CreateTableInput {
-            billing_mode: Some(BillingMode::Provisioned),
-            provisioned_throughput: Some(throughput.clone()),
-            ..Default::default()
-        };
-        extenddb_core::validation::validate_provisioned_throughput(&input)?;
-    }
-    Ok(())
-}
-
-/// The rule that needs the backup's own billing mode: a throughput override
-/// is only meaningful if the restored table is PROVISIONED.
-fn validate_override_for_source(
-    overrides: &RestoreTableOverrides,
-    source_billing_mode: &str,
-) -> Result<(), DynamoDbError> {
-    let effective = overrides
-        .billing_mode
-        .unwrap_or(if source_billing_mode == "PAY_PER_REQUEST" {
-            BillingMode::PayPerRequest
-        } else {
-            BillingMode::Provisioned
-        });
-    if overrides.provisioned_throughput.is_some() && effective == BillingMode::PayPerRequest {
-        return Err(DynamoDbError::ValidationException(
-            "One or more parameter values were invalid: ProvisionedThroughputOverride can \
-             only be specified with BillingModeOverride PROVISIONED"
-                .to_owned(),
-        ));
+        let prefix = "provisionedThroughputOverride";
+        let below_one: Vec<(String, String)> = [
+            (throughput.write_capacity_units, "writeCapacityUnits"),
+            (throughput.read_capacity_units, "readCapacityUnits"),
+        ]
+        .into_iter()
+        .filter(|&(units, _)| units < 1)
+        .map(|(units, member)| (units.to_string(), format!("{prefix}.{member}")))
+        .collect();
+        if !below_one.is_empty() {
+            let constraint = "Member must have value greater than or equal to 1";
+            let faults: Vec<_> = below_one
+                .iter()
+                .map(|(value, path)| (value.as_str(), path.as_str(), constraint))
+                .collect();
+            return Err(DynamoDbError::ValidationException(
+                extenddb_core::error::validation_errors(&faults),
+            ));
+        }
     }
     Ok(())
 }
@@ -1241,10 +1230,10 @@ where
 /// checked by the job once its record exists, the design's 5.3 step 4); the
 /// steps below are the legacy path's: (6) refuse what no backend restores
 /// faithfully from an in-catalog backup (multi-part key, vector indexes);
-/// (7) check the throughput override against the backup's billing mode,
-/// build the target's `CreateTableInput`, and apply the index and on-demand
-/// throughput overrides to it, refusing what the service refuses
-/// ([`overrides`]); (8) validate that input as CreateTable does; (9) refuse
+/// (7) build the target's `CreateTableInput` and apply the overrides to it,
+/// checking the throughput overrides against the backup's billing mode and
+/// refusing what the service refuses ([`overrides`]); (8) validate that
+/// input as CreateTable does; (9) refuse
 /// while a maintenance command holds the catalog's claim
 /// ([`refuse_while_maintenance_held`]), then take the job permit, last among
 /// the checks (`LimitExceededException` for either; the permit when none is
@@ -1343,9 +1332,8 @@ where
     source.ensure_restorable().map_err(storage_err_to_dynamo)?;
 
     // 7.
-    validate_override_for_source(&overrides, &source.billing_mode)?;
     let mut input = source.restore_input(target_table_name, &overrides);
-    index_overrides.apply(&mut input, overrides.billing_mode)?;
+    index_overrides.apply(&mut input, &overrides)?;
 
     // 8. A stored definition the service would refuse at CreateTable is
     // refused here too (the service re-validates on restore): a backup row
