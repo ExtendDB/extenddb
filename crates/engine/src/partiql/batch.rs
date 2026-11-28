@@ -502,10 +502,12 @@ fn is_charged_failure(error: &DynamoDbError) -> bool {
     }
 }
 
-/// The refusals of an update that the stored item cannot take.
-const UPDATE_FAILURES: [&str; 2] = [
+/// The refusals of an update that the stored item cannot take (measured
+/// 2026-11-05, and 2026-11-20 for an attribute the item does not have).
+const UPDATE_FAILURES: [&str; 3] = [
     "An operand in the update expression has an incorrect data type",
     "The document path provided in the update expression is invalid for update",
+    "The provided expression refers to an attribute that does not exist in the item",
 ];
 
 /// The write units a failed write is charged: those of the item stored under
@@ -738,6 +740,7 @@ mod tests {
             ),
             DynamoDbError::ValidationException(UPDATE_FAILURES[0].to_owned()),
             DynamoDbError::ValidationException(UPDATE_FAILURES[1].to_owned()),
+            DynamoDbError::ValidationException(UPDATE_FAILURES[2].to_owned()),
         ] {
             assert!(is_charged_failure(&error), "{error:?}");
         }
