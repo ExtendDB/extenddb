@@ -105,13 +105,12 @@ pub fn error_message(key: ErrorMessageKey, args: &[&str]) -> String {
             "Too many KeySchema attributes defined for table".to_owned()
         }
         ErrorMessageKey::KeySchemaFirstNotHash => {
-            "First KeySchemaElement is not a HASH type".to_owned()
+            "Invalid KeySchema: The first KeySchemaElement is not a HASH key type".to_owned()
         }
         ErrorMessageKey::AttrDefNotInKey => {
-            format!(
-                "Number of attributes in KeySchema does not exactly match number of attributes defined in AttributeDefinitions: {}",
-                args[0]
-            )
+            "One or more parameter values were invalid: Number of attributes in KeySchema does not \
+             exactly match number of attributes defined in AttributeDefinitions"
+                .to_owned()
         }
     }
 }

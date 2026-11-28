@@ -713,8 +713,26 @@ fn format_key_schema_value(ks: &[KeySchemaElement]) -> String {
     format!("[{}]", elements.join(", "))
 }
 
+/// The refusal of a `KeySchema` with more than `max` elements, for a table,
+/// a global secondary index or a local secondary index alike (measured 13 and
+/// 14 Nov 2026).
+fn key_schema_too_long(ks: &[KeySchemaElement], max: usize) -> DynamoDbError {
+    DynamoDbError::ValidationException(crate::error::validation_error(
+        &format_key_schema_value(ks),
+        "keySchema",
+        &format!("Member must have length less than or equal to {max}"),
+    ))
+}
+
 /// Maximum number of HASH or RANGE elements in a multi-part key schema.
 const MAX_MULTIPART_KEY_ELEMENTS: usize = 4;
+
+/// Most elements in the `KeySchema` of a table or a local secondary index.
+const MAX_KEY_SCHEMA_LEN: usize = 2;
+
+/// Most elements in the `KeySchema` of a global secondary index: four HASH
+/// and four RANGE.
+const MAX_GSI_KEY_SCHEMA_LEN: usize = 2 * MAX_MULTIPART_KEY_ELEMENTS;
 
 fn validate_key_schema(
     input: &CreateTableInput,
@@ -734,15 +752,11 @@ fn validate_key_schema(
     }
 
     if allow_multipart {
-        validate_multipart_key_schema(&input.key_schema, "table")?;
+        validate_multipart_key_schema(&input.key_schema)?;
     } else {
         // Standard DynamoDB: 1 HASH + optional 1 RANGE
-        if input.key_schema.len() > 2 {
-            let ks_repr = format_key_schema_value(&input.key_schema);
-            return Err(DynamoDbError::ValidationException(format!(
-                "1 validation error detected: Value '{ks_repr}' at 'keySchema' failed to satisfy constraint: \
-                 Member must have length less than or equal to 2"
-            )));
+        if input.key_schema.len() > MAX_KEY_SCHEMA_LEN {
+            return Err(key_schema_too_long(&input.key_schema, MAX_KEY_SCHEMA_LEN));
         }
         if input.key_schema.len() == 2 {
             if input.key_schema[1].key_type != KeyType::Range {
@@ -761,11 +775,9 @@ fn validate_key_schema(
 }
 
 /// Validate a multi-part key schema: all HASH elements first, then all RANGE elements,
-/// up to 4 of each type.
-fn validate_multipart_key_schema(
-    key_schema: &[KeySchemaElement],
-    context: &str,
-) -> Result<(), DynamoDbError> {
+/// up to 4 of each type. The texts are the service's for a global secondary index
+/// (measured 13 and 14 Nov 2026). The first element is a HASH key when this runs.
+fn validate_multipart_key_schema(key_schema: &[KeySchemaElement]) -> Result<(), DynamoDbError> {
     let hash_count = key_schema
         .iter()
         .filter(|ks| ks.key_type == KeyType::Hash)
@@ -775,20 +787,15 @@ fn validate_multipart_key_schema(
         .filter(|ks| ks.key_type == KeyType::Range)
         .count();
 
-    if hash_count == 0 {
-        return Err(DynamoDbError::ValidationException(format!(
-            "One or more parameter values were invalid: {context} KeySchema must have at least one HASH key"
-        )));
-    }
     if hash_count > MAX_MULTIPART_KEY_ELEMENTS {
-        return Err(DynamoDbError::ValidationException(format!(
-            "One or more parameter values were invalid: {context} KeySchema exceeds maximum of {MAX_MULTIPART_KEY_ELEMENTS} HASH key attributes"
-        )));
+        return Err(DynamoDbError::ValidationException(
+            "One or more parameter values were invalid: The KeySchema exceeds the maximum allowed number of HASH key attributes".to_owned(),
+        ));
     }
     if range_count > MAX_MULTIPART_KEY_ELEMENTS {
-        return Err(DynamoDbError::ValidationException(format!(
-            "One or more parameter values were invalid: {context} KeySchema exceeds maximum of {MAX_MULTIPART_KEY_ELEMENTS} RANGE key attributes"
-        )));
+        return Err(DynamoDbError::ValidationException(
+            "One or more parameter values were invalid: The KeySchema exceeds the maximum allowed number of RANGE key attributes".to_owned(),
+        ));
     }
 
     // HASH elements must come before RANGE elements
@@ -797,9 +804,9 @@ fn validate_multipart_key_schema(
         match ks.key_type {
             KeyType::Hash => {
                 if seen_range {
-                    return Err(DynamoDbError::ValidationException(format!(
-                        "One or more parameter values were invalid: {context} KeySchema: HASH key attributes must precede RANGE key attributes"
-                    )));
+                    return Err(DynamoDbError::ValidationException(
+                        "One or more parameter values were invalid: All HASH key attributes must precede RANGE key attributes in the KeySchema".to_owned(),
+                    ));
                 }
             }
             KeyType::Range => {
@@ -824,18 +831,23 @@ fn validate_gsi_key_schemas(input: &CreateTableInput) -> Result<(), DynamoDbErro
                 gsi.index_name
             )));
         }
-        if gsi.key_schema[0].key_type != KeyType::Hash {
-            return Err(DynamoDbError::ValidationException(
-                "One or more parameter values were invalid: Index KeySchema: The first KeySchemaElement is not a HASH type".to_owned(),
-            ));
+        if gsi.key_schema.len() > MAX_GSI_KEY_SCHEMA_LEN {
+            return Err(key_schema_too_long(&gsi.key_schema, MAX_GSI_KEY_SCHEMA_LEN));
         }
-        validate_multipart_key_schema(&gsi.key_schema, &format!("Index {}", gsi.index_name))?;
+        if gsi.key_schema[0].key_type != KeyType::Hash {
+            return Err(DynamoDbError::ValidationException(error_message(
+                ErrorMessageKey::KeySchemaFirstNotHash,
+                &[],
+            )));
+        }
+        validate_multipart_key_schema(&gsi.key_schema)?;
     }
     Ok(())
 }
 
-/// Validate LSI key schemas: each must have exactly 2 elements, HASH key must match
-/// the table's HASH key, second element must be RANGE.
+/// Validate LSI key schemas: the table's HASH key, then one RANGE key, with
+/// the service's texts (measured 13 and 14 Nov 2026). The shape of the index
+/// key is checked before its relation to the table key.
 /// LSIs do not support multi-part keys (same as real `DynamoDB`).
 fn validate_lsi_key_schemas(input: &CreateTableInput) -> Result<(), DynamoDbError> {
     let Some(lsis) = &input.local_secondary_indexes else {
@@ -844,37 +856,31 @@ fn validate_lsi_key_schemas(input: &CreateTableInput) -> Result<(), DynamoDbErro
     let table_hash_key = &input.key_schema[0].attribute_name;
     for lsi in lsis {
         validate_index_name(&lsi.index_name)?;
-        match lsi.key_schema.as_slice() {
-            [hash, range] => {
-                if hash.key_type != KeyType::Hash {
-                    return Err(DynamoDbError::ValidationException(
-                        "One or more parameter values were invalid: Index KeySchema: The first KeySchemaElement is not a HASH type".to_owned(),
-                    ));
-                }
-                if hash.attribute_name != *table_hash_key {
-                    return Err(DynamoDbError::ValidationException(
-                        "One or more parameter values were invalid: Table KeySchema: The HASH key of a local secondary index must be the same as the HASH key of the table".to_owned(),
-                    ));
-                }
-                if range.key_type != KeyType::Range {
-                    return Err(DynamoDbError::ValidationException(
-                        "One or more parameter values were invalid: Index KeySchema: The second KeySchemaElement is not a RANGE type".to_owned(),
-                    ));
-                }
-            }
-            [] | [_] => {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "One or more parameter values were invalid: No defined key schema for index: {}",
-                    lsi.index_name
-                )));
-            }
-            _ => {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "One or more parameter values were invalid: Too many KeySchema attributes for index: {}",
-                    lsi.index_name
-                )));
-            }
+        if lsi.key_schema.len() > MAX_KEY_SCHEMA_LEN {
+            return Err(key_schema_too_long(&lsi.key_schema, MAX_KEY_SCHEMA_LEN));
         }
+        let message = match lsi.key_schema.as_slice() {
+            [] => format!(
+                "One or more parameter values were invalid: No defined key schema for index: {}",
+                lsi.index_name
+            ),
+            [first, ..] if first.key_type != KeyType::Hash => {
+                error_message(ErrorMessageKey::KeySchemaFirstNotHash, &[])
+            }
+            [_, second] if second.key_type != KeyType::Range => {
+                "Invalid KeySchema: The second KeySchemaElement is not a RANGE key type".to_owned()
+            }
+            [_] => format!(
+                "One or more parameter values were invalid: Index KeySchema does not have a range key for index: {}",
+                lsi.index_name
+            ),
+            [hash, _] if hash.attribute_name != *table_hash_key => format!(
+                "One or more parameter values were invalid: Index KeySchema does not have the same leading hash key as table KeySchema for index: {}. index hash key: {}, table hash key: {table_hash_key}",
+                lsi.index_name, hash.attribute_name
+            ),
+            _ => continue,
+        };
+        return Err(DynamoDbError::ValidationException(message));
     }
     Ok(())
 }
@@ -979,7 +985,7 @@ fn validate_attribute_definitions(input: &CreateTableInput) -> Result<(), Dynamo
         if !key_attrs.contains(def) {
             return Err(DynamoDbError::ValidationException(error_message(
                 ErrorMessageKey::AttrDefNotInKey,
-                &[&input.table_name],
+                &[],
             )));
         }
     }
@@ -1007,7 +1013,7 @@ pub fn validate_provisioned_throughput(input: &CreateTableInput) -> Result<(), D
         BillingMode::Provisioned => {
             let Some(pt) = &input.provisioned_throughput else {
                 return Err(DynamoDbError::ValidationException(
-                    "No provisioned throughput specified for the table".to_owned(),
+                    "One or more parameter values were invalid: ReadCapacityUnits and WriteCapacityUnits must both be specified when BillingMode is PROVISIONED".to_owned(),
                 ));
             };
             if pt.read_capacity_units < 1 || pt.write_capacity_units < 1 {
@@ -1074,7 +1080,7 @@ fn validate_lsi_count(
         && lsis.len() > limits.max_lsis_per_table
     {
         return Err(DynamoDbError::ValidationException(format!(
-            "One or more parameter values were invalid: LocalSecondaryIndexes count exceeds limit of {}",
+            "One or more parameter values were invalid: Number of LocalSecondaryIndexes exceeds per-table limit of {}",
             limits.max_lsis_per_table
         )));
     }
@@ -2620,6 +2626,7 @@ fn validate_unique_index_names(input: &CreateTableInput) -> Result<(), DynamoDbE
 
 #[cfg(test)]
 mod tests {
+    mod create_table_refusals;
 
     /// A create arriving by UpdateTable gets the same rules as one arriving by
     /// CreateTable, including the field name in the message path.
