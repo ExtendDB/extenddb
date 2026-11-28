@@ -317,6 +317,8 @@ EXTENDDB__AUTH__PROVIDER=builtin
 
 Precedence: CLI flags > environment variables > config file > defaults.
 
+When the name or value of an `EXTENDDB__` variable is not UTF-8, `extenddb serve` and the other commands that load the configuration stop with an error that names the variable. `extenddb stop`, and `extenddb status --port` when that port is in use, read the default PID file in that case, as they do for any configuration error.
+
 ### Runtime Settings
 
 Managed via `extenddb settings set`. Changes take effect within 30 seconds without restart.

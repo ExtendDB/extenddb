@@ -10,6 +10,7 @@
 //! the CLI/app layer can depend on it without pulling in a backend or forming
 //! a dependency cycle.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use extenddb_core::limits::LimitsConfig;
@@ -454,24 +455,77 @@ pub fn serves_tls(tls: &TlsConfig) -> bool {
 ///
 /// # Errors
 ///
-/// Returns an error if the config file exists but is malformed, or if
-/// environment variable values cannot be deserialized.
+/// Returns an error if the config file exists but is malformed, if the name
+/// or value of an `EXTENDDB__` variable is not UTF-8, or if environment
+/// variable values cannot be deserialized.
 pub fn load(config_path: &str) -> anyhow::Result<AppConfig> {
     let config = config::Config::builder()
         .add_source(config::File::with_name(config_path).required(false))
-        .add_source(environment(None))
+        .add_source(ProcessEnvironment)
         .build()?;
     validated(config.try_deserialize()?)
 }
 
-/// The `EXTENDDB__*` variables as a configuration source, `__` between
-/// section names (`EXTENDDB__AUTH__ENCRYPTION__KEY_FILE` sets
-/// `auth.encryption.key_file`). `vars` replaces the process environment in
-/// tests.
-fn environment(vars: Option<config::Map<String, String>>) -> config::Environment {
-    config::Environment::with_prefix("EXTENDDB")
-        .separator("__")
-        .source(vars)
+/// The prefix and separator of setting variables: `EXTENDDB__SERVER__PORT` sets `server.port`.
+const ENV_PREFIX: &str = "EXTENDDB";
+const ENV_SEPARATOR: &str = "__";
+
+/// The `EXTENDDB__*` variables of `vars` as a configuration source.
+fn environment(vars: config::Map<String, String>) -> config::Environment {
+    config::Environment::with_prefix(ENV_PREFIX)
+        .separator(ENV_SEPARATOR)
+        .source(Some(vars))
+}
+
+/// The process environment as a configuration source. The config crate's own
+/// read of the environment panics on a name or value that is not UTF-8. This
+/// source reads it with [`collect_vars`] when the config is built, where the
+/// crate reads it, so a malformed config file is reported before a variable.
+#[derive(Debug)]
+struct ProcessEnvironment;
+
+impl config::Source for ProcessEnvironment {
+    fn clone_into_box(&self) -> Box<dyn config::Source + Send + Sync> {
+        Box::new(Self)
+    }
+
+    fn collect(&self) -> Result<config::Map<String, config::Value>, config::ConfigError> {
+        collect_vars(std::env::vars_os())
+    }
+}
+
+/// The configuration values of `vars`, an environment in its order. A
+/// variable whose name does not start with `EXTENDDB__` in any letter case, as
+/// the config crate compares it, is skipped, whatever bytes it holds. An
+/// `EXTENDDB__` variable whose name or value is not UTF-8 is an error that
+/// names it. When two variables set one setting, the later one wins.
+fn collect_vars(
+    vars: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Result<config::Map<String, config::Value>, config::ConfigError> {
+    let prefix = [ENV_PREFIX, ENV_SEPARATOR].concat();
+    let mut settings = config::Map::new();
+    for (name, value) in vars {
+        if !name
+            .as_encoded_bytes()
+            .get(..prefix.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(prefix.as_bytes()))
+        {
+            continue;
+        }
+        // The `Debug` form quotes the name and escapes its bytes that are not
+        // UTF-8 and its control characters.
+        #[allow(clippy::unnecessary_debug_formatting)]
+        let (Some(text), Some(value)) = (name.to_str(), value.to_str()) else {
+            return Err(config::ConfigError::Message(format!(
+                "environment variable {name:?} is not valid UTF-8; every {prefix} variable is a \
+                 setting, and a setting must be UTF-8 text. Unset it, or give it a UTF-8 name \
+                 and value."
+            )));
+        };
+        let var = config::Map::from([(text.to_owned(), value.to_owned())]);
+        settings.extend(config::Source::collect(&environment(var))?);
+    }
+    Ok(settings)
 }
 
 /// The cross-field checks a deserialized config still has to pass, and the
@@ -499,8 +553,9 @@ fn validated(mut config: AppConfig) -> anyhow::Result<AppConfig> {
 ///
 /// # Errors
 ///
-/// Returns an error if no backend is installed, or if environment variable
-/// values cannot be deserialized.
+/// Returns an error if no backend is installed, if the name or value of an
+/// `EXTENDDB__` variable is not UTF-8, or if environment variable values
+/// cannot be deserialized.
 pub fn load_builtin_defaults() -> anyhow::Result<AppConfig> {
     let backend = extenddb_storage::backend_name()
         .ok_or_else(|| anyhow::anyhow!("no storage backend installed"))?;
@@ -510,7 +565,7 @@ pub fn load_builtin_defaults() -> anyhow::Result<AppConfig> {
             &storage_section,
             config::FileFormat::Toml,
         ))
-        .add_source(environment(None))
+        .add_source(ProcessEnvironment)
         .build()?;
     validated(config.try_deserialize()?)
 }
@@ -604,5 +659,111 @@ mod tests {
             pid_file_path("/run/extenddb", 18443),
             PathBuf::from("/run/extenddb/extenddb-18443.pid")
         );
+    }
+
+    /// `collect_vars` over an environment of `(name, value)` byte pairs in
+    /// order: the settings it reads, or the name (as the error prints it) of
+    /// the variable it refuses.
+    #[cfg(unix)]
+    #[test]
+    fn collect_vars_keeps_extenddb_variables_and_refuses_them_when_not_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+        type Vars = &'static [(&'static [u8], &'static [u8])];
+        type Settings = &'static [(&'static str, &'static str)];
+        let cases: [(&str, Vars, Result<Settings, &str>); 13] = [
+            ("other value not UTF-8", &[(b"LANG_X", b"\xff")], Ok(&[])),
+            ("other name not UTF-8", &[(b"LANG_\xff", b"1")], Ok(&[])),
+            ("other variable", &[(b"LANG_X", b"C.UTF-8")], Ok(&[])),
+            (
+                "one underscore",
+                &[(b"EXTENDDB_SERVER__PORT", b"\xff")],
+                Ok(&[]),
+            ),
+            ("prefix inside", &[(b"XEXTENDDB__SERVER", b"\xff")], Ok(&[])),
+            (
+                "setting",
+                &[(b"EXTENDDB__SERVER__PORT", b"9000")],
+                Ok(&[("server.port", "9000")]),
+            ),
+            (
+                "setting in lowercase",
+                &[(b"extenddb__server__port", b"9000")],
+                Ok(&[("server.port", "9000")]),
+            ),
+            (
+                "setting value not UTF-8",
+                &[(b"EXTENDDB__SERVER__REGION", b"us-\xff")],
+                Err(r#""EXTENDDB__SERVER__REGION""#),
+            ),
+            (
+                "setting name not UTF-8",
+                &[(b"EXTENDDB__SERVER__\xff", b"1")],
+                Err(r#""EXTENDDB__SERVER__\xFF""#),
+            ),
+            (
+                "other variable not UTF-8, then a setting",
+                &[
+                    (b"LANG_\xff", b"\xff"),
+                    (b"EXTENDDB__SERVER__PORT", b"9000"),
+                ],
+                Ok(&[("server.port", "9000")]),
+            ),
+            (
+                "two settings",
+                &[
+                    (b"EXTENDDB__SERVER__PORT", b"1"),
+                    (b"EXTENDDB__SERVER__REGION", b"eu-west-1"),
+                ],
+                Ok(&[("server.port", "1"), ("server.region", "eu-west-1")]),
+            ),
+            (
+                "one setting in two letter cases",
+                &[
+                    (b"EXTENDDB__SERVER__PORT", b"1"),
+                    (b"extenddb__server__port", b"2"),
+                ],
+                Ok(&[("server.port", "2")]),
+            ),
+            (
+                "one setting with `.` and with `__`",
+                &[
+                    (b"EXTENDDB__SERVER.PORT", b"1"),
+                    (b"EXTENDDB__SERVER__PORT", b"2"),
+                ],
+                Ok(&[("server.port", "2")]),
+            ),
+        ];
+        for (row, vars, expected) in cases {
+            let vars = vars.iter().map(|(name, value)| {
+                (
+                    OsString::from_vec(name.to_vec()),
+                    OsString::from_vec(value.to_vec()),
+                )
+            });
+            let settings: Result<config::Map<String, config::ValueKind>, String> =
+                collect_vars(vars)
+                    .map(|settings| {
+                        settings
+                            .into_iter()
+                            .map(|(key, value)| (key, value.kind))
+                            .collect()
+                    })
+                    .map_err(|error| error.to_string());
+            let expected = expected
+                .map(|settings| {
+                    settings
+                        .iter()
+                        .map(|(key, value)| ((*key).to_owned(), (*value).into()))
+                        .collect()
+                })
+                .map_err(|name| {
+                    format!(
+                        "environment variable {name} is not valid UTF-8; every EXTENDDB__ \
+                         variable is a setting, and a setting must be UTF-8 text. Unset it, or \
+                         give it a UTF-8 name and value."
+                    )
+                });
+            assert_eq!(settings, expected, "{row}");
+        }
     }
 }
