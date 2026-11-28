@@ -58,6 +58,9 @@ pub enum ErrorMessageKey {
     KeySchemaTooMany,
     KeySchemaFirstNotHash,
     AttrDefNotInKey,
+    /// An empty `GlobalSecondaryIndexes` or `LocalSecondaryIndexes` list in
+    /// `CreateTable`. `args[0]` is the member (measured 2026-11-14).
+    IndexListEmpty,
 }
 
 /// Build an error message from a key and arguments.
@@ -100,6 +103,12 @@ pub fn error_message(key: ErrorMessageKey, args: &[&str]) -> String {
             "1 validation error detected: Value null at 'keySchema' failed to satisfy constraint: \
              Member must not be null"
                 .to_owned()
+        }
+        ErrorMessageKey::IndexListEmpty => {
+            format!(
+                "One or more parameter values were invalid: List of {} is empty",
+                args[0]
+            )
         }
         ErrorMessageKey::KeySchemaTooMany => {
             "Too many KeySchema attributes defined for table".to_owned()

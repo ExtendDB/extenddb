@@ -368,6 +368,61 @@ class TestCreateTableValidation:
         assert exc_info.value.response["Error"]["Code"] == "ValidationException"
 
 
+# CreateTable with an empty index list.
+def _keys(*pairs):
+    return [{"AttributeName": name, "KeyType": kind} for name, kind in pairs]
+
+
+_GSI, _LSI = "GlobalSecondaryIndexes", "LocalSecondaryIndexes"
+_ALL = {"ProjectionType": "ALL"}
+_BY_LABEL = [{"IndexName": "by-label", "KeySchema": _keys(("label", "HASH")), "Projection": _ALL}]
+_BY_STAMP = [{"IndexName": "by-stamp", "KeySchema": _keys(("pk", "HASH"), ("stamp", "RANGE")),
+              "Projection": _ALL}]
+_FOUR = ["pk", "sk", "label", "stamp"]
+_TWO = ["pk", "sk"]
+# Each row has the string definitions, the members added to an on-demand
+# table keyed on pk and sk, and the member DynamoDB names. Measured in
+# us-east-1 on 14 Nov 2026. The core tests hold the order against other
+# faults.
+EMPTY_INDEX_LIST_ROWS = [
+    (_FOUR, {_GSI: []}, _GSI),
+    (_FOUR, {_LSI: []}, _LSI),
+    (_FOUR, {_GSI: [], _LSI: []}, _LSI),
+    (_FOUR, {_GSI: [], _LSI: _BY_STAMP}, _GSI),
+    (_FOUR, {_GSI: _BY_LABEL, _LSI: []}, _LSI),
+    (_TWO, {_GSI: []}, _GSI),
+]
+
+
+class TestCreateTableEmptyIndexList:
+    """CreateTable refuses an empty index list and creates no table."""
+
+    @pytest.mark.parametrize("defs,members,named", EMPTY_INDEX_LIST_ROWS)
+    def test_create_table_refuses_an_empty_index_list(
+        self, dynamodb_client_no_validation, defs, members, named
+    ):
+        client = dynamodb_client_no_validation
+        name = f"extenddb-test-{uuid.uuid4().hex[:8]}"
+
+        def refusal(members):
+            with pytest.raises(ClientError) as exc_info:
+                client.create_table(**{
+                    "TableName": name,
+                    "BillingMode": "PAY_PER_REQUEST",
+                    "KeySchema": _keys(("pk", "HASH"), ("sk", "RANGE")),
+                    "AttributeDefinitions": [{"AttributeName": d, "AttributeType": "S"} for d in defs],
+                    **members,
+                })
+            with pytest.raises(ClientError) as described:
+                client.describe_table(TableName=name)
+            assert described.value.response["Error"]["Code"] == "ResourceNotFoundException"
+            err = exc_info.value.response["Error"]
+            return err["Code"], err["Message"]
+
+        message = f"One or more parameter values were invalid: List of {named} is empty"
+        assert refusal(members) == ("ValidationException", message)
+
+
 # ---------------------------------------------------------------------------
 # ListTables sort order
 # ---------------------------------------------------------------------------

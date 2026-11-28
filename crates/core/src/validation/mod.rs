@@ -145,6 +145,30 @@ pub fn validate_create_table(
     Ok(())
 }
 
+/// Refuse an empty `LocalSecondaryIndexes` list, then an empty
+/// `GlobalSecondaryIndexes` list: with both empty, DynamoDB names
+/// `LocalSecondaryIndexes` (measured 2026-11-14). An absent member passes.
+/// DynamoDB answers a PROVISIONED table with no `ProvisionedThroughput` ahead
+/// of an empty list (measured 2026-11-18), so the table's throughput is
+/// checked first.
+fn validate_index_lists_not_empty(input: &CreateTableInput) -> Result<(), DynamoDbError> {
+    let member = if matches!(input.local_secondary_indexes.as_deref(), Some([])) {
+        "LocalSecondaryIndexes"
+    } else if matches!(input.global_secondary_indexes.as_deref(), Some([])) {
+        "GlobalSecondaryIndexes"
+    } else {
+        return Ok(());
+    };
+    validate_provisioned_throughput(input)?;
+    Err(DynamoDbError::ValidationException(error_message(
+        ErrorMessageKey::IndexListEmpty,
+        &[member],
+    )))
+}
+
+#[cfg(test)]
+mod empty_index_list_tests;
+
 /// Most `NonKeyAttributes` a table may project across all of its global and
 /// local secondary indexes (the documented DynamoDB limit). An attribute
 /// projected into two indexes counts twice.
@@ -973,6 +997,11 @@ fn validate_attribute_definitions(input: &CreateTableInput) -> Result<(), Dynamo
             )));
         }
     }
+
+    // An empty index list is answered after a key attribute with no definition
+    // and ahead of a definition that no key uses (measured 2026-11-14 and
+    // 2026-11-18).
+    validate_index_lists_not_empty(input)?;
 
     // Every definition must be used by a key
     for def in &def_names {
