@@ -266,6 +266,7 @@ impl DynamoDbError {
     /// - Infrastructure/auth errors → `com.amazon.coral.service#`
     ///   (`SerializationException`, `UnknownOperationException`,
     ///   `MissingAuthenticationToken`, `IncompleteSignature`,
+    ///   `UnrecognizedClientException`,
     ///   `InvalidSignatureException`)
     /// - All other `DynamoDB` errors → `com.amazonaws.dynamodb.v20120810#`
     ///
@@ -278,6 +279,7 @@ impl DynamoDbError {
             | Self::UnknownOperationException(_)
             | Self::MissingAuthenticationToken(_)
             | Self::IncompleteSignature(_)
+            | Self::UnrecognizedClientException(_)
             | Self::InvalidSignatureException(_) => "com.amazon.coral.service#",
             _ => "com.amazonaws.dynamodb.v20120810#",
         };
@@ -526,6 +528,19 @@ mod tests {
                 err.error_type(),
                 expected
             );
+        }
+    }
+
+    /// The `__type` the service sends for each error measured outside the
+    /// default namespace (us-east-1, 21 Nov 2026, each request sent twice).
+    #[test]
+    fn error_types_carry_the_namespace_the_service_sends() {
+        let rows = [(
+            DynamoDbError::UnrecognizedClientException(String::new()),
+            "com.amazon.coral.service#UnrecognizedClientException",
+        )];
+        for (err, expected) in rows {
+            assert_eq!(err.full_error_type(), expected);
         }
     }
 
