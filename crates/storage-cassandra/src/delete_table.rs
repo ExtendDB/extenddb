@@ -7,6 +7,7 @@ use crate::cassandra_util::PolicySession as _;
 use crate::cassandra_util::Stmt;
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_core::types::{DeleteTableInput, TableDescription};
+use extenddb_storage::backup_catalog::restore_target_in_use;
 use extenddb_storage::error::StorageError;
 
 use crate::CassandraEngine;
@@ -20,14 +21,6 @@ pub(crate) enum DeleteTableCaller<'a> {
     /// The restore copy or the reconciler removing a restore target. Deletes only the incarnation with this `table_id`, so a target
     /// that was already removed and whose name was reused is left alone.
     RestoreCleanup { table_id: &'a str },
-}
-
-/// The refusal for DeleteTable on a table being restored. Same text as the
-/// MongoDB backend's.
-pub(crate) fn table_being_restored(table_name: &str) -> StorageError {
-    StorageError::IndexesInUse(format!(
-        "Attempt to change a resource which is still in use: Table is being restored: {table_name}"
-    ))
 }
 
 impl CassandraEngine {
@@ -102,7 +95,7 @@ impl CassandraEngine {
                     .ok()
                     .flatten();
                 if status.as_deref() == Some("CREATING") && restoring_from.is_some() {
-                    return Err(table_being_restored(&input.table_name));
+                    return Err(restore_target_in_use(&input.table_name));
                 }
             }
             DeleteTableCaller::RestoreCleanup { table_id: expected } => {

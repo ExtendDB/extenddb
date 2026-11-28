@@ -16,6 +16,7 @@ use extenddb_core::types::{
     UpdateTableInput,
 };
 use extenddb_storage::TableEngine;
+use extenddb_storage::backup_catalog::restore_target_in_use;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{
     effective_attribute_definitions, index_arn, merge_attribute_definitions, sk_info, stream_arn,
@@ -705,10 +706,7 @@ impl MongoEngine {
         // Deleting one mid-copy can leave orphaned physical collections, so
         // match the SQL backends and DynamoDB by refusing it while CREATING.
         if desc.table_status == TableStatus::Creating && desc.restore_summary.is_some() {
-            return Err(StorageError::IndexesInUse(format!(
-                "Attempt to change a resource which is still in use: Table is being restored: {}",
-                input.table_name
-            )));
+            return Err(restore_target_in_use(&input.table_name));
         }
 
         // Mark as DELETING

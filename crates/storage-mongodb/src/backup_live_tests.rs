@@ -3551,8 +3551,10 @@ async fn live_backup_and_target_are_protected_while_the_copy_runs() {
             },
         )
         .await;
+    // The service's text, measured on DynamoDB on 2026-11-21.
     assert!(
-        matches!(&refused, Err(StorageError::IndexesInUse(m)) if m.contains("being restored")),
+        matches!(&refused, Err(StorageError::IndexesInUse(m))
+            if m == "Attempt to change a resource which is still in use: Table: dst is being used."),
         "DeleteTable of a target being restored is refused: {refused:?}"
     );
     assert_eq!(

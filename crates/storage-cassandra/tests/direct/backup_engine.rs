@@ -1110,8 +1110,10 @@ async fn test_backup_and_target_are_held_while_restoring() {
         )
         .await
         .expect_err("DeleteTable during the copy");
+    // The service's text, measured on DynamoDB on 2026-11-21.
     assert!(
-        matches!(refused, StorageError::IndexesInUse(ref m) if m.contains("being restored")),
+        matches!(refused, StorageError::IndexesInUse(ref m)
+            if m == "Attempt to change a resource which is still in use: Table: HeldTarget is being used."),
         "got {refused:?}"
     );
     // Liveness: both refusals happened while the restore was in progress, not

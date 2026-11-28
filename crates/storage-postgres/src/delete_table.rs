@@ -19,6 +19,7 @@
 use std::time::{Duration, Instant};
 
 use extenddb_core::types::{DeleteTableInput, TableDescription, TableStatus};
+use extenddb_storage::backup_catalog::restore_target_in_use;
 use extenddb_storage::error::StorageError;
 
 use crate::PostgresEngine;
@@ -108,11 +109,7 @@ impl PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
             if restoring {
-                return Err(StorageError::IndexesInUse(format!(
-                    "Attempt to change a resource which is still in use: Table is being \
-                     restored: {}",
-                    row.table_name
-                )));
+                return Err(restore_target_in_use(&row.table_name));
             }
         }
 
