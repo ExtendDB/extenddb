@@ -66,6 +66,28 @@ fn significant_digits_ignore_leading_and_trailing_zeros() {
     assert_eq!(problem(&format!("0.{}", &digits39[..38])), None);
 }
 
+/// The magnitude range comes before the digit count (measured on 2026-11-23,
+/// each as a parameter, twice).
+#[test]
+fn the_magnitude_range_comes_before_the_digit_count() {
+    let forty = "1234567890123456789012345678901234567890";
+    let digits39 = &forty[..39];
+    for (text, expected) in [
+        (format!("{forty}E200"), NumberProblem::Overflow),
+        (format!("-{forty}E200"), NumberProblem::Overflow),
+        (format!("{forty}E-200"), NumberProblem::Underflow),
+        (forty.to_owned(), NumberProblem::TooManyDigits),
+        (format!("{digits39}E87"), NumberProblem::TooManyDigits),
+        (format!("{digits39}E88"), NumberProblem::Overflow),
+        (format!("{digits39}E-168"), NumberProblem::TooManyDigits),
+        (format!("{digits39}E-169"), NumberProblem::Underflow),
+        (format!("{forty}E2147483600"), NumberProblem::Overflow),
+        (format!("{forty}E2147483647"), NumberProblem::Underflow),
+    ] {
+        assert_eq!(problem(&text), Some(expected), "{text}");
+    }
+}
+
 #[test]
 fn zero_is_accepted_at_any_scale() {
     for text in ["0", "-0", "0.000", "0e-500", "000e2147483647"] {
@@ -209,6 +231,35 @@ fn a_literal_that_breaks_a_rule_names_its_position() {
         err("INSERT INTO \"t\" VALUE {'pk': 1, 'm': {'x': [{'y': 1e126}]}}"),
         format!("{OVERFLOW_MESSAGE} under root.x[0].y")
     );
+}
+
+/// A literal of forty digits names the magnitude fault (measured on
+/// 2026-11-23, twice each).
+#[test]
+fn a_literal_names_the_magnitude_before_the_digit_count() {
+    let forty = "1234567890123456789012345678901234567890";
+    let over = |path: &str| format!("{OVERFLOW_MESSAGE} under {path}");
+    let under = |path: &str| format!("{UNDERFLOW_MESSAGE} under {path}");
+    let set = |value: &str| format!("UPDATE \"t\" SET n = {value} WHERE pk = 'k'");
+    for (sql, expected) in [
+        (set(&format!("{forty}E200")), over("root")),
+        (set(&format!("{forty}E-200")), under("root")),
+        (set(forty), format!("{TOO_MANY_DIGITS_MESSAGE} under root")),
+        (set(&format!("{}E88", &forty[..39])), over("root")),
+        (set(&format!("{{'x': {forty}E200}}")), over("root.x")),
+        (set(&format!("[{forty}E-200]")), under("root[0]")),
+        (set(&format!("<<{forty}E200>>")), over("root")),
+        (
+            format!("INSERT INTO \"t\" VALUE {{'pk': 'k', 'n': {forty}E200}}"),
+            over("root"),
+        ),
+        (
+            format!("SELECT * FROM \"t\" WHERE pk = 'k' AND n = {forty}E-200"),
+            under("root"),
+        ),
+    ] {
+        assert_eq!(err(&sql), expected, "{sql}");
+    }
 }
 
 #[test]

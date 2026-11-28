@@ -12,8 +12,9 @@ multi-attribute key refusal and the batch and transaction envelopes.
 
 Runs against real DynamoDB (EXTENDDB_TEST_ENDPOINT unset, AWS credentials) and
 against an extenddb server (EXTENDDB_TEST_ENDPOINT set) with identical
-assertions. Every expected value was measured on the service (2026-11-02).
-Tables use the ``extenddb-measure-pqn-`` prefix and are deleted at the end.
+assertions. Every expected value was measured on the service (2026-11-02, the
+``DIGITS_40`` rows on 2026-11-23). Tables use the ``extenddb-measure-pqn-``
+prefix and are deleted at the end.
 """
 
 from __future__ import annotations
@@ -61,6 +62,7 @@ REFUSED = (
     "keys or multi-attribute RANGE keys."
 )
 DIGITS_39 = "123456789012345678901234567890123456789"
+DIGITS_40 = DIGITS_39 + "0"
 PROJECTED_CALL = "Unexpected path component at 1:8:5"
 
 
@@ -247,8 +249,14 @@ class TestParameterNumbers:
 
     @pytest.mark.parametrize(
         ("value", "expected"),
-        [("1e126", OVERFLOW), ("1e-131", UNDERFLOW), (DIGITS_39, DIGITS)],
-        ids=["overflow", "underflow", "digits"],
+        [
+            ("1e126", OVERFLOW),
+            ("1e-131", UNDERFLOW),
+            (DIGITS_39, DIGITS),
+            (f"{DIGITS_40}E200", OVERFLOW),
+            (f"{DIGITS_40}E-200", UNDERFLOW),
+        ],
+        ids=["overflow", "underflow", "digits", "digits-overflow", "digits-underflow"],
     )
     def test_a_number_rule_gets_the_bare_message(self, dynamodb_client, tables, value, expected):
         statement = positions(tables)["where"]
@@ -446,10 +454,20 @@ class TestLiteralNumbers:
             ("WHERE pk = 1e126", f"{OVERFLOW} under root"),
             ("WHERE pk = 1e-131", f"{UNDERFLOW} under root"),
             (f"WHERE pk = {DIGITS_39}", f"{DIGITS} under root"),
+            (f"WHERE pk = {DIGITS_40}E200", f"{OVERFLOW} under root"),
+            (f"WHERE pk = {DIGITS_40}E-200", f"{UNDERFLOW} under root"),
             ("WHERE pk = 1e2147483647", f"{UNDERFLOW} under root"),
             ("WHERE pk IN [1, 1e126]", f"{OVERFLOW} under root"),
         ],
-        ids=["overflow", "underflow", "digits", "wrap", "in-list"],
+        ids=[
+            "overflow",
+            "underflow",
+            "digits",
+            "digits-overflow",
+            "digits-underflow",
+            "wrap",
+            "in-list",
+        ],
     )
     def test_a_where_literal_names_root(self, dynamodb_client, tables, clause, expected):
         statement = f"SELECT * FROM \"{tables['num']}\" {clause}"
