@@ -120,7 +120,7 @@ fn aliasing_is_rejected() {
 }
 
 #[test]
-fn limit_clause_is_an_unsupported_clause() {
+fn a_limit_is_an_unsupported_clause_only_after_a_select() {
     // The column is that of the token after LIMIT, with length 1.
     let sql = "SELECT * FROM \"t\" WHERE pk='a' LIMIT 2";
     let column = sql.find('2').unwrap() + 1;
@@ -128,6 +128,30 @@ fn limit_clause_is_an_unsupported_clause() {
         err(sql),
         format!("Unsupported clause: LIMIT at 1:{column}:1")
     );
+    // Measured 2026-11-23 in ExecuteStatement on a table that does not
+    // exist. With nothing after it, the LIMIT of a SELECT wants a term.
+    assert_eq!(
+        err("SELECT * FROM \"tbl\" WHERE pk = 'q' LIMIT"),
+        wf("Unexpected term")
+    );
+    // After any other statement a LIMIT is a token left over.
+    let leftover = wf("Unexpected token after expression");
+    for sql in [
+        "UPDATE \"tbl\" SET a = 1 WHERE pk = 'q' LIMIT 1",
+        "UPDATE \"tbl\" SET a = 1 LIMIT 1",
+        "UPDATE \"tbl\" REMOVE a WHERE pk = 'q' LIMIT 1",
+        "UPDATE \"tbl\" SET a = 1 WHERE pk = 'q' RETURNING ALL NEW * LIMIT 1",
+        "UPDATE \"tbl\" SET a = 1 WHERE pk = 'q' limit 1",
+        "UPDATE \"tbl\" SET a = 1 WHERE pk = 'q' LIMIT 1;",
+        "UPDATE \"tbl\" SET a = 1 WHERE pk = 'q' LIMIT",
+        "DELETE FROM \"tbl\" WHERE pk = 'q' LIMIT 1",
+        "INSERT INTO \"tbl\" VALUE {'pk': 'q'} LIMIT 1",
+        "INSERT INTO \"tbl\" VALUE {'pk': 'q'} LIMIT",
+        "EXISTS(SELECT * FROM \"tbl\" WHERE pk = 'q') LIMIT 1",
+    ] {
+        let got = parse_for_execute_statement(sql, 0).unwrap_err().message;
+        assert_eq!(got, leftover, "{sql}");
+    }
 }
 
 #[test]

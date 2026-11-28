@@ -315,18 +315,24 @@ impl Parser {
         self.eat_final_semicolon();
         match &self.peek().kind {
             TokenKind::Eof => Ok(stmt),
-            // A trailing unsupported clause keyword (e.g. LIMIT, which is a
-            // request parameter rather than grammar) is refused by name, in
-            // its place among the refusals of a statement that parses (see
-            // [`walk`]). The position is the token after it (measured
-            // 2026-11-02: `LIMIT 2` names the `2`, length 1). LIMIT at the
-            // end of the statement is not measured and names itself.
-            TokenKind::Ident(s) if s.eq_ignore_ascii_case("LIMIT") => {
-                let t = self
-                    .tokens
-                    .get(self.pos + 1)
-                    .filter(|t| !matches!(t.kind, TokenKind::Eof))
-                    .unwrap_or_else(|| self.peek());
+            // A LIMIT after a SELECT (a request parameter rather than
+            // grammar) is refused by name, in its place among the refusals of
+            // a statement that parses (see [`walk`]). The position is the
+            // token after it (measured 2026-11-02: `LIMIT 2` names the `2`,
+            // length 1). With nothing after it, the LIMIT wants a term, and
+            // after any other statement it is a token left over (measured
+            // 2026-11-23: `SELECT ... LIMIT` is "Unexpected term", and
+            // `UPDATE ... LIMIT 1`, `DELETE ... LIMIT 1`, `INSERT ... LIMIT 1`
+            // and `EXISTS(...) LIMIT 1` are "Unexpected token after
+            // expression").
+            TokenKind::Ident(s)
+                if s.eq_ignore_ascii_case("LIMIT") && matches!(stmt, Statement::Select(_)) =>
+            {
+                self.bump();
+                if matches!(self.peek().kind, TokenKind::Eof) {
+                    return Err(self.term_error());
+                }
+                let t = self.peek();
                 let refusal = format!("Unsupported clause: LIMIT at {}:{}:1", t.line, t.column);
                 self.refuse_clause(refusal);
                 Ok(stmt)
