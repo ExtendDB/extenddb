@@ -525,18 +525,53 @@ fn scan_holds_its_filter_projection_and_start_key_names() {
     );
 }
 
+/// No value, whatever the request names: the service served a search that
+/// projected `ssn`, and one whose condition named `ssn`, under a Deny on
+/// `ssn`, and refused a projected search under a Deny gated on `Null` `true`
+/// (measured 2026-11-21).
 #[test]
-fn search_vectors_holds_its_projected_paths() {
-    let input = json!({
-        "TableName": "t",
-        "IndexName": "vi",
-        "ProjectionExpression": "#v.x, name",
-        "ExpressionAttributeNames": {"#v": "vec"},
-    });
-    assert_eq!(
-        single("SearchVectors", &input, Some(&hash_table())),
-        names(&["name", "vec"])
-    );
+fn search_vectors_holds_no_attributes() {
+    let v = || json!({":v": {"S": "1"}});
+    let rows = [
+        (
+            "projected paths",
+            json!({
+                "ProjectionExpression": "#v.x, name",
+                "ExpressionAttributeNames": {"#v": "vec"},
+            }),
+            None,
+        ),
+        (
+            "a projection of ssn",
+            json!({"ProjectionExpression": "ssn"}),
+            None,
+        ),
+        (
+            "a key without #",
+            json!({"ProjectionExpression": "#n", "ExpressionAttributeNames": {"n": "ssn"}}),
+            None,
+        ),
+        (
+            "a condition on ssn",
+            json!({
+                "SearchConditionExpression": "ssn = :v",
+                "ExpressionAttributeValues": v(),
+                "ProjectionExpression": "cat",
+            }),
+            None,
+        ),
+        (
+            "a condition and no projection",
+            json!({"SearchConditionExpression": "ssn = :v", "ExpressionAttributeValues": v()}),
+            None,
+        ),
+    ];
+    for (row, mut input, expected) in rows {
+        input["TableName"] = json!("t");
+        input["IndexName"] = json!("vi");
+        let found = single("SearchVectors", &input, Some(&hash_table()));
+        assert_eq!(found, expected, "{row}");
+    }
 }
 
 #[test]

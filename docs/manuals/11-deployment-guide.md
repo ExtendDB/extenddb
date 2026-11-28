@@ -274,6 +274,8 @@ RestartSec=5
 # keys needs about 640 KiB for the default [auth.cache] max_entries. Kernels
 # before 5.16 default the memlock limit to 64 KiB (the admin guide's Memory
 # locking section).
+# With upstream commit 97d34aa65c29, the memfd_secret pages of every process
+# that runs as the extenddb user count together against this limit.
 LimitMEMLOCK=16M
 # On a host that backs up tables of large items, one malloc arena keeps a
 # backup job's high-water mark at the pipeline's terms whatever the number of
@@ -421,8 +423,7 @@ it can be the sort key. It never drops a bucket. Resident memory then grows
 with the number of distinct values those requests carry.
 
 Every release through 1.0.0 kept one latency segment record per request that
-reaches dispatch in memory for 24 hours. So does any later release before the
-one that carries this change. The upgrade manual's
+reaches dispatch in memory for 24 hours. The upgrade manual's
 [v1.1.0 entry](07-upgrade-manual.md#v110-latency-segments-are-summed-into-time-buckets)
 lists what the change does to the `segments` that `/metrics` returns. A record
 takes about 190 bytes through 0.1.14, and about

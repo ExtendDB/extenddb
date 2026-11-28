@@ -34,6 +34,11 @@ const RUNTIME_KEYS: &[(&str, Option<&str>)] = &[
     ("data_database_name", None),
     ("index_propagation_delay_ms", None),
     ("log_level", Some("info")),
+    #[cfg(feature = "search-inequality-filters")]
+    (
+        extenddb_core::settings_keys::SEARCH_INEQUALITY_FILTERS,
+        Some(extenddb_core::settings_keys::SEARCH_INEQUALITY_FILTERS_DEFAULT),
+    ),
     ("sqlx_log_level", Some("warn")),
     ("throttling_enabled", Some("false")),
 ];

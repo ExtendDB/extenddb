@@ -306,7 +306,7 @@ impl Bootstrapper for PostgresBootstrapper {
         env_password: Option<&str>,
     ) -> OpResult<AdminBootstrapResult> {
         let pool = self.app_pool(&self.config.catalog_db).await?;
-        let admin_name = env_user.filter(|s| !s.is_empty()).unwrap_or("admin");
+        let admin_name = env_user.unwrap_or("admin");
 
         let exists: bool =
             sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM admin_users WHERE admin_name = $1)")
@@ -327,8 +327,8 @@ impl Bootstrapper for PostgresBootstrapper {
 
         println!("--- Creating admin user '{admin_name}'...");
         let (password, from_env) = match env_password {
-            Some(p) if !p.is_empty() => (p.to_owned(), true),
-            _ => (generate_random_password(), false),
+            Some(p) => (p.to_owned(), true),
+            None => (generate_random_password(), false),
         };
         let hash = hash_password_async(password.clone()).await?;
 

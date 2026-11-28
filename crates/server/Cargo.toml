@@ -11,6 +11,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
+default = ["search-inequality-filters"]
 mongodb-test-hooks = []
 # The backup and restore jobs' kill-point pauses (`EXTENDDB_BACKUP_PAUSE`),
 # for the binary-level crash tests. The engine's points are its own feature;
@@ -21,12 +22,23 @@ mongodb-test-hooks = []
 # `extenddb-storage/test-hooks` arms them in whichever backend the build
 # selects without naming a backend crate here (the server depends on none).
 backup-test-hooks = ["extenddb-engine/backup-test-hooks", "extenddb-storage/test-hooks"]
+# SearchVectors inequality filters: the extended SearchConditionExpression
+# grammar (comparators, BETWEEN, IN, OR, NOT, attribute_exists and
+# attribute_not_exists) for the accounts the `search_inequality_filters`
+# runtime setting names, every account when it is absent. On by default.
+# This crate takes the engine without its default features, so with this off
+# the engine's feature is off too unless another crate of the build turns it
+# on: SearchVectors accepts only an AND of equalities, and the server has no
+# `search_inequality_filters` key. Core's grammar module stays compiled while
+# another crate of the build (a storage backend with its default features)
+# turns core's feature on.
+search-inequality-filters = ["extenddb-core/search-inequality-filters", "extenddb-engine/search-inequality-filters"]
 
 [dependencies]
 extenddb-cache = { workspace = true }
 extenddb-core = { workspace = true }
 extenddb-config = { workspace = true }
-extenddb-engine = { workspace = true, features = ["default"] }
+extenddb-engine = { workspace = true, features = ["partiql"] }
 extenddb-storage = { workspace = true }
 extenddb-backup-store = { workspace = true }
 extenddb-auth = { workspace = true }

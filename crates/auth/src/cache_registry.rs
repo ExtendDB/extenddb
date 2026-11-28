@@ -102,20 +102,14 @@ pub trait AuthzCacheInvalidator: Send + Sync {
         role_name: &'a str,
     ) -> BoxFuture<'a, ()>;
 
-    fn invalidate_session<'a>(
-        &'a self,
-        account_id: &'a str,
-        role_name: &'a str,
-        session_name: &'a str,
-    ) -> BoxFuture<'a, ()>;
-
     fn invalidate_resource_tags<'a>(&'a self, arn: &'a str) -> BoxFuture<'a, ()>;
 
     /// Invalidate every cached session-data entry for a given role.
     ///
     /// Used when a role is deleted so cached session policies and tags for
     /// any active session of that role are dropped immediately. Implemented
-    /// via `invalidate_if` over the `(account, role, session)` cache key.
+    /// via `invalidate_if` over the `(account, role, access key ID)` cache
+    /// key.
     fn invalidate_role_sessions<'a>(
         &'a self,
         account_id: &'a str,
@@ -267,13 +261,6 @@ impl AuthCacheRegistry {
     pub async fn invalidate_role_created_at(&self, account_id: &str, role_name: &str) {
         if let Some(c) = &self.authz {
             c.invalidate_role_created_at(account_id, role_name).await;
-        }
-    }
-
-    pub async fn invalidate_session(&self, account_id: &str, role_name: &str, session_name: &str) {
-        if let Some(c) = &self.authz {
-            c.invalidate_session(account_id, role_name, session_name)
-                .await;
         }
     }
 

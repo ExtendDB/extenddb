@@ -128,38 +128,23 @@ impl AuthorizationStore for SqliteCatalogStore {
 
     fn fetch_session_data(
         &self,
-        account_id: &str,
-        role_name: &str,
-        session_name: &str,
+        access_key_id: &str,
     ) -> BoxFuture<'_, OpResult<Option<SessionData>>> {
-        let account_id = account_id.to_owned();
-        let role_name = role_name.to_owned();
-        let session_name = session_name.to_owned();
+        let access_key_id = access_key_id.to_owned();
         Box::pin(async move {
-            let row: Option<(Option<String>, Option<String>, String, String)> = sqlx::query_as(
-                "SELECT session_policy, session_tags, expires_at, created_at FROM iam_sessions \
-                 WHERE account_id = ? AND role_name = ? AND session_name = ?",
+            // `access_key_id` is UNIQUE, so this reads one session's row.
+            let row: Option<(Option<String>, Option<String>, String)> = sqlx::query_as(
+                "SELECT session_policy, session_tags, created_at FROM iam_sessions \
+                 WHERE access_key_id = ?",
             )
-            .bind(&account_id)
-            .bind(&role_name)
-            .bind(&session_name)
+            .bind(&access_key_id)
             .fetch_optional(self.pool())
             .await
             .map_err(|e| db_err("fetch_session_data", e))?;
 
-            let Some((session_policy, tags_json, expires_at, created_at)) = row else {
+            let Some((session_policy, tags_json, created_at)) = row else {
                 return Ok(None);
             };
-
-            // Treat an expired session as absent (parity with the Postgres
-            // expiry filter). Authentication already rejects expired sessions,
-            // so this is defense-in-depth; evaluate it with the same parser
-            // lookup_session uses rather than a format-fragile SQL comparison.
-            if let Ok(expires) = parse_timestamp(&expires_at)
-                && expires < time::OffsetDateTime::now_utc()
-            {
-                return Ok(None);
-            }
 
             // session_tags is stored as JSON: either an object {key: value} or
             // an array [{"Key": ..., "Value": ...}] (the form AWS SDKs send).
@@ -302,5 +287,18 @@ impl AuthorizationStore for SqliteCatalogStore {
                 })
             }))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use extenddb_storage::session_data_conformance::{Expectations, run};
+
+    /// Same-name sessions of one role each read their own session data
+    /// (`extenddb_storage::session_data_conformance`).
+    #[tokio::test]
+    async fn a_session_reads_its_own_data_by_its_access_key() {
+        let store = crate::management_store::migration_tests::store().await;
+        run(&store, "111111111111", Expectations::default()).await;
     }
 }

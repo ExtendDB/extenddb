@@ -42,6 +42,11 @@ const CORPUS: &str = include_str!("../parity/corpus.json");
 /// has one.
 const ON_WASM: bool = cfg!(target_arch = "wasm32");
 
+/// Whether the build serves the extended search grammar, and the name prefix
+/// of the corpus cases that need it.
+const SEARCH_GRAMMAR: bool = cfg!(feature = "search-inequality-filters");
+const SEARCH_GRAMMAR_CASES: &str = "search grammar: ";
+
 /// The members a case may have.
 const CASE_MEMBERS: [&str; 8] = [
     "name", "op", "body", "rawBody", "error", "checks", "save", "onWasm",
@@ -618,6 +623,11 @@ async fn every_case_gives_its_expected_answer() {
     let mut saved = HashMap::new();
     let mut checks = 0;
     for case in &cases {
+        // The extended search grammar's cases need the grammar, which a build
+        // with the feature compiled out does not have.
+        if !SEARCH_GRAMMAR && case.name.starts_with(SEARCH_GRAMMAR_CASES) {
+            continue;
+        }
         let expect = match &case.on_wasm {
             Some(on_wasm) if ON_WASM => on_wasm,
             _ => &case.expect,

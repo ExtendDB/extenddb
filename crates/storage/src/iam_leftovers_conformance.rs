@@ -57,14 +57,16 @@ async fn failures(attempts: &dyn RateLimitStore, principal: &str, label: &str) -
         .unwrap_or_else(|e| panic!("count the failed logins of {label}: {e:?}"))
 }
 
-fn allow(action: &str) -> Value {
+/// A policy that allows `action` on every resource.
+pub(crate) fn allow(action: &str) -> Value {
     json!({
         "Version": "2012-10-17",
         "Statement": [{"Effect": "Allow", "Action": action, "Resource": "*"}],
     })
 }
 
-fn trust(account_id: &str) -> Value {
+/// A trust policy that lets `account_id` assume the role.
+pub(crate) fn trust(account_id: &str) -> Value {
     json!({
         "Version": "2012-10-17",
         "Statement": [{

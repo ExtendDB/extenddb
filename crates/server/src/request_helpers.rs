@@ -25,7 +25,7 @@ pub(crate) fn extract_operation(headers: &HeaderMap) -> Result<String, DynamoDbE
             if headers.contains_key("authorization") {
                 DynamoDbError::UnknownOperationException(String::new())
             } else {
-                DynamoDbError::MissingAuthenticationToken("Missing Authentication Token".to_owned())
+                DynamoDbError::missing_authentication_token()
             }
         })?;
 
@@ -498,6 +498,10 @@ pub(crate) async fn authorize_request(
                 key_info.as_ref(),
                 &state.limits,
             ),
+            // The service sets no `dynamodb:Attributes` value on a
+            // SearchVectors, so a bare negated operator over the key matches
+            // as it does in IAM (see `request_attributes`).
+            attributes_absent_on_service: operation == "SearchVectors",
             select: input
                 .get("Select")
                 .and_then(|v| v.as_str())

@@ -287,8 +287,10 @@ case "$step" in
     core)
         # extenddb-core's wasm32 unit tests, under Node: the cases of
         # src/crypto.rs, which on wasm32 run its RustCrypto backend (natively
-        # they run AWS-LC), and the test of limits::page_size in
-        # src/limits/mod.rs, which on wasm32 runs with a 32-bit usize.
+        # they run AWS-LC), and the tests of limits::page_size in
+        # src/limits/mod.rs and of the combined size of a search condition in
+        # src/expression/search_filter/tests_operands.rs, which on wasm32 run
+        # with a 32-bit usize.
         #
         # TESTS names every wasm test of the suite as the runner reports it,
         # and the step fails unless the run reports each of them ok and no
@@ -305,6 +307,7 @@ case "$step" in
             crypto::tests::open_rejects_wrong_aad_wrong_key_and_tampering
             crypto::tests::seal_open_round_trip_with_fresh_nonce
             crypto::tests::sha256_known_vector
+            expression::search_filter::tests_operands::the_combined_size_saturates_instead_of_wrapping
             limits::tests::page_size_is_at_least_one_and_never_below_the_limit_it_can_hold
         )
         run_suite core
