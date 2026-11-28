@@ -12,6 +12,8 @@ without number validation.
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from botocore.exceptions import ClientError
 
@@ -103,3 +105,115 @@ def test_update_item_accepts_valid_number_in_expression(
         ConsistentRead=True,
     )
     assert resp["Item"]["good"] == {"N": "42"}
+
+
+PREFIX = "1 validation error detected: "
+BOB = PREFIX + "The parameter cannot be converted to a numeric value: bob"
+OVERFLOW = (
+    PREFIX + "Number overflow. Attempting to store a number with magnitude "
+    "larger than supported range"
+)
+
+
+def _update_missing_table(dynamodb_client, **fields):
+    """UpdateItem on a table that does not exist, answered with an error."""
+    with pytest.raises(ClientError) as ei:
+        dynamodb_client.update_item(
+            TableName=f"absent-{uuid.uuid4().hex[:12]}",
+            Key={"pk": {"S": "k"}},
+            **fields,
+        )
+    err = ei.value.response["Error"]
+    return err["Code"], err["Message"]
+
+
+# Measured 2026-11-23 (us-east-1) on a table that does not exist, each request
+# twice: a number in ExpressionAttributeValues that DynamoDB cannot read, nested
+# ones included, is refused ahead of the parameter usage checks, the
+# expressions, the undefined and unused names and values, and the table lookup.
+@pytest.mark.parametrize(
+    ("fields", "value", "message"),
+    [
+        ({"UpdateExpression": "SET a = :v"}, {"N": "bob"}, BOB),
+        ({"UpdateExpression": "SET a = :v,"}, {"N": "bob"}, BOB),
+        ({"UpdateExpression": "SET a = :v", "values": {":w": {"S": "x"}}}, {"N": "bob"}, BOB),
+        ({"UpdateExpression": "SET #n = :v"}, {"N": "bob"}, BOB),
+        ({"UpdateExpression": "SET a = :v", "ConditionExpression": "a = "}, {"N": "bob"}, BOB),
+        ({"UpdateExpression": "SET a = :v, b = :x"}, {"N": "bob"}, BOB),
+        (
+            {
+                "UpdateExpression": "SET b = :c",
+                "ConditionExpression": "a = :v",
+                "values": {":c": {"S": "x"}},
+            },
+            {"N": "bob"},
+            BOB,
+        ),
+        (
+            {"UpdateExpression": "SET a = :v", "ExpressionAttributeNames": {"#n": "b"}},
+            {"N": "bob"},
+            BOB,
+        ),
+        ({"UpdateExpression": "SET a = :v,"}, {"L": [{"N": "bob"}]}, BOB),
+        ({"UpdateExpression": "SET a = :v,"}, {"NS": ["1", "bob"]}, BOB),
+        ({"UpdateExpression": "SET a = :v,"}, {"M": {"x": {"N": "1e126"}}}, OVERFLOW),
+        ({}, {"N": "bob"}, BOB),
+        ({"ExpressionAttributeNames": {"#n": "a"}}, {"N": "bob"}, BOB),
+        (
+            {"AttributeUpdates": {"b": {"Action": "PUT", "Value": {"S": "x"}}}},
+            {"N": "bob"},
+            BOB,
+        ),
+    ],
+    ids=[
+        "alone",
+        "update-syntax",
+        "unused-value",
+        "undefined-name",
+        "condition-syntax",
+        "undefined-value",
+        "condition-only-value",
+        "unused-name",
+        "in-a-list",
+        "in-a-number-set",
+        "in-a-map",
+        "no-expression",
+        "names-and-no-expression",
+        "attribute-updates-and-no-expression",
+    ],
+)
+def test_a_value_number_is_refused_ahead_of_the_expressions_and_the_table(
+    dynamodb_client, fields, value, message
+):
+    fields = dict(fields)
+    values = {":v": value, **fields.pop("values", {})}
+    assert _update_missing_table(
+        dynamodb_client, ExpressionAttributeValues=values, **fields
+    ) == ("ValidationException", message)
+
+
+# Measured the same way: the mixed parameters check and an empty
+# ExpressionAttributeNames map come ahead of the number. Only the check is
+# asserted here, since the prefix of these texts is a separate difference.
+@pytest.mark.parametrize(
+    ("fields", "text"),
+    [
+        (
+            {"AttributeUpdates": {"b": {"Action": "PUT", "Value": {"S": "x"}}}},
+            "Can not use both expression and non-expression parameters",
+        ),
+        ({"ExpressionAttributeNames": {}}, "ExpressionAttributeNames must not be empty"),
+    ],
+    ids=["mixed-parameters", "empty-names"],
+)
+def test_mixing_and_an_empty_names_map_come_ahead_of_a_value_number(
+    dynamodb_client, fields, text
+):
+    code, message = _update_missing_table(
+        dynamodb_client,
+        UpdateExpression="SET a = :v",
+        ExpressionAttributeValues={":v": {"N": "bob"}},
+        **fields,
+    )
+    assert code == "ValidationException"
+    assert text in message

@@ -1191,14 +1191,6 @@ pub fn validate_update_item(
     validate_key_only(&input.key, key_schema, attr_defs)?;
     validate_key_sizes(&input.key, key_schema, limits)?;
 
-    // Validate number values supplied via ExpressionAttributeValues. Unlike a
-    // PutItem item (validated by validate_item_numbers), these are checked here
-    // because the AttributeValue deserializer intentionally stores malformed
-    // numbers raw and defers rejection to the validation layer. The service
-    // answers `1 validation error detected: ` and the number message, with no
-    // ExpressionAttributeValues wrapper (measured 2026-11-11).
-    number::operations::update_item_values(input)?;
-
     if let Some(updates) = &input.attribute_updates {
         validate_attribute_values_nesting_depth(updates.values().filter_map(|u| u.value.as_ref()))?;
         // Legacy AttributeUpdates values carry the bare numeric-value message,
@@ -4046,76 +4038,6 @@ mod tests {
         let attr_defs = vec![make_ad("pk", ScalarAttributeType::S)];
         let mut input = update_input_no_directives();
         input.update_expression = Some(String::new());
-        assert!(validate_update_item(&input, &limits, &key_schema, &attr_defs).is_ok());
-    }
-
-    fn eav_update_input(key: &str, value: AttributeValue) -> UpdateItemInput {
-        let mut input = update_input_no_directives();
-        input.update_expression = Some(format!("SET bad = {key}"));
-        let mut m = std::collections::HashMap::new();
-        m.insert(key.to_owned(), value);
-        input.expression_attribute_values = Some(m);
-        input
-    }
-
-    #[test]
-    fn update_item_rejects_malformed_number_in_eav() {
-        // The AttributeValue deserializer stores malformed numbers raw and
-        // defers rejection here. The service answers the prefix and the
-        // number message, with no ExpressionAttributeValues wrapper (measured
-        // 2026-11-11, `12e` and `abc`).
-        let limits = LimitsConfig::default();
-        let key_schema = vec![make_ks("pk", KeyType::Hash)];
-        let attr_defs = vec![make_ad("pk", ScalarAttributeType::S)];
-        let input = eav_update_input(":v", AttributeValue::N("12e".to_owned()));
-        let err = validate_update_item(&input, &limits, &key_schema, &attr_defs).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "1 validation error detected: \
-             The parameter cannot be converted to a numeric value: 12e"
-        );
-    }
-
-    #[test]
-    fn update_item_rejects_number_overflow_in_eav() {
-        // Measured 2026-11-11 with `1E126` and `1E2147483648`.
-        let limits = LimitsConfig::default();
-        let key_schema = vec![make_ks("pk", KeyType::Hash)];
-        let attr_defs = vec![make_ad("pk", ScalarAttributeType::S)];
-        let big = format!("1{}", "0".repeat(200));
-        let input = eav_update_input(":v", AttributeValue::N(big));
-        let err = validate_update_item(&input, &limits, &key_schema, &attr_defs).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "1 validation error detected: \
-             Number overflow. Attempting to store a number with magnitude larger than \
-             supported range"
-        );
-    }
-
-    #[test]
-    fn update_item_rejects_invalid_number_set_member_in_eav() {
-        // Measured 2026-11-11 with `NS [1, abc]`.
-        let limits = LimitsConfig::default();
-        let key_schema = vec![make_ks("pk", KeyType::Hash)];
-        let attr_defs = vec![make_ad("pk", ScalarAttributeType::S)];
-        let ns: std::collections::BTreeSet<String> =
-            ["1".to_owned(), "abc".to_owned()].into_iter().collect();
-        let input = eav_update_input(":v", AttributeValue::NS(ns));
-        let err = validate_update_item(&input, &limits, &key_schema, &attr_defs).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "1 validation error detected: \
-             The parameter cannot be converted to a numeric value: abc"
-        );
-    }
-
-    #[test]
-    fn update_item_accepts_valid_number_in_eav() {
-        let limits = LimitsConfig::default();
-        let key_schema = vec![make_ks("pk", KeyType::Hash)];
-        let attr_defs = vec![make_ad("pk", ScalarAttributeType::S)];
-        let input = eav_update_input(":v", AttributeValue::N("42".to_owned()));
         assert!(validate_update_item(&input, &limits, &key_schema, &attr_defs).is_ok());
     }
 
