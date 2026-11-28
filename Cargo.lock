@@ -1752,6 +1752,7 @@ dependencies = [
  "async-trait",
  "aws-credential-types",
  "aws-sigv4",
+ "base64 0.22.1",
  "extenddb-cache",
  "extenddb-core",
  "futures",
